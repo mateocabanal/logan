@@ -1,0 +1,12 @@
+[package]
+name = "logan-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Logan IR: the tensor graph + plan artifact shared by the compiler and the runtime"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"

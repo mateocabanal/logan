@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["logan-abi", "logan-format", "logan-compiler", "logan-qwen", "logan-qwen4"]
+members = ["logan-abi", "logan-format", "logan-ir", "logan-compiler", "logan-qwen", "logan-qwen4"]
 
 [workspace.package]
 version = "0.1.0"
