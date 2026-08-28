@@ -8,6 +8,7 @@
 pub mod core;
 pub mod ids;
 pub mod runtime;
+pub mod sim;
 
 pub use core::{
     Action, ActionKind, Budget, Effect, Outcome, SchedError, SchedulerCore, Session, SessionState,
@@ -18,4 +19,7 @@ pub use runtime::{
     BoundedExecutor, CompletionSendError, CompletionSink, DispatchRequest, ExecutorSet,
     RequestSendError, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeReply,
     RuntimeRequest, SchedulerRuntime, ShutdownMode, SubmitDisposition, SubmitResult,
+};
+pub use sim::{
+    FakeCompletionScript, ReplayError, SchedulerSimulator, SimOp, SimOutcome, TraceEvent,
 };
