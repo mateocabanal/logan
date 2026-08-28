@@ -13,6 +13,8 @@ pub mod coliload;
 pub mod colisource;
 pub mod ffi;
 
+use logan_core::expert::Slot as _; // for SlotExpert::release
+
 // ---------------------------------------------------------------------------
 // safetensors reader (same minimal F32 adapter as qwen-rs)
 // ---------------------------------------------------------------------------
@@ -369,8 +371,8 @@ pub struct Model {
     // 280->173 ms/tok; LRU upgrade if hit-rate plateaus low). Entries own
     // their Metal tensor handles — the C backend keys handles by weight
     // pointer, so stale handles would serve wrong weights.
-    expert_cache: std::collections::VecDeque<((i32, i32), crate::colisource::SlotExpert)>,
-    expert_cache_cap: usize,
+    /// LRU expert store (engine-neutral core; slot-owning values).
+    expert_store: logan_core::expert::ExpertStore<crate::colisource::SlotExpert>,
     /// Metal direct path (fused Apple8 moe_topk + coalesced GDN kernels).
     /// Brought up lazily on the first decode token; failures leave it off and
     /// every caller falls back to the CPU reference (C contract).
@@ -1235,10 +1237,9 @@ impl Model {
         li: i32,
         ei: i32,
     ) -> Option<std::rc::Rc<crate::colisource::SlotRef>> {
-        for (k, v) in self.expert_cache.iter() {
-            if *k == (li, ei) {
-                return Some(std::rc::Rc::new(v.ref_view()));
-            }
+        // LRU hit: promote + return a borrowed view (no slot ownership).
+        if let Some(v) = self.expert_store.get((li as u32, ei as u32)) {
+            return Some(std::rc::Rc::new(v.ref_view()));
         }
         let coli = self.coli.as_ref()?;
         let se: Option<crate::colisource::SlotExpert> = (|| {
@@ -1276,17 +1277,12 @@ impl Model {
             })
         })();
         let se = se?;
-        let entry = se;
-        if self.expert_cache.len() >= self.expert_cache_cap {
-            if let Some((_, old)) = self.expert_cache.pop_front() {
-                drop(old); // SlotExpert::drop frees the MetalIO slot
-            }
+        // LRU insert; evicted slot is released by the caller (drop).
+        if let Some(mut evicted) = self.expert_store.insert((li as u32, ei as u32), se) {
+            evicted.release();
         }
-        self.expert_cache.push_back(((li, ei), entry));
-        for (k, v) in self.expert_cache.iter() {
-            if *k == (li, ei) {
-                return Some(std::rc::Rc::new(v.ref_view()));
-            }
+        if let Some(v) = self.expert_store.get((li as u32, ei as u32)) {
+            return Some(std::rc::Rc::new(v.ref_view()));
         }
         None
     }
@@ -1926,8 +1922,7 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
-            expert_cache: std::collections::VecDeque::new(),
-            expert_cache_cap: 256,
+            expert_store: logan_core::expert::ExpertStore::new(256),
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")

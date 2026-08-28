@@ -130,6 +130,7 @@ name = "logan-qwen4"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "logan-core",
  "logan-format",
  "logan-metal",
  "serde_json",

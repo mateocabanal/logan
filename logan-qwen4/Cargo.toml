@@ -7,4 +7,5 @@ edition = "2021"
 serde_json = "1.0"
 logan-format = { path = "../logan-format" }
 logan-metal = { path = "../logan-metal" }
+logan-core = { path = "../logan-core" }
 libc = "0.2"

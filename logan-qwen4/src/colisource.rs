@@ -93,6 +93,17 @@ impl Drop for SlotExpert {
     }
 }
 
+/// The core's Slot contract: release = free the MetalIO slot (the LRU
+/// store calls this on eviction/replace/drop).
+impl logan_core::expert::Slot for SlotExpert {
+    fn release(&mut self) {
+        if self.slot >= 0 {
+            unsafe { crate::ffi::metalio_slot_free(self.slot) };
+            self.slot = -1;
+        }
+    }
+}
+
 /// Resident weight: BF16 bytes + shape. matmul decodes on the fly.
 pub struct ColiWt {
     pub bytes: Vec<u8>, // BF16 little-endian

@@ -185,8 +185,7 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
-            expert_cache: std::collections::VecDeque::new(),
-            expert_cache_cap: 256,
+            expert_store: logan_core::expert::ExpertStore::new(256),
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")
