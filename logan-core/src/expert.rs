@@ -63,8 +63,11 @@ impl<V: Slot> ExpertStore<V> {
     }
 
     /// Insert (or replace) an expert, evicting LRU when over capacity.
-    /// Returns the evicted value (engine frees its slot) if any.
-    pub fn insert(&mut self, key: (u32, u32), value: V) -> Option<V> {
+    /// Returns (evicted-value-requiring-release, ref-to-inserted-value).
+    /// The inserted ref does NOT bump `hits` — only `get` does, so the hit
+    /// counter measures genuine reuse, not the insert-then-immediate-get
+    /// pattern engines use to fetch a fresh expert.
+    pub fn insert(&mut self, key: (u32, u32), value: V) -> (Option<V>, &V) {
         if let Some(&idx) = self.map.get(&key) {
             // replace in place, promote
             let node = self.slab[idx].as_mut().unwrap();
@@ -72,7 +75,8 @@ impl<V: Slot> ExpertStore<V> {
             old.release();
             self.unlink(idx);
             self.push_front(idx);
-            return None;
+            let v = &self.slab[idx].as_ref().unwrap().value;
+            return (None, v);
         }
         self.misses += 1;
         let mut evicted = None;
@@ -95,7 +99,8 @@ impl<V: Slot> ExpertStore<V> {
         }));
         self.map.insert(key, idx);
         self.push_front(idx);
-        evicted
+        let v = &self.slab[idx].as_ref().unwrap().value;
+        (evicted, v)
     }
 
     pub fn len(&self) -> usize {
@@ -172,7 +177,7 @@ mod tests {
         s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
         // touch (0,0) so (0,1) becomes LRU
         assert!(s.get((0, 0)).is_some());
-        let evicted = s.insert((1, 0), FakeSlot { key: (1, 0), released: false });
+        let (evicted, _) = s.insert((1, 0), FakeSlot { key: (1, 0), released: false });
         let mut ev = evicted.unwrap();
         assert_eq!(ev.key, (0, 1));
         // eviction returns the value; the caller releases it (engine frees
@@ -191,11 +196,22 @@ mod tests {
         s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
         s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
         // replace (0,0) in place: old released internally, (0,0) promoted
-        let old = s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        let (old, _) = s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
         assert!(old.is_none());
         // (0,0) is now MRU; (0,1) is LRU; cap 2 -> inserting (1,1) evicts (0,1)
-        let evicted = s.insert((1, 1), FakeSlot { key: (1, 1), released: false });
+        let (evicted, _) = s.insert((1, 1), FakeSlot { key: (1, 1), released: false });
         assert_eq!(evicted.unwrap().key, (0, 1));
+    }
+
+    #[test]
+    fn insert_does_not_bump_hits() {
+        let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
+        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        // insert returns the value ref WITHOUT a hit — hits stay 0
+        assert_eq!(s.hits, 0);
+        assert!(s.get((0, 1)).is_some()); // genuine reuse -> 1 hit
+        assert_eq!(s.hits, 1);
     }
 
     #[test]

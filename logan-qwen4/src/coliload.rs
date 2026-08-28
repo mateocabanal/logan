@@ -5,6 +5,7 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
+    cache_cap,
     colisource::{bf16_to_f32, ColiSource},
     Cfg, HcGlobal, Layer, Model, Wt,
 };
@@ -185,7 +186,7 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
-            expert_store: logan_core::expert::ExpertStore::new(256),
+            expert_store: logan_core::expert::ExpertStore::new(cache_cap()),
             spans: logan_core::telemetry::TokenSpans::default(),
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")

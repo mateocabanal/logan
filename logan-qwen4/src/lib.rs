@@ -1279,14 +1279,13 @@ impl Model {
             })
         })();
         let se = se?;
-        // LRU insert; evicted slot is released by the caller (drop).
-        if let Some(mut evicted) = self.expert_store.insert((li as u32, ei as u32), se) {
-            evicted.release();
+        // LRU insert; the returned ref is the fresh value (no hit bump —
+        // hits measure genuine reuse only). Evicted slot released by drop.
+        let (mut evicted, v) = self.expert_store.insert((li as u32, ei as u32), se);
+        if let Some(mut e) = evicted.take() {
+            e.release();
         }
-        if let Some(v) = self.expert_store.get((li as u32, ei as u32)) {
-            return Some(std::rc::Rc::new(v.ref_view()));
-        }
-        None
+        Some(std::rc::Rc::new(v.ref_view()))
     }
 
     /// Direct-path expert descriptor for the fused moe_topk (slot + offsets).
@@ -1797,6 +1796,18 @@ impl Model {
 // load
 // ---------------------------------------------------------------------------
 
+/// Expert-cache capacity: QWEN4_CACHE env (default 256). Mirrors the C
+/// engine's CACHE arg — the measured plateau is ~1230 misses at any cap
+/// >= 256 (cold first-touch floor), so raising it past 256 only helps if
+/// the working set per token exceeds the cap.
+pub fn cache_cap() -> usize {
+    std::env::var("QWEN4_CACHE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+        .max(1)
+}
+
 fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
     Ok(Wt { f: st.f32(name, &[o as u64, i as u64])?, bytes: None, o, i })
 }
@@ -1967,7 +1978,7 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
-            expert_store: logan_core::expert::ExpertStore::new(256),
+            expert_store: logan_core::expert::ExpertStore::new(cache_cap()),
             spans: logan_core::telemetry::TokenSpans::default(),
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")
