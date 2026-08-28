@@ -7,5 +7,6 @@
 
 pub mod expert;
 pub mod math;
+pub mod sched;
 pub mod storage;
 pub mod telemetry;

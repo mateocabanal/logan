@@ -9,3 +9,4 @@ publish = false
 
 [dependencies]
 logan-ir = { path = "../logan-ir" }
+serde = { version = "1.0", features = ["derive"] }
