@@ -1234,7 +1234,12 @@ impl Model {
     /// CPU fallback preads its shared-storage bytes. One MTLIOFileHandle per
     /// shard (cached process-wide; the C table caps at 64). Eviction frees
     /// the slot (its Drop waits + releases).
-    fn cached_expert(
+    /// Phase 1 (async issue): ensure the expert is resident, enqueuing the
+    /// MetalIO load WITHOUT waiting. Returns a borrowed view; the caller
+    /// must drain the pending event via `expert_wait` before consuming the
+    /// slot bytes (this is what lets the C engine overlap all K loads of a
+    /// layer — the serialization fix).
+    fn cached_expert_issue(
         &mut self,
         li: i32,
         ei: i32,
@@ -1251,10 +1256,6 @@ impl Model {
             let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
             let fid = crate::ffi::mio_file(&shard)?;
             let (slot, ev) = crate::ffi::mio_load_expert(fid, &regions)?;
-            if unsafe { crate::ffi::metalio_wait(ev) } != 0 {
-                unsafe { crate::ffi::metalio_slot_free(slot) };
-                return None;
-            }
             let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) } as *mut u8;
             if ptr.is_null() {
                 unsafe { crate::ffi::metalio_slot_free(slot) };
@@ -1273,6 +1274,7 @@ impl Model {
                 down_offset: down_off,
                 down_bytes: db,
                 ptr,
+                pending: std::cell::Cell::new(ev),
                 bf16_cache: std::cell::RefCell::new(None),
                 rows: [dims[0].0, dims[1].0, dims[2].0],
                 cols: [dims[0].1, dims[1].1, dims[2].1],
@@ -1286,6 +1288,40 @@ impl Model {
             e.release();
         }
         Some(std::rc::Rc::new(v.ref_view()))
+    }
+
+    /// Phase 2 (drain): wait for a previously-issued expert's MetalIO event.
+    /// Uses `peek` (not `get`) so the drain does NOT count as a cache hit —
+    /// hits measure genuine reuse only. Returns false on I/O failure
+    /// (caller falls back to the CPU path).
+    fn expert_wait(&mut self, li: i32, ei: i32) -> bool {
+        let ev = match self.expert_store.peek((li as u32, ei as u32)) {
+            Some(v) => v.pending.get(),
+            None => return true, // nothing pending
+        };
+        if ev == 0 {
+            return true; // already resident
+        }
+        if unsafe { crate::ffi::metalio_wait(ev) } != 0 {
+            return false;
+        }
+        if let Some(v) = self.expert_store.peek((li as u32, ei as u32)) {
+            v.pending.set(0);
+        }
+        true
+    }
+
+    /// Synchronous variant (CPU fallback paths): issue then drain.
+    fn cached_expert_await(
+        &mut self,
+        li: i32,
+        ei: i32,
+    ) -> Option<std::rc::Rc<crate::colisource::SlotRef>> {
+        let r = self.cached_expert_issue(li, ei)?;
+        if !self.expert_wait(li, ei) {
+            return None;
+        }
+        Some(r)
     }
 
     /// Direct-path expert descriptor for the fused moe_topk (slot + offsets).
@@ -1380,19 +1416,36 @@ impl Model {
         let mut pending_acc: Option<Vec<f32>> = None;
         let mut _io_t = logan_core::telemetry::Span::begin("io");
         if direct {
-            let mut ex: Vec<crate::ffi::ColiApple8MetalioExpert> = Vec::with_capacity(k);
-            let mut ws: Vec<f32> = Vec::with_capacity(k);
+            // Async issue: enqueue ALL K expert loads first (no waits), so
+            // MTLIO pipelines them back-to-back instead of serializing each
+            // load+wait (the C engine's exact-demand async issue). The
+            // awaits below drain the events just before the fused submit.
+            let mut refs: Vec<std::rc::Rc<crate::colisource::SlotRef>> =
+                Vec::with_capacity(k);
             let mut all_ok = true;
             for i in 0..k {
-                match self.cached_expert(li as i32, idx[i] as i32) {
-                    Some(ce) => {
-                        ex.push(Self::slot_descriptor(&ce));
-                        ws.push(val[i] / wsum);
-                    }
+                match self.cached_expert_issue(li as i32, idx[i] as i32) {
+                    Some(ce) => refs.push(ce),
                     None => {
                         all_ok = false;
                         break;
                     }
+                }
+            }
+            if all_ok {
+                for i in 0..k {
+                    if !self.expert_wait(li as i32, idx[i] as i32) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            let mut ex: Vec<crate::ffi::ColiApple8MetalioExpert> = Vec::with_capacity(k);
+            let mut ws: Vec<f32> = Vec::with_capacity(k);
+            if all_ok {
+                for (i, ce) in refs.iter().enumerate() {
+                    ex.push(Self::slot_descriptor(ce));
+                    ws.push(val[i] / wsum);
                 }
             }
             if all_ok {
@@ -1439,7 +1492,7 @@ impl Model {
                 acc = vec![0.0; d];
                 for i in 0..k {
                     let w = val[i] / wsum;
-                    if let Some(ce) = self.cached_expert(li as i32, idx[i] as i32) {
+                    if let Some(ce) = self.cached_expert_await(li as i32, idx[i] as i32) {
                         let mut gate = vec![0.0; c.moe_inter];
                         let mut up = vec![0.0; c.moe_inter];
                         let mut y = vec![0.0; d];
@@ -1465,7 +1518,7 @@ impl Model {
             // the canonical decode path for non-Apple8 packages.
             // safetensors mode: preloaded experts.
             let mats: [Wt; 3] = if self.coli.is_some() {
-                match self.cached_expert(li as i32, idx[i] as i32) {
+                match self.cached_expert_await(li as i32, idx[i] as i32) {
                     Some(ce) => {
                         let mut gate = vec![0.0; c.moe_inter];
                         let mut up = vec![0.0; c.moe_inter];
@@ -1770,6 +1823,7 @@ impl Model {
             return;
         }
         let (e, s, w, k, fc, fe) = logan_metal::metal_profile();
+        let mio = logan_metal::mio_stats();
         let metal = logan_core::telemetry::MetalCounters {
             encode_ns: e,
             submit_ns: s,
@@ -1777,7 +1831,10 @@ impl Model {
             kernel_ns: k,
             fused_calls: fc,
             fused_experts: fe,
-            ..Default::default()
+            mio_loads: mio.loads,
+            mio_bytes: mio.bytes,
+            mio_waits: mio.waits,
+            mio_fails: mio.fails,
         };
         let mut spans = self.spans.clone();
         spans.total_ms = total_ms;

@@ -62,6 +62,13 @@ impl<V: Slot> ExpertStore<V> {
         Some(&self.slab[idx].as_ref().unwrap().value)
     }
 
+    /// Look up WITHOUT counting a hit or promoting (internal lookups like
+    /// waiting on a pending load must not pollute the reuse metric).
+    pub fn peek(&self, key: (u32, u32)) -> Option<&V> {
+        let &idx = self.map.get(&key)?;
+        Some(&self.slab[idx].as_ref().unwrap().value)
+    }
+
     /// Insert (or replace) an expert, evicting LRU when over capacity.
     /// Returns (evicted-value-requiring-release, ref-to-inserted-value).
     /// The inserted ref does NOT bump `hits` — only `get` does, so the hit
@@ -201,6 +208,20 @@ mod tests {
         // (0,0) is now MRU; (0,1) is LRU; cap 2 -> inserting (1,1) evicts (0,1)
         let (evicted, _) = s.insert((1, 1), FakeSlot { key: (1, 1), released: false });
         assert_eq!(evicted.unwrap().key, (0, 1));
+    }
+
+    #[test]
+    fn peek_does_not_bump_hits_or_promote() {
+        let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
+        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        assert!(s.peek((0, 0)).is_some());
+        assert_eq!(s.hits, 0); // peek is not a hit
+        // Peek must NOT promote: (0,1) was inserted second so it is MRU;
+        // (0,0) is still LRU. Inserting a third key evicts (0,0), proving
+        // the peek didn't touch the recency order.
+        let (evicted, _) = s.insert((2, 0), FakeSlot { key: (2, 0), released: false });
+        assert_eq!(evicted.unwrap().key, (0, 0));
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub struct SlotExpert {
     /// CPU-visible pointer to the slot's shared-storage MTLBuffer contents
     /// (valid while the slot is allocated).
     pub ptr: *mut u8,
+    /// Pending MetalIO load event (0 = fully resident). Set on async issue;
+    /// `Model::expert_wait` drains it before the expert is consumed.
+    pub pending: std::cell::Cell<i64>,
     /// CPU fallback weights: decoded BF16 bytes (filled lazily on first CPU
     /// use; Metal users never pay for this).
     pub bf16_cache: std::cell::RefCell<Option<[Vec<u8>; 3]>>,

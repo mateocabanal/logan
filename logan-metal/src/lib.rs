@@ -156,6 +156,25 @@ mod imp {
         ) -> i64;
         pub fn metalio_wait(event_value: i64) -> i32;
         pub fn metalio_slot_consumed(slot: i32);
+        pub fn metalio_stats(out: *mut ColiMetalioStats);
+    }
+
+    /// MetalIO streaming counters (mirror of the C ColiMetalioStats).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct ColiMetalioStats {
+        pub loads: u64,
+        pub bytes: u64,
+        pub waits: u64,
+        pub fails: u64,
+        pub prefetch_loads: u64,
+        pub prefetch_used: u64,
+        pub prefetch_wasted: u64,
+        pub outstanding: u64,
+        pub peak_outstanding: u64,
+        pub latency_samples: u64,
+        pub total_latency_s: f64,
+        pub lat_hist: [u64; 32],
     }
 
     pub fn mio_init() -> bool {
@@ -242,6 +261,15 @@ mod imp {
             return None;
         }
         Some((slot, ev))
+    }
+
+    /// MetalIO streaming counters (loads/bytes/waits/fails + prefetch).
+    pub fn mio_stats() -> ColiMetalioStats {
+        let mut s: ColiMetalioStats = Default::default();
+        if mio_active() {
+            unsafe { metalio_stats(&mut s) };
+        }
+        s
     }
 
     // -------------------------------------------------------------------------
@@ -578,6 +606,41 @@ mod imp {
     }
     pub fn mio_load_expert(_fid: i32, _regions: &[(u64, usize)]) -> Option<(i32, i64)> {
         None
+    }
+    pub struct ColiMetalioStats {
+        pub loads: u64,
+        pub bytes: u64,
+        pub waits: u64,
+        pub fails: u64,
+        pub prefetch_loads: u64,
+        pub prefetch_used: u64,
+        pub prefetch_wasted: u64,
+        pub outstanding: u64,
+        pub peak_outstanding: u64,
+        pub latency_samples: u64,
+        pub total_latency_s: f64,
+        pub lat_hist: [u64; 32],
+    }
+    impl Default for ColiMetalioStats {
+        fn default() -> ColiMetalioStats {
+            ColiMetalioStats {
+                loads: 0,
+                bytes: 0,
+                waits: 0,
+                fails: 0,
+                prefetch_loads: 0,
+                prefetch_used: 0,
+                prefetch_wasted: 0,
+                outstanding: 0,
+                peak_outstanding: 0,
+                latency_samples: 0,
+                total_latency_s: 0.0,
+                lat_hist: [0; 32],
+            }
+        }
+    }
+    pub fn mio_stats() -> ColiMetalioStats {
+        ColiMetalioStats::default()
     }
     pub fn metalio_wait(_ev: i64) -> i32 {
         -1

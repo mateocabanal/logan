@@ -269,11 +269,21 @@ impl Package {
     /// expert so MetalIO can stream the resident tiles straight into a
     /// buffer. Returns None for anything else (caller falls back to pread).
     pub fn expert_matrix_regions(&self, rec: &RecordInfo) -> Option<(Vec<(u64, usize)>, Vec<(usize, usize)>)> {
-        let raw = self.read_record(rec).ok()?;
-        if &raw[..8] != b"COLIEXPT" {
+        // Header-only read: the C engine's expert_info equivalent. The
+        // 2.6 MB weight payload is NOT touched here — the runtime streams
+        // it via MetalIO from these byte offsets. Reading the whole record
+        // (read_record + CRC) was the ~35 ms/load synchronous stall.
+        let head = self.read_payload_range(rec, 0, 32).ok()?;
+        if &head[..8] != b"COLIEXPT" {
             return None;
         }
-        let desc_size = u32::from_le_bytes(raw[28..32].try_into().ok()?) as usize;
+        let desc_size = u32::from_le_bytes(head[28..32].try_into().ok()?) as usize;
+        if desc_size < 88 {
+            return None; // descriptor must hold the offsets we read below
+        }
+        let raw = self
+            .read_payload_range(rec, 0, 64 + 3 * desc_size)
+            .ok()?;
         let mut regions = Vec::with_capacity(3);
         let mut dims = Vec::with_capacity(3);
         for i in 0..3 {
