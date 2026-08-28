@@ -912,3 +912,29 @@ impl Model {
 fn cdim_total(cfg: &Cfg) -> usize {
     cfg.lin_k_dim * cfg.lin_k_heads * 2 + cfg.lin_v_dim * cfg.lin_v_heads
 }
+
+/// Standalone greedy runner for `logan run` on a Qwen3 MoE package dir
+/// (safetensors fixture or .coli package dir with config.json).
+pub fn run_greedy(package_dir: &std::path::Path, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
+    let cfg = load_cfg(&package_dir.join("config.json"))?;
+    let st = StFile::open(&package_dir.join("model.safetensors"))?;
+    let mut model = Model::load(&st, &cfg)?;
+    for (i, &t) in prompt.iter().enumerate() {
+        model.forward_token(t as usize, i);
+    }
+    let mut out = Vec::with_capacity(max_new);
+    let mut last = *prompt.last().unwrap_or(&0);
+    let start = prompt.len();
+    for pos in start..start + max_new {
+        let logits = model.forward_token(last as usize, pos);
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        out.push(next);
+        last = next;
+    }
+    Ok(out)
+}

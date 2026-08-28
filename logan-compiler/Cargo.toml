@@ -18,3 +18,4 @@ sha2 = "0.10"
 logan-abi = { path = "../logan-abi" }
 logan-format = { path = "../logan-format" }
 logan-qwen4 = { path = "../logan-qwen4" }
+logan-qwen = { path = "../logan-qwen" }

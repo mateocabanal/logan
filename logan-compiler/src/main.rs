@@ -223,7 +223,7 @@ fn run() -> logan_compiler::Result<()> {
             Ok(())
         }
         Command::InspectSource { source } => {
-            eprintln!("colic: source discovery...");
+            eprintln!("logan: source discovery...");
             let mut progress = ConsoleProgress::new();
             let inventory = logan_compiler::source::discover_with_progress(&source, &mut |update| {
                 progress.source_file(&update);
@@ -253,7 +253,7 @@ fn run() -> logan_compiler::Result<()> {
             Ok(())
         }
         Command::Verify { package } => {
-            eprintln!("colic: verification...");
+            eprintln!("logan: verification...");
             let mut progress = ConsoleProgress::new();
             progress.verification_started = Some(Instant::now());
             let summary = logan_compiler::verify::verify_package_with_progress(&package, &mut |update| {
@@ -269,12 +269,37 @@ fn run() -> logan_compiler::Result<()> {
             let prompt_ids: Vec<u32> = prompt
                 .split_whitespace()
                 .map(|t| t.parse().unwrap_or_else(|_| {
-                    eprintln!("colic: invalid token id: {t}");
+                    eprintln!("logan: invalid token id: {t}");
                     std::process::exit(2);
                 }))
                 .collect();
-            let out = logan_qwen4::run_greedy(&package, &prompt_ids, max_new)
-                .map_err(|e| logan_compiler::ColicError::Unsupported { stage: "run", detail: e })?;
+            // Architecture dispatch (engine-neutral): read the package's
+            // config.json model_type and hand the decode to the matching
+            // engine crate. Both engines share the core (storage, LRU,
+            // Metal backends, telemetry) — this is the neutral-CLI seam.
+            let cfg_path = package.join("config.json");
+            let model_type: String = std::fs::read_to_string(&cfg_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("model_type").and_then(|t| t.as_str()).map(str::to_owned))
+                .unwrap_or_else(|| "qwen4_exp_text".to_string());
+            let out = match model_type.as_str() {
+                "qwen4_exp_text" | "qwen4_exp" => logan_qwen4::run_greedy(&package, &prompt_ids, max_new)
+                    .map_err(|e| logan_compiler::ColicError::Unsupported { stage: "run", detail: e })?,
+                _ => {
+                    // Default to the Qwen3 MoE engine for other qwen model
+                    // types; unknown architectures are reported honestly.
+                    match logan_qwen::run_greedy(&package, &prompt_ids, max_new) {
+                        Ok(o) => o,
+                        Err(qwen_err) => {
+                            return Err(logan_compiler::ColicError::Unsupported {
+                                stage: "run",
+                                detail: format!("model_type={model_type}: {qwen_err}"),
+                            })
+                        }
+                    }
+                }
+            };
             println!("generated: {out:?}");
             Ok(())
         }

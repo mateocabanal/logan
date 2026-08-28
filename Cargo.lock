@@ -87,6 +87,7 @@ version = "0.1.0"
 dependencies = [
  "logan-abi",
  "logan-format",
+ "logan-qwen",
  "logan-qwen4",
  "serde_json",
  "sha2",
