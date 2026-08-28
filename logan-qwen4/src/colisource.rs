@@ -15,9 +15,30 @@ use logan_format::package::{Package, RecordInfo};
 
 const HF_PREFIX: &str = "model.language_model.";
 
+/// Resolved PLE n-gram shard set for one layer: record indices (into
+/// `Package::records()`, in the original manifest-order scan) plus the
+/// derived rows-per-shard, cached so `ple_ngram_row_f8` stops re-scanning
+/// every package record by name-prefix on every per-token/per-head call.
+#[derive(Clone)]
+struct PleNgramShards {
+    layer: i32,
+    hd_per: usize,
+    record_indices: Vec<usize>,
+    rows_per_shard: u64,
+}
+
 #[derive(Clone)]
 pub struct ColiSource {
     pkg: Package,
+    /// Cache for [`Self::ple_ngram_row_f8`]'s shard resolution (see
+    /// [`PleNgramShards`]) — invalidated automatically if a caller ever asks
+    /// for a different `layer`/`hd_per` than what's cached.
+    ple_shards: std::cell::RefCell<Option<PleNgramShards>>,
+    /// Cache for [`Self::ple_ngram_scale`]: `(layer, scale)`. The scale is a
+    /// single invariant scalar per layer, but the per-token loop calls this
+    /// once per ngram head (~16x/token), so caching avoids re-reading and
+    /// re-CRCing the same tiny record from disk every time.
+    ple_scale: std::cell::RefCell<Option<(i32, f32)>>,
 }
 
 /// Raw GPU-ready expert matrix (Apple8 MXFP4 tiles + E8M0 scales).
@@ -118,6 +139,8 @@ impl ColiSource {
     pub fn open(dir: &Path) -> Result<ColiSource, String> {
         Ok(ColiSource {
             pkg: Package::open(dir).map_err(|e| e.to_string())?,
+            ple_shards: std::cell::RefCell::new(None),
+            ple_scale: std::cell::RefCell::new(None),
         })
     }
 
@@ -349,13 +372,40 @@ impl ColiSource {
     /// a global BF16 scale; the C engine preads hd_per bytes per row, never
     /// loading the 400 MB shard. The tiny fixture's BF16 single-tensor form
     /// is handled by the safetensors loader (not this path).
+    ///
+    /// The shard-record resolution (name-prefix scan over every package
+    /// record) is cached per `(layer, hd_per)` in `self.ple_shards`, since
+    /// this is called once per ngram head per token and the shard set never
+    /// changes for a given layer after the package is opened.
     pub fn ple_ngram_row_f8(&self, layer: i32, r: u64, hd_per: usize) -> Result<Vec<u8>, String> {
+        {
+            let cached = self.ple_shards.borrow();
+            if let Some(shards) = cached.as_ref() {
+                if shards.layer == layer && shards.hd_per == hd_per {
+                    let shard_idx = (r / shards.rows_per_shard) as usize;
+                    let index = *shards.record_indices.get(shard_idx).ok_or_else(|| {
+                        format!(
+                            "ngram row {r} out of range ({} shards)",
+                            shards.record_indices.len()
+                        )
+                    })?;
+                    let within = r % shards.rows_per_shard;
+                    let rec = &self.pkg.records()[index];
+                    return self
+                        .pkg
+                        .read_payload_range(rec, within * hd_per as u64, hd_per)
+                        .map_err(|e| e.to_string());
+                }
+            }
+        }
+
         let prefix = format!("layers.{layer}.ple.ple_embedding.ngram_embedding.shard_");
-        let recs: Vec<&RecordInfo> = self
+        let record_indices: Vec<usize> = self
             .pkg
             .records()
             .iter()
-            .filter(|rec| {
+            .enumerate()
+            .filter(|(_, rec)| {
                 rec.kind == 1
                     && rec
                         .name
@@ -363,24 +413,42 @@ impl ColiSource {
                         .map(|n| n.starts_with(&prefix))
                         .unwrap_or(false)
             })
+            .map(|(index, _)| index)
             .collect();
-        if recs.is_empty() {
+        if record_indices.is_empty() {
             return Err(format!("no ngram shards for layer {layer}"));
         }
-        let rps = recs[0].decoded as u64 / hd_per as u64; // rows per shard (F8: 1 byte/row-elem)
-        let shard_idx = (r / rps) as usize;
-        let rec = recs
+        let rows_per_shard = self.pkg.records()[record_indices[0]].decoded / hd_per as u64;
+        let shard_idx = (r / rows_per_shard) as usize;
+        let index = *record_indices
             .get(shard_idx)
-            .ok_or_else(|| format!("ngram row {r} out of range ({} shards)", recs.len()))?;
-        let within = (r % rps) as u64;
+            .ok_or_else(|| format!("ngram row {r} out of range ({} shards)", record_indices.len()))?;
+        let within = r % rows_per_shard;
+        let rec = &self.pkg.records()[index];
         // pread only this row (F8: hd_per bytes) — never the whole shard
-        self.pkg
+        let out = self
+            .pkg
             .read_payload_range(rec, within * hd_per as u64, hd_per)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        *self.ple_shards.borrow_mut() = Some(PleNgramShards {
+            layer,
+            hd_per,
+            record_indices,
+            rows_per_shard,
+        });
+        out
     }
 
-    /// Global BF16 scale for the F8 ngram table.
+    /// Global BF16 scale for the F8 ngram table. Cached per layer in
+    /// `self.ple_scale` — this is a single invariant scalar re-read (with a
+    /// full record lookup + CRC check) once per ngram head per token
+    /// (~16x/token) unless cached.
     pub fn ple_ngram_scale(&self, layer: i32) -> Result<f32, String> {
+        if let Some((cached_layer, scale)) = *self.ple_scale.borrow() {
+            if cached_layer == layer {
+                return Ok(scale);
+            }
+        }
         let rec = self
             .rec(&format!("layers.{layer}.ple.ple_embedding.ngram_embedding.weight_scale"))
             .ok_or_else(|| format!("missing ngram weight_scale"))?;
@@ -389,7 +457,9 @@ impl ColiSource {
             return Err(format!("weight_scale payload {} != 2", payload.len()));
         }
         let u = u16::from_le_bytes(payload.try_into().unwrap());
-        Ok(f32::from_bits((u as u32) << 16))
+        let scale = f32::from_bits((u as u32) << 16);
+        *self.ple_scale.borrow_mut() = Some((layer, scale));
+        Ok(scale)
     }
 
     /// F8 E4M3 decode (bit-exact with the C engine's E4M3_LUT).

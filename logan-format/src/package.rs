@@ -6,14 +6,15 @@
 
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use crate::{
     verify::{
-        i32_at, invalid, read_file_range, region, string_at, u16_at, u32_at, u64_at, usage,
-        validate_string_id, variable_region, FormatError, Result, LAYOUT_NONE,
+        i32_at, invalid, region, string_at, u16_at, u32_at, u64_at, usage, validate_string_id,
+        variable_region, FormatError, Result, LAYOUT_NONE,
     },
     MANIFEST_HEADER_BYTES, MANIFEST_MAGIC,
 };
@@ -53,6 +54,13 @@ pub struct Package {
     by_id: HashMap<u64, usize>,
     by_name: HashMap<String, usize>,
     by_expert: HashMap<(i32, i32), Vec<usize>>,
+    /// Cached open file handles, one per shard, so `read_payload_range` and
+    /// `read_record` don't pay a fresh `open`/`close` syscall pair on every
+    /// call (a shard is opened once, lazily, on first access). Reads use
+    /// positional I/O (see `read_exact_at`) rather than seek+read, so a
+    /// handle shared across calls (and, since `Package` is `Clone`, across
+    /// cloned `Package`s via the shared `Arc`) never races on a cursor.
+    shard_files: Arc<Mutex<HashMap<u32, Arc<File>>>>,
 }
 
 impl Package {
@@ -222,6 +230,7 @@ impl Package {
             by_id,
             by_name,
             by_expert,
+            shard_files: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -261,7 +270,30 @@ impl Package {
 
     /// Absolute path of a shard file.
     pub fn shard_path(&self, shard_id: u32) -> Option<String> {
-        Some(self.root.join(format!("data-{shard_id:05}.coli")).to_string_lossy().into_owned())
+        Some(self.shard_file_path(shard_id).to_string_lossy().into_owned())
+    }
+
+    fn shard_file_path(&self, shard_id: u32) -> PathBuf {
+        self.root.join(format!("data-{shard_id:05}.coli"))
+    }
+
+    /// Returns a cached, opened handle for `shard_id`, opening (and
+    /// caching) it on first use. The lock is held only long enough to
+    /// get-or-insert the `Arc<File>` — the clone is cheap and the actual
+    /// read happens after the lock is dropped, so I/O is never serialized
+    /// across threads sharing this `Package`.
+    fn shard_file(&self, shard_id: u32) -> Result<Arc<File>> {
+        let mut cache = self.shard_files.lock().unwrap();
+        if let Some(file) = cache.get(&shard_id) {
+            return Ok(Arc::clone(file));
+        }
+        let path = self.shard_file_path(shard_id);
+        let file = Arc::new(fs::File::open(&path).map_err(|source| FormatError::Io {
+            path,
+            source,
+        })?);
+        cache.insert(shard_id, Arc::clone(&file));
+        Ok(file)
     }
 
     /// (file_offset, bytes) of each matrix payload in an expert record, plus
@@ -314,15 +346,25 @@ impl Package {
         within_off: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
-        let path = self.root.join(format!("data-{:05}.coli", record.shard_id));
-        let bytes = read_file_range(&path, record.offset + within_off, len as u64)?;
+        let file = self.shard_file(record.shard_id)?;
+        let mut bytes = vec![0_u8; len];
+        read_exact_at(&file, record.offset + within_off, &mut bytes).map_err(|source| {
+            FormatError::Io {
+                path: self.shard_file_path(record.shard_id),
+                source,
+            }
+        })?;
         Ok(bytes)
     }
 
     /// Reads a record's raw stored bytes and verifies the stored CRC32C.
     pub fn read_record(&self, record: &RecordInfo) -> Result<Vec<u8>> {
-        let path = self.root.join(format!("data-{:05}.coli", record.shard_id));
-        let bytes = read_file_range(&path, record.offset, record.stored)?;
+        let file = self.shard_file(record.shard_id)?;
+        let mut bytes = vec![0_u8; record.stored as usize];
+        read_exact_at(&file, record.offset, &mut bytes).map_err(|source| FormatError::Io {
+            path: self.shard_file_path(record.shard_id),
+            source,
+        })?;
         if crate::crc32c(&bytes) != record.stored_crc {
             return invalid("record stored CRC32C does not match");
         }
@@ -450,6 +492,43 @@ impl Package {
         }
         Ok(bytes[data_offset as usize..data_end].to_vec())
     }
+}
+
+/// Fills `buf` from `file` starting at `offset`, without moving (or racing
+/// on) the file's shared cursor — required since `shard_file` caches one
+/// handle per shard that may be read from multiple call sites.
+#[cfg(unix)]
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected end of file while reading a shard",
+            ));
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+/// Fallback for targets without a positional-read API: duplicate the
+/// handle (an independent cursor) instead of touching the cached file's
+/// shared position.
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
 }
 
 #[cfg(test)]
