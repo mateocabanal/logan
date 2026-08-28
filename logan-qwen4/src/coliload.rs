@@ -186,6 +186,7 @@ impl Model {
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
             expert_store: logan_core::expert::ExpertStore::new(256),
+            spans: logan_core::telemetry::TokenSpans::default(),
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")

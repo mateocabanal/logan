@@ -373,6 +373,8 @@ pub struct Model {
     // pointer, so stale handles would serve wrong weights.
     /// LRU expert store (engine-neutral core; slot-owning values).
     expert_store: logan_core::expert::ExpertStore<crate::colisource::SlotExpert>,
+    /// Per-token telemetry accumulator (LOGAN_PROFILE=1).
+    spans: logan_core::telemetry::TokenSpans,
     /// Metal direct path (fused Apple8 moe_topk + coalesced GDN kernels).
     /// Brought up lazily on the first decode token; failures leave it off and
     /// every caller falls back to the CPU reference (C contract).
@@ -1345,6 +1347,7 @@ impl Model {
         let k = c.topk;
         let d = c.hidden;
 
+        let mut _route_t = logan_core::telemetry::Span::begin("route");
         let mut logits = vec![0.0; e];
         matmul(&mut logits, x, &layer.router);
         softmax_row(&mut logits);
@@ -1362,6 +1365,7 @@ impl Model {
             val.swap(i, best);
         }
         let wsum: f32 = val[..k].iter().sum();
+        self.spans.route_ms += _route_t.end();
         let mut acc = vec![0.0; d];
 
         // Direct fused path (C QWEN_APPLE8_DIRECT): all K slot-resident
@@ -1375,6 +1379,7 @@ impl Model {
             && self.coli.is_some();
         let mut pending: Option<*mut std::ffi::c_void> = None;
         let mut pending_acc: Option<Vec<f32>> = None;
+        let mut _io_t = logan_core::telemetry::Span::begin("io");
         if direct {
             let mut ex: Vec<crate::ffi::ColiApple8MetalioExpert> = Vec::with_capacity(k);
             let mut ws: Vec<f32> = Vec::with_capacity(k);
@@ -1392,11 +1397,13 @@ impl Model {
                 }
             }
             if all_ok {
+                let mut _gpu_t = logan_core::telemetry::Span::begin("gpu");
                 if self.metal_overlap {
                     pending = crate::ffi::moe_topk_begin(&ex, &ws, x, d, c.moe_inter);
                 } else if !crate::ffi::moe_topk(&ex, &ws, x, &mut acc, d, c.moe_inter) {
                     pending = None; // decline -> CPU per-expert loop below
                 }
+                self.spans.gpu_ms += _gpu_t.end();
             }
             if pending.is_none() && self.metal_overlap && all_ok {
                 // begin() declined mid-run: fall through to the CPU loop
@@ -1404,9 +1411,11 @@ impl Model {
             }
         }
 
+        self.spans.io_ms += _io_t.end();
         if pending.is_some() {
             // CPU shared expert overlaps the routed-GPU wait (C order: shared
             // expert runs BETWEEN submit and finish).
+            let mut _shared_t = logan_core::telemetry::Span::begin("shared");
             let mut sg = vec![0.0; 1];
             matmul(&mut sg, x, &layer.se_g);
             let gs = 1.0 / (1.0 + (-sg[0]).exp());
@@ -1419,8 +1428,12 @@ impl Model {
             }
             let mut sy = vec![0.0; d];
             matmul(&mut sy, &h, &layer.se_down);
+            self.spans.shared_ms += _shared_t.end();
             let p = pending.unwrap();
-            if !crate::ffi::moe_topk_finish(p, &mut acc, d) {
+            let mut _gpu_wait = logan_core::telemetry::Span::begin("gpu-wait");
+            let gpu_ok = crate::ffi::moe_topk_finish(p, &mut acc, d);
+            self.spans.gpu_ms += _gpu_wait.end();
+            if !gpu_ok {
                 // GPU fault AFTER submit: C contract = redo those experts on
                 // CPU. acc was scratch for the GPU result; recompute routed
                 // experts on CPU into a fresh accumulator.
@@ -1444,6 +1457,7 @@ impl Model {
             return;
         }
 
+        let mut _fill_t = logan_core::telemetry::Span::begin("fill");
         for i in 0..k {
             let w = val[i] / wsum;
             // .coli mode: slot-resident expert. The Metal fused path ran
@@ -1497,6 +1511,8 @@ impl Model {
                 acc[dd] += y[dd] * w;
             }
         }
+        self.spans.fill_ms += _fill_t.end();
+        let mut _shared_t = logan_core::telemetry::Span::begin("shared");
         let mut sg = vec![0.0; 1];
         matmul(&mut sg, x, &layer.se_g);
         let gs = 1.0 / (1.0 + (-sg[0]).exp());
@@ -1509,6 +1525,7 @@ impl Model {
         }
         let mut sy = vec![0.0; d];
         matmul(&mut sy, &h, &layer.se_down);
+        self.spans.shared_ms += _shared_t.end();
         for dd in 0..d {
             out[dd] = acc[dd] + sy[dd] * gs;
         }
@@ -1746,6 +1763,34 @@ impl Model {
         }
         logits
     }
+
+    /// Emit the LOGAN_PROFILE=1 per-request summary (spans + Metal counters
+    /// + LRU hit/miss). No-op when profiling is disabled.
+    pub fn profile_summary(&self, tokens: usize, total_ms: f64) {
+        if !logan_core::telemetry::enabled() {
+            return;
+        }
+        let (e, s, w, k, fc, fe) = logan_metal::metal_profile();
+        let metal = logan_core::telemetry::MetalCounters {
+            encode_ns: e,
+            submit_ns: s,
+            wait_ns: w,
+            kernel_ns: k,
+            fused_calls: fc,
+            fused_experts: fe,
+            ..Default::default()
+        };
+        let mut spans = self.spans.clone();
+        spans.total_ms = total_ms;
+        logan_core::telemetry::emit_request_summary(
+            tokens,
+            &spans,
+            &metal,
+            self.expert_store.hits,
+            self.expert_store.misses,
+        );
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,6 +1968,7 @@ impl Model {
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
             expert_store: logan_core::expert::ExpertStore::new(256),
+            spans: logan_core::telemetry::TokenSpans::default(),
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")
@@ -1956,6 +2002,8 @@ pub fn run_greedy(package_dir: &std::path::Path, prompt: &[u32], max_new: usize)
 
 /// Greedy decode against an already-loaded model.
 pub fn run_greedy_with(mut model: Model, cfg: Cfg, prompt: &[u32], max_new: usize) -> Vec<u32> {
+    let profile = logan_core::telemetry::enabled();
+    let t0 = std::time::Instant::now();
     for (i, &t) in prompt.iter().enumerate() {
         model.forward_token(t as usize, i);
     }
@@ -1972,6 +2020,9 @@ pub fn run_greedy_with(mut model: Model, cfg: Cfg, prompt: &[u32], max_new: usiz
             .unwrap();
         out.push(next);
         last = next;
+    }
+    if profile {
+        model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
     }
     out
 }

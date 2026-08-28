@@ -52,6 +52,8 @@ fn main() {
             .unwrap_or_else(|_| "8".into())
             .parse()
             .unwrap();
+        let profile = logan_core::telemetry::enabled();
+        let t0 = std::time::Instant::now();
         for (i, &t) in prompt.iter().enumerate() {
             model.forward_token(t as usize, i);
         }
@@ -67,6 +69,9 @@ fn main() {
                 .unwrap();
             out.push(next);
             last = next;
+        }
+        if profile {
+            model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
         }
         println!("generated: {out:?}");
         std::process::exit(0);

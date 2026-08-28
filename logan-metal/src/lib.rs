@@ -446,6 +446,16 @@ mod imp {
         unsafe { coli_apple8_metalio_moe_topk_finish(pending, y.as_mut_ptr()) == 1 }
     }
 
+    /// Direct-path profile counters (encode/submit/wait/kernel ns +
+    /// fused call/expert counts). Process-local, reset at direct_init.
+    pub fn metal_profile() -> (u64, u64, u64, u64, u64, u64) {
+        let (mut e, mut s, mut w, mut k, mut fc, mut fe) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        unsafe {
+            coli_apple8_metalio_profile_get(&mut e, &mut s, &mut w, &mut k, &mut fc, &mut fe);
+        }
+        (e, s, w, k, fc, fe)
+    }
+
     /// Decode-only Metal GDN token, byte-exact C seam contract:
     /// - the five BF16 weight matrices, the recurrent state, and the conv
     ///   state MUST live in 16 KiB page-aligned host memory (the .mm wraps
@@ -608,6 +618,9 @@ mod imp {
         _hidden: usize,
     ) -> bool {
         false
+    }
+    pub fn metal_profile() -> (u64, u64, u64, u64, u64, u64) {
+        (0, 0, 0, 0, 0, 0)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_token(
