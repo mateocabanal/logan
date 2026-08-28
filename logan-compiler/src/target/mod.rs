@@ -10,7 +10,7 @@ use crate::{
     ir::RoutedExpert,
     pipeline::TargetRequest,
     source,
-    storage::{align_up, crc32c},
+    storage::{align_up, crc32c, crc32c_update},
     target_registry,
 };
 

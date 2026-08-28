@@ -80,14 +80,13 @@ pub fn stream_exact_tensor<W: Write + Seek>(
     Ok((logical_crc32c, crc32c_combine(crc32c(&header), !payload_state, tensor.len)))
 }
 
-fn crc32c_state(mut crc: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    crc
+/// Advances a streaming CRC32C state using the fast slice-by-8 core shared
+/// with `logan-format` (was a hand-rolled bit-by-bit loop — the compiler's
+/// streamed tensor/expert writers CRC every byte they emit, so this was a
+/// CPU bottleneck on the write path just like the read path in
+/// `logan-format::verify`).
+fn crc32c_state(crc: u32, bytes: &[u8]) -> u32 {
+    crc32c_update(crc, bytes)
 }
 
 fn write_padding<W: Write>(

@@ -13,6 +13,7 @@ use crate::{
 
 pub use logan_format::{
     DATA_MAGIC, DATA_SHARD_HEADER_BYTES, MANIFEST_HEADER_BYTES, MANIFEST_MAGIC, align_up, crc32c,
+    crc32c_update,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

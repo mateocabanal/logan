@@ -27,3 +27,13 @@ pub fn align_up(value: u64, alignment: u64) -> crate::verify::Result<u64> {
 pub fn crc32c(bytes: &[u8]) -> u32 {
     crate::verify::crc32c_impl(bytes)
 }
+
+/// Advances a CRC-32C running state over `bytes`, for callers that must
+/// checksum data incrementally (e.g. streamed shard writers) instead of
+/// from one contiguous buffer. `state` starts at `!0` and the final result
+/// is `!state` — the same convention `crc32c` uses internally — so this is
+/// a drop-in replacement for a hand-rolled polynomial loop with the same
+/// fast slice-by-8 core that backs `crc32c`.
+pub fn crc32c_update(state: u32, bytes: &[u8]) -> u32 {
+    crate::verify::crc32c_update_impl(state, bytes)
+}

@@ -59,16 +59,68 @@ pub(crate) fn align_up_impl(value: u64, alignment: u64) -> Result<u64> {
         .ok_or_else(|| usage("alignment calculation overflows u64"))
 }
 
+/// Castagnoli CRC32C polynomial (reflected form, as used by the bit-serial
+/// reference definition below and by the slice-by-8 tables it generates).
+const CRC32C_POLY: u32 = 0x82f6_3b78;
+
+/// Lazily-built slice-by-8 lookup tables (8 x 256 entries). Built once per
+/// process from the bit-serial definition, so the fast path is provably
+/// byte-identical to the reference algorithm it replaces — CRC32C is a
+/// disk-bound-decode bottleneck (every `Package::read_record` call CRCs the
+/// full record), and the bit-by-bit loop it replaces caps out around
+/// 150-200 MB/s/core, well below NVMe read speeds; slice-by-8 runs at
+/// several GB/s/core in safe Rust (no `unsafe`, no new dependency).
+fn crc32c_tables() -> &'static [[u32; 256]; 8] {
+    static TABLES: std::sync::OnceLock<[[u32; 256]; 8]> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut tables = [[0_u32; 256]; 8];
+        for (n, slot) in tables[0].iter_mut().enumerate() {
+            let mut c = n as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { (c >> 1) ^ CRC32C_POLY } else { c >> 1 };
+            }
+            *slot = c;
+        }
+        for k in 1..8 {
+            for n in 0..256 {
+                let c = tables[k - 1][n];
+                tables[k][n] = tables[0][(c & 0xff) as usize] ^ (c >> 8);
+            }
+        }
+        tables
+    })
+}
+
+/// Advances a CRC32C running state (the same `!0`-initialized,
+/// `!state`-finalized convention used throughout this crate) over `bytes`.
+/// Exposed via [`crate::crc32c_update`] so streaming callers (e.g. the
+/// compiler's shard writers) can checksum data incrementally instead of
+/// re-implementing the polynomial loop.
+pub(crate) fn crc32c_update_impl(mut crc: u32, bytes: &[u8]) -> u32 {
+    let tables = crc32c_tables();
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let lo = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let hi = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        crc ^= lo;
+        crc = tables[7][(crc & 0xff) as usize]
+            ^ tables[6][((crc >> 8) & 0xff) as usize]
+            ^ tables[5][((crc >> 16) & 0xff) as usize]
+            ^ tables[4][((crc >> 24) & 0xff) as usize]
+            ^ tables[3][(hi & 0xff) as usize]
+            ^ tables[2][((hi >> 8) & 0xff) as usize]
+            ^ tables[1][((hi >> 16) & 0xff) as usize]
+            ^ tables[0][((hi >> 24) & 0xff) as usize];
+    }
+    for &byte in chunks.remainder() {
+        crc = tables[0][((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
 /// Castagnoli CRC32C used by all COLI v1 integrity fields.
 pub(crate) fn crc32c_impl(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    !crc
+    !crc32c_update_impl(!0_u32, bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,12 +521,7 @@ fn crc32c_file_range(path: &Path, offset: u64, length: u64) -> Result<u32> {
                 path: path.to_owned(),
                 source,
             })?;
-        for byte in &buffer[..count] {
-            state ^= *byte as u32;
-            for _ in 0..8 {
-                state = (state >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(state & 1)));
-            }
-        }
+        state = crc32c_update_impl(state, &buffer[..count]);
         remaining -= count as u64;
     }
     Ok(!state)
