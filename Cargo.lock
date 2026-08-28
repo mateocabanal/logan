@@ -115,6 +115,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "logan-metal"
+version = "0.1.0"
+
+[[package]]
 name = "logan-qwen"
 version = "0.1.0"
 dependencies = [
@@ -127,6 +131,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "logan-format",
+ "logan-metal",
  "serde_json",
 ]
 

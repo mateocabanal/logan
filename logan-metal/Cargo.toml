@@ -1,0 +1,10 @@
+[package]
+name = "logan-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Logan Metal backend: Metal/MetalIO FFI (quantized GEMV, async expert streaming, fused Apple8 execution, coalesced GDN kernels) — engine-neutral, CPU fallback when absent"
+publish = false
+
+[dependencies]
