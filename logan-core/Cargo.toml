@@ -1,0 +1,11 @@
+[package]
+name = "logan-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Logan core: engine-neutral runtime foundation (math primitives, tensor storage, expert store, decode loop, telemetry)"
+publish = false
+
+[dependencies]
+logan-ir = { path = "../logan-ir" }

@@ -93,6 +93,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "logan-core"
+version = "0.1.0"
+dependencies = [
+ "logan-ir",
+]
+
+[[package]]
 name = "logan-format"
 version = "0.1.0"
 dependencies = [
