@@ -210,6 +210,18 @@ impl SchedulerCore {
         self.ready.len()
     }
 
+    /// Return all known sessions in deterministic ID order. The runtime uses
+    /// this query during shutdown; lifecycle mutation remains in this core.
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        let mut ids: Vec<_> = self.sessions.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn total_inflight(&self) -> usize {
+        self.inflight.len()
+    }
+
     /// Move a runnable session to Blocked. The engine calls this after it has
     /// submitted the dependencies represented by its live tickets.
     pub fn block(&mut self, session: SessionId) -> Result<Vec<Effect>, SchedError> {
@@ -484,11 +496,10 @@ impl SchedulerCore {
             }
         }
         for (ticket, (session, _generation)) in &self.inflight {
-            assert!(
-                self.sessions
-                    .get(session)
-                    .is_some_and(|record| record.inflight.contains(ticket))
-            );
+            assert!(self
+                .sessions
+                .get(session)
+                .is_some_and(|record| record.inflight.contains(ticket)));
         }
     }
 }

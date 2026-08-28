@@ -7,9 +7,15 @@
 
 pub mod core;
 pub mod ids;
+pub mod runtime;
 
 pub use core::{
     Action, ActionKind, Budget, Effect, Outcome, SchedError, SchedulerCore, Session, SessionState,
     Step,
 };
 pub use ids::{Generation, LoadId, SessionId, Ticket};
+pub use runtime::{
+    BoundedExecutor, CompletionSendError, CompletionSink, DispatchRequest, ExecutorSet,
+    RequestSendError, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeReply,
+    RuntimeRequest, SchedulerRuntime, ShutdownMode, SubmitDisposition, SubmitResult,
+};
