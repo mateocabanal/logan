@@ -414,6 +414,17 @@ struct Apple8MoePending {
     uint64_t submit_ns = 0;
 };
 
+/* One worker has at most one split-phase MoE command in flight. Reuse its
+ * five scratch buffers after finish() releases the lease; reject overlapping
+ * begins rather than aliasing an in-flight command. */
+struct Apple8MoeScratch {
+    id<MTLBuffer> xb = nil, mid = nil, expert_y = nil, rw = nil, yb = nil;
+    size_t x_bytes = 0, mid_bytes = 0, expert_y_bytes = 0;
+    size_t rw_bytes = 0, y_bytes = 0;
+    bool in_use = false;
+};
+static Apple8MoeScratch g_moe_scratch;
+
 /* Dense BF16 weight buffer cache: the lm_head pointer is stable for the
  * model lifetime, so the 622 MB copy happens once and every later token
  * reuses the buffer. */
@@ -446,8 +457,58 @@ static void profile_completed_locked(id<MTLCommandBuffer> cb,
 static int qwen_gdn_init_locked(void);
 static void qwen_gdn_clear_locked(void);
 
+static void clear_moe_scratch_locked(void) {
+    g_moe_scratch.xb = nil;
+    g_moe_scratch.mid = nil;
+    g_moe_scratch.expert_y = nil;
+    g_moe_scratch.rw = nil;
+    g_moe_scratch.yb = nil;
+    g_moe_scratch.x_bytes = g_moe_scratch.mid_bytes = 0;
+    g_moe_scratch.expert_y_bytes = g_moe_scratch.rw_bytes = 0;
+    g_moe_scratch.y_bytes = 0;
+    g_moe_scratch.in_use = false;
+}
+
+static int ensure_moe_scratch_locked(size_t x_bytes, size_t mid_bytes,
+                                     size_t expert_y_bytes, size_t rw_bytes,
+                                     size_t y_bytes) {
+    if (g_moe_scratch.in_use) return 0;
+    if (!g_moe_scratch.xb || g_moe_scratch.x_bytes < x_bytes) {
+        id<MTLBuffer> b = [g_device newBufferWithLength:x_bytes
+                                                options:MTLResourceStorageModeShared];
+        if (!b) return 0;
+        g_moe_scratch.xb = b; g_moe_scratch.x_bytes = x_bytes;
+    }
+    if (!g_moe_scratch.mid || g_moe_scratch.mid_bytes < mid_bytes) {
+        id<MTLBuffer> b = [g_device newBufferWithLength:mid_bytes
+                                                options:MTLResourceStorageModePrivate];
+        if (!b) return 0;
+        g_moe_scratch.mid = b; g_moe_scratch.mid_bytes = mid_bytes;
+    }
+    if (!g_moe_scratch.expert_y || g_moe_scratch.expert_y_bytes < expert_y_bytes) {
+        id<MTLBuffer> b = [g_device newBufferWithLength:expert_y_bytes
+                                                options:MTLResourceStorageModePrivate];
+        if (!b) return 0;
+        g_moe_scratch.expert_y = b; g_moe_scratch.expert_y_bytes = expert_y_bytes;
+    }
+    if (!g_moe_scratch.rw || g_moe_scratch.rw_bytes < rw_bytes) {
+        id<MTLBuffer> b = [g_device newBufferWithLength:rw_bytes
+                                                options:MTLResourceStorageModeShared];
+        if (!b) return 0;
+        g_moe_scratch.rw = b; g_moe_scratch.rw_bytes = rw_bytes;
+    }
+    if (!g_moe_scratch.yb || g_moe_scratch.y_bytes < y_bytes) {
+        id<MTLBuffer> b = [g_device newBufferWithLength:y_bytes
+                                                options:MTLResourceStorageModeShared];
+        if (!b) return 0;
+        g_moe_scratch.yb = b; g_moe_scratch.y_bytes = y_bytes;
+    }
+    return 1;
+}
+
 static void clear_locked(void) {
     qwen_gdn_clear_locked();
+    clear_moe_scratch_locked();
     g_matmul_pipeline = nil;
     g_gu_pipeline = nil;
     g_down_pipeline = nil;
@@ -1368,26 +1429,25 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
             return 0;
     }
 
-    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
-                                            options:MTLResourceStorageModeShared];
-    id<MTLBuffer> mid = [g_device newBufferWithLength:mid_bytes
-                                              options:MTLResourceStorageModePrivate];
-    id<MTLBuffer> expert_y = [g_device newBufferWithLength:expert_y_bytes
-                                                   options:MTLResourceStorageModePrivate];
-    id<MTLBuffer> rw = [g_device newBufferWithBytes:route_weights
-                                             length:K * sizeof(float)
-                                            options:MTLResourceStorageModeShared];
-    id<MTLBuffer> yb = [g_device newBufferWithLength:y_bytes
-                                             options:MTLResourceStorageModeShared];
-    if (!xb || !mid || !expert_y || !rw || !yb) return 0;
+    if (!ensure_moe_scratch_locked(x_bytes, mid_bytes, expert_y_bytes,
+                                   K * sizeof(float), y_bytes))
+        return 0;
+    g_moe_scratch.in_use = true;
+    id<MTLBuffer> xb = g_moe_scratch.xb;
+    id<MTLBuffer> mid = g_moe_scratch.mid;
+    id<MTLBuffer> expert_y = g_moe_scratch.expert_y;
+    id<MTLBuffer> rw = g_moe_scratch.rw;
+    id<MTLBuffer> yb = g_moe_scratch.yb;
+    memcpy(xb.contents, x, x_bytes);
+    memcpy(rw.contents, route_weights, K * sizeof(float));
 
     Apple8MoePending *pending = new (std::nothrow) Apple8MoePending();
-    if (!pending) return 0;
+    if (!pending) { g_moe_scratch.in_use = false; return 0; }
 
     const int S = 1;
     uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    if (!cb) { delete pending; return 0; }
+    if (!cb) { delete pending; g_moe_scratch.in_use = false; return 0; }
 
     int gate_off[8] = {}, up_off[8] = {}, down_off[8] = {};
     for (int i = 0; i < expert_count && i < 8; ++i) {
@@ -1397,7 +1457,7 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     }
 
     id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
-    if (!gu) { delete pending; return 0; }
+    if (!gu) { delete pending; g_moe_scratch.in_use = false; return 0; }
     if (expert_count <= 8) {
         /* Merged tile dispatch: all experts in one grid and eight physical
          * output rows per 256-thread group. */
@@ -1433,7 +1493,7 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     [gu endEncoding];
 
     id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
-    if (!down) { delete pending; return 0; }
+    if (!down) { delete pending; g_moe_scratch.in_use = false; return 0; }
     if (expert_count <= 8) {
         [down setComputePipelineState:g_down8_pipeline];
         for (int i = 0; i < 8; ++i)
@@ -1466,7 +1526,7 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     [down endEncoding];
 
     id<MTLComputeCommandEncoder> reduce = [cb computeCommandEncoder];
-    if (!reduce) { delete pending; return 0; }
+    if (!reduce) { delete pending; g_moe_scratch.in_use = false; return 0; }
     [reduce setComputePipelineState:g_reduce_pipeline];
     [reduce setBuffer:expert_y offset:0 atIndex:0];
     [reduce setBuffer:rw offset:0 atIndex:1];
@@ -1475,7 +1535,7 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     [reduce setBytes:&hidden length:sizeof(hidden) atIndex:4];
     NSUInteger threads = g_reduce_pipeline.maxTotalThreadsPerThreadgroup;
     if (threads > 256) threads = 256;
-    if (threads < 1) { delete pending; return 0; }
+    if (threads < 1) { delete pending; g_moe_scratch.in_use = false; return 0; }
     NSUInteger groups = ((NSUInteger)hidden + threads - 1) / threads;
     [reduce dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -1514,6 +1574,7 @@ extern "C" int coli_apple8_metalio_moe_topk_finish(void *opaque, float *y) {
                                      pending->expert_count);
         for (int i = 0; i < pending->expert_count; ++i)
             metalio_slot_consumed(pending->slots[i]);
+        g_moe_scratch.in_use = false;
     }
     if (!ok) {
         fprintf(stderr, "[apple8-metalio] fused top-k command failed: %s\n",
