@@ -665,21 +665,30 @@ fn l2norm(x: &mut [f32]) {
     }
 }
 
-fn rope_partial(v: &mut [f32], pos: usize, cfg: &Cfg) {
+fn rope_angles(pos: usize, cfg: &Cfg) -> Vec<(f32, f32)> {
     let rd = cfg.rotary_dim;
-    let n = rd / 2;
-    if n == 0 {
-        return;
-    }
-    for j in 0..n {
-        let inv = cfg.theta.powf(-2.0 * j as f32 / rd as f32);
-        let ang = pos as f32 * inv;
-        let (cs, sn) = (ang.cos(), ang.sin());
+    (0..rd / 2)
+        .map(|j| {
+            let inv = cfg.theta.powf(-2.0 * j as f32 / rd as f32);
+            let ang = pos as f32 * inv;
+            (ang.cos(), ang.sin())
+        })
+        .collect()
+}
+
+fn rope_partial_with_angles(v: &mut [f32], angles: &[(f32, f32)], rd: usize) {
+    for (j, &(cs, sn)) in angles.iter().enumerate() {
         let a = v[j];
         let b = v[j + rd / 2];
         v[j] = a * cs - b * sn;
         v[j + rd / 2] = b * cs + a * sn;
     }
+}
+
+fn rope_partial(v: &mut [f32], pos: usize, cfg: &Cfg) {
+    let rd = cfg.rotary_dim;
+    let angles = rope_angles(pos, cfg);
+    rope_partial_with_angles(v, &angles, rd);
 }
 
 // qwen4 PLE helpers (C-identical)
@@ -1026,6 +1035,7 @@ impl Model {
         li: usize,
         x: &[f32],
         pos: usize,
+        rope: &[(f32, f32)],
         selected: Option<&[usize]>,
         out: &mut [f32],
     ) {
@@ -1060,10 +1070,14 @@ impl Model {
             );
         }
         for hh in 0..h {
-            rope_partial(&mut qg[hh * 2 * hd..hh * 2 * hd + 2 * hd], pos, &c);
+            rope_partial_with_angles(
+                &mut qg[hh * 2 * hd..hh * 2 * hd + 2 * hd],
+                rope,
+                c.rotary_dim,
+            );
         }
         for g in 0..kv {
-            rope_partial(&mut k[g * hd..g * hd + hd], pos, &c);
+            rope_partial_with_angles(&mut k[g * hd..g * hd + hd], rope, c.rotary_dim);
         }
         for g in 0..kv {
             let base = (li * kv + g) * c.max_t * hd + pos * hd;
@@ -1118,11 +1132,26 @@ impl Model {
         matmul(out, &attn_out, &layer.attn_o);
     }
 
-    fn attention_token(&mut self, layer: &Layer, li: usize, x: &[f32], pos: usize, out: &mut [f32]) {
-        self.attention_common(layer, li, x, pos, None, out);
+    fn attention_token(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        pos: usize,
+        rope: &[(f32, f32)],
+        out: &mut [f32],
+    ) {
+        self.attention_common(layer, li, x, pos, rope, None, out);
     }
 
-    fn qsa_select(&mut self, layer: &Layer, li: usize, x: &[f32], pos: usize) -> Vec<usize> {
+    fn qsa_select(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        pos: usize,
+        rope: &[(f32, f32)],
+    ) -> Vec<usize> {
         let c = self.cfg.clone();
         let ih = c.idx_head_dim;
         let in_ = c.idx_n_heads;
@@ -1145,7 +1174,7 @@ impl Model {
             );
         }
         for hh in 0..in_ {
-            rope_partial(&mut q[hh * ih..hh * ih + ih], pos, &c);
+            rope_partial_with_angles(&mut q[hh * ih..hh * ih + ih], rope, c.rotary_dim);
         }
         // store raw indexer k for this position
         let cached = &mut self.idx_cache[li];
@@ -1223,9 +1252,17 @@ impl Model {
         sel
     }
 
-    fn sparse_attn_token(&mut self, layer: &Layer, li: usize, x: &[f32], pos: usize, out: &mut [f32]) {
-        let sel = self.qsa_select(layer, li, x, pos);
-        self.attention_common(layer, li, x, pos, Some(&sel), out);
+    fn sparse_attn_token(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        pos: usize,
+        rope: &[(f32, f32)],
+        out: &mut [f32],
+    ) {
+        let sel = self.qsa_select(layer, li, x, pos, rope);
+        self.attention_common(layer, li, x, pos, rope, Some(&sel), out);
     }
 
     /// FIFO expert cache. On miss, stream the expert's three raw Apple8
@@ -1716,6 +1753,7 @@ impl Model {
         let d = c.hidden;
         let hc = c.hc_count;
         let hcd = hc * d;
+        let rope = rope_angles(pos, &c);
 
         // embed row repeated hc times (BF16 bytes in .coli mode, f32 in
         // safetensors mode)
@@ -1764,9 +1802,9 @@ impl Model {
             if layer.is_gdn {
                 self.gdn_token(&layer, l, &mixed, &mut attn);
             } else if layer.is_qsa {
-                self.sparse_attn_token(&layer, l, &mixed, pos, &mut attn);
+                self.sparse_attn_token(&layer, l, &mixed, pos, &rope, &mut attn);
             } else {
-                self.attention_token(&layer, l, &mixed, pos, &mut attn);
+                self.attention_token(&layer, l, &mixed, pos, &rope, &mut attn);
             }
             for g in 0..hc {
                 for dd in 0..d {
