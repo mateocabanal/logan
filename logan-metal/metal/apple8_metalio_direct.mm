@@ -1987,17 +1987,29 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
         [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * mtiles, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        [gu setComputePipelineState:g_gu_pipeline];
-        for (int i = 0; i < expert_count; ++i) {
-            [gu setBuffer:weight_buffers[i] offset:experts[i].gate_offset atIndex:0];
-            [gu setBuffer:weight_buffers[i] offset:experts[i].up_offset atIndex:1];
-            [gu setBuffer:xb offset:0 atIndex:2];
-            [gu setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:3];
-            [gu setBytes:&S length:sizeof(S) atIndex:4];
-            [gu setBytes:&hidden length:sizeof(hidden) atIndex:5];
-            [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:6];
-            [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [gu setComputePipelineState:g_gu8_pipeline];
+        const NSUInteger mtiles = ((NSUInteger)intermediate + 7u) / 8u;
+        for (int base = 0; base < expert_count; base += 8) {
+            const int batch = (expert_count - base < 8) ? expert_count - base : 8;
+            int batch_gate[8] = {}, batch_up[8] = {}, batch_down[8] = {};
+            for (int i = 0; i < 8; ++i) {
+                const int src = base + (i < batch ? i : batch - 1);
+                [gu setBuffer:weight_buffers[src] offset:0 atIndex:i];
+                batch_gate[i] = (int)experts[src].gate_offset;
+                batch_up[i] = (int)experts[src].up_offset;
+                batch_down[i] = (int)experts[src].down_offset;
+            }
+            [gu setBuffer:xb offset:0 atIndex:8];
+            [gu setBuffer:mid offset:(NSUInteger)base * mid_stride atIndex:9];
+            [gu setBytes:&S length:sizeof(S) atIndex:10];
+            [gu setBytes:&hidden length:sizeof(hidden) atIndex:11];
+            [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:12];
+            [gu setBytes:&batch length:sizeof(batch) atIndex:13];
+            [gu setBytes:batch_gate length:sizeof(batch_gate) atIndex:14];
+            [gu setBytes:batch_up length:sizeof(batch_up) atIndex:15];
+            [gu setBytes:batch_down length:sizeof(batch_down) atIndex:16];
+            [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)batch * (NSUInteger)S * mtiles, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     }
     [gu endEncoding];
@@ -2021,16 +2033,29 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
         [down dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_count * (NSUInteger)S * htiles, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        [down setComputePipelineState:g_down_pipeline];
-        for (int i = 0; i < expert_count; ++i) {
-            [down setBuffer:weight_buffers[i] offset:experts[i].down_offset atIndex:0];
-            [down setBuffer:mid offset:(NSUInteger)i * mid_stride atIndex:1];
-            [down setBuffer:expert_y offset:(NSUInteger)i * out_stride atIndex:2];
-            [down setBytes:&S length:sizeof(S) atIndex:3];
-            [down setBytes:&hidden length:sizeof(hidden) atIndex:4];
-            [down setBytes:&intermediate length:sizeof(intermediate) atIndex:5];
-            [down dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [down setComputePipelineState:g_down8_pipeline];
+        const NSUInteger htiles = ((NSUInteger)hidden + 7u) / 8u;
+        for (int base = 0; base < expert_count; base += 8) {
+            const int batch = (expert_count - base < 8) ? expert_count - base : 8;
+            int batch_gate[8] = {}, batch_up[8] = {}, batch_down[8] = {};
+            for (int i = 0; i < 8; ++i) {
+                const int src = base + (i < batch ? i : batch - 1);
+                [down setBuffer:weight_buffers[src] offset:0 atIndex:i];
+                batch_gate[i] = (int)experts[src].gate_offset;
+                batch_up[i] = (int)experts[src].up_offset;
+                batch_down[i] = (int)experts[src].down_offset;
+            }
+            [down setBuffer:mid offset:(NSUInteger)base * mid_stride atIndex:8];
+            [down setBuffer:expert_y offset:(NSUInteger)base * out_stride atIndex:9];
+            [down setBytes:&S length:sizeof(S) atIndex:10];
+            [down setBytes:&hidden length:sizeof(hidden) atIndex:11];
+            [down setBytes:&intermediate length:sizeof(intermediate) atIndex:12];
+            [down setBytes:&batch length:sizeof(batch) atIndex:13];
+            [down setBytes:batch_gate length:sizeof(batch_gate) atIndex:14];
+            [down setBytes:batch_up length:sizeof(batch_up) atIndex:15];
+            [down setBytes:batch_down length:sizeof(batch_down) atIndex:16];
+            [down dispatchThreadgroups:MTLSizeMake((NSUInteger)batch * (NSUInteger)S * htiles, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     }
     [down endEncoding];
