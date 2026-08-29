@@ -7,6 +7,7 @@
 
 pub mod core;
 pub mod ids;
+pub mod residency;
 pub mod runtime;
 pub mod sim;
 
@@ -15,6 +16,11 @@ pub use core::{
     Step,
 };
 pub use ids::{Generation, LoadId, SessionId, Ticket};
+pub use residency::{
+    CompletionDisposition, DeviceId, ExpertKey, Lease, LeaseId, LoadCompletion, LoadDisposition,
+    LoadResult, LoadWake, MemoryPoolId, PoolStats, RepresentationKey, ResidencyError,
+    ResidencyManager, ResidencyState,
+};
 pub use runtime::{
     BoundedExecutor, CompletionSendError, CompletionSink, DispatchRequest, ExecutorSet,
     RequestSendError, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeReply,
