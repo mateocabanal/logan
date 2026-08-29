@@ -39,6 +39,20 @@ fn decode_op(payload: &[u8]) -> Result<(u8, usize, usize), String> {
     Ok((payload[0], token, pos))
 }
 
+fn greedy_next(logits: &[f32]) -> Result<u32, String> {
+    let mut best = None;
+    for (index, &value) in logits.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("non-finite Qwen logit at index {index}"));
+        }
+        if best.map_or(true, |(_, current)| value >= current) {
+            best = Some((index, value));
+        }
+    }
+    best.map(|(index, _)| index as u32)
+        .ok_or_else(|| "empty Qwen logits".to_string())
+}
+
 fn execute_op(model: &mut Model, payload: &[u8]) -> Result<Option<u32>, String> {
     match decode_op(payload)? {
         (OP_PREFILL, token, pos) => {
@@ -47,12 +61,7 @@ fn execute_op(model: &mut Model, payload: &[u8]) -> Result<Option<u32>, String> 
         }
         (OP_DECODE, token, pos) => {
             let logits = model.forward_token(token, pos);
-            let next = logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(index, _)| index as u32)
-                .ok_or_else(|| "empty Qwen logits".to_string())?;
+            let next = greedy_next(&logits)?;
             Ok(Some(next))
         }
         (kind, _, _) => Err(format!("unknown scheduled Qwen op {kind}")),
@@ -312,5 +321,16 @@ mod tests {
     #[test]
     fn action_encoding_round_trips() {
         assert_eq!(decode_op(&encode_op(OP_DECODE, 123, 456)).unwrap(), (OP_DECODE, 123, 456));
+    }
+
+    #[test]
+    fn non_finite_logits_are_reported() {
+        let error = greedy_next(&[0.0, f32::NAN]).unwrap_err();
+        assert_eq!(error, "non-finite Qwen logit at index 1");
+    }
+
+    #[test]
+    fn greedy_ties_keep_max_by_order() {
+        assert_eq!(greedy_next(&[1.0, 3.0, 3.0]).unwrap(), 2);
     }
 }
