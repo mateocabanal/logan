@@ -35,6 +35,10 @@ impl Model {
         let mut cfg = cfg.clone();
         // Bring up the Metal backend once (experts GEMV via FFI).
         crate::ffi::metal_init();
+        let direct_ok = crate::ffi::direct_init()
+            && std::env::var("QWEN_APPLE8_DIRECT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         // Package is ground truth for the PLE layer (frontend resolution can
         // differ from config ple_layer_ids; live: config says 2, package has
         // layers.1.ple.*).
@@ -142,7 +146,7 @@ impl Model {
 
         // C-style one-line status (QWEN-APPLE8 / metalio parity with the C
         // engine's startup banner): makes silent-fallback visible.
-        if crate::ffi::direct_available() {
+        if direct_ok {
             eprintln!(
                 "[qwen4-rs] direct raw Apple8 + MetalIO execution enabled{}",
                 if crate::ffi::metal_available() { "" } else { " (compute backend unavailable)" }
@@ -188,7 +192,7 @@ impl Model {
             ],
             expert_store: logan_core::expert::ExpertStore::new(cache_cap()),
             spans: logan_core::telemetry::TokenSpans::default(),
-            metal_direct: crate::ffi::direct_init()
+            metal_direct: direct_ok
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")
                     .unwrap_or(true),

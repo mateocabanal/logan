@@ -19,6 +19,33 @@ fn main() {
     });
     // .coli package mode: no model.safetensors -> load via colibri-format
     let is_coli = !dir.join("model.safetensors").exists();
+    let ref_path = dir.join("ref.json");
+    if is_coli && !ref_path.exists() {
+        let prompt: Vec<u32> = std::env::var("QWEN_PROMPT")
+            .unwrap_or_else(|_| "1 2 3 4 5".into())
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        let max_new: usize = std::env::var("QWEN_MAX_NEW")
+            .unwrap_or_else(|_| "8".into())
+            .parse()
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let out = logan_qwen4::scheduled::run_greedy_scheduled(dir, &prompt, max_new)
+            .unwrap_or_else(|e| {
+                eprintln!("scheduled decode error: {e}");
+                std::process::exit(1);
+            });
+        if logan_core::telemetry::enabled() {
+            eprintln!(
+                "logan scheduler: tokens={} total={:.1} ms/tok",
+                out.len(),
+                t0.elapsed().as_secs_f64() * 1e3 / out.len().max(1) as f64
+            );
+        }
+        println!("generated: {out:?}");
+        return;
+    }
     let model = if is_coli {
         let src = logan_qwen4::colisource::ColiSource::open(dir).unwrap_or_else(|e| {
             eprintln!("coli error: {e}");
@@ -38,44 +65,6 @@ fn main() {
             std::process::exit(1);
         })
     };
-    let mut model = model;
-
-    let ref_path = dir.join("ref.json");
-    if !ref_path.exists() {
-        // Real package: no oracle — plain greedy decode.
-        let prompt: Vec<u32> = std::env::var("QWEN_PROMPT")
-            .unwrap_or_else(|_| "1 2 3 4 5".into())
-            .split_whitespace()
-            .map(|t| t.parse().unwrap())
-            .collect();
-        let max_new: usize = std::env::var("QWEN_MAX_NEW")
-            .unwrap_or_else(|_| "8".into())
-            .parse()
-            .unwrap();
-        let profile = logan_core::telemetry::enabled();
-        let t0 = std::time::Instant::now();
-        for (i, &t) in prompt.iter().enumerate() {
-            model.forward_token(t as usize, i);
-        }
-        let mut out: Vec<u32> = Vec::new();
-        let mut last = *prompt.last().unwrap();
-        for pos in prompt.len()..prompt.len() + max_new {
-            let logits = model.forward_token(last as usize, pos);
-            let next = logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(i, _)| i as u32)
-                .unwrap();
-            out.push(next);
-            last = next;
-        }
-        if profile {
-            model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
-        }
-        println!("generated: {out:?}");
-        std::process::exit(0);
-    }
     let ref_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ref_path).expect("ref.json"))
             .expect("ref.json parse");

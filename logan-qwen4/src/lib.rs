@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod coliload;
 pub mod colisource;
+pub mod scheduled;
 pub mod ffi;
 
 use logan_core::expert::Slot as _; // for SlotExpert::release
