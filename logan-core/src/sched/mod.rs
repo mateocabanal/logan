@@ -8,6 +8,7 @@
 pub mod core;
 pub mod ids;
 pub mod residency;
+pub mod residency_sim;
 pub mod runtime;
 pub mod sim;
 
@@ -21,6 +22,7 @@ pub use residency::{
     LoadResult, LoadWake, MemoryPoolId, PoolStats, RepresentationKey, ResidencyError,
     ResidencyManager, ResidencyState,
 };
+pub use residency_sim::{ResidencyOp, ResidencyOutcome, ResidencyReplayError, ResidencySimulator, ResidencyTraceEvent};
 pub use runtime::{
     BoundedExecutor, CompletionSendError, CompletionSink, DispatchRequest, ExecutorSet,
     RequestSendError, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeReply,
