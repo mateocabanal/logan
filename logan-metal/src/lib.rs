@@ -346,6 +346,15 @@ mod imp {
             fused_calls: *mut u64,
             fused_experts: *mut u64,
         );
+        // Generic BF16 GEMV (S x I rows -> O): attention q/k/v/o projections.
+        pub fn coli_apple8_metalio_bf16_matmul(
+            w: *const u16,
+            x: *const f32,
+            y: *mut f32,
+            s: i32,
+            o: i32,
+            i: i32,
+        ) -> i32;
         // GDN (coalesced Metal kernels, qwen_moe.c seam contract)
         pub fn coli_apple8_metalio_gdn_token(
             layer: i32,
@@ -714,3 +723,22 @@ mod imp {
 }
 
 pub use imp::*;
+
+/// BF16 GEMV on the direct path (generic; wired for the attention
+/// projections). w = BF16 bytes, O x I row-major; x = S x I f32; y = S x O.
+/// rc > 0 done; rc == 0 declined pre-submit (CPU fallback); rc < 0 fatal.
+pub fn bf16_matmul(w: &[u8], x: &[f32], y: &mut [f32], s: usize, o: usize, i: usize) -> i32 {
+    if !direct_available() || !metal_available() {
+        return 0;
+    }
+    unsafe {
+        coli_apple8_metalio_bf16_matmul(
+            w.as_ptr() as *const u16,
+            x.as_ptr(),
+            y.as_mut_ptr(),
+            s as i32,
+            o as i32,
+            i as i32,
+        )
+    }
+}

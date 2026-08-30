@@ -434,6 +434,9 @@ pub struct Model {
     /// there is exactly ONE copy of the GDN weights (moved, not duplicated —
     /// the 16 GB M2 budget).
     gdn_metal: Vec<Option<GdnMetalLayer>>,
+    /// Per-attention-layer Metal BF16 projection buffers (lazy build,
+    /// mirror of gdn_metal). QWEN_ATTN_METAL=0 opts out.
+    attn_metal: Vec<Option<AttnMetalLayer>>,
     /// Scheduler-driven expert acquisition (QWEN_SCHED=1): the forward
     /// reports cold routed experts instead of loading them; the executor
     /// lane loads them through the plan and the forward resumes from a
@@ -512,6 +515,21 @@ impl Drop for AlignedBuf {
 /// Page-aligned GDN weights + state for one layer (Metal zero-copy source of
 /// truth). The CPU scalar path reads the same memory, so both paths see
 /// identical state; layouts are [O, I] row-major to match the Rust `Wt`.
+/// Attention projection weights homed into 16 KiB-aligned buffers for the
+/// generic Metal BF16 GEMV seam (mirror of GdnMetalLayer: moved, not
+/// duplicated; the CPU fallback reads the same memory).
+struct AttnMetalLayer {
+    /// [2*heads*hd, hidden] BF16 q|gate fused projection
+    q: *mut u8,
+    /// [kv_heads*hd, hidden] BF16 k projection
+    k: *mut u8,
+    /// [kv_heads*hd, hidden] BF16 v projection
+    v: *mut u8,
+    /// [hidden, heads*hd] BF16 out projection
+    o: *mut u8,
+    _bufs: Vec<AlignedBuf>,
+}
+
 struct GdnMetalLayer {
     /// [cdim, hidden] BF16 in_proj_qkv (16 KiB-aligned, zero-copy wrapped)
     wqkv: *mut u8,
@@ -892,6 +910,29 @@ impl Model {
         })
     }
 
+    fn build_attn_metal(layer: &Layer, cfg: &Cfg) -> Option<AttnMetalLayer> {
+        if layer.is_gdn || !crate::ffi::direct_available() {
+            return None;
+        }
+        let move_bf16 = |w: &Wt| -> Option<AlignedBuf> {
+            let bytes = w.bytes.as_ref()?;
+            let mut buf = AlignedBuf::zeroed(bytes.len())?;
+            buf.as_mut_u8()[..bytes.len()].copy_from_slice(bytes);
+            Some(buf)
+        };
+        let q = move_bf16(&layer.attn_q)?;
+        let k = move_bf16(&layer.attn_k)?;
+        let v = move_bf16(&layer.attn_v)?;
+        let o = move_bf16(&layer.attn_o)?;
+        Some(AttnMetalLayer {
+            q: q.ptr,
+            k: k.ptr,
+            v: v.ptr,
+            o: o.ptr,
+            _bufs: vec![q, k, v, o],
+        })
+    }
+
     fn gdn_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let kd = c.lin_k_dim;
@@ -1125,9 +1166,58 @@ impl Model {
         let mut qg = vec![0.0; 2 * h * hd];
         let mut k = vec![0.0; kv * hd];
         let mut vv = vec![0.0; kv * hd];
-        matmul(&mut qg, x, &layer.attn_q);
-        matmul(&mut k, x, &layer.attn_k);
-        matmul(&mut vv, x, &layer.attn_v);
+        // Metal BF16 GEMV seam (QWEN_ATTN_METAL default ON; GPU is the
+        // numeric reference per C parity — near-tie logit divergence is a
+        // hardware fact). rc semantics per the GDN seam; fallback is the
+        // exact scalar matmuls below.
+        let mut metal_ok = false;
+        if self.attn_metal[li].is_none() && !layer.is_gdn && crate::ffi::direct_available() {
+            self.attn_metal[li] = Self::build_attn_metal(layer, &self.cfg);
+        }
+        if let Some(am) = self.attn_metal[li].as_ref() {
+            let gate = std::env::var("QWEN_ATTN_METAL").map(|v| v != "0").unwrap_or(true);
+            if gate {
+                // SAFETY: exact-length views over the layer's aligned blocks
+                // (kept alive by am._bufs for the model lifetime); the GPU
+                // only reads weights here — CPU fallback reads the same
+                // memory, so there is exactly one copy.
+                let w = |p: *mut u8, len: usize| unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+                let rc = crate::ffi::bf16_matmul(
+                    w(am.q, 2 * h * hd * c.hidden * 2),
+                    x,
+                    &mut qg,
+                    1,
+                    2 * h * hd,
+                    c.hidden,
+                );
+                if rc > 0 {
+                    metal_ok = crate::ffi::bf16_matmul(
+                        w(am.k, kv * hd * c.hidden * 2),
+                        x,
+                        &mut k,
+                        1,
+                        kv * hd,
+                        c.hidden,
+                    ) > 0;
+                    metal_ok &= crate::ffi::bf16_matmul(
+                        w(am.v, kv * hd * c.hidden * 2),
+                        x,
+                        &mut vv,
+                        1,
+                        kv * hd,
+                        c.hidden,
+                    ) > 0;
+                } else if rc < 0 {
+                    eprintln!("qwen4-rs: Metal attention failed after submission (layer {li})");
+                    std::process::exit(1);
+                }
+            }
+        }
+        if !metal_ok {
+            matmul(&mut qg, x, &layer.attn_q);
+            matmul(&mut k, x, &layer.attn_k);
+            matmul(&mut vv, x, &layer.attn_v);
+        }
         let qg_snap = qg.clone();
         for hh in 0..h {
             rmsnorm_row(
@@ -1206,7 +1296,21 @@ impl Model {
                 oh[dd] *= 1.0 / (1.0 + (-gh[dd]).exp());
             }
         }
-        matmul(out, &attn_out, &layer.attn_o);
+        if !metal_ok {
+            matmul(out, &attn_out, &layer.attn_o);
+        } else if let Some(am) = self.attn_metal[li].as_ref() {
+            // SAFETY: exact-length view over the aligned o_proj block
+            // (kept alive by am._bufs for the model lifetime).
+            let wo = unsafe { std::slice::from_raw_parts(am.o as *const u8, c.hidden * h * hd * 2) };
+            let rc = crate::ffi::bf16_matmul(wo, &attn_out, out, 1, c.hidden, h * hd);
+            if rc < 0 {
+                eprintln!("qwen4-rs: Metal attention out_proj failed after submission (layer {li})");
+                std::process::exit(1);
+            }
+            if rc == 0 {
+                matmul(out, &attn_out, &layer.attn_o);
+            }
+        }
     }
 
     fn attention_token(
@@ -2386,6 +2490,7 @@ impl Model {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             gdn_metal: (0..cfg.layers).map(|_| None).collect(),
+            attn_metal: (0..cfg.layers).map(|_| None).collect(),
             sched_mode: false,
             sched_blocked: None,
             sched_pause: None,
