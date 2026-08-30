@@ -14,6 +14,10 @@ use crate::{
     target_registry,
 };
 
+pub mod machine;
+
+pub use machine::{MachineProfile, metal_available_for};
+
 const TENSOR_HEADER_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,26 +75,9 @@ pub const LINUX_X86_64_AVX2_V1: TargetProfile = TargetProfile {
 
 pub const PROFILES: &[TargetProfile] = &[MACOS_ARM64_METAL_APPLE8_V1, LINUX_X86_64_AVX2_V1];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostCapabilities {
-    pub operating_system: &'static str,
-    pub architecture: &'static str,
-    pub avx2: bool,
-}
-
-impl HostCapabilities {
-    pub fn current() -> Self {
-        Self {
-            operating_system: std::env::consts::OS,
-            architecture: std::env::consts::ARCH,
-            avx2: current_has_avx2(),
-        }
-    }
-}
-
-pub fn resolve(request: &TargetRequest, host: HostCapabilities) -> Result<TargetProfile> {
+pub fn resolve(request: &TargetRequest, machine: &MachineProfile) -> Result<TargetProfile> {
     let profile = match request {
-        TargetRequest::Native => native(host)?,
+        TargetRequest::Native => from_machine(machine)?,
         TargetRequest::Profile(name) => PROFILES
             .iter()
             .find(|profile| profile.name == name)
@@ -112,29 +99,47 @@ pub fn resolve(request: &TargetRequest, host: HostCapabilities) -> Result<Target
     Ok(profile)
 }
 
-fn native(host: HostCapabilities) -> Result<TargetProfile> {
-    if host.operating_system == "macos" && host.architecture == "aarch64" {
+/// Automatic (native/`auto`) selection: pick the Apple8/Metal target only
+/// when its ABI is actually available on this host, else the CPU profile,
+/// else explain why nothing matched. There is deliberately NO hardcoded
+/// fallback to Apple8 — a non-Apple host never sees an Apple8 plan.
+fn from_machine(machine: &MachineProfile) -> Result<TargetProfile> {
+    if machine.apple8_abi {
         return Ok(MACOS_ARM64_METAL_APPLE8_V1);
     }
-    if host.operating_system == "linux" && host.architecture == "x86_64" && host.avx2 {
+    if machine.operating_system == "linux"
+        && machine.architecture == "x86_64"
+        && machine.avx2
+    {
         return Ok(LINUX_X86_64_AVX2_V1);
     }
     Err(ColicError::unsupported(
         "target detection",
-        format!(
-            "no target profile supports {} / {} with these detected capabilities",
-            host.operating_system, host.architecture
-        ),
+        selection_reason(machine),
     ))
 }
 
-#[cfg(target_arch = "x86_64")]
-fn current_has_avx2() -> bool {
-    std::is_x86_feature_detected!("avx2")
-}
-#[cfg(not(target_arch = "x86_64"))]
-fn current_has_avx2() -> bool {
-    false
+/// Human-readable explanation of why no target was auto-selected (the
+/// planner's "explain selection/rejection" contract).
+fn selection_reason(machine: &MachineProfile) -> String {
+    let mut reason = format!(
+        "no target profile supports {} / {} with these detected capabilities",
+        machine.operating_system, machine.architecture
+    );
+    if machine.operating_system == "macos" {
+        reason.push_str(&format!(
+            "; Apple8/Metal requires aarch64 + Metal + the direct path (got aarch64={}, metal={}, apple8_abi={})",
+            machine.architecture == "aarch64",
+            machine.metal_available,
+            machine.apple8_abi
+        ));
+        if machine.architecture == "aarch64" && machine.metal_available && !machine.apple8_abi {
+            reason.push_str("; QWEN_APPLE8_DIRECT=0 disables the runtime direct path");
+        }
+    } else if machine.operating_system == "linux" && machine.architecture == "x86_64" {
+        reason.push_str("; linux x86_64 CPU profile requires AVX2 (not detected on this host)");
+    }
+    reason
 }
 
 pub trait TargetBackend {

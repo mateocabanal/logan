@@ -13,46 +13,85 @@ fn crc32c_combine_matches_a_contiguous_stream() {
     );
 }
 
+fn apple_machine() -> MachineProfile {
+    MachineProfile {
+        operating_system: "macos",
+        architecture: "aarch64",
+        ram_bytes: None,
+        unified_memory: true,
+        metal_available: true,
+        apple8_abi: true,
+        avx2: false,
+        apple_gpu_family_min: 8,
+    }
+}
+
+fn linux_machine(avx2: bool) -> MachineProfile {
+    MachineProfile {
+        operating_system: "linux",
+        architecture: "x86_64",
+        ram_bytes: None,
+        unified_memory: false,
+        metal_available: false,
+        apple8_abi: false,
+        avx2,
+        apple_gpu_family_min: 8,
+    }
+}
+
 #[test]
 fn native_apple_resolves_production_lowerer() {
     assert_eq!(
-        resolve(
-            &TargetRequest::Native,
-            HostCapabilities {
-                operating_system: "macos",
-                architecture: "aarch64",
-                avx2: false,
-            },
-        )
-        .unwrap(),
+        resolve(&TargetRequest::Native, &apple_machine()).unwrap(),
+        MACOS_ARM64_METAL_APPLE8_V1
+    );
+}
+
+#[test]
+fn auto_apple_resolves_same_profile_as_native() {
+    // `--target auto` parses to TargetRequest::Native; both spellings pick
+    // the Apple8 profile when the machine ABI is available.
+    assert_eq!(
+        resolve(&TargetRequest::parse("auto").unwrap(), &apple_machine()).unwrap(),
         MACOS_ARM64_METAL_APPLE8_V1
     );
 }
 
 #[test]
 fn native_linux_requires_avx2() {
-    assert!(
-        resolve(
-            &TargetRequest::Native,
-            HostCapabilities {
-                operating_system: "linux",
-                architecture: "x86_64",
-                avx2: false,
-            },
-        )
-        .is_err()
-    );
+    assert!(resolve(&TargetRequest::Native, &linux_machine(false)).is_err());
     assert_eq!(
-        resolve(
-            &TargetRequest::Native,
-            HostCapabilities {
-                operating_system: "linux",
-                architecture: "x86_64",
-                avx2: true,
-            },
-        )
-        .unwrap(),
+        resolve(&TargetRequest::Native, &linux_machine(true)).unwrap(),
         LINUX_X86_64_AVX2_V1
+    );
+}
+
+#[test]
+fn apple8_is_never_auto_selected_on_an_intel_mac() {
+    let intel_mac = MachineProfile {
+        operating_system: "macos",
+        architecture: "x86_64",
+        apple8_abi: false,
+        ..apple_machine()
+    };
+    let error = resolve(&TargetRequest::Native, &intel_mac).unwrap_err();
+    let detail = format!("{error}");
+    // rejection is explained, not silent
+    assert!(detail.contains("Apple8/Metal"), "{detail}");
+    assert!(detail.contains("aarch64=false"), "{detail}");
+}
+
+#[test]
+fn auto_rejection_mentions_the_disabled_direct_path() {
+    let machine = MachineProfile {
+        metal_available: true,
+        apple8_abi: false,
+        ..apple_machine()
+    };
+    let error = resolve(&TargetRequest::Native, &machine).unwrap_err();
+    assert!(
+        format!("{error}").contains("QWEN_APPLE8_DIRECT=0"),
+        "expected the direct-path gate to be cited: {error}"
     );
 }
 
@@ -85,17 +124,13 @@ fn profile_identity_is_registry_owned() {
     assert_eq!(
         resolve(
             &TargetRequest::Profile(target_registry::APPLE8_PROFILE_NAME.into()),
-            HostCapabilities::current(),
+            &apple_machine(),
         )
         .unwrap(),
         MACOS_ARM64_METAL_APPLE8_V1
     );
     assert!(
-        resolve(
-            &TargetRequest::Profile("portable-v1".into()),
-            HostCapabilities::current(),
-        )
-        .is_err()
+        resolve(&TargetRequest::Profile("portable-v1".into()), &apple_machine()).is_err()
     );
 }
 
