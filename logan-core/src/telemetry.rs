@@ -157,6 +157,11 @@ mod tests {
             shared_ms: 5.0,
             gpu_ms: 15.0,
             fill_ms: 2.0,
+            gdn_ms: 0.0,
+            attn_ms: 0.0,
+            hc_ms: 0.0,
+            head_ms: 0.0,
+            gdn_metal_ok: 0,
             total_ms: 52.0,
         };
         let metal = MetalCounters {
