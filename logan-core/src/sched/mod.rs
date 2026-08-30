@@ -6,6 +6,8 @@
 //! The core deliberately contains no Rust async executor machinery.
 
 pub mod core;
+pub mod device;
+pub mod executor;
 pub mod ids;
 pub mod residency;
 pub mod residency_sim;
@@ -16,6 +18,8 @@ pub use core::{
     Action, ActionKind, Budget, Effect, Outcome, SchedError, SchedulerCore, Session, SessionState,
     Step,
 };
+pub use device::{DeviceError, DeviceKind, DeviceRegistry, ExecutionTarget};
+pub use executor::{Completed, CpuConfig, CpuExecutor, ExecutorConfigError, Job, SubmitOutcome};
 pub use ids::{Generation, LoadId, SessionId, Ticket};
 pub use residency::{
     CompletionDisposition, DeviceId, ExpertKey, Lease, LeaseId, LoadCompletion, LoadDisposition,
