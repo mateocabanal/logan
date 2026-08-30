@@ -218,7 +218,7 @@ fn prepare(
     spool_path: Option<&Path>,
 ) -> Result<PreparedCompile> {
     let quantization = resolve_quantization(request, model)?;
-    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    let target_profile = target::resolve(&request.target, &target::MachineProfile::probe())?;
     if target_profile != target::MACOS_ARM64_METAL_APPLE8_V1 {
         return Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),
@@ -518,6 +518,12 @@ fn validate_options(request: &CompileRequest) -> Result<()> {
         return Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),
             "codec profile is not implemented by the PR3 codec compiler",
+        ));
+    }
+    if request.plan.is_some() {
+        return Err(ColicError::unsupported(
+            Stage::TargetPlanning.as_str(),
+            "plan artifact emission is not implemented for the rANS codec path; use `--codec none`",
         ));
     }
     if request.optimization != OptimizationProfile::Default {

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::{
     error::{ColicError, Result},
-    pipeline::{CodecRequest, CompileRequest, OptimizationProfile, QuantRequest, TargetRequest},
+    pipeline::{CodecRequest, CompileRequest, OptimizationProfile, QuantFloor, QuantRequest, TargetRequest},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR --target native|PROFILE --quant exact|PROFILE --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--dry-run] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -91,10 +91,14 @@ where
         match flag.as_str() {
             "--target" => request.target = TargetRequest::parse(&value(&mut args, "--target")?)?,
             "--quant" => request.quant = QuantRequest::parse(&value(&mut args, "--quant")?)?,
+            "--quant-floor" => {
+                request.quant_floor = QuantFloor::parse(&value(&mut args, "--quant-floor")?)?
+            }
             "--codec" => request.codec = CodecRequest::parse(&value(&mut args, "--codec")?)?,
             "--opt" => {
-                request.optimization = OptimizationProfile::parse(&value(&mut args, "--opt")?)?
+                request.optimization = OptimizationProfile::parse(&value(&mut args, "--opt")?)?;
             }
+            "--plan" => request.plan = Some(PathBuf::from(value(&mut args, "--plan")?)),
             "-o" | "--output" => {
                 request.output = Some(PathBuf::from(value(&mut args, "--output")?))
             }
