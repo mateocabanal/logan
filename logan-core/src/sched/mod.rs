@@ -5,6 +5,7 @@
 //!
 //! The core deliberately contains no Rust async executor machinery.
 
+pub mod accel;
 pub mod core;
 pub mod device;
 pub mod executor;
@@ -14,6 +15,9 @@ pub mod residency_sim;
 pub mod runtime;
 pub mod sim;
 
+pub use accel::{
+    Accel, AccelAction, AccelCompletion, AccelDispatch, AccelError, AccelOutcome, NativeHandle,
+};
 pub use core::{
     Action, ActionKind, Budget, Effect, Outcome, SchedError, SchedulerCore, Session, SessionState,
     Step,
