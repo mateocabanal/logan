@@ -519,12 +519,11 @@ impl Drop for AlignedBuf {
 /// generic Metal BF16 GEMV seam (mirror of GdnMetalLayer: moved, not
 /// duplicated; the CPU fallback reads the same memory).
 struct AttnMetalLayer {
-    /// [2*heads*hd, hidden] BF16 q|gate fused projection
-    q: *mut u8,
-    /// [kv_heads*hd, hidden] BF16 k projection
-    k: *mut u8,
-    /// [kv_heads*hd, hidden] BF16 v projection
-    v: *mut u8,
+    /// [2*heads*hd + 2*kv_heads*hd, hidden] BF16 q|gate || k || v packed
+    /// into ONE aligned buffer so the three projections run in a single
+    /// dispatch (4 -> 2 syncs per attention layer; syncs, not compute,
+    /// bound the C engine's attention ceiling too).
+    qkv: *mut u8,
     /// [hidden, heads*hd] BF16 out projection
     o: *mut u8,
     _bufs: Vec<AlignedBuf>,
@@ -920,16 +919,19 @@ impl Model {
             buf.as_mut_u8()[..bytes.len()].copy_from_slice(bytes);
             Some(buf)
         };
-        let q = move_bf16(&layer.attn_q)?;
-        let k = move_bf16(&layer.attn_k)?;
-        let v = move_bf16(&layer.attn_v)?;
         let o = move_bf16(&layer.attn_o)?;
+        let q_bytes = layer.attn_q.bytes.as_ref()?;
+        let k_bytes = layer.attn_k.bytes.as_ref()?;
+        let v_bytes = layer.attn_v.bytes.as_ref()?;
+        let mut qkv = AlignedBuf::zeroed(q_bytes.len() + k_bytes.len() + v_bytes.len())?;
+        let dst = qkv.as_mut_u8();
+        dst[..q_bytes.len()].copy_from_slice(q_bytes);
+        dst[q_bytes.len()..q_bytes.len() + k_bytes.len()].copy_from_slice(k_bytes);
+        dst[q_bytes.len() + k_bytes.len()..].copy_from_slice(v_bytes);
         Some(AttnMetalLayer {
-            q: q.ptr,
-            k: k.ptr,
-            v: v.ptr,
+            qkv: qkv.ptr,
             o: o.ptr,
-            _bufs: vec![q, k, v, o],
+            _bufs: vec![qkv, o],
         })
     }
 
@@ -1168,8 +1170,9 @@ impl Model {
         let mut vv = vec![0.0; kv * hd];
         // Metal BF16 GEMV seam (QWEN_ATTN_METAL default ON; GPU is the
         // numeric reference per C parity — near-tie logit divergence is a
-        // hardware fact). rc semantics per the GDN seam; fallback is the
-        // exact scalar matmuls below.
+        // hardware fact). q|k|v run in ONE packed dispatch (2 syncs per
+        // layer incl. o_proj); rc semantics per the GDN seam; fallback is
+        // the exact scalar matmuls below.
         let mut metal_ok = false;
         if self.attn_metal[li].is_none() && !layer.is_gdn && crate::ffi::direct_available() {
             self.attn_metal[li] = Self::build_attn_metal(layer, &self.cfg);
@@ -1181,32 +1184,23 @@ impl Model {
                 // (kept alive by am._bufs for the model lifetime); the GPU
                 // only reads weights here — CPU fallback reads the same
                 // memory, so there is exactly one copy.
+                let rows_q = 2 * h * hd;
+                let rows_kv = kv * hd;
                 let w = |p: *mut u8, len: usize| unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+                let mut proj = vec![0.0; rows_q + 2 * rows_kv];
                 let rc = crate::ffi::bf16_matmul(
-                    w(am.q, 2 * h * hd * c.hidden * 2),
+                    w(am.qkv, (rows_q + 2 * rows_kv) * c.hidden * 2),
                     x,
-                    &mut qg,
+                    &mut proj,
                     1,
-                    2 * h * hd,
+                    rows_q + 2 * rows_kv,
                     c.hidden,
                 );
                 if rc > 0 {
-                    metal_ok = crate::ffi::bf16_matmul(
-                        w(am.k, kv * hd * c.hidden * 2),
-                        x,
-                        &mut k,
-                        1,
-                        kv * hd,
-                        c.hidden,
-                    ) > 0;
-                    metal_ok &= crate::ffi::bf16_matmul(
-                        w(am.v, kv * hd * c.hidden * 2),
-                        x,
-                        &mut vv,
-                        1,
-                        kv * hd,
-                        c.hidden,
-                    ) > 0;
+                    qg.copy_from_slice(&proj[..rows_q]);
+                    k.copy_from_slice(&proj[rows_q..rows_q + rows_kv]);
+                    vv.copy_from_slice(&proj[rows_q + rows_kv..]);
+                    metal_ok = true;
                 } else if rc < 0 {
                     eprintln!("qwen4-rs: Metal attention failed after submission (layer {li})");
                     std::process::exit(1);
