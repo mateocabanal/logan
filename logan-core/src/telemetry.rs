@@ -16,6 +16,16 @@ pub struct TokenSpans {
     pub shared_ms: f64,
     pub gpu_ms: f64,
     pub fill_ms: f64,
+    /// GDN layer phase (Metal direct calls + CPU fallback), ms.
+    pub gdn_ms: f64,
+    /// Full-attention/QSA layer phase, ms.
+    pub attn_ms: f64,
+    /// Hyper-connection mixer phase (both hc_mix calls per layer), ms.
+    pub hc_ms: f64,
+    /// Head phase (final norm + lm_head), ms.
+    pub head_ms: f64,
+    /// Count of gdn_token calls that ran on Metal (rc > 0).
+    pub gdn_metal_ok: u64,
     pub total_ms: f64,
 }
 
@@ -88,13 +98,18 @@ pub fn emit_request_summary(
         return;
     }
     eprintln!(
-        "logan profile: tokens={tokens} route={:.1} io={:.1} shared={:.1} gpu={:.1} fill={:.1} total={:.1} ms/tok | cache hits={cache_hits} misses={cache_misses} | metal encode={} submit={} wait={} kernel={} ns fused_calls={} fused_experts={} | mio loads={} bytes={} waits={} fails={}",
+        "logan profile: tokens={tokens} route={:.1} io={:.1} shared={:.1} gpu={:.1} fill={:.1} gdn={:.1} attn={:.1} hc={:.1} head={:.1} total={:.1} ms/tok | cache hits={cache_hits} misses={cache_misses} | gdn_metal_ok={} | metal encode={} submit={} wait={} kernel={} ns fused_calls={} fused_experts={} | mio loads={} bytes={} waits={} fails={}",
         spans.route_ms / tokens.max(1) as f64,
         spans.io_ms / tokens.max(1) as f64,
         spans.shared_ms / tokens.max(1) as f64,
         spans.gpu_ms / tokens.max(1) as f64,
         spans.fill_ms / tokens.max(1) as f64,
+        spans.gdn_ms / tokens.max(1) as f64,
+        spans.attn_ms / tokens.max(1) as f64,
+        spans.hc_ms / tokens.max(1) as f64,
+        spans.head_ms / tokens.max(1) as f64,
         spans.total_ms / tokens.max(1) as f64,
+        spans.gdn_metal_ok,
         metal.encode_ns,
         metal.submit_ns,
         metal.wait_ns,
@@ -142,6 +157,11 @@ mod tests {
             shared_ms: 5.0,
             gpu_ms: 15.0,
             fill_ms: 2.0,
+            gdn_ms: 0.0,
+            attn_ms: 0.0,
+            hc_ms: 0.0,
+            head_ms: 0.0,
+            gdn_metal_ok: 0,
             total_ms: 52.0,
         };
         let metal = MetalCounters {

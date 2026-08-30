@@ -8,4 +8,5 @@ description = "COLI CSF artifact framing shared by colic and the runtime: checks
 publish = false
 
 [dependencies]
+crc32c = "0.6"
 logan-abi = { path = "../logan-abi" }

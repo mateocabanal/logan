@@ -5,10 +5,16 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
-    cache_cap,
-    colisource::{bf16_to_f32, ColiSource},
-    Cfg, HcGlobal, Layer, Model, Wt,
+    cache_cap, colisource::{bf16_to_f32, ColiSource},
+    lazy_zeroed_f32, Cfg, HcGlobal, Layer, Model, Wt,
 };
+
+/// C parity (coli_target_registry.h): the direct Apple8/MetalIO execution
+/// path is only valid for packages carrying the Apple8 target profile. Any
+/// other profile runs the canonical CPU path (the direct seam declines per
+/// call anyway via strict tile checks — this gate just makes fallback the
+/// stated default outside the validated profile).
+const APPLE8_PROFILE: &str = "macos-arm64-metal-apple8-v1";
 
 fn load_wt(src: &ColiSource, name: &str, o: usize, i: usize) -> Result<Wt, String> {
     let m = src.wt(name, o, i)?;
@@ -35,7 +41,11 @@ impl Model {
         let mut cfg = cfg.clone();
         // Bring up the Metal backend once (experts GEMV via FFI).
         crate::ffi::metal_init();
-        let direct_ok = crate::ffi::direct_init()
+        // Direct path default: ON for Apple8-profile packages (C parity —
+        // the C runner enables the direct seam for the validated target
+        // profile). QWEN_APPLE8_DIRECT=0 remains the opt-OUT.
+        let direct_ok = src.pkg_ref().profile() == APPLE8_PROFILE
+            && crate::ffi::direct_init()
             && std::env::var("QWEN_APPLE8_DIRECT")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -182,9 +192,12 @@ impl Model {
                 cfg.layers
             ],
             gdn_s: vec![vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]; cfg.layers],
-            kv_k: vec![0.0; cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim],
-            kv_v: vec![0.0; cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim],
-            idx_cache: vec![vec![0.0; cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim]; cfg.layers],
+            kv_k: lazy_zeroed_f32(cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim),
+            kv_v: lazy_zeroed_f32(cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim),
+            idx_cache: vec![
+                lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim);
+                cfg.layers
+            ],
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
             ple_conv_state: vec![
                 0.0;

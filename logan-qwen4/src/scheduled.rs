@@ -111,6 +111,7 @@ impl QwenExecutor {
         let worker = thread::Builder::new()
             .name("logan-qwen-worker".into())
             .spawn(move || {
+                let t_open = std::time::Instant::now();
                 let mut model = match crate::colisource::ColiSource::open(&package_dir)
                     .and_then(|src| Model::load_coli(&src, &cfg))
                 {
@@ -120,6 +121,12 @@ impl QwenExecutor {
                         None
                     }
                 };
+                if std::env::var("LOGAN_PROFILE").map(|v| v != "0").unwrap_or(false) {
+                    eprintln!(
+                        "logan load: {:.1} s (package open + weights)",
+                        t_open.elapsed().as_secs_f64()
+                    );
+                }
                 let run_started = std::time::Instant::now();
                 let mut generated = 0usize;
                 while let Ok(request) = receiver.recv() {

@@ -131,6 +131,18 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
     }
     let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+    // Context window: the C engine sizes the KV/indexer caches by the
+    // runner CTX (getenv CTX, default 65536 — qwen_moe_base.inc), NOT by
+    // config max_position_embeddings. The real package advertises
+    // 262144; sizing eagerly off that would zero ~51.6 GB of KV f32 on a
+    // 16 GB M2 (swap storm: 113 s load + 10x inflated decode spans).
+    // Mirror C parity: CTX env wins, capped by the config ceiling.
+    let cfg_max_t = get("max_position_embeddings").max(1);
+    let ctx = std::env::var("CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(65536);
+    let max_t = ctx.min(cfg_max_t);
     let rope = v.get("rope_parameters");
     let theta = rope
         .and_then(|r| r.get("rope_theta"))
@@ -199,7 +211,7 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
         lin_v_heads: get("linear_num_value_heads"),
         lin_v_dim: get("linear_value_head_dim"),
         conv_kernel: get("linear_conv_kernel_dim"),
-        max_t: get("max_position_embeddings"),
+        max_t,
         vocab: get("vocab_size"),
         eps: num("rms_norm_eps").max(1e-6),
         gdn_layers,
@@ -397,6 +409,29 @@ pub struct Model {
 struct AlignedBuf {
     ptr: *mut u8,
     len: usize, // allocated (page-rounded) length
+}
+
+/// Lazy-zero f32 buffer (C calloc parity) for the big sparse caches:
+/// KV (12.9 GB at CTX=65536) and the indexer positions. Eager
+/// `vec![0.0; n]` forces every page dirty at load — on a 16 GB M2 that
+/// swap-storms the box (113 s load, 10x inflated decode spans measured
+/// before this). `alloc_zeroed` on the system allocator maps untouched
+/// pages to the shared zero page (libmalloc mmap behavior), so the cache
+/// costs ~0 RSS until a token actually writes its positions. Touched pages
+/// are zeroed by the kernel on first write — same observable semantics as
+/// `vec![0.0; n]`, so token math is unaffected.
+fn lazy_zeroed_f32(n: usize) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<f32>(n).expect("KV layout");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut f32;
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: alloc_zeroed guarantees initialized-to-zero f32 storage;
+    // capacity == len so Vec's drop (dealloc with the same layout) is exact.
+    unsafe { Vec::from_raw_parts(ptr, n, n) }
 }
 
 // SAFETY: the raw allocation is owned exclusively by this struct; it is
@@ -873,6 +908,7 @@ impl Model {
                     )
                 };
                 if rc > 0 {
+                    self.spans.gdn_metal_ok += 1;
                     return;
                 }
                 if rc < 0 {
@@ -1790,6 +1826,7 @@ impl Model {
                 self.ple_forward(&mut stream);
             }
             let mut inj = vec![0.0; hc];
+            let mut _hc_t = logan_core::telemetry::Span::begin("hc");
             self.hc_mix(
                 &layer.hc_norm,
                 &layer.hc_mix_down,
@@ -1799,13 +1836,18 @@ impl Model {
                 &mut mixed,
                 Some(&mut inj),
             );
+            self.spans.hc_ms += _hc_t.end();
+            let mut _attn_t = logan_core::telemetry::Span::begin("attn");
             if layer.is_gdn {
+                let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
                 self.gdn_token(&layer, l, &mixed, &mut attn);
+                self.spans.gdn_ms += _gdn_t.end();
             } else if layer.is_qsa {
                 self.sparse_attn_token(&layer, l, &mixed, pos, &rope, &mut attn);
             } else {
                 self.attention_token(&layer, l, &mixed, pos, &rope, &mut attn);
             }
+            self.spans.attn_ms += _attn_t.end();
             for g in 0..hc {
                 for dd in 0..d {
                     stream[g * d + dd] += inj[g] * attn[dd];
@@ -1813,6 +1855,7 @@ impl Model {
             }
             let mut m2 = vec![0.0; d];
             let mut moe = vec![0.0; d];
+            let mut _hc2_t = logan_core::telemetry::Span::begin("hc");
             self.hc_mix(
                 &layer.hc_mlp_norm,
                 &layer.hc_mlp_mix_down,
@@ -1822,6 +1865,7 @@ impl Model {
                 &mut m2,
                 Some(&mut inj),
             );
+            self.spans.hc_ms += _hc2_t.end();
             self.moe_token(&layer, l, &m2, &mut moe);
             for g in 0..hc {
                 for dd in 0..d {
@@ -1832,6 +1876,7 @@ impl Model {
         }
         // final global hc_mix (no inject)
         let mut out = vec![0.0; d];
+        let mut _hc3_t = logan_core::telemetry::Span::begin("hc");
         self.hc_mix(
             &self.hc_global.norm,
             &self.hc_global.mix_down,
@@ -1841,9 +1886,11 @@ impl Model {
             &mut out,
             None,
         );
+        self.spans.hc_ms += _hc3_t.end();
         // qwen4_no_final_norm: when hc is active and norm.weight is absent,
         // the mixer output goes straight to the head (C: qwen4_no_final_norm
         // = hc_count > 0 && !st_have(norm.weight)).
+        let mut _head_t = logan_core::telemetry::Span::begin("head");
         let mut logits = vec![0.0; c.vocab];
         if !self.final_norm.is_empty() {
             let mut normed = vec![0.0; d];
@@ -1852,6 +1899,7 @@ impl Model {
         } else {
             matmul(&mut logits, &out, &self.lm_head);
         }
+        self.spans.head_ms += _head_t.end();
         logits
     }
 
@@ -2076,6 +2124,10 @@ impl Model {
             ],
             expert_store: logan_core::expert::ExpertStore::new(cache_cap()),
             spans: logan_core::telemetry::TokenSpans::default(),
+            // safetensors mode: no package profile, so the Apple8 direct path
+            // never applies (C parity: direct requires the Apple8 target
+            // profile). Keep the env gate for symmetry; the path is inert
+            // without a .coli package anyway (moe_token requires coli).
             metal_direct: crate::ffi::direct_init()
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")
