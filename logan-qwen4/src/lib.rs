@@ -411,6 +411,29 @@ struct AlignedBuf {
     len: usize, // allocated (page-rounded) length
 }
 
+/// Lazy-zero f32 buffer (C calloc parity) for the big sparse caches:
+/// KV (12.9 GB at CTX=65536) and the indexer positions. Eager
+/// `vec![0.0; n]` forces every page dirty at load — on a 16 GB M2 that
+/// swap-storms the box (113 s load, 10x inflated decode spans measured
+/// before this). `alloc_zeroed` on the system allocator maps untouched
+/// pages to the shared zero page (libmalloc mmap behavior), so the cache
+/// costs ~0 RSS until a token actually writes its positions. Touched pages
+/// are zeroed by the kernel on first write — same observable semantics as
+/// `vec![0.0; n]`, so token math is unaffected.
+fn lazy_zeroed_f32(n: usize) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<f32>(n).expect("KV layout");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut f32;
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: alloc_zeroed guarantees initialized-to-zero f32 storage;
+    // capacity == len so Vec's drop (dealloc with the same layout) is exact.
+    unsafe { Vec::from_raw_parts(ptr, n, n) }
+}
+
 // SAFETY: the raw allocation is owned exclusively by this struct; it is
 // created and freed on the host thread that owns the Model (decode is a
 // single-threaded per-token pipeline; the GPU reads the memory but Metal

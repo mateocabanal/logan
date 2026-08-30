@@ -5,9 +5,8 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
-    cache_cap,
-    colisource::{bf16_to_f32, ColiSource},
-    Cfg, HcGlobal, Layer, Model, Wt,
+    cache_cap, colisource::{bf16_to_f32, ColiSource},
+    lazy_zeroed_f32, Cfg, HcGlobal, Layer, Model, Wt,
 };
 
 /// C parity (coli_target_registry.h): the direct Apple8/MetalIO execution
@@ -193,9 +192,12 @@ impl Model {
                 cfg.layers
             ],
             gdn_s: vec![vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]; cfg.layers],
-            kv_k: vec![0.0; cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim],
-            kv_v: vec![0.0; cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim],
-            idx_cache: vec![vec![0.0; cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim]; cfg.layers],
+            kv_k: lazy_zeroed_f32(cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim),
+            kv_v: lazy_zeroed_f32(cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim),
+            idx_cache: vec![
+                lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim);
+                cfg.layers
+            ],
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
             ple_conv_state: vec![
                 0.0;
