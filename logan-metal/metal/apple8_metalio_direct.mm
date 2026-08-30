@@ -1065,6 +1065,12 @@ extern "C" int coli_apple8_metalio_gdn_token(
     }
     profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
     memcpy(out, ctx->outb.contents, (size_t)D * sizeof(float));
+    if (getenv("QWEN_GDN_DEBUG")) {
+        const double t_total = (double)(direct_now_ns() - encode_begin) / 1.0e6;
+        fprintf(stderr, "[qwen-gdn-metal] layer=%d rows=%d enc=%.2fms sub=%.2fms wait=%.2fms tot=%.2fms\n",
+                layer, input_rows, (double)encode_ns / 1.0e6, (double)submit_ns / 1.0e6,
+                (double)wait_ns / 1.0e6, t_total);
+    }
     return 1;
 }
 
