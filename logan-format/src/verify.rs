@@ -566,8 +566,13 @@ pub(crate) mod tests {
     /// one shard (expert record kind=2) and a manifest whose CRC32C is
     /// computed over the manifest with its CRC field zeroed.
     pub(crate) fn write_valid_package() -> std::path::PathBuf {
+        // ponytail: pid+nanos can collide across parallel test threads in
+        // one process (~1-in-4 workspace runs) — a process-local seq makes
+        // it unique; use a full tempdir API if cross-process races ever matter.
+        static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let package = std::env::temp_dir().join(format!(
-            "colibri-format-{}-{}",
+            "colibri-format-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
