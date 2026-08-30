@@ -1,4 +1,9 @@
-use std::{fs, io::Read, path::PathBuf};
+use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
+
+use logan_ir::{
+    graph::{Graph, Op, ValueType},
+    plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec},
+};
 
 use crate::{
     error::{ColicError, Result},
@@ -22,6 +27,13 @@ pub struct CompileRequest {
     pub dry_run: bool,
     pub verify: bool,
     pub force: bool,
+    /// Emit the plan artifact (graph + placement + quant + memory plan)
+    /// to this path. Requires a real (non --dry-run) compile.
+    pub plan: Option<PathBuf>,
+    /// Sensitive-dense representation floor (like the C planner's veto
+    /// floors): the plan refuses a narrower than `bf16` representation for
+    /// sensitive dense tensors unless `exact` waives the floor.
+    pub quant_floor: QuantFloor,
 }
 
 impl CompileRequest {
@@ -36,18 +48,23 @@ impl CompileRequest {
             dry_run: false,
             verify: false,
             force: false,
+            plan: None,
+            quant_floor: QuantFloor::Bf16,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetRequest {
+    /// Automatic: the planner picks the target from the host machine
+    /// profile (`--target auto` / `--target native`).
     Native,
+    /// Explicit, manually chosen profile (overrides auto selection).
     Profile(String),
 }
 impl TargetRequest {
     pub fn parse(value: &str) -> Result<Self> {
-        if value == "native" {
+        if value == "native" || value == "auto" {
             return Ok(Self::Native);
         }
         if value.starts_with("portable") {
@@ -179,6 +196,25 @@ pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<S
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantFloor {
+    /// Sensitive dense tensors must be represented at >= 16-bit width.
+    Bf16,
+    /// No floor: sensitive dense keeps whatever its source representation is.
+    Exact,
+}
+impl QuantFloor {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "bf16" => Ok(Self::Bf16),
+            "exact" => Ok(Self::Exact),
+            other => Err(ColicError::Usage(format!(
+                "unknown quant floor `{other}` (expected `bf16` or `exact`)"
+            ))),
+        }
+    }
+}
+
 fn resolve_expert_quantization(
     request: &CompileRequest,
     model: &SemanticModel,
@@ -211,7 +247,7 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
         )
     })?;
     let quantization = resolve_expert_quantization(request, &model)?;
-    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    let target_profile = target::resolve(&request.target, &target::MachineProfile::probe())?;
     let records = record_inventory(&model, quantization, target_profile)?;
     let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
@@ -636,6 +672,226 @@ fn copy_package_json_metadata(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Physical plan artifact (issue 42): graph + placement + quant + memory plan
+// ---------------------------------------------------------------------------
+
+/// Apple8 representations live in the physical IR as ordinary per-value
+/// options (logan-ir `QuantSpec` kind + `ValueType` dtype), not top-level
+/// pipeline branches.
+pub const KIND_APPLE8: &str = "mxfp4-tile8x32";
+pub const KIND_BF16: &str = "bf16";
+pub const KIND_EXACT: &str = "exact";
+
+/// Sensitive dense families the C planner's veto floors protect: embedding,
+/// head, norms, and the router gate. Routed experts are exempt (they are
+/// the Apple8 streamed payload); attention/shared-expert F8 tensors keep
+/// their verified source representation.
+fn is_sensitive_dense(name: &str) -> bool {
+    name == "embed.weight"
+        || name == "head.weight"
+        || name.contains("norm")
+        || name.ends_with("gate.weight")
+}
+
+/// Stored representation kind for a dense tensor, from its source dtype.
+fn dense_quant_kind(dtype: &str) -> &'static str {
+    match dtype {
+        "BF16" => KIND_BF16,
+        "F32" => "f32",
+        "F8_E4M3FN" => "f8-e4m3",
+        _ => KIND_EXACT,
+    }
+}
+
+/// Bit width of a representation kind; `None` means >= 16-bit (never
+/// narrower than the bf16 floor).
+fn narrow_bits(kind: &str) -> Option<u32> {
+    match kind {
+        "f8-e4m3" | "f8-e8m0" => Some(8),
+        _ => None,
+    }
+}
+
+/// The runtime's expert-store slot count (mirrors QWEN4_CACHE / CACHE;
+/// default 256 is the C engine's measured plateau).
+fn expert_cache_slots() -> u64 {
+    std::env::var("QWEN4_CACHE")
+        .or_else(|_| std::env::var("CACHE"))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+        .max(1)
+}
+
+/// ONE unified pool on Apple silicon: state, static tensors, PLE, expert
+/// cache and streamed slots all compete for the same physical RAM. The
+/// planner accounts resident weights + the expert-slot cache against the
+/// pool once, and refuses a plan that cannot fit (with the numbers, so the
+/// rejection explains itself).
+fn check_uma_pool(
+    machine: &target::MachineProfile,
+    resident_bytes: u64,
+    expert_cache_bytes: u64,
+) -> Result<u64> {
+    let pool = machine.ram_bytes.unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
+    let demand = resident_bytes
+        .checked_add(expert_cache_bytes)
+        .ok_or_else(|| ColicError::Usage("memory demand overflows u64".into()))?;
+    if demand > pool {
+        return Err(ColicError::unsupported(
+            Stage::StoragePlanning.as_str(),
+            format!(
+                "unified pool is {pool} bytes but resident weights need {resident_bytes} and the expert cache needs {expert_cache_bytes} ({} total); shrink the model, raise RAM_GB, or lower the cache with QWEN4_CACHE/CACHE",
+                demand
+            ),
+        ));
+    }
+    Ok(pool)
+}
+
+/// Builds the physical plan artifact for an already-planned compile:
+/// one value + LoadWeight node per record (exact compile order), the
+/// per-value placement/quant decisions, and the UMA memory plan. The byte
+/// math reuses the verified Apple8 layout constants (136-byte 8x32 tiles =
+/// 4.25 bits/weight) through the same lowering that emits the package.
+fn build_physical_plan(
+    sources: &[ExactSource],
+    records: &[LoweredRecord],
+    expert_quantization: ExpertQuantization,
+    target: target::TargetProfile,
+    quant_floor: QuantFloor,
+    machine: &target::MachineProfile,
+    package_fingerprint: &str,
+) -> Result<PlanArtifact> {
+    if sources.len() != records.len() {
+        return Err(ColicError::Usage(
+            "physical plan source/record count mismatch".into(),
+        ));
+    }
+    let mut graph = Graph::new();
+    let mut placement = Vec::with_capacity(records.len());
+    let mut quant = Vec::with_capacity(records.len());
+    let mut resident_bytes = 0_u64;
+    let mut largest_expert_decoded = 0_u64;
+    for (source, record) in sources.iter().zip(records) {
+        let (name, layer, expert_id, dtype, shape) = match source {
+            ExactSource::Tensor { name, layer, tensor } => (
+                name.clone(),
+                i32::from(*layer),
+                -1,
+                dense_quant_kind(&tensor.dtype),
+                tensor.shape.clone(),
+            ),
+            ExactSource::Expert { expert, .. } => {
+                let stored_verified = if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
+                    target::apple8_expert_stored_bytes(expert)?
+                } else {
+                    mxfp4_record::stored_bytes(expert)?
+                };
+                if record.stored_bytes != stored_verified {
+                    return Err(ColicError::Usage(format!(
+                        "Apple8 expert record {} planned {} bytes but the verified tile math says {stored_verified}",
+                        record.id, record.stored_bytes
+                    )));
+                }
+                largest_expert_decoded = largest_expert_decoded.max(record.decoded_bytes);
+                (
+                    format!("layers.{}.ffn.experts.{}", expert.layer, expert.expert),
+                    i32::try_from(expert.layer).map_err(|_| {
+                        ColicError::Usage("expert layer exceeds i32".into())
+                    })?,
+                    i32::try_from(expert.expert).map_err(|_| {
+                        ColicError::Usage("expert id exceeds i32".into())
+                    })?,
+                    if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
+                        KIND_APPLE8
+                    } else {
+                        "mxfp4"
+                    },
+                    vec![3, u64::from(expert.gate.rows), u64::from(expert.gate.columns)],
+                )
+            }
+        };
+        let kind = match source {
+            ExactSource::Expert { .. } => {
+                if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
+                    KIND_APPLE8
+                } else {
+                    match expert_quantization {
+                        ExpertQuantization::Exact => KIND_EXACT,
+                        ExpertQuantization::Mxfp4 => "mxfp4",
+                    }
+                }
+            }
+            ExactSource::Tensor { .. } => dtype,
+        };
+        let placed = match source {
+            ExactSource::Expert { .. } => Placement::Streamed,
+            ExactSource::Tensor { .. } => Placement::Resident,
+        };
+        if matches!(source, ExactSource::Tensor { .. })
+            && quant_floor == QuantFloor::Bf16
+            && is_sensitive_dense(&name)
+            && narrow_bits(kind).is_some_and(|bits| bits < 16)
+        {
+            return Err(ColicError::unsupported(
+                Stage::TargetPlanning.as_str(),
+                format!(
+                    "dense tensor `{name}` records representation `{kind}` (8-bit), narrower than the sensitive-dense floor `bf16`; pass --quant-floor exact to waive"
+                ),
+            ));
+        }
+        match placed {
+            Placement::Resident => resident_bytes = resident_bytes
+                .checked_add(record.decoded_bytes)
+                .ok_or_else(|| ColicError::Usage("resident bytes overflow u64".into()))?,
+            Placement::Streamed => {}
+            Placement::Gpu => {}
+        }
+        let scale = (kind == KIND_APPLE8).then(|| "f8-e8m0/1x32".to_string());
+        let value = graph.add_value(
+            ValueType {
+                shape,
+                dtype: kind.to_string(),
+            },
+            Some(name.clone()),
+        );
+        let mut attrs = BTreeMap::new();
+        attrs.insert("record_kind".into(), record.kind.to_string());
+        attrs.insert("quant".into(), kind.to_string());
+        attrs.insert("placement".into(), format!("{placed:?}"));
+        attrs.insert("stored_bytes".into(), record.stored_bytes.to_string());
+        attrs.insert("decoded_bytes".into(), record.decoded_bytes.to_string());
+        if layer >= 0 || expert_id >= 0 {
+            attrs.insert("layer".into(), layer.to_string());
+            attrs.insert("expert".into(), expert_id.to_string());
+        }
+        graph.add_node(Op::LoadWeight, vec![], vec![value], attrs);
+        placement.push((name.clone(), placed));
+        quant.push((
+            name,
+            QuantSpec {
+                kind: kind.to_string(),
+                scale,
+            },
+        ));
+    }
+    let pool = check_uma_pool(
+        machine,
+        resident_bytes,
+        expert_cache_slots()
+            .checked_mul(largest_expert_decoded)
+            .unwrap_or(u64::MAX),
+    )?;
+    let memory = MemoryPlan {
+        placement,
+        quant,
+        ram_budget_bytes: pool,
+    };
+    Ok(PlanArtifact::new(package_fingerprint.to_string(), graph, memory))
+}
+
 pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Result<()> {
     if request.dry_run {
         let _summary = dry_run(request)?;
@@ -655,7 +911,8 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     })?;
     let expert_quantization = resolve_expert_quantization(request, &model)?;
     progress.stage(Stage::TargetPlanning);
-    let target_profile = target::resolve(&request.target, target::HostCapabilities::current())?;
+    let machine = target::MachineProfile::probe();
+    let target_profile = target::resolve(&request.target, &machine)?;
     let output = request
         .output
         .as_ref()
@@ -734,6 +991,21 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
     } else {
         storage::publish_package(&temporary, output)
     }?;
+    if let Some(plan_path) = &request.plan {
+        let plan = build_physical_plan(
+            &sources,
+            &records,
+            expert_quantization,
+            target_profile,
+            request.quant_floor,
+            &machine,
+            &inventory.source_fingerprint,
+        )?;
+        fs::write(plan_path, plan.to_bytes().map_err(ColicError::Usage)?).map_err(|source| ColicError::Io {
+            path: plan_path.clone(),
+            source,
+        })?;
+    }
     if request.verify {
         progress.stage(Stage::Verification);
         let _summary = verify::verify_package(output)?;
@@ -762,6 +1034,16 @@ fn validate_supported_options(request: &CompileRequest) -> Result<()> {
         return Err(ColicError::unsupported(
             Stage::TargetPlanning.as_str(),
             "non-default optimization profiles are not implemented; use `--opt default`",
+        ));
+    }
+    if request.plan.is_some() && request.output.is_none() {
+        return Err(ColicError::Usage(
+            "--plan requires -o/--output (a plan artifact belongs to a package)".into(),
+        ));
+    }
+    if request.dry_run && request.plan.is_some() {
+        return Err(ColicError::Usage(
+            "--plan cannot be combined with --dry-run (use --dry-run to preview the storage summary)".into(),
         ));
     }
     Ok(())
