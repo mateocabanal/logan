@@ -61,16 +61,12 @@ pub(crate) fn align_up_impl(value: u64, alignment: u64) -> Result<u64> {
 
 /// Castagnoli CRC32C used by all COLI v1 integrity fields.
 pub(crate) fn crc32c_impl(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    !crc
+    // crc32c crate: safe-API, hardware-accelerated (SSE4.2/ARMv8) CRC-32C,
+    // bit-identical to the Castagnoli reference — stored CRCs must match.
+    // The load path CRCs ~11 GB of dense weights; the old bitwise loop ran
+    // ~95 MB/s (the 113 s load on the M2 was CRC-bound, not disk-bound).
+    crc32c::crc32c(bytes)
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationSummary {
     pub shards: u32,
