@@ -213,6 +213,9 @@ impl Model {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             gdn_metal: (0..cfg.layers).map(|_| None).collect(),
+            sched_mode: false,
+            sched_blocked: None,
+            sched_pause: None,
         })
     }
 }
