@@ -738,6 +738,65 @@ fn matmul_bf16_neon(_y: &mut [f32], _x: &[f32], _w: &[u8], _o: usize, _i: usize)
     unreachable!();
 }
 
+fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize) {
+    debug_assert!(bytes.len() >= o * i * 2);
+
+    let parallel = o * i >= 16_000_000
+        && std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            > 1;
+
+    let neon = std::env::var("QWEN_NEON_BF16")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    #[cfg(target_arch = "aarch64")]
+    let neon = neon && o * i >= 1 << 18;
+    #[cfg(not(target_arch = "aarch64"))]
+    let neon = false;
+
+    if neon {
+        matmul_bf16_neon(y, x, bytes, o, i);
+        return;
+    }
+
+    if parallel {
+        std::thread::scope(|scope| {
+            let nthreads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let chunk = o.div_ceil(nthreads);
+
+            for (c, yslice) in y.chunks_mut(chunk).enumerate() {
+                let rows = c * chunk;
+                scope.spawn(move || {
+                    for (oo, yv) in yslice.iter_mut().enumerate() {
+                        let oo = rows + oo;
+                        let mut acc = 0.0_f32;
+                        for ii in 0..i {
+                            let off = (oo * i + ii) * 2;
+                            let u = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                            acc += x[ii] * f32::from_bits((u as u32) << 16);
+                        }
+                        *yv = acc;
+                    }
+                });
+            }
+        });
+    } else {
+        for oo in 0..o {
+            let mut acc = 0.0_f32;
+            for ii in 0..i {
+                let off = (oo * i + ii) * 2;
+                let u = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                acc += x[ii] * f32::from_bits((u as u32) << 16);
+            }
+            y[oo] = acc;
+        }
+    }
+}
+
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
     // ponytail: thread::scope per call costs ~50-100us of spawn; only
@@ -1019,7 +1078,7 @@ impl Model {
     /// contract: newBufferWithBytesNoCopy requires 16 KiB-aligned pointers,
     /// length page-rounded). Returns None if any alloc fails (Metal GDN then
     /// stays off for that layer; CPU path unaffected).
-    fn build_gdn_metal(layer: &Layer, cfg: &Cfg) -> Option<GdnMetalLayer> {
+    fn build_gdn_metal(layer: &mut Layer, cfg: &Cfg) -> Option<GdnMetalLayer> {
         if !layer.is_gdn || !crate::ffi::direct_available() {
             return None;
         }
@@ -1044,7 +1103,7 @@ impl Model {
         let wa = move_bf16(&layer.gdn_in_a)?;
         let wb = move_bf16(&layer.gdn_in_b)?;
         let wout = move_bf16(&layer.gdn_out)?;
-        Some(GdnMetalLayer {
+        let metal = GdnMetalLayer {
             wqkv: wqkv.ptr,
             wz: wz.ptr,
             wa: wa.ptr,
@@ -1053,7 +1112,26 @@ impl Model {
             state: state.ptr as *mut f32,
             conv_state: conv_state.ptr as *mut f32,
             _bufs: vec![wqkv, wz, wa, wb, wout, state, conv_state],
-        })
+        };
+
+        // The aligned Metal allocation is now the authoritative BF16
+        // storage. The old code retained both copies for the model lifetime,
+        // which duplicates ~3.9 GiB on Flash-Next's 36 GDN layers.
+        //
+        // Default ON; disable for an exact same-binary memory/perf A/B.
+        let single_copy = std::env::var("QWEN_GDN_SINGLE_COPY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
+        if single_copy {
+            layer.gdn_in_qkv.bytes = None;
+            layer.gdn_in_z.bytes = None;
+            layer.gdn_in_a.bytes = None;
+            layer.gdn_in_b.bytes = None;
+            layer.gdn_out.bytes = None;
+        }
+
+        Some(metal)
     }
 
     fn build_attn_metal(layer: &Layer, cfg: &Cfg) -> Option<AttnMetalLayer> {
@@ -1101,7 +1179,7 @@ impl Model {
         })
     }
 
-    fn gdn_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
+    fn gdn_token(&mut self, layer: &mut Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let kd = c.lin_k_dim;
         let kheads = c.lin_k_heads;
@@ -1182,13 +1260,49 @@ impl Model {
         }
 
         let mut qkv = vec![0.0; cdim];
-        matmul(&mut qkv, x, &layer.gdn_in_qkv);
         let mut a = vec![0.0; vheads];
         let mut b = vec![0.0; vheads];
         let mut z = vec![0.0; vdim];
-        matmul(&mut a, x, &layer.gdn_in_a);
-        matmul(&mut b, x, &layer.gdn_in_b);
-        matmul(&mut z, x, &layer.gdn_in_z);
+
+        if let Some(gm) = self.gdn_metal[li].as_ref() {
+            // SAFETY: GdnMetalLayer owns every aligned allocation for the
+            // entire model lifetime. These are the exact BF16 package bytes.
+            unsafe {
+                matmul_bf16_bytes(
+                    &mut qkv,
+                    x,
+                    std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                    cdim,
+                    c.hidden,
+                );
+                matmul_bf16_bytes(
+                    &mut z,
+                    x,
+                    std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                    vdim,
+                    c.hidden,
+                );
+                matmul_bf16_bytes(
+                    &mut a,
+                    x,
+                    std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                    vheads,
+                    c.hidden,
+                );
+                matmul_bf16_bytes(
+                    &mut b,
+                    x,
+                    std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                    vheads,
+                    c.hidden,
+                );
+            }
+        } else {
+            matmul(&mut qkv, x, &layer.gdn_in_qkv);
+            matmul(&mut a, x, &layer.gdn_in_a);
+            matmul(&mut b, x, &layer.gdn_in_b);
+            matmul(&mut z, x, &layer.gdn_in_z);
+        }
 
         let mut y = vec![0.0; cdim];
         if kk > 1 {
@@ -1308,7 +1422,20 @@ impl Model {
                 c.eps,
             );
         }
-        matmul(out, &normed, &layer.gdn_out);
+        if let Some(gm) = self.gdn_metal[li].as_ref() {
+            // SAFETY: model-lifetime aligned BF16 storage.
+            unsafe {
+                matmul_bf16_bytes(
+                    out,
+                    &normed,
+                    std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                    c.hidden,
+                    vdim,
+                );
+            }
+        } else {
+            matmul(out, &normed, &layer.gdn_out);
+        }
     }
 
     /// Input-side attention projection. QSA can append index_qk to the packed
@@ -2305,7 +2432,7 @@ impl Model {
         self.spans.hc_ms += _hc_t.end();
         if layer.is_gdn {
             let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
-            self.gdn_token(&layer, l, &mixed, &mut attn);
+            self.gdn_token(&mut layer, l, &mixed, &mut attn);
             self.spans.gdn_ms += _gdn_t.end();
         } else {
             let mut _attn_t = logan_core::telemetry::Span::begin("attn");
