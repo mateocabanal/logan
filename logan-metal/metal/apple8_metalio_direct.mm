@@ -736,16 +736,17 @@ kernel void qwen_gdn_conv_recur_norm(
         kv_mem += s * khh;
     }
     const float delta = (vv - kv_mem) * beta_h;
-    for (int kk2 = 0; kk2 < kd; ++kk2) {
-        const float khh = kv[kk2] * kinv;
-        const long si = hs + (long)kk2 * vd + d;
-        state[si] += khh * delta;
-    }
+    /* Update the recurrent state and consume that updated value for q*S in
+     * one ascending-kk pass. This preserves the observable state equation and
+     * output accumulation order while removing one full state read traversal. */
     float outv = 0.0f;
     for (int kk2 = 0; kk2 < kd; ++kk2) {
+        const float khh = kv[kk2] * kinv;
         const float qhh = (qv[kk2] * qinv) * qscale;
         const long si = hs + (long)kk2 * vd + d;
-        outv += state[si] * qhh;
+        const float next_s = state[si] + khh * delta;
+        state[si] = next_s;
+        outv += next_s * qhh;
     }
     head_out[local_head * vd + d] = outv;
     threadgroup_barrier(mem_flags::mem_threadgroup);

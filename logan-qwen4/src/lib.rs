@@ -646,14 +646,24 @@ impl Drop for AlignedBuf {
 /// generic Metal BF16 GEMV seam (mirror of GdnMetalLayer: moved, not
 /// duplicated; the CPU fallback reads the same memory).
 struct AttnMetalLayer {
-    /// [2*heads*hd + 2*kv_heads*hd, hidden] BF16 q|gate || k || v packed
-    /// into ONE aligned buffer so the three projections run in a single
-    /// dispatch (4 -> 2 syncs per attention layer; syncs, not compute,
-    /// bound the C engine's attention ceiling too).
+    /// [q|gate || k || v || optional index_qk, hidden] BF16 rows.
+    /// QSA index rows share the same x input and can therefore execute in
+    /// the existing QKV dispatch without another command buffer or host wait.
     qkv: *mut u8,
+    qkv_rows: usize,
     /// [hidden, heads*hd] BF16 out projection
     o: *mut u8,
     _bufs: Vec<AlignedBuf>,
+}
+
+/// Outputs of the input-side attention projection. QSA may additionally
+/// carry index_qk so selection does not repeat that matmul on the CPU.
+struct AttnProjection {
+    qg: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    index_qk: Option<Vec<f32>>,
+    metal_ok: bool,
 }
 
 struct GdnMetalLayer {
@@ -728,6 +738,72 @@ fn matmul_bf16_neon(_y: &mut [f32], _x: &[f32], _w: &[u8], _o: usize, _i: usize)
     unreachable!();
 }
 
+fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize) {
+    debug_assert!(bytes.len() >= o * i * 2);
+
+    let bnns = std::env::var("QWEN_BNNS_BF16")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    if bnns && logan_metal::bnns_bf16_matmul(bytes, x, y, o, i) {
+        return;
+    }
+
+    let parallel = o * i >= 16_000_000
+        && std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            > 1;
+
+    let neon = std::env::var("QWEN_NEON_BF16")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    #[cfg(target_arch = "aarch64")]
+    let neon = neon && o * i >= 1 << 18;
+    #[cfg(not(target_arch = "aarch64"))]
+    let neon = false;
+
+    if neon {
+        matmul_bf16_neon(y, x, bytes, o, i);
+        return;
+    }
+
+    if parallel {
+        std::thread::scope(|scope| {
+            let nthreads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let chunk = o.div_ceil(nthreads);
+
+            for (c, yslice) in y.chunks_mut(chunk).enumerate() {
+                let rows = c * chunk;
+                scope.spawn(move || {
+                    for (oo, yv) in yslice.iter_mut().enumerate() {
+                        let oo = rows + oo;
+                        let mut acc = 0.0_f32;
+                        for ii in 0..i {
+                            let off = (oo * i + ii) * 2;
+                            let u = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                            acc += x[ii] * f32::from_bits((u as u32) << 16);
+                        }
+                        *yv = acc;
+                    }
+                });
+            }
+        });
+    } else {
+        for oo in 0..o {
+            let mut acc = 0.0_f32;
+            for ii in 0..i {
+                let off = (oo * i + ii) * 2;
+                let u = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                acc += x[ii] * f32::from_bits((u as u32) << 16);
+            }
+            y[oo] = acc;
+        }
+    }
+}
+
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
     // ponytail: thread::scope per call costs ~50-100us of spawn; only
@@ -740,6 +816,12 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
             .unwrap_or(1)
             > 1;
     if let Some(bytes) = &w.bytes {
+        let bnns = std::env::var("QWEN_BNNS_BF16")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        if bnns && logan_metal::bnns_bf16_matmul(bytes, x, y, o, i) {
+            return;
+        }
         // NEON BF16: 4 f32 lanes, bf16 weights widened by (u16<<16).
         // fp-order differs from scalar (grouped fma) — the token-identity
         // gate decides; QWEN_NEON_BF16=0 opts out.
@@ -1009,7 +1091,7 @@ impl Model {
     /// contract: newBufferWithBytesNoCopy requires 16 KiB-aligned pointers,
     /// length page-rounded). Returns None if any alloc fails (Metal GDN then
     /// stays off for that layer; CPU path unaffected).
-    fn build_gdn_metal(layer: &Layer, cfg: &Cfg) -> Option<GdnMetalLayer> {
+    fn build_gdn_metal(layer: &mut Layer, cfg: &Cfg) -> Option<GdnMetalLayer> {
         if !layer.is_gdn || !crate::ffi::direct_available() {
             return None;
         }
@@ -1034,7 +1116,7 @@ impl Model {
         let wa = move_bf16(&layer.gdn_in_a)?;
         let wb = move_bf16(&layer.gdn_in_b)?;
         let wout = move_bf16(&layer.gdn_out)?;
-        Some(GdnMetalLayer {
+        let metal = GdnMetalLayer {
             wqkv: wqkv.ptr,
             wz: wz.ptr,
             wa: wa.ptr,
@@ -1043,7 +1125,26 @@ impl Model {
             state: state.ptr as *mut f32,
             conv_state: conv_state.ptr as *mut f32,
             _bufs: vec![wqkv, wz, wa, wb, wout, state, conv_state],
-        })
+        };
+
+        // The aligned Metal allocation is now the authoritative BF16
+        // storage. The old code retained both copies for the model lifetime,
+        // which duplicates ~3.9 GiB on Flash-Next's 36 GDN layers.
+        //
+        // Default ON; disable for an exact same-binary memory/perf A/B.
+        let single_copy = std::env::var("QWEN_GDN_SINGLE_COPY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
+        if single_copy {
+            layer.gdn_in_qkv.bytes = None;
+            layer.gdn_in_z.bytes = None;
+            layer.gdn_in_a.bytes = None;
+            layer.gdn_in_b.bytes = None;
+            layer.gdn_out.bytes = None;
+        }
+
+        Some(metal)
     }
 
     fn build_attn_metal(layer: &Layer, cfg: &Cfg) -> Option<AttnMetalLayer> {
@@ -1060,19 +1161,38 @@ impl Model {
         let q_bytes = layer.attn_q.bytes.as_ref()?;
         let k_bytes = layer.attn_k.bytes.as_ref()?;
         let v_bytes = layer.attn_v.bytes.as_ref()?;
-        let mut qkv = AlignedBuf::zeroed(q_bytes.len() + k_bytes.len() + v_bytes.len())?;
+        let idx_bytes = if layer.is_qsa {
+            layer.index_qk.bytes.as_deref()
+        } else {
+            None
+        };
+        let idx_len = idx_bytes.map_or(0, |b| b.len());
+        let total = q_bytes.len() + k_bytes.len() + v_bytes.len() + idx_len;
+        let row_bytes = cfg.hidden.checked_mul(2)?;
+        if total % row_bytes != 0 {
+            return None;
+        }
+
+        let mut qkv = AlignedBuf::zeroed(total)?;
         let dst = qkv.as_mut_u8();
-        dst[..q_bytes.len()].copy_from_slice(q_bytes);
-        dst[q_bytes.len()..q_bytes.len() + k_bytes.len()].copy_from_slice(k_bytes);
-        dst[q_bytes.len() + k_bytes.len()..].copy_from_slice(v_bytes);
+        let mut off = 0usize;
+        for bytes in [q_bytes.as_slice(), k_bytes.as_slice(), v_bytes.as_slice()] {
+            dst[off..off + bytes.len()].copy_from_slice(bytes);
+            off += bytes.len();
+        }
+        if let Some(bytes) = idx_bytes {
+            dst[off..off + bytes.len()].copy_from_slice(bytes);
+        }
+
         Some(AttnMetalLayer {
             qkv: qkv.ptr,
+            qkv_rows: total / row_bytes,
             o: o.ptr,
             _bufs: vec![qkv, o],
         })
     }
 
-    fn gdn_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
+    fn gdn_token(&mut self, layer: &mut Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let kd = c.lin_k_dim;
         let kheads = c.lin_k_heads;
@@ -1153,13 +1273,49 @@ impl Model {
         }
 
         let mut qkv = vec![0.0; cdim];
-        matmul(&mut qkv, x, &layer.gdn_in_qkv);
         let mut a = vec![0.0; vheads];
         let mut b = vec![0.0; vheads];
         let mut z = vec![0.0; vdim];
-        matmul(&mut a, x, &layer.gdn_in_a);
-        matmul(&mut b, x, &layer.gdn_in_b);
-        matmul(&mut z, x, &layer.gdn_in_z);
+
+        if let Some(gm) = self.gdn_metal[li].as_ref() {
+            // SAFETY: GdnMetalLayer owns every aligned allocation for the
+            // entire model lifetime. These are the exact BF16 package bytes.
+            unsafe {
+                matmul_bf16_bytes(
+                    &mut qkv,
+                    x,
+                    std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                    cdim,
+                    c.hidden,
+                );
+                matmul_bf16_bytes(
+                    &mut z,
+                    x,
+                    std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                    vdim,
+                    c.hidden,
+                );
+                matmul_bf16_bytes(
+                    &mut a,
+                    x,
+                    std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                    vheads,
+                    c.hidden,
+                );
+                matmul_bf16_bytes(
+                    &mut b,
+                    x,
+                    std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                    vheads,
+                    c.hidden,
+                );
+            }
+        } else {
+            matmul(&mut qkv, x, &layer.gdn_in_qkv);
+            matmul(&mut a, x, &layer.gdn_in_a);
+            matmul(&mut b, x, &layer.gdn_in_b);
+            matmul(&mut z, x, &layer.gdn_in_z);
+        }
 
         let mut y = vec![0.0; cdim];
         if kk > 1 {
@@ -1239,14 +1395,12 @@ impl Model {
             }
             for d in 0..vd {
                 let delta = (vhh[d] - kv_mem[d]) * bt;
-                for kk2 in 0..kd {
-                    sn[kk2 * vd + d] += khh[kk2] * delta;
-                }
-            }
-            for d in 0..vd {
                 let mut acc = 0.0_f32;
                 for kk2 in 0..kd {
-                    acc += sn[kk2 * vd + d] * qhh[kk2];
+                    let si = kk2 * vd + d;
+                    let next_s = sn[si] + khh[kk2] * delta;
+                    sn[si] = next_s;
+                    acc += next_s * qhh[kk2];
                 }
                 kv_mem[d] = acc;
             }
@@ -1279,7 +1433,116 @@ impl Model {
                 c.eps,
             );
         }
-        matmul(out, &normed, &layer.gdn_out);
+        if let Some(gm) = self.gdn_metal[li].as_ref() {
+            // SAFETY: model-lifetime aligned BF16 storage.
+            unsafe {
+                matmul_bf16_bytes(
+                    out,
+                    &normed,
+                    std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                    c.hidden,
+                    vdim,
+                );
+            }
+        } else {
+            matmul(out, &normed, &layer.gdn_out);
+        }
+    }
+
+    /// Input-side attention projection. QSA can append index_qk to the packed
+    /// Metal projection because all four matrices consume the same x.
+    fn project_attention(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        include_index: bool,
+    ) -> AttnProjection {
+        let c = self.cfg.clone();
+        let h = c.heads;
+        let hd = c.head_dim;
+        let kv = c.kv_heads;
+
+        let rows_q = 2 * h * hd;
+        let rows_kv = kv * hd;
+        let base_rows = rows_q + 2 * rows_kv;
+        let index_rows = if include_index && layer.is_qsa {
+            (c.idx_n_heads + c.idx_kv_heads) * c.idx_head_dim
+        } else {
+            0
+        };
+
+        let mut qg = vec![0.0; rows_q];
+        let mut k = vec![0.0; rows_kv];
+        let mut v = vec![0.0; rows_kv];
+        let mut index_qk = None;
+        let mut metal_ok = false;
+
+        if self.attn_metal[li].is_none() && !layer.is_gdn && crate::ffi::direct_available() {
+            self.attn_metal[li] = Self::build_attn_metal(layer, &self.cfg);
+        }
+
+        if let Some(am) = self.attn_metal[li].as_ref() {
+            let gate = std::env::var("QWEN_ATTN_METAL")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
+            if gate {
+                // Only include index rows when this QSA layer actually has
+                // them packed. Otherwise retain Metal QKV and calculate the
+                // index projection on the CPU below.
+                let fused_index_rows = if index_rows > 0 && am.qkv_rows >= base_rows + index_rows {
+                    index_rows
+                } else {
+                    0
+                };
+                let total_rows = base_rows + fused_index_rows;
+
+                // SAFETY: AttnMetalLayer owns this aligned allocation for the
+                // model lifetime.
+                let weights = unsafe {
+                    std::slice::from_raw_parts(am.qkv as *const u8, total_rows * c.hidden * 2)
+                };
+
+                let mut proj = vec![0.0; total_rows];
+                let rc = crate::ffi::bf16_matmul(weights, x, &mut proj, 1, total_rows, c.hidden);
+
+                if rc > 0 {
+                    qg.copy_from_slice(&proj[..rows_q]);
+                    k.copy_from_slice(&proj[rows_q..rows_q + rows_kv]);
+                    v.copy_from_slice(&proj[rows_q + rows_kv..rows_q + 2 * rows_kv]);
+                    if fused_index_rows > 0 {
+                        index_qk = Some(proj[base_rows..].to_vec());
+                    }
+                    metal_ok = true;
+                } else if rc < 0 {
+                    eprintln!("qwen4-rs: Metal attention failed after submission (layer {li})");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        if !metal_ok {
+            matmul(&mut qg, x, &layer.attn_q);
+            matmul(&mut k, x, &layer.attn_k);
+            matmul(&mut v, x, &layer.attn_v);
+        }
+
+        // If QKV ran on Metal but index fusion was unavailable, preserve the
+        // exact existing CPU indexer path rather than disabling Metal QKV.
+        if include_index && layer.is_qsa && index_qk.is_none() {
+            let mut qk = vec![0.0; (c.idx_n_heads + c.idx_kv_heads) * c.idx_head_dim];
+            matmul(&mut qk, x, &layer.index_qk);
+            index_qk = Some(qk);
+        }
+
+        AttnProjection {
+            qg,
+            k,
+            v,
+            index_qk,
+            metal_ok,
+        }
     }
 
     fn attention_common(
@@ -1290,6 +1553,7 @@ impl Model {
         pos: usize,
         rope: &[(f32, f32)],
         selected: Option<&[usize]>,
+        projected: Option<AttnProjection>,
         out: &mut [f32],
     ) {
         let c = self.cfg.clone();
@@ -1298,57 +1562,13 @@ impl Model {
         let kv = c.kv_heads;
         let groups = h / kv;
 
-        let mut qg = vec![0.0; 2 * h * hd];
-        let mut k = vec![0.0; kv * hd];
-        let mut vv = vec![0.0; kv * hd];
-        // Metal BF16 GEMV seam (QWEN_ATTN_METAL default ON; GPU is the
-        // numeric reference per C parity — near-tie logit divergence is a
-        // hardware fact). q|k|v run in ONE packed dispatch (2 syncs per
-        // layer incl. o_proj); rc semantics per the GDN seam; fallback is
-        // the exact scalar matmuls below.
-        let mut metal_ok = false;
-        if self.attn_metal[li].is_none() && !layer.is_gdn && crate::ffi::direct_available() {
-            self.attn_metal[li] = Self::build_attn_metal(layer, &self.cfg);
-        }
-        if let Some(am) = self.attn_metal[li].as_ref() {
-            let gate = std::env::var("QWEN_ATTN_METAL")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            if gate {
-                // SAFETY: exact-length views over the layer's aligned blocks
-                // (kept alive by am._bufs for the model lifetime); the GPU
-                // only reads weights here — CPU fallback reads the same
-                // memory, so there is exactly one copy.
-                let rows_q = 2 * h * hd;
-                let rows_kv = kv * hd;
-                let w = |p: *mut u8, len: usize| unsafe {
-                    std::slice::from_raw_parts(p as *const u8, len)
-                };
-                let mut proj = vec![0.0; rows_q + 2 * rows_kv];
-                let rc = crate::ffi::bf16_matmul(
-                    w(am.qkv, (rows_q + 2 * rows_kv) * c.hidden * 2),
-                    x,
-                    &mut proj,
-                    1,
-                    rows_q + 2 * rows_kv,
-                    c.hidden,
-                );
-                if rc > 0 {
-                    qg.copy_from_slice(&proj[..rows_q]);
-                    k.copy_from_slice(&proj[rows_q..rows_q + rows_kv]);
-                    vv.copy_from_slice(&proj[rows_q + rows_kv..]);
-                    metal_ok = true;
-                } else if rc < 0 {
-                    eprintln!("qwen4-rs: Metal attention failed after submission (layer {li})");
-                    std::process::exit(1);
-                }
-            }
-        }
-        if !metal_ok {
-            matmul(&mut qg, x, &layer.attn_q);
-            matmul(&mut k, x, &layer.attn_k);
-            matmul(&mut vv, x, &layer.attn_v);
-        }
+        let AttnProjection {
+            mut qg,
+            mut k,
+            v: vv,
+            index_qk: _,
+            metal_ok,
+        } = projected.unwrap_or_else(|| self.project_attention(layer, li, x, false));
         let qg_snap = qg.clone();
         for hh in 0..h {
             rmsnorm_row(
@@ -1458,7 +1678,7 @@ impl Model {
         rope: &[(f32, f32)],
         out: &mut [f32],
     ) {
-        self.attention_common(layer, li, x, pos, rope, None, out);
+        self.attention_common(layer, li, x, pos, rope, None, None, out);
     }
 
     fn qsa_select(
@@ -1468,6 +1688,7 @@ impl Model {
         x: &[f32],
         pos: usize,
         rope: &[(f32, f32)],
+        projected_qk: Option<&[f32]>,
     ) -> Vec<usize> {
         let c = self.cfg.clone();
         let ih = c.idx_head_dim;
@@ -1478,8 +1699,17 @@ impl Model {
         let nq = ih * in_;
         let nk = ih * ik;
 
-        let mut qk = vec![0.0; nq + nk];
-        matmul(&mut qk, x, &layer.index_qk);
+        let qk = match projected_qk {
+            Some(qk) => {
+                debug_assert_eq!(qk.len(), nq + nk);
+                qk.to_vec()
+            }
+            None => {
+                let mut qk = vec![0.0; nq + nk];
+                matmul(&mut qk, x, &layer.index_qk);
+                qk
+            }
+        };
         let mut q = qk[..nq].to_vec();
         let q_snap = q.clone();
         for hh in 0..in_ {
@@ -1579,8 +1809,22 @@ impl Model {
         rope: &[(f32, f32)],
         out: &mut [f32],
     ) {
-        let sel = self.qsa_select(layer, li, x, pos, rope);
-        self.attention_common(layer, li, x, pos, rope, Some(&sel), out);
+        let index_metal = std::env::var("QWEN_QSA_INDEX_METAL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let attn_metal = std::env::var("QWEN_ATTN_METAL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
+        if index_metal && attn_metal && crate::ffi::direct_available() {
+            let projection = self.project_attention(layer, li, x, true);
+            let sel = self.qsa_select(layer, li, x, pos, rope, projection.index_qk.as_deref());
+            self.attention_common(layer, li, x, pos, rope, Some(&sel), Some(projection), out);
+        } else {
+            // Exact pre-fusion ordering for the A/B baseline.
+            let sel = self.qsa_select(layer, li, x, pos, rope, None);
+            self.attention_common(layer, li, x, pos, rope, Some(&sel), None, out);
+        }
     }
 
     /// FIFO expert cache. On miss, stream the expert's three raw Apple8
@@ -1750,6 +1994,24 @@ impl Model {
         matmul(y, &h, &dw);
     }
 
+    fn shared_expert_value(&self, layer: &Layer, x: &[f32]) -> (Vec<f32>, f32) {
+        let c = &self.cfg;
+        let d = c.hidden;
+        let mut sg = vec![0.0; 1];
+        matmul(&mut sg, x, &layer.se_g);
+        let gs = 1.0 / (1.0 + (-sg[0]).exp());
+        let mut gv = vec![0.0; c.shared_inter];
+        let mut h = vec![0.0; c.shared_inter];
+        matmul(&mut gv, x, &layer.se_gate);
+        matmul(&mut h, x, &layer.se_up);
+        for i in 0..c.shared_inter {
+            h[i] = silu(gv[i]) * h[i];
+        }
+        let mut sy = vec![0.0; d];
+        matmul(&mut sy, &h, &layer.se_down);
+        (sy, gs)
+    }
+
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let e = c.experts;
@@ -1807,7 +2069,11 @@ impl Model {
         let direct =
             self.metal_direct && crate::ffi::direct_available() && k <= 64 && self.coli.is_some();
         let mut pending: Option<*mut std::ffi::c_void> = None;
-        let mut pending_acc: Option<Vec<f32>> = None;
+        let mut direct_done = false;
+        let mut shared_ready: Option<(Vec<f32>, f32)> = None;
+        let shared_io_overlap = std::env::var("QWEN_SHARED_IO_OVERLAP")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let mut _io_t = logan_core::telemetry::Span::begin("io");
         if direct {
             // Async issue: enqueue ALL K expert loads first (no waits), so
@@ -1824,6 +2090,14 @@ impl Model {
                         break;
                     }
                 }
+            }
+            // The shared expert depends only on x, not on routed-expert bytes.
+            // Run it while MetalIO owns outstanding NVMe->UMA transfers instead of
+            // spending the same CPU work after all I/O has already drained.
+            if all_ok && shared_io_overlap {
+                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                shared_ready = Some(self.shared_expert_value(layer, x));
+                self.spans.shared_ms += _shared_t.end();
             }
             if all_ok {
                 for i in 0..k {
@@ -1845,7 +2119,9 @@ impl Model {
                 let mut _gpu_t = logan_core::telemetry::Span::begin("gpu");
                 if self.metal_overlap {
                     pending = crate::ffi::moe_topk_begin(&ex, &ws, x, d, c.moe_inter);
-                } else if !crate::ffi::moe_topk(&ex, &ws, x, &mut acc, d, c.moe_inter) {
+                } else if crate::ffi::moe_topk(&ex, &ws, x, &mut acc, d, c.moe_inter) {
+                    direct_done = true;
+                } else {
                     pending = None; // decline -> CPU per-expert loop below
                 }
                 self.spans.gpu_ms += _gpu_t.end();
@@ -1857,23 +2133,32 @@ impl Model {
         }
 
         self.spans.io_ms += _io_t.end();
-        if pending.is_some() {
-            // CPU shared expert overlaps the routed-GPU wait (C order: shared
-            // expert runs BETWEEN submit and finish).
-            let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-            let mut sg = vec![0.0; 1];
-            matmul(&mut sg, x, &layer.se_g);
-            let gs = 1.0 / (1.0 + (-sg[0]).exp());
-            let mut gv = vec![0.0; c.shared_inter];
-            let mut h = vec![0.0; c.shared_inter];
-            matmul(&mut gv, x, &layer.se_gate);
-            matmul(&mut h, x, &layer.se_up);
-            for i in 0..c.shared_inter {
-                h[i] = silu(gv[i]) * h[i];
+        if direct_done {
+            let (sy, gs) = if let Some(v) = shared_ready.take() {
+                v
+            } else {
+                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                let v = self.shared_expert_value(layer, x);
+                self.spans.shared_ms += _shared_t.end();
+                v
+            };
+            for dd in 0..d {
+                out[dd] = acc[dd] + sy[dd] * gs;
             }
-            let mut sy = vec![0.0; d];
-            matmul(&mut sy, &h, &layer.se_down);
-            self.spans.shared_ms += _shared_t.end();
+            return;
+        }
+        if pending.is_some() {
+            // With QWEN_SHARED_IO_OVERLAP=1 this result was produced while
+            // expert loads were outstanding. Opt-out retains the old GPU-overlap
+            // placement for a same-binary A/B.
+            let (sy, gs) = if let Some(v) = shared_ready.take() {
+                v
+            } else {
+                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                let v = self.shared_expert_value(layer, x);
+                self.spans.shared_ms += _shared_t.end();
+                v
+            };
             let p = pending.unwrap();
             let mut _gpu_wait = logan_core::telemetry::Span::begin("gpu-wait");
             let gpu_ok = crate::ffi::moe_topk_finish(p, &mut acc, d);
@@ -1972,20 +2257,14 @@ impl Model {
             }
         }
         self.spans.fill_ms += _fill_t.end();
-        let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-        let mut sg = vec![0.0; 1];
-        matmul(&mut sg, x, &layer.se_g);
-        let gs = 1.0 / (1.0 + (-sg[0]).exp());
-        let mut gv = vec![0.0; c.shared_inter];
-        let mut h = vec![0.0; c.shared_inter];
-        matmul(&mut gv, x, &layer.se_gate);
-        matmul(&mut h, x, &layer.se_up);
-        for i in 0..c.shared_inter {
-            h[i] = silu(gv[i]) * h[i];
-        }
-        let mut sy = vec![0.0; d];
-        matmul(&mut sy, &h, &layer.se_down);
-        self.spans.shared_ms += _shared_t.end();
+        let (sy, gs) = if let Some(v) = shared_ready.take() {
+            v
+        } else {
+            let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+            let v = self.shared_expert_value(layer, x);
+            self.spans.shared_ms += _shared_t.end();
+            v
+        };
         for dd in 0..d {
             out[dd] = acc[dd] + sy[dd] * gs;
         }
@@ -2197,17 +2476,19 @@ impl Model {
             Some(&mut inj),
         );
         self.spans.hc_ms += _hc_t.end();
-        let mut _attn_t = logan_core::telemetry::Span::begin("attn");
         if layer.is_gdn {
             let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
-            self.gdn_token(&layer, l, &mixed, &mut attn);
+            self.gdn_token(&mut layer, l, &mixed, &mut attn);
             self.spans.gdn_ms += _gdn_t.end();
-        } else if layer.is_qsa {
-            self.sparse_attn_token(&layer, l, &mixed, pos, &rope, &mut attn);
         } else {
-            self.attention_token(&layer, l, &mixed, pos, &rope, &mut attn);
+            let mut _attn_t = logan_core::telemetry::Span::begin("attn");
+            if layer.is_qsa {
+                self.sparse_attn_token(&layer, l, &mixed, pos, &rope, &mut attn);
+            } else {
+                self.attention_token(&layer, l, &mixed, pos, &rope, &mut attn);
+            }
+            self.spans.attn_ms += _attn_t.end();
         }
-        self.spans.attn_ms += _attn_t.end();
         for g in 0..hc {
             for dd in 0..d {
                 stream[g * d + dd] += inj[g] * attn[dd];

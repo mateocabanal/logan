@@ -46,6 +46,13 @@ mod imp {
         pub fn coli_metal_silu_mul(g: *mut f32, u: *const f32, n: i32) -> i32;
         pub fn coli_metal_tensor_free(tensor: *mut ColiMetalTensor);
         pub fn coli_metal_shutdown();
+        pub fn coli_bnns_bf16_matmul(
+            w: *const u16,
+            x: *const f32,
+            y: *mut f32,
+            o: i32,
+            i: i32,
+        ) -> i32;
     }
 
     /// Lazily-initialized Metal availability. Returns true once init() succeeded.
@@ -98,6 +105,22 @@ mod imp {
             )
         };
         rc == 1
+    }
+
+    /// CPU BF16 GEMV through Accelerate/BNNS. No weight copy is retained.
+    pub fn bnns_bf16_matmul(w: &[u8], x: &[f32], y: &mut [f32], o: usize, i: usize) -> bool {
+        if w.len() < o * i * 2 || x.len() < i || y.len() < o {
+            return false;
+        }
+        unsafe {
+            coli_bnns_bf16_matmul(
+                w.as_ptr() as *const u16,
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                o as i32,
+                i as i32,
+            ) == 1
+        }
     }
 
     /// In-place rmsnorm over nrows rows of n. Returns true on GPU success.
@@ -657,6 +680,10 @@ mod imp {
     pub fn metalio_slot_free(_slot: i32) {}
     pub fn metalio_slot_ptr(_slot: i32) -> *mut std::os::raw::c_void {
         std::ptr::null_mut()
+    }
+
+    pub fn bnns_bf16_matmul(_w: &[u8], _x: &[f32], _y: &mut [f32], _o: usize, _i: usize) -> bool {
+        false
     }
 
     pub fn direct_init() -> bool {
