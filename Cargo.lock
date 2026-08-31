@@ -147,6 +147,7 @@ dependencies = [
  "logan-format",
  "logan-metal",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -275,4 +276,4 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd1a3ab225bbbdac83319345b1b44ccfc1b"
