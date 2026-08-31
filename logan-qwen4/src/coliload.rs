@@ -5,7 +5,8 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
-    cache_cap, colisource::{bf16_to_f32, ColiSource},
+    cache_cap,
+    colisource::{bf16_to_f32, ColiSource},
     lazy_zeroed_f32, Cfg, HcGlobal, Layer, Model, Wt,
 };
 
@@ -69,46 +70,244 @@ impl Model {
             } else {
                 vec_f32(src, &format!("{lp}.input_layernorm.weight"), cfg.hidden)?
             };
-            let empty = || Wt { f: vec![], bytes: None, o: 0, i: 0 };
+            let empty = || Wt {
+                f: vec![],
+                bytes: None,
+                o: 0,
+                i: 0,
+            };
             let layer = Layer {
                 in_ln,
                 is_gdn,
                 is_qsa,
-                gdn_a_log: if is_gdn { vec_f32(src, &format!("{lp}.linear_attn.A_log"), cfg.lin_v_heads)? } else { vec![] },
-                gdn_dt_bias: if is_gdn { vec_f32(src, &format!("{lp}.linear_attn.dt_bias"), cfg.lin_v_heads)? } else { vec![] },
-                gdn_conv1d: if is_gdn { vec_f32(src, &format!("{lp}.linear_attn.conv1d.weight"), cdim * cfg.conv_kernel)? } else { vec![] },
-                gdn_in_a: if is_gdn { load_wt(src, &format!("{lp}.linear_attn.in_proj_a.weight"), cfg.lin_v_heads, cfg.hidden)? } else { empty() },
-                gdn_in_b: if is_gdn { load_wt(src, &format!("{lp}.linear_attn.in_proj_b.weight"), cfg.lin_v_heads, cfg.hidden)? } else { empty() },
-                gdn_in_qkv: if is_gdn { load_wt(src, &format!("{lp}.linear_attn.in_proj_qkv.weight"), cdim, cfg.hidden)? } else { empty() },
-                gdn_in_z: if is_gdn { load_wt(src, &format!("{lp}.linear_attn.in_proj_z.weight"), vdim, cfg.hidden)? } else { empty() },
-                gdn_norm: if is_gdn { vec_f32(src, &format!("{lp}.linear_attn.norm.weight"), cfg.lin_v_dim)? } else { vec![] },
-                gdn_out: if is_gdn { load_wt(src, &format!("{lp}.linear_attn.out_proj.weight"), cfg.hidden, vdim)? } else { empty() },
-                attn_q: if !is_gdn { load_wt(src, &format!("{lp}.self_attn.q_proj.weight"), 2 * cfg.heads * hd, cfg.hidden)? } else { empty() },
-                attn_k: if !is_gdn { load_wt(src, &format!("{lp}.self_attn.k_proj.weight"), cfg.kv_heads * hd, cfg.hidden)? } else { empty() },
-                attn_v: if !is_gdn { load_wt(src, &format!("{lp}.self_attn.v_proj.weight"), cfg.kv_heads * hd, cfg.hidden)? } else { empty() },
-                attn_o: if !is_gdn { load_wt(src, &format!("{lp}.self_attn.o_proj.weight"), cfg.hidden, cfg.heads * hd)? } else { empty() },
-                attn_qn: if !is_gdn { vec_f32(src, &format!("{lp}.self_attn.q_norm.weight"), hd)? } else { vec![] },
-                attn_kn: if !is_gdn { vec_f32(src, &format!("{lp}.self_attn.k_norm.weight"), hd)? } else { vec![] },
-                index_qk: if is_qsa {
-                    load_wt(src, &format!("{lp}.self_attn.indexer.index_qk_proj.weight"), cfg.idx_n_heads * cfg.idx_head_dim + cfg.idx_kv_heads * cfg.idx_head_dim, cfg.hidden)?
+                gdn_a_log: if is_gdn {
+                    vec_f32(src, &format!("{lp}.linear_attn.A_log"), cfg.lin_v_heads)?
+                } else {
+                    vec![]
+                },
+                gdn_dt_bias: if is_gdn {
+                    vec_f32(src, &format!("{lp}.linear_attn.dt_bias"), cfg.lin_v_heads)?
+                } else {
+                    vec![]
+                },
+                gdn_conv1d: if is_gdn {
+                    vec_f32(
+                        src,
+                        &format!("{lp}.linear_attn.conv1d.weight"),
+                        cdim * cfg.conv_kernel,
+                    )?
+                } else {
+                    vec![]
+                },
+                gdn_in_a: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.linear_attn.in_proj_a.weight"),
+                        cfg.lin_v_heads,
+                        cfg.hidden,
+                    )?
                 } else {
                     empty()
                 },
-                idx_qn: if is_qsa { vec_f32(src, &format!("{lp}.self_attn.indexer.q_layernorm.weight"), cfg.idx_head_dim)? } else { vec![] },
-                idx_kn: if is_qsa { vec_f32(src, &format!("{lp}.self_attn.indexer.k_layernorm.weight"), cfg.idx_head_dim)? } else { vec![] },
-                hc_norm: vec_f32(src, &format!("{lp}.attn_hyper_connection.hc_norm.weight"), hcd)?,
-                hc_mix_down: load_wt(src, &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"), cfg.hc_lowrank, hcd)?,
-                hc_mix_up: load_wt(src, &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"), hcd, cfg.hc_lowrank)?,
-                hc_inject: load_wt(src, &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"), cfg.hc_count, hcd)?,
-                hc_mlp_norm: vec_f32(src, &format!("{lp}.mlp_hyper_connection.hc_norm.weight"), hcd)?,
-                hc_mlp_mix_down: load_wt(src, &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"), cfg.hc_lowrank, hcd)?,
-                hc_mlp_mix_up: load_wt(src, &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"), hcd, cfg.hc_lowrank)?,
-                hc_mlp_inject: load_wt(src, &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"), cfg.hc_count, hcd)?,
-                router: load_wt(src, &format!("{lp}.mlp.gate.weight"), cfg.experts, cfg.hidden)?,
-                se_gate: load_wt(src, &format!("{lp}.mlp.shared_expert.gate_proj.weight"), cfg.shared_inter, cfg.hidden)?,
-                se_up: load_wt(src, &format!("{lp}.mlp.shared_expert.up_proj.weight"), cfg.shared_inter, cfg.hidden)?,
-                se_down: load_wt(src, &format!("{lp}.mlp.shared_expert.down_proj.weight"), cfg.hidden, cfg.shared_inter)?,
-                se_g: load_wt(src, &format!("{lp}.mlp.shared_expert_gate.weight"), 1, cfg.hidden)?,
+                gdn_in_b: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.linear_attn.in_proj_b.weight"),
+                        cfg.lin_v_heads,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                gdn_in_qkv: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.linear_attn.in_proj_qkv.weight"),
+                        cdim,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                gdn_in_z: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.linear_attn.in_proj_z.weight"),
+                        vdim,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                gdn_norm: if is_gdn {
+                    vec_f32(src, &format!("{lp}.linear_attn.norm.weight"), cfg.lin_v_dim)?
+                } else {
+                    vec![]
+                },
+                gdn_out: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.linear_attn.out_proj.weight"),
+                        cfg.hidden,
+                        vdim,
+                    )?
+                } else {
+                    empty()
+                },
+                attn_q: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.self_attn.q_proj.weight"),
+                        2 * cfg.heads * hd,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                attn_k: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.self_attn.k_proj.weight"),
+                        cfg.kv_heads * hd,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                attn_v: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.self_attn.v_proj.weight"),
+                        cfg.kv_heads * hd,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                attn_o: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{lp}.self_attn.o_proj.weight"),
+                        cfg.hidden,
+                        cfg.heads * hd,
+                    )?
+                } else {
+                    empty()
+                },
+                attn_qn: if !is_gdn {
+                    vec_f32(src, &format!("{lp}.self_attn.q_norm.weight"), hd)?
+                } else {
+                    vec![]
+                },
+                attn_kn: if !is_gdn {
+                    vec_f32(src, &format!("{lp}.self_attn.k_norm.weight"), hd)?
+                } else {
+                    vec![]
+                },
+                index_qk: if is_qsa {
+                    load_wt(
+                        src,
+                        &format!("{lp}.self_attn.indexer.index_qk_proj.weight"),
+                        cfg.idx_n_heads * cfg.idx_head_dim + cfg.idx_kv_heads * cfg.idx_head_dim,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty()
+                },
+                idx_qn: if is_qsa {
+                    vec_f32(
+                        src,
+                        &format!("{lp}.self_attn.indexer.q_layernorm.weight"),
+                        cfg.idx_head_dim,
+                    )?
+                } else {
+                    vec![]
+                },
+                idx_kn: if is_qsa {
+                    vec_f32(
+                        src,
+                        &format!("{lp}.self_attn.indexer.k_layernorm.weight"),
+                        cfg.idx_head_dim,
+                    )?
+                } else {
+                    vec![]
+                },
+                hc_norm: vec_f32(
+                    src,
+                    &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
+                    hcd,
+                )?,
+                hc_mix_down: load_wt(
+                    src,
+                    &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
+                    cfg.hc_lowrank,
+                    hcd,
+                )?,
+                hc_mix_up: load_wt(
+                    src,
+                    &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
+                    hcd,
+                    cfg.hc_lowrank,
+                )?,
+                hc_inject: load_wt(
+                    src,
+                    &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
+                    cfg.hc_count,
+                    hcd,
+                )?,
+                hc_mlp_norm: vec_f32(
+                    src,
+                    &format!("{lp}.mlp_hyper_connection.hc_norm.weight"),
+                    hcd,
+                )?,
+                hc_mlp_mix_down: load_wt(
+                    src,
+                    &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
+                    cfg.hc_lowrank,
+                    hcd,
+                )?,
+                hc_mlp_mix_up: load_wt(
+                    src,
+                    &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
+                    hcd,
+                    cfg.hc_lowrank,
+                )?,
+                hc_mlp_inject: load_wt(
+                    src,
+                    &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
+                    cfg.hc_count,
+                    hcd,
+                )?,
+                router: load_wt(
+                    src,
+                    &format!("{lp}.mlp.gate.weight"),
+                    cfg.experts,
+                    cfg.hidden,
+                )?,
+                se_gate: load_wt(
+                    src,
+                    &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+                    cfg.shared_inter,
+                    cfg.hidden,
+                )?,
+                se_up: load_wt(
+                    src,
+                    &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+                    cfg.shared_inter,
+                    cfg.hidden,
+                )?,
+                se_down: load_wt(
+                    src,
+                    &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+                    cfg.hidden,
+                    cfg.shared_inter,
+                )?,
+                se_g: load_wt(
+                    src,
+                    &format!("{lp}.mlp.shared_expert_gate.weight"),
+                    1,
+                    cfg.hidden,
+                )?,
             };
             layers.push(layer);
         }
@@ -134,19 +333,71 @@ impl Model {
         }
         let hcd = cfg.hc_count * cfg.hidden;
         let ple_key_proj = if cfg.ple_layer >= 0 {
-            load_wt(src, &format!("layers.{}.ple.key_proj.weight", cfg.ple_layer), cfg.hc_count * cfg.hidden, cfg.ple_embed_dim)?
+            load_wt(
+                src,
+                &format!("layers.{}.ple.key_proj.weight", cfg.ple_layer),
+                cfg.hc_count * cfg.hidden,
+                cfg.ple_embed_dim,
+            )?
         } else {
-            Wt { f: vec![], bytes: None, o: 0, i: 0 }
+            Wt {
+                f: vec![],
+                bytes: None,
+                o: 0,
+                i: 0,
+            }
         };
         let ple_value_proj = if cfg.ple_layer >= 0 {
-            load_wt(src, &format!("layers.{}.ple.value_proj.weight", cfg.ple_layer), cfg.hidden, cfg.ple_embed_dim)?
+            load_wt(
+                src,
+                &format!("layers.{}.ple.value_proj.weight", cfg.ple_layer),
+                cfg.hidden,
+                cfg.ple_embed_dim,
+            )?
         } else {
-            Wt { f: vec![], bytes: None, o: 0, i: 0 }
+            Wt {
+                f: vec![],
+                bytes: None,
+                o: 0,
+                i: 0,
+            }
         };
-        let ple_norm_key = if cfg.ple_layer >= 0 { vec_f32(src, &format!("layers.{}.ple.norm_key.weight", cfg.ple_layer), hcd)? } else { vec![] };
-        let ple_norm_query = if cfg.ple_layer >= 0 { vec_f32(src, &format!("layers.{}.ple.norm_query.weight", cfg.ple_layer), hcd)? } else { vec![] };
-        let ple_norm_conv = if cfg.ple_layer >= 0 { vec_f32(src, &format!("layers.{}.ple.norm_conv.weight", cfg.ple_layer), hcd)? } else { vec![] };
-        let ple_conv1d = if cfg.ple_layer >= 0 { vec_f32(src, &format!("layers.{}.ple.conv1d.weight", cfg.ple_layer), hcd * cfg.ple_conv_kernel)? } else { vec![] };
+        let ple_norm_key = if cfg.ple_layer >= 0 {
+            vec_f32(
+                src,
+                &format!("layers.{}.ple.norm_key.weight", cfg.ple_layer),
+                hcd,
+            )?
+        } else {
+            vec![]
+        };
+        let ple_norm_query = if cfg.ple_layer >= 0 {
+            vec_f32(
+                src,
+                &format!("layers.{}.ple.norm_query.weight", cfg.ple_layer),
+                hcd,
+            )?
+        } else {
+            vec![]
+        };
+        let ple_norm_conv = if cfg.ple_layer >= 0 {
+            vec_f32(
+                src,
+                &format!("layers.{}.ple.norm_conv.weight", cfg.ple_layer),
+                hcd,
+            )?
+        } else {
+            vec![]
+        };
+        let ple_conv1d = if cfg.ple_layer >= 0 {
+            vec_f32(
+                src,
+                &format!("layers.{}.ple.conv1d.weight", cfg.ple_layer),
+                hcd * cfg.ple_conv_kernel,
+            )?
+        } else {
+            vec![]
+        };
 
         let final_norm = if cfg.hc_count > 0 && src.rec("norm.weight").is_none() {
             vec![]
@@ -159,7 +410,11 @@ impl Model {
         if direct_ok {
             eprintln!(
                 "[qwen4-rs] direct raw Apple8 + MetalIO execution enabled{}",
-                if crate::ffi::metal_available() { "" } else { " (compute backend unavailable)" }
+                if crate::ffi::metal_available() {
+                    ""
+                } else {
+                    " (compute backend unavailable)"
+                }
             );
         } else {
             eprintln!("[qwen4-rs] direct path unavailable; using canonical fallback");
@@ -174,10 +429,25 @@ impl Model {
             experts: Vec::new(), // fetched on demand via coli
             hc_global: HcGlobal {
                 norm: vec_f32(src, "hyper_connection_mixer.hc_norm.weight", hcd)?,
-                mix_down: load_wt(src, "hyper_connection_mixer.input_mix_weight_down.weight", cfg.hc_lowrank, hcd)?,
-                mix_up: load_wt(src, "hyper_connection_mixer.input_mix_weight_up.weight", hcd, cfg.hc_lowrank)?,
+                mix_down: load_wt(
+                    src,
+                    "hyper_connection_mixer.input_mix_weight_down.weight",
+                    cfg.hc_lowrank,
+                    hcd,
+                )?,
+                mix_up: load_wt(
+                    src,
+                    "hyper_connection_mixer.input_mix_weight_up.weight",
+                    hcd,
+                    cfg.hc_lowrank,
+                )?,
             },
-            ple_ngram: Wt { f: vec![], bytes: None, o: 0, i: 0 }, // rows fetched via coli
+            ple_ngram: Wt {
+                f: vec![],
+                bytes: None,
+                o: 0,
+                i: 0,
+            }, // rows fetched via coli
             ple_key_proj,
             ple_value_proj,
             ple_norm_key,
@@ -192,12 +462,39 @@ impl Model {
                 cfg.layers
             ],
             gdn_s: vec![vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]; cfg.layers],
-            kv_k: lazy_zeroed_f32(cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim),
-            kv_v: lazy_zeroed_f32(cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim),
-            idx_cache: vec![
-                lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim);
-                cfg.layers
-            ],
+            kv_k: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        Vec::new()
+                    } else {
+                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                    }
+                })
+                .collect(),
+            kv_v: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        Vec::new()
+                    } else {
+                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                    }
+                })
+                .collect(),
+            idx_cache: cfg
+                .qsa_layers
+                .iter()
+                .map(|&is_qsa| {
+                    if is_qsa {
+                        lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
             ple_conv_state: vec![
                 0.0;
