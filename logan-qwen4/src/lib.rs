@@ -741,6 +741,13 @@ fn matmul_bf16_neon(_y: &mut [f32], _x: &[f32], _w: &[u8], _o: usize, _i: usize)
 fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize) {
     debug_assert!(bytes.len() >= o * i * 2);
 
+    let bnns = std::env::var("QWEN_BNNS_BF16")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    if bnns && logan_metal::bnns_bf16_matmul(bytes, x, y, o, i) {
+        return;
+    }
+
     let parallel = o * i >= 16_000_000
         && std::thread::available_parallelism()
             .map(|n| n.get())
@@ -809,6 +816,12 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
             .unwrap_or(1)
             > 1;
     if let Some(bytes) = &w.bytes {
+        let bnns = std::env::var("QWEN_BNNS_BF16")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        if bnns && logan_metal::bnns_bf16_matmul(bytes, x, y, o, i) {
+            return;
+        }
         // NEON BF16: 4 f32 lanes, bf16 weights widened by (u16<<16).
         // fp-order differs from scalar (grouped fma) — the token-identity
         // gate decides; QWEN_NEON_BF16=0 opts out.

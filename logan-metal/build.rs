@@ -115,11 +115,41 @@ fn main() {
         println!("cargo:rerun-if-changed=metal/generated/coli_target_registry.h");
     }
 
+    // bnns_dense.mm — CPU BF16 dense fallback using Accelerate/BNNS.
+    // It keeps caller-owned BF16 weights and caches workspace only.
+    let bnns_src = metal_dir.join("bnns_dense.mm");
+    if bnns_src.exists() {
+        let bnns_obj = std::path::Path::new(&out).join("bnns_dense.o");
+        let status = std::process::Command::new("clang++")
+            .args([
+                "-x",
+                "objective-c++",
+                "-std=gnu++17",
+                "-fobjc-arc",
+                "-O3",
+                "-fobjc-exceptions",
+                "-c",
+                bnns_src.to_str().unwrap(),
+                "-o",
+                bnns_obj.to_str().unwrap(),
+            ])
+            .status()
+            .expect("clang++ must be available on macOS");
+        assert!(status.success(), "bnns_dense.mm failed to compile");
+        let ar = std::process::Command::new("ar")
+            .args(["rcs", lib.to_str().unwrap(), bnns_obj.to_str().unwrap()])
+            .status()
+            .expect("ar failed for bnns_dense.o");
+        assert!(ar.success(), "ar failed for bnns_dense.o");
+        println!("cargo:rerun-if-changed=metal/bnns_dense.mm");
+    }
+
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=backend_metal");
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=Accelerate");
     println!("cargo:rerun-if-changed=metal/backend_metal.mm");
     println!("cargo:rerun-if-changed=metal/backend_metal.h");
 }
