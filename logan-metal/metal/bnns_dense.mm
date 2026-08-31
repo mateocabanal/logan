@@ -19,7 +19,7 @@ extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
     if (!w || !x || !y || O <= 0 || I <= 0) return 0;
 
     BNNSNDArrayDescriptor a = {};
-    a.flags = 0;
+    a.flags = BNNSNDArrayFlagBackpropSet;
     a.layout = BNNSDataLayoutRowMajorMatrix;
     a.size[0] = (size_t)I;
     a.size[1] = 1;
@@ -31,7 +31,7 @@ extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
     a.data_bias = 0.0f;
 
     BNNSNDArrayDescriptor b = {};
-    b.flags = 0;
+    b.flags = BNNSNDArrayFlagBackpropSet;
     b.layout = BNNSDataLayoutRowMajorMatrix;
     b.size[0] = (size_t)I;
     b.size[1] = (size_t)O;
@@ -43,7 +43,7 @@ extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
     b.data_bias = 0.0f;
 
     BNNSNDArrayDescriptor c = {};
-    c.flags = 0;
+    c.flags = BNNSNDArrayFlagBackpropSet;
     c.layout = BNNSDataLayoutRowMajorMatrix;
     c.size[0] = (size_t)O;
     c.size[1] = 1;
