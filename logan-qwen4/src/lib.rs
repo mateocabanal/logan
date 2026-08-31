@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod coliload;
 pub mod colisource;
+pub mod plan;
 pub mod scheduled;
 pub mod ffi;
 
@@ -235,6 +236,36 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
 // model
 // ---------------------------------------------------------------------------
 
+/// Resume cursor for a scheduler-blocked token forward (issue #53). The
+/// layer's MoE input and injectors are pure snapshots (no persistent state
+/// is mutated in the MoE phase), so re-entering the MoE phase once the
+/// experts are resident reproduces the canonical forward byte-identically.
+pub struct TokenPause {
+    pub layer: usize,
+    /// The cold routed experts that blocked this layer (the driver loads
+    /// them through the scheduler before resubmitting the op).
+    pub experts: Vec<u32>,
+    /// MoE input for `layer` (post hyper-connection mix).
+    pub x: Vec<f32>,
+    /// Hyper-connection injectors paired with `x`.
+    pub inj: Vec<f32>,
+    /// The token stream (all layers before `layer` applied).
+    pub stream: Vec<f32>,
+    pub token: usize,
+    pub pos: usize,
+}
+
+/// Outcome of one scheduler-driven forward (issue #53 engine boundary: the
+/// scheduler sees generic step outcomes, never model internals).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchedForward {
+    /// The full token forward completed.
+    Logits(Vec<f32>),
+    /// The forward stopped at a layer whose routed experts are cold. The
+    /// caller loads them, then resubmits the SAME (token, pos).
+    NeedExperts { layer: usize, experts: Vec<u32> },
+}
+
 #[derive(Clone)]
 pub struct Wt {
     f: Vec<f32>,
@@ -391,6 +422,16 @@ pub struct Model {
     /// there is exactly ONE copy of the GDN weights (moved, not duplicated —
     /// the 16 GB M2 budget).
     gdn_metal: Vec<Option<GdnMetalLayer>>,
+    /// Scheduler-driven expert acquisition (QWEN_SCHED=1): the forward
+    /// reports cold routed experts instead of loading them; the executor
+    /// lane loads them through the plan and the forward resumes from a
+    /// stashed cursor. Canonical path never reads these.
+    sched_mode: bool,
+    /// Cold experts of the layer currently being forward-passed (set by the
+    /// MoE phase, consumed by `forward_layer`'s block point).
+    sched_blocked: Option<Vec<u32>>,
+    /// Resume cursor for a blocked token forward (same-op resubmission).
+    sched_pause: Option<TokenPause>,
 }
 
 /// 16 KiB page-aligned allocation (Metal zero-copy wrap contract).
@@ -1439,6 +1480,24 @@ impl Model {
         }
         let wsum: f32 = val[..k].iter().sum();
         self.spans.route_ms += _route_t.end();
+
+        // Scheduler-driven mode (issue #53): the model never issues expert
+        // loads. If any routed expert of this layer is not resident in the
+        // physical store, report the cold set and abort the layer BEFORE any
+        // compute, load, or state change. `forward_layer` stashes the resume
+        // cursor; the scheduler loads the experts as separate actions and
+        // the same op is resubmitted, re-entering this exact MoE phase with
+        // resident slots (byte-identical: routing is a pure function of x).
+        if self.sched_mode && self.coli.is_some() {
+            let cold: Vec<u32> = (0..k)
+                .filter(|i| self.expert_store.peek((li as u32, idx[*i] as u32)).is_none())
+                .map(|i| idx[i] as u32)
+                .collect();
+            if !cold.is_empty() {
+                self.sched_blocked = Some(cold);
+                return;
+            }
+        }
         let mut acc = vec![0.0; d];
 
         // Direct fused path (C QWEN_APPLE8_DIRECT): all K slot-resident
@@ -1779,57 +1838,109 @@ impl Model {
         self.ple_ring[c.ngram_size - 1] = token as i64;
 
         for l in 0..c.layers {
-            // Share-on-read: `self.layers[l].clone()` deep-copied EVERY weight
-            // per token (~3.7 GB memcpy/token on the real model — it would
-            // dominate any Metal win). Split-borrow: methods take &Layer, so
-            // pull the layer out, run both sub-phases, put it back.
-            let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
-            let mut mixed = vec![0.0; d];
-            let mut attn = vec![0.0; d];
-            if c.ple_layer == l as i64 {
-                self.ple_forward(&mut stream);
+            if !self.forward_layer(l, token, pos, &rope, &mut stream) {
+                // Scheduler-driven block for cold experts: resume cursor
+                // stashed, persistent state applied exactly once. The caller
+                // must not consume these logits.
+                return Vec::new();
             }
-            let mut inj = vec![0.0; hc];
-            self.hc_mix(
-                &layer.hc_norm,
-                &layer.hc_mix_down,
-                &layer.hc_mix_up,
-                Some(&layer.hc_inject),
-                &stream,
-                &mut mixed,
-                Some(&mut inj),
-            );
-            if layer.is_gdn {
-                self.gdn_token(&layer, l, &mixed, &mut attn);
-            } else if layer.is_qsa {
-                self.sparse_attn_token(&layer, l, &mixed, pos, &rope, &mut attn);
-            } else {
-                self.attention_token(&layer, l, &mixed, pos, &rope, &mut attn);
-            }
-            for g in 0..hc {
-                for dd in 0..d {
-                    stream[g * d + dd] += inj[g] * attn[dd];
-                }
-            }
-            let mut m2 = vec![0.0; d];
-            let mut moe = vec![0.0; d];
-            self.hc_mix(
-                &layer.hc_mlp_norm,
-                &layer.hc_mlp_mix_down,
-                &layer.hc_mlp_mix_up,
-                Some(&layer.hc_mlp_inject),
-                &stream,
-                &mut m2,
-                Some(&mut inj),
-            );
-            self.moe_token(&layer, l, &m2, &mut moe);
-            for g in 0..hc {
-                for dd in 0..d {
-                    stream[g * d + dd] += inj[g] * moe[dd];
-                }
-            }
-            self.layers[l] = layer;
         }
+        self.forward_tail(&stream)
+    }
+
+    /// One transformer layer of the token stream — the exact canonical per-layer
+    /// body. Returns true when the layer completed; false when scheduler-driven
+    /// mode met cold routed experts, in which case the layer's MoE input and
+    /// injectors are stashed in `sched_pause` for a byte-identical resume (all
+    /// persistent state mutations — GDN conv/recurrent, KV, PLE — happen in the
+    /// pre-MoE phases and are applied exactly once per token).
+    fn forward_layer(
+        &mut self,
+        l: usize,
+        token: usize,
+        pos: usize,
+        rope: &[(f32, f32)],
+        stream: &mut [f32],
+    ) -> bool {
+        let c = self.cfg.clone();
+        let d = c.hidden;
+        let hc = c.hc_count;
+        // Share-on-read: `self.layers[l].clone()` deep-copied EVERY weight
+        // per token (~3.7 GB memcpy/token on the real model — it would
+        // dominate any Metal win). Split-borrow: methods take &Layer, so
+        // pull the layer out, run both sub-phases, put it back.
+        let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
+        let mut mixed = vec![0.0; d];
+        let mut attn = vec![0.0; d];
+        if c.ple_layer == l as i64 {
+            self.ple_forward(stream);
+        }
+        let mut inj = vec![0.0; hc];
+        self.hc_mix(
+            &layer.hc_norm,
+            &layer.hc_mix_down,
+            &layer.hc_mix_up,
+            Some(&layer.hc_inject),
+            &stream,
+            &mut mixed,
+            Some(&mut inj),
+        );
+        if layer.is_gdn {
+            self.gdn_token(&layer, l, &mixed, &mut attn);
+        } else if layer.is_qsa {
+            self.sparse_attn_token(&layer, l, &mixed, pos, &rope, &mut attn);
+        } else {
+            self.attention_token(&layer, l, &mixed, pos, &rope, &mut attn);
+        }
+        for g in 0..hc {
+            for dd in 0..d {
+                stream[g * d + dd] += inj[g] * attn[dd];
+            }
+        }
+        let mut m2 = vec![0.0; d];
+        let mut moe = vec![0.0; d];
+        self.hc_mix(
+            &layer.hc_mlp_norm,
+            &layer.hc_mlp_mix_down,
+            &layer.hc_mlp_mix_up,
+            Some(&layer.hc_mlp_inject),
+            &stream,
+            &mut m2,
+            Some(&mut inj),
+        );
+        self.moe_token(&layer, l, &m2, &mut moe);
+        if let Some(experts) = self.sched_blocked.take() {
+            // Block point: the layer's MoE phase reported cold expert(s).
+            // Restore the layer and stash the exact resume cursor. Nothing
+            // in the MoE phase mutates persistent state, so re-entering it
+            // after the load reproduces the canonical order.
+            self.layers[l] = layer;
+            self.sched_pause = Some(TokenPause {
+                layer: l,
+                experts,
+                x: m2,
+                inj,
+                stream: stream.to_vec(),
+                token,
+                pos,
+            });
+            return false;
+        }
+        for g in 0..hc {
+            for dd in 0..d {
+                stream[g * d + dd] += inj[g] * moe[dd];
+            }
+        }
+        self.layers[l] = layer;
+        true
+    }
+
+    /// Post-layer tail: global hyper-connection mixer, optional final norm,
+    /// and the LM head. Shared by the full forward and the schedule resume.
+    fn forward_tail(&mut self, stream: &[f32]) -> Vec<f32> {
+        let c = self.cfg.clone();
+        let d = c.hidden;
+        let hcd = c.hc_count * d;
         // final global hc_mix (no inject)
         let mut out = vec![0.0; d];
         self.hc_mix(
@@ -1853,6 +1964,147 @@ impl Model {
             matmul(&mut logits, &out, &self.lm_head);
         }
         logits
+    }
+
+    /// Switch the model to scheduler-driven expert acquisition (QWEN_SCHED=1).
+    /// Must be called before any forward; the canonical path never does.
+    pub fn enable_sched_mode(&mut self) {
+        self.sched_mode = true;
+    }
+
+    /// Scheduler-driven forward (issue #53): one token forward with the
+    /// routed-MoE phase reporting cold experts instead of loading them.
+    /// A blocked forward stashes a resume cursor; resubmitting the SAME
+    /// (token, pos) resumes byte-identically (persistent state is mutated
+    /// exactly once per token). A stale cursor from an abandoned op is
+    /// discarded.
+    pub fn forward_scheduled(&mut self, token: usize, pos: usize) -> SchedForward {
+        if let Some(pause) = self.sched_pause.take() {
+            if pause.token == token && pause.pos == pos {
+                return self.forward_resume(pause, pos);
+            }
+            // Stale pause from an abandoned op: fall through fresh.
+        }
+        let logits = self.forward_token(token, pos);
+        match self.sched_pause.as_ref() {
+            Some(pause) => SchedForward::NeedExperts {
+                layer: pause.layer,
+                experts: pause.experts.clone(),
+            },
+            None => SchedForward::Logits(logits),
+        }
+    }
+
+    fn forward_resume(&mut self, pause: TokenPause, pos: usize) -> SchedForward {
+        let c = self.cfg.clone();
+        let d = c.hidden;
+        let hc = c.hc_count;
+        let rope = rope_angles(pause.pos, &c);
+        let mut stream = pause.stream;
+        // Re-enter the blocked layer's MoE phase only; its dense phases and
+        // persistent state are already applied exactly once.
+        let mut moe = vec![0.0; d];
+        let layer = std::mem::replace(&mut self.layers[pause.layer], Layer::empty());
+        self.moe_token(&layer, pause.layer, &pause.x, &mut moe);
+        if let Some(experts) = self.sched_blocked.take() {
+            // A resumed layer is still cold (eviction between ops): re-block.
+            self.layers[pause.layer] = layer;
+            let new_pause = TokenPause {
+                layer: pause.layer,
+                experts: experts.clone(),
+                x: pause.x,
+                inj: pause.inj,
+                stream,
+                token: pause.token,
+                pos: pause.pos,
+            };
+            self.sched_pause = Some(new_pause);
+            return SchedForward::NeedExperts {
+                layer: pause.layer,
+                experts,
+            };
+        }
+        for g in 0..hc {
+            for dd in 0..d {
+                stream[g * d + dd] += pause.inj[g] * moe[dd];
+            }
+        }
+        self.layers[pause.layer] = layer;
+        for l in pause.layer + 1..c.layers {
+            if !self.forward_layer(l, pause.token, pos, &rope, &mut stream) {
+                let blocked = self
+                    .sched_pause
+                    .as_ref()
+                    .expect("blocked layer stashes a pause");
+                return SchedForward::NeedExperts {
+                    layer: blocked.layer,
+                    experts: blocked.experts.clone(),
+                };
+            }
+        }
+        SchedForward::Logits(self.forward_tail(&stream))
+    }
+
+    /// Scheduler-driven load of one planned expert (executor-lane role: the
+    /// lane owns the MetalIO wait — the scheduler thread and the model's
+    /// forward path never wait on it). Resolves nothing at runtime: the plan
+    /// carries the record identity, stream regions, and dims. The load
+    /// publishes into the physical store (the engine LRU); eviction frees
+    /// the slot. No-op when already resident.
+    pub fn load_expert_planned(
+        &mut self,
+        li: i32,
+        ei: i32,
+        planned: &crate::plan::PlannedExpert,
+    ) -> Result<(), String> {
+        if self.expert_store.peek((li as u32, ei as u32)).is_some() {
+            return Ok(());
+        }
+        let coli = self
+            .coli
+            .as_ref()
+            .ok_or_else(|| "load_expert_planned requires .coli mode".to_string())?;
+        let shard = coli
+            .pkg_ref()
+            .shard_path(planned.shard_id)
+            .ok_or_else(|| format!("planned expert ({li},{ei}) shard {} missing", planned.shard_id))?;
+        let fid = crate::ffi::mio_file(&shard)
+            .ok_or_else(|| format!("MetalIO unavailable for expert ({li},{ei})"))?;
+        let regions = [planned.regions[0], planned.regions[1], planned.regions[2]];
+        let (slot, ev) = crate::ffi::mio_load_expert(fid, &regions)
+            .ok_or_else(|| format!("MetalIO slot alloc failed for expert ({li},{ei})"))?;
+        let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) } as *mut u8;
+        if ptr.is_null() {
+            unsafe { crate::ffi::metalio_slot_free(slot) };
+            return Err(format!("MetalIO slot has no CPU-visible memory for expert ({li},{ei})"));
+        }
+        let [gb, ub, db] = [regions[0].1, regions[1].1, regions[2].1];
+        let up_off = (gb + 15) & !15usize;
+        let down_off = (up_off + ub + 15) & !15usize;
+        let se = crate::colisource::SlotExpert {
+            slot,
+            gate_bytes: gb,
+            up_offset: up_off,
+            up_bytes: ub,
+            down_offset: down_off,
+            down_bytes: db,
+            ptr,
+            pending: std::cell::Cell::new(ev),
+            bf16_cache: std::cell::RefCell::new(None),
+            rows: [planned.dims[0].0, planned.dims[1].0, planned.dims[2].0],
+            cols: [planned.dims[0].1, planned.dims[1].1, planned.dims[2].1],
+        };
+        let (mut evicted, _) = self.expert_store.insert((li as u32, ei as u32), se);
+        if let Some(mut e) = evicted.take() {
+            e.release();
+        }
+        if unsafe { crate::ffi::metalio_wait(ev) } != 0 {
+            return Err(format!("MetalIO load failed for expert ({li},{ei})"));
+        }
+        if let Some(v) = self.expert_store.peek((li as u32, ei as u32)) {
+            v.pending.set(0);
+        }
+        Ok(())
     }
 
     /// Emit the LOGAN_PROFILE=1 per-request summary (spans + Metal counters
@@ -2084,6 +2336,9 @@ impl Model {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             gdn_metal: (0..cfg.layers).map(|_| None).collect(),
+            sched_mode: false,
+            sched_blocked: None,
+            sched_pause: None,
         })
     }
 }

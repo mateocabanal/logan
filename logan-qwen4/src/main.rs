@@ -17,7 +17,10 @@ fn main() {
         eprintln!("config error: {e}");
         std::process::exit(1);
     });
-    // .coli package mode: no model.safetensors -> load via colibri-format
+    // .coli package mode: no model.safetensors -> load via colibri-format.
+    // QWEN_SCHED=1 routes execution through the scheduler driver (issue
+    // #53); DEFAULT OFF this session — the canonical direct path stays the
+    // correctness reference and A/B oracle.
     let is_coli = !dir.join("model.safetensors").exists();
     let ref_path = dir.join("ref.json");
     if is_coli && !ref_path.exists() {
@@ -31,14 +34,26 @@ fn main() {
             .parse()
             .unwrap();
         let t0 = std::time::Instant::now();
-        let out = logan_qwen4::scheduled::run_greedy_scheduled(dir, &prompt, max_new)
-            .unwrap_or_else(|e| {
-                eprintln!("scheduled decode error: {e}");
+        let out = if std::env::var("QWEN_SCHED").map(|v| v == "1").unwrap_or(false) {
+            logan_qwen4::scheduled::run_greedy_scheduled(dir, &prompt, max_new)
+                .unwrap_or_else(|e| {
+                    eprintln!("scheduled decode error: {e}");
+                    std::process::exit(1);
+                })
+        } else {
+            let src = logan_qwen4::colisource::ColiSource::open(dir).unwrap_or_else(|e| {
+                eprintln!("coli error: {e}");
                 std::process::exit(1);
             });
+            let model = logan_qwen4::Model::load_coli(&src, &cfg).unwrap_or_else(|e| {
+                eprintln!("model error: {e}");
+                std::process::exit(1);
+            });
+            logan_qwen4::run_greedy_with(model, cfg, &prompt, max_new)
+        };
         if logan_core::telemetry::enabled() {
             eprintln!(
-                "logan scheduler: tokens={} total={:.1} ms/tok",
+                "logan qwen4: tokens={} total={:.1} ms/tok",
                 out.len(),
                 t0.elapsed().as_secs_f64() * 1e3 / out.len().max(1) as f64
             );
