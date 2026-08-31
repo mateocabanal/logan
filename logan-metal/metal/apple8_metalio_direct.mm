@@ -425,9 +425,11 @@ struct Apple8MoeScratch {
 };
 static Apple8MoeScratch g_moe_scratch;
 
-/* Dense BF16 weight buffer cache: the lm_head pointer is stable for the
- * model lifetime, so the 622 MB copy happens once and every later token
- * reuses the buffer. */
+/* Dense BF16 weight buffer cache. Attention alternates layer-local QKV/O
+ * pointers, so a copy-backed newBufferWithBytes would copy a large matrix
+ * on every projection. Logan's attention weights are 16 KiB aligned and
+ * model-lifetime; wrap those pointers zero-copy. Unaligned callers retain
+ * the old copy-backed fallback. */
 static const uint16_t *g_bf16_w = NULL;
 static id<MTLBuffer> g_bf16_wbuf = nil;
 static int g_bf16_O = 0, g_bf16_I = 0;
@@ -1250,9 +1252,33 @@ extern "C" int coli_apple8_metalio_bf16_matmul(
     if (!g_bf16_matmul_pipeline || !g_queue || !g_device) return 0;
 
     if (w != g_bf16_w || O != g_bf16_O || I != g_bf16_I) {
-        g_bf16_wbuf = [g_device newBufferWithBytes:w
-                        length:(size_t)O * (size_t)I * sizeof(uint16_t)
-                       options:MTLResourceStorageModeShared];
+        size_t w_bytes = 0;
+        if (!qwen_gdn_mul3_size(
+                (size_t)O, (size_t)I, sizeof(uint16_t), &w_bytes))
+            return 0;
+
+        const char *nocopy_env = getenv("QWEN_ATTN_BF16_NOCOPY");
+        const bool use_nocopy =
+            !nocopy_env || !nocopy_env[0] || strcmp(nocopy_env, "0") != 0;
+
+        g_bf16_wbuf = nil;
+
+        /* AttnMetalLayer owns a page-aligned, page-rounded allocation for
+         * the model lifetime, so Metal can safely reference it directly.
+         * Reuse the GDN zero-copy wrapper contract rather than copying the
+         * entire projection matrix into a fresh MTLBuffer every call. */
+        if (use_nocopy)
+            g_bf16_wbuf = qwen_gdn_wrap_nocopy_locked(w, w_bytes);
+
+        /* Preserve the generic BF16 API contract for any unaligned caller,
+         * and provide an exact A/B baseline with
+         * QWEN_ATTN_BF16_NOCOPY=0. */
+        if (!g_bf16_wbuf) {
+            g_bf16_wbuf = [g_device newBufferWithBytes:w
+                                                   length:w_bytes
+                                                  options:MTLResourceStorageModeShared];
+        }
+
         if (!g_bf16_wbuf) return 0;
         g_bf16_w = w;
         g_bf16_O = O;
