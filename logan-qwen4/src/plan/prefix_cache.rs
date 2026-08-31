@@ -1,9 +1,10 @@
 //! Persistent Qwen4 prefix-state cache.
 //!
 //! One semantic prefix is stored as one contiguous `.lpfx` file. The format
-//! is versioned, strongly keyed to the exact package/config/prefix, and
-//! restored directly into the live model state (no second 100+ MiB snapshot
-//! allocation). Files are checksummed before any model state is mutated.
+//! is versioned, strongly keyed to the exact package/config/numerical policy
+//! and token prefix, and restored directly into the live model state (no
+//! second 100+ MiB snapshot allocation). The complete payload is checksummed
+//! before any model state is mutated.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -12,8 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::colisource::ColiSource;
-use crate::{Cfg, Model};
+use crate::Model;
 
 const MAGIC: &[u8; 8] = b"LOGANPFX";
 const FORMAT_VERSION: u32 = 1;
@@ -31,27 +31,31 @@ pub struct PrefixCacheKey {
 }
 
 impl PrefixCacheKey {
-    pub fn new(src: &ColiSource, cfg: &Cfg, tokens: &[u32]) -> Self {
-        Self::with_salt(src, cfg, tokens, &[])
+    /// Build a key from the exact already-loaded model. This deliberately
+    /// includes math-affecting runtime policy so a checkpoint produced by a
+    /// Metal path is never silently consumed by a numerically different
+    /// CPU/BNNS path (or vice versa).
+    pub fn new(model: &Model, tokens: &[u32]) -> Result<Self, String> {
+        Self::with_salt(model, tokens, &[])
     }
 
     /// `salt` is an optional isolation namespace (e.g. user/tenant/session).
-    pub fn with_salt(src: &ColiSource, cfg: &Cfg, tokens: &[u32], salt: &[u8]) -> Self {
-        let model = model_digest(src, cfg);
+    pub fn with_salt(model: &Model, tokens: &[u32], salt: &[u8]) -> Result<Self, String> {
+        let model_digest = model_digest(model)?;
         let mut h = Sha256::new();
         h.update(b"logan-qwen4-prefix-key-v1\0");
-        h.update(model);
+        h.update(model_digest);
         h.update((salt.len() as u64).to_le_bytes());
         h.update(salt);
         h.update((tokens.len() as u64).to_le_bytes());
         for &token in tokens {
             h.update(token.to_le_bytes());
         }
-        Self {
-            model,
+        Ok(Self {
+            model: model_digest,
             prefix: h.finalize().into(),
             prefix_len: tokens.len(),
-        }
+        })
     }
 
     pub fn prefix_len(&self) -> usize {
@@ -119,9 +123,10 @@ impl PrefixCacheStore {
             .join(format!("{:08}-{}.lpfx", key.prefix_len, key.prefix_hex()))
     }
 
-    /// Persist the current model state at exactly `key.prefix_len()` completed
-    /// token positions. The write is same-directory temp + fsync + atomic
-    /// rename. Existing entries are immutable and reused.
+    /// Persist the live state at exactly `key.prefix_len()` completed token
+    /// positions. Publication is same-directory temp + fsync + atomic rename.
+    /// Entries are immutable; an existing path is reused and will be fully
+    /// validated by `restore` before it can mutate model state.
     pub fn store(&self, model: &Model, key: &PrefixCacheKey) -> Result<CacheWriteStats, String> {
         ensure_little_endian()?;
         validate_key_for_model(model, key)?;
@@ -131,7 +136,9 @@ impl PrefixCacheStore {
 
         let started = Instant::now();
         let path = self.path_for(key);
-        let parent = path.parent().ok_or_else(|| "cache path has no parent".to_string())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "cache path has no parent".to_string())?;
         fs::create_dir_all(parent).map_err(|e| format!("create cache dir: {e}"))?;
         let payload_bytes = expected_payload_bytes(model, key.prefix_len)?;
         let file_bytes = HEADER_BYTES as u64 + payload_bytes;
@@ -152,7 +159,9 @@ impl PrefixCacheStore {
             .as_nanos();
         let tmp = parent.join(format!(
             ".{}.tmp.{}.{}",
-            path.file_name().and_then(|x| x.to_str()).unwrap_or("prefix.lpfx"),
+            path.file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("prefix.lpfx"),
             std::process::id(),
             stamp
         ));
@@ -165,8 +174,7 @@ impl PrefixCacheStore {
                 .open(&tmp)
                 .map_err(|e| format!("create cache temp {}: {e}", tmp.display()))?;
 
-            let header = encode_header(model, key, payload_bytes, [0; 32])?;
-            file.write_all(&header)
+            file.write_all(&encode_header(model, key, payload_bytes, [0; 32])?)
                 .map_err(|e| format!("write cache header: {e}"))?;
 
             let mut hasher = Sha256::new();
@@ -189,10 +197,8 @@ impl PrefixCacheStore {
             fs::rename(&tmp, &path)
                 .map_err(|e| format!("publish cache {}: {e}", path.display()))?;
             #[cfg(unix)]
-            {
-                if let Ok(dir) = File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
             }
             Ok(())
         })();
@@ -211,10 +217,9 @@ impl PrefixCacheStore {
         })
     }
 
-    /// Verify the complete file first, then seek back and stream the payload
-    /// directly into the live model buffers. This deliberately pays a
-    /// conservative validation pass so corruption can never partially mutate
-    /// model state.
+    /// Validate identity/geometry/length and the complete SHA-256 payload
+    /// first; only then stream the file directly into live model buffers.
+    /// The double pass is intentionally conservative for the first SSD A/B.
     pub fn restore(
         &self,
         model: &mut Model,
@@ -234,7 +239,8 @@ impl PrefixCacheStore {
 
         let verify_started = Instant::now();
         let header = read_header(&mut file)?;
-        validate_header(model, key, &header, file.metadata().map_err(|e| e.to_string())?.len())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        validate_header(model, key, &header, file_len)?;
         verify_payload_checksum(&mut file, &header)?;
         let verify = verify_started.elapsed();
 
@@ -255,8 +261,7 @@ impl PrefixCacheStore {
     }
 }
 
-/// Exact digest of the live causal state using the same byte order/layout as
-/// the persistent file. Useful for gates without allocating a RAM snapshot.
+/// Exact digest of live causal state using the persistent payload byte layout.
 pub fn live_prefix_state_digest(model: &Model, prefix_len: usize) -> Result<[u8; 32], String> {
     ensure_little_endian()?;
     let mut h = Sha256::new();
@@ -295,12 +300,44 @@ struct Header {
     checksum: [u8; 32],
 }
 
-fn model_digest(src: &ColiSource, cfg: &Cfg) -> [u8; 32] {
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name).map(|v| v != "0").unwrap_or(default)
+}
+
+fn hash_numerical_policy(h: &mut Sha256, model: &Model) {
+    h.update(b"logan-qwen4-numerical-policy-v1\0");
+    h.update(std::env::consts::OS.as_bytes());
+    h.update([0]);
+    h.update(std::env::consts::ARCH.as_bytes());
+    h.update([0]);
+    h.update([crate::ffi::direct_available() as u8]);
+    // `metal_direct` is resolved at model load and therefore more exact than
+    // re-reading QWEN_APPLE8_DIRECT here.
+    h.update([model.metal_direct as u8]);
+    for (name, default) in [
+        ("QWEN_GDN_METAL", true),
+        ("QWEN_BNNS_BF16", false),
+        ("QWEN_ATTN_METAL", true),
+        ("QWEN_QSA_INDEX_METAL", true),
+    ] {
+        h.update(name.as_bytes());
+        h.update([0]);
+        h.update([env_bool(name, default) as u8]);
+    }
+}
+
+fn model_digest(model: &Model) -> Result<[u8; 32], String> {
+    let src = model
+        .coli
+        .as_ref()
+        .ok_or_else(|| "persistent prefix cache requires a .coli model".to_string())?;
+    let cfg = &model.cfg;
     let mut h = Sha256::new();
-    h.update(b"logan-qwen4-prefix-model-v1\0");
-    // The manifest contains the package's source fingerprint, record table,
-    // representations and CRCs, so hashing it binds state to this exact .coli
-    // package without touching the 100+ GB shards.
+    h.update(b"logan-qwen4-prefix-model-v2\0");
+    h.update(FORMAT_VERSION.to_le_bytes());
+    h.update(STATE_ABI_VERSION.to_le_bytes());
+    // The manifest binds the package's record table, representations and CRCs
+    // without reading the 100+ GB data shards.
     h.update(src.pkg_ref().manifest_ref());
 
     macro_rules! usize_field {
@@ -348,7 +385,8 @@ fn model_digest(src: &ColiSource, cfg: &Cfg) -> [u8; 32] {
     for &v in &cfg.qsa_layers {
         h.update([v as u8]);
     }
-    h.finalize().into()
+    hash_numerical_policy(&mut h, model);
+    Ok(h.finalize().into())
 }
 
 fn validate_key_for_model(model: &Model, key: &PrefixCacheKey) -> Result<(), String> {
@@ -358,13 +396,8 @@ fn validate_key_for_model(model: &Model, key: &PrefixCacheKey) -> Result<(), Str
             key.prefix_len, model.cfg.max_t
         ));
     }
-    let src = model
-        .coli
-        .as_ref()
-        .ok_or_else(|| "persistent prefix cache requires a .coli model".to_string())?;
-    let actual = model_digest(src, &model.cfg);
-    if actual != key.model {
-        return Err("prefix cache key belongs to a different package/config".into());
+    if model_digest(model)? != key.model {
+        return Err("prefix cache key belongs to a different model/numerical policy".into());
     }
     Ok(())
 }
@@ -374,25 +407,21 @@ fn expected_payload_bytes(model: &Model, prefix_len: usize) -> Result<u64, Strin
     let gdn = cfg.gdn_layers.iter().filter(|&&x| x).count() as u128;
     let attn = cfg.gdn_layers.iter().filter(|&&x| !x).count() as u128;
     let qsa = cfg.qsa_layers.iter().filter(|&&x| x).count() as u128;
-    let state = (cfg.lin_v_heads as u128)
-        * (cfg.lin_k_dim as u128)
-        * (cfg.lin_v_dim as u128);
-    let cdim = (cfg.lin_k_dim as u128) * (cfg.lin_k_heads as u128) * 2
-        + (cfg.lin_v_dim as u128) * (cfg.lin_v_heads as u128);
-    let conv = cdim * (cfg.conv_kernel.saturating_sub(1) as u128);
+    let state = cfg.lin_v_heads as u128 * cfg.lin_k_dim as u128 * cfg.lin_v_dim as u128;
+    let cdim = cfg.lin_k_dim as u128 * cfg.lin_k_heads as u128 * 2
+        + cfg.lin_v_dim as u128 * cfg.lin_v_heads as u128;
+    let conv = cdim * cfg.conv_kernel.saturating_sub(1) as u128;
     let kv_per_layer = 2u128
-        * (cfg.kv_heads as u128)
-        * (prefix_len as u128)
-        * (cfg.head_dim as u128);
-    let idx_per_layer = (prefix_len as u128)
-        * (cfg.idx_kv_heads as u128)
-        * (cfg.idx_head_dim as u128);
-
+        * cfg.kv_heads as u128
+        * prefix_len as u128
+        * cfg.head_dim as u128;
+    let idx_per_layer =
+        prefix_len as u128 * cfg.idx_kv_heads as u128 * cfg.idx_head_dim as u128;
     let f32_elems = gdn * (state + conv)
         + attn * kv_per_layer
         + qsa * idx_per_layer
         + model.ple_conv_state.len() as u128;
-    let bytes = f32_elems * 4 + (model.ple_ring.len() as u128) * 8;
+    let bytes = f32_elems * 4 + model.ple_ring.len() as u128 * 8;
     u64::try_from(bytes).map_err(|_| "prefix cache payload size overflows u64".into())
 }
 
@@ -407,7 +436,6 @@ fn encode_header(
     put_u32(&mut b, 8, FORMAT_VERSION);
     put_u32(&mut b, 12, HEADER_BYTES as u32);
     put_u32(&mut b, 16, STATE_ABI_VERSION);
-    put_u32(&mut b, 20, 0);
     b[24..56].copy_from_slice(&key.model);
     b[56..88].copy_from_slice(&key.prefix);
     put_u64(&mut b, 88, key.prefix_len as u64);
@@ -625,19 +653,19 @@ fn restore_payload_into(
     prefix_len: usize,
     file: &mut File,
 ) -> Result<(), String> {
-    // If Metal GDN is selected for this process, build its aligned buffers
-    // *before* reading state. build_gdn_metal currently zero-initializes those
-    // buffers; immediately filling both CPU and aligned copies here makes a
-    // fresh-process SSD restore backend-correct.
-    let gdn_enabled = std::env::var("QWEN_GDN_METAL")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    if gdn_enabled {
+    // gdn_token lazily builds these aligned buffers before it checks the
+    // QWEN_GDN_METAL gate, and build_gdn_metal starts recurrent state at zero.
+    // A fresh SSD restore must therefore build them first whenever the direct
+    // backend exists, even when Metal GDN itself is disabled, then overwrite
+    // both CPU and aligned state with the checkpoint.
+    if crate::ffi::direct_available() {
         let cfg = &model.cfg;
         for li in 0..cfg.layers {
             if cfg.gdn_layers[li] && model.gdn_metal[li].is_none() {
-                let gm = Model::build_gdn_metal(&mut model.layers[li], cfg);
-                model.gdn_metal[li] = gm;
+                let gm = Model::build_gdn_metal(&mut model.layers[li], cfg).ok_or_else(|| {
+                    format!("layer {li}: failed to initialize aligned GDN state for restore")
+                })?;
+                model.gdn_metal[li] = Some(gm);
             }
         }
     }
@@ -741,9 +769,7 @@ fn i64_as_bytes_mut(v: &mut [i64]) -> &mut [u8] {
 }
 
 fn maybe_enable_nocache(file: &File) -> Result<bool, String> {
-    let requested = std::env::var("LOGAN_PREFIX_CACHE_NOCACHE")
-        .map(|v| v != "0")
-        .unwrap_or(false);
+    let requested = env_bool("LOGAN_PREFIX_CACHE_NOCACHE", false);
     if !requested {
         return Ok(false);
     }
@@ -757,7 +783,7 @@ fn maybe_enable_nocache(file: &File) -> Result<bool, String> {
                 std::io::Error::last_os_error()
             ));
         }
-        return Ok(true);
+        Ok(true)
     }
     #[cfg(not(target_os = "macos"))]
     {
