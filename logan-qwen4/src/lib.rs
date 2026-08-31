@@ -1382,14 +1382,12 @@ impl Model {
             }
             for d in 0..vd {
                 let delta = (vhh[d] - kv_mem[d]) * bt;
-                for kk2 in 0..kd {
-                    sn[kk2 * vd + d] += khh[kk2] * delta;
-                }
-            }
-            for d in 0..vd {
                 let mut acc = 0.0_f32;
                 for kk2 in 0..kd {
-                    acc += sn[kk2 * vd + d] * qhh[kk2];
+                    let si = kk2 * vd + d;
+                    let next_s = sn[si] + khh[kk2] * delta;
+                    sn[si] = next_s;
+                    acc += next_s * qhh[kk2];
                 }
                 kv_mem[d] = acc;
             }
