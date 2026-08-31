@@ -6,7 +6,25 @@ use std::path::Path;
 
 use logan_qwen4::{load_cfg, Model, StFile};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn apply_apple_runtime_defaults() {
+    // Measured on the M2 Qwen3.8-Flash-Next Apple8 package: Accelerate/BNNS
+    // BF16 dense execution beats the current Metal GDN path while preserving
+    // greedy token identity. Keep both knobs overridable for A/B and fallback.
+    if std::env::var_os("QWEN_BNNS_BF16").is_none() {
+        std::env::set_var("QWEN_BNNS_BF16", "1");
+    }
+    if std::env::var_os("QWEN_GDN_METAL").is_none() {
+        std::env::set_var("QWEN_GDN_METAL", "0");
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn apply_apple_runtime_defaults() {}
+
 fn main() {
+    apply_apple_runtime_defaults();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("usage: qwen4-rs <fixture-dir | .coli-package>");
