@@ -85,10 +85,12 @@ fn main() -> Result<(), String> {
         .unwrap_or(false);
     let dirty: Vec<u32> = prefix.iter().map(|&t| t.saturating_add(1)).collect();
     let store = PrefixCacheStore::from_env()?;
+    let prompt_len = prefix.len() + suffix.len();
 
-    // A: canonical execution and durable cache creation. With
-    // QWEN_GATE_REUSE=1 the old .lpfx is intentionally retained, proving a
-    // cache made by an earlier process remains valid.
+    // A: canonical fresh execution and durable cache creation. Keep tail
+    // timing separate from persistence so the uncached E2E baseline is
+    // prefix replay + suffix/generation only. This path starts with a cold
+    // expert cache, just like the fresh SSD-restored model below.
     let mut a = load_model(package)?;
     let key = PrefixCacheKey::new(&a, &prefix)?;
     let cache_path = store.path_for(&key);
@@ -105,18 +107,22 @@ fn main() -> Result<(), String> {
     let write = store.store(&a, &key)?;
     let write_ms = write.elapsed.as_secs_f64() * 1e3;
 
+    let a_tail_t0 = Instant::now();
     prefill(&mut a, &suffix, prefix.len());
-    let prompt_len = prefix.len() + suffix.len();
     let (a_tokens, a_logits) = generate_trace(
         &mut a,
         *suffix.last().unwrap(),
         prompt_len,
         new_tokens,
     );
+    let a_tail_ms = a_tail_t0.elapsed().as_secs_f64() * 1e3;
+    let uncached_e2e_ms = cold_prefix_ms + a_tail_ms;
     let a_final = live_prefix_state_digest(&a, prompt_len + new_tokens)?;
     drop(a);
 
-    // B: conservative replay baseline after warming lazy allocations/backends.
+    // B: a deliberately favorable replay-only baseline after unrelated work
+    // has warmed lazy allocations/backends. Raw SSD restore must beat this by
+    // 4x; it is stricter than comparing against cold replay.
     let mut b = load_model(package)?;
     let empty = b.snapshot_state(0)?;
     prefill(&mut b, &dirty, 0);
@@ -128,12 +134,15 @@ fn main() -> Result<(), String> {
     let replay_exact = replay_digest == prefix_digest;
     drop(b);
 
-    // C: a fresh model instance restores only from the persistent file.
+    // C: a fresh model instance restores only from the persistent file. Its
+    // expert cache is cold, intentionally capturing the possible disadvantage
+    // versus replay (replay naturally warms prefix experts).
     let mut c = load_model(package)?;
     let restore = store.restore(&mut c, &key)?;
     let restored_digest = live_prefix_state_digest(&c, prefix.len())?;
     let restored_exact = restored_digest == prefix_digest;
 
+    let c_tail_t0 = Instant::now();
     prefill(&mut c, &suffix, prefix.len());
     let (c_tokens, c_logits) = generate_trace(
         &mut c,
@@ -141,18 +150,28 @@ fn main() -> Result<(), String> {
         prompt_len,
         new_tokens,
     );
+    let c_tail_ms = c_tail_t0.elapsed().as_secs_f64() * 1e3;
     let c_final = live_prefix_state_digest(&c, prompt_len + new_tokens)?;
 
     let tokens_exact = a_tokens == c_tokens;
     let logits_exact = a_logits == c_logits;
     let final_state_exact = a_final == c_final;
     let restore_ms = restore.total.as_secs_f64() * 1e3;
-    let ratio = if replay_ms > 0.0 {
+    let restore_ratio = if replay_ms > 0.0 {
         restore_ms / replay_ms
     } else {
         f64::INFINITY
     };
-    let perf_pass = ratio < 0.25;
+    let cached_e2e_ms = restore_ms + c_tail_ms;
+    let e2e_ratio = if uncached_e2e_ms > 0.0 {
+        cached_e2e_ms / uncached_e2e_ms
+    } else {
+        f64::INFINITY
+    };
+    let restore_perf_pass = restore_ratio < 0.25;
+    // Demand a material E2E win, not a noise-level improvement. This includes
+    // the cold-expert disadvantage of the restored model.
+    let e2e_perf_pass = e2e_ratio < 0.80;
 
     println!("prefix_tokens={} reuse_existing={reuse_existing}", prefix.len());
     println!("cache_dir={}", store.root().display());
@@ -163,12 +182,17 @@ fn main() -> Result<(), String> {
         write.file_bytes as f64 / (1024.0 * 1024.0),
         write.already_existed,
     );
-    println!("cold_prefix={cold_prefix_ms:.2} ms warmed_replay={replay_ms:.2} ms");
     println!(
-        "ssd_verify={:.2} ms ssd_apply={:.2} ms ssd_total={restore_ms:.2} ms nocache={} restore/replay={ratio:.4}x",
+        "cold_prefix={cold_prefix_ms:.2} ms warmed_replay={replay_ms:.2} ms uncached_tail={a_tail_ms:.2} ms"
+    );
+    println!(
+        "ssd_verify={:.2} ms ssd_apply={:.2} ms ssd_total={restore_ms:.2} ms nocache={} restore/replay={restore_ratio:.4}x",
         restore.verify.as_secs_f64() * 1e3,
         restore.apply.as_secs_f64() * 1e3,
         restore.nocache,
+    );
+    println!(
+        "cached_tail={c_tail_ms:.2} ms uncached_e2e={uncached_e2e_ms:.2} ms cached_e2e={cached_e2e_ms:.2} ms cached/uncached={e2e_ratio:.4}x"
     );
     println!(
         "exact: replay_state={} restored_state={} tokens={} logits={} final_state={}",
@@ -182,13 +206,16 @@ fn main() -> Result<(), String> {
         && tokens_exact
         && logits_exact
         && final_state_exact
-        && perf_pass
+        && restore_perf_pass
+        && e2e_perf_pass
     {
-        println!("GATE: PASS persistent SSD restore is exact and <25% warmed replay cost");
+        println!(
+            "GATE: PASS persistent SSD restore is exact, <25% warmed replay, and >20% faster E2E"
+        );
         Ok(())
     } else {
         Err(format!(
-            "GATE: FAIL replay_exact={replay_exact} restored_exact={restored_exact} tokens={tokens_exact} logits={logits_exact} final_state={final_state_exact} perf={perf_pass}"
+            "GATE: FAIL replay_exact={replay_exact} restored_exact={restored_exact} tokens={tokens_exact} logits={logits_exact} final_state={final_state_exact} restore_perf={restore_perf_pass} e2e_perf={e2e_perf_pass}"
         ))
     }
 }
