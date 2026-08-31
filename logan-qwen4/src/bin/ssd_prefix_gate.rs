@@ -8,7 +8,7 @@ use logan_qwen4::colisource::ColiSource;
 use logan_qwen4::plan::{
     digest_hex, live_prefix_state_digest, PrefixCacheKey, PrefixCacheStore,
 };
-use logan_qwen4::{load_cfg, Cfg, Model};
+use logan_qwen4::{load_cfg, Model};
 
 fn parse_tokens(name: &str, default: &str) -> Vec<u32> {
     std::env::var(name)
@@ -18,11 +18,10 @@ fn parse_tokens(name: &str, default: &str) -> Vec<u32> {
         .collect()
 }
 
-fn load_model(path: &Path) -> Result<(Cfg, ColiSource, Model), String> {
+fn load_model(path: &Path) -> Result<Model, String> {
     let cfg = load_cfg(&path.join("config.json"))?;
     let src = ColiSource::open(path)?;
-    let model = Model::load_coli(&src, &cfg)?;
-    Ok((cfg, src, model))
+    Model::load_coli(&src, &cfg)
 }
 
 fn prefill(model: &mut Model, tokens: &[u32], start_pos: usize) {
@@ -90,8 +89,8 @@ fn main() -> Result<(), String> {
     // A: canonical execution and durable cache creation. With
     // QWEN_GATE_REUSE=1 the old .lpfx is intentionally retained, proving a
     // cache made by an earlier process remains valid.
-    let (cfg_a, src_a, mut a) = load_model(package)?;
-    let key = PrefixCacheKey::new(&src_a, &cfg_a, &prefix);
+    let mut a = load_model(package)?;
+    let key = PrefixCacheKey::new(&a, &prefix)?;
     let cache_path = store.path_for(&key);
     if cache_path.exists() && !reuse_existing {
         fs::remove_file(&cache_path)
@@ -118,7 +117,7 @@ fn main() -> Result<(), String> {
     drop(a);
 
     // B: conservative replay baseline after warming lazy allocations/backends.
-    let (_, _, mut b) = load_model(package)?;
+    let mut b = load_model(package)?;
     let empty = b.snapshot_state(0)?;
     prefill(&mut b, &dirty, 0);
     b.restore_state(&empty)?;
@@ -130,7 +129,7 @@ fn main() -> Result<(), String> {
     drop(b);
 
     // C: a fresh model instance restores only from the persistent file.
-    let (_, _, mut c) = load_model(package)?;
+    let mut c = load_model(package)?;
     let restore = store.restore(&mut c, &key)?;
     let restored_digest = live_prefix_state_digest(&c, prefix.len())?;
     let restored_exact = restored_digest == prefix_digest;
@@ -164,9 +163,7 @@ fn main() -> Result<(), String> {
         write.file_bytes as f64 / (1024.0 * 1024.0),
         write.already_existed,
     );
-    println!(
-        "cold_prefix={cold_prefix_ms:.2} ms warmed_replay={replay_ms:.2} ms"
-    );
+    println!("cold_prefix={cold_prefix_ms:.2} ms warmed_replay={replay_ms:.2} ms");
     println!(
         "ssd_verify={:.2} ms ssd_apply={:.2} ms ssd_total={restore_ms:.2} ms nocache={} restore/replay={ratio:.4}x",
         restore.verify.as_secs_f64() * 1e3,
