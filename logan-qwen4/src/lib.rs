@@ -1981,6 +1981,24 @@ impl Model {
         matmul(y, &h, &dw);
     }
 
+    fn shared_expert_value(&self, layer: &Layer, x: &[f32]) -> (Vec<f32>, f32) {
+        let c = &self.cfg;
+        let d = c.hidden;
+        let mut sg = vec![0.0; 1];
+        matmul(&mut sg, x, &layer.se_g);
+        let gs = 1.0 / (1.0 + (-sg[0]).exp());
+        let mut gv = vec![0.0; c.shared_inter];
+        let mut h = vec![0.0; c.shared_inter];
+        matmul(&mut gv, x, &layer.se_gate);
+        matmul(&mut h, x, &layer.se_up);
+        for i in 0..c.shared_inter {
+            h[i] = silu(gv[i]) * h[i];
+        }
+        let mut sy = vec![0.0; d];
+        matmul(&mut sy, &h, &layer.se_down);
+        (sy, gs)
+    }
+
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let c = self.cfg.clone();
         let e = c.experts;
@@ -2038,7 +2056,11 @@ impl Model {
         let direct =
             self.metal_direct && crate::ffi::direct_available() && k <= 64 && self.coli.is_some();
         let mut pending: Option<*mut std::ffi::c_void> = None;
-        let mut pending_acc: Option<Vec<f32>> = None;
+        let mut direct_done = false;
+        let mut shared_ready: Option<(Vec<f32>, f32)> = None;
+        let shared_io_overlap = std::env::var("QWEN_SHARED_IO_OVERLAP")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let mut _io_t = logan_core::telemetry::Span::begin("io");
         if direct {
             // Async issue: enqueue ALL K expert loads first (no waits), so
@@ -2055,6 +2077,14 @@ impl Model {
                         break;
                     }
                 }
+            }
+            // The shared expert depends only on x, not on routed-expert bytes.
+            // Run it while MetalIO owns outstanding NVMe->UMA transfers instead of
+            // spending the same CPU work after all I/O has already drained.
+            if all_ok && shared_io_overlap {
+                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                shared_ready = Some(self.shared_expert_value(layer, x));
+                self.spans.shared_ms += _shared_t.end();
             }
             if all_ok {
                 for i in 0..k {
@@ -2076,7 +2106,9 @@ impl Model {
                 let mut _gpu_t = logan_core::telemetry::Span::begin("gpu");
                 if self.metal_overlap {
                     pending = crate::ffi::moe_topk_begin(&ex, &ws, x, d, c.moe_inter);
-                } else if !crate::ffi::moe_topk(&ex, &ws, x, &mut acc, d, c.moe_inter) {
+                } else if crate::ffi::moe_topk(&ex, &ws, x, &mut acc, d, c.moe_inter) {
+                    direct_done = true;
+                } else {
                     pending = None; // decline -> CPU per-expert loop below
                 }
                 self.spans.gpu_ms += _gpu_t.end();
@@ -2088,23 +2120,32 @@ impl Model {
         }
 
         self.spans.io_ms += _io_t.end();
-        if pending.is_some() {
-            // CPU shared expert overlaps the routed-GPU wait (C order: shared
-            // expert runs BETWEEN submit and finish).
-            let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-            let mut sg = vec![0.0; 1];
-            matmul(&mut sg, x, &layer.se_g);
-            let gs = 1.0 / (1.0 + (-sg[0]).exp());
-            let mut gv = vec![0.0; c.shared_inter];
-            let mut h = vec![0.0; c.shared_inter];
-            matmul(&mut gv, x, &layer.se_gate);
-            matmul(&mut h, x, &layer.se_up);
-            for i in 0..c.shared_inter {
-                h[i] = silu(gv[i]) * h[i];
+        if direct_done {
+            let (sy, gs) = if let Some(v) = shared_ready.take() {
+                v
+            } else {
+                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                let v = self.shared_expert_value(layer, x);
+                self.spans.shared_ms += _shared_t.end();
+                v
+            };
+            for dd in 0..d {
+                out[dd] = acc[dd] + sy[dd] * gs;
             }
-            let mut sy = vec![0.0; d];
-            matmul(&mut sy, &h, &layer.se_down);
-            self.spans.shared_ms += _shared_t.end();
+            return;
+        }
+        if pending.is_some() {
+            // With QWEN_SHARED_IO_OVERLAP=1 this result was produced while
+            // expert loads were outstanding. Opt-out retains the old GPU-overlap
+            // placement for a same-binary A/B.
+            let (sy, gs) = if let Some(v) = shared_ready.take() {
+                v
+            } else {
+                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                let v = self.shared_expert_value(layer, x);
+                self.spans.shared_ms += _shared_t.end();
+                v
+            };
             let p = pending.unwrap();
             let mut _gpu_wait = logan_core::telemetry::Span::begin("gpu-wait");
             let gpu_ok = crate::ffi::moe_topk_finish(p, &mut acc, d);
@@ -2203,20 +2244,14 @@ impl Model {
             }
         }
         self.spans.fill_ms += _fill_t.end();
-        let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-        let mut sg = vec![0.0; 1];
-        matmul(&mut sg, x, &layer.se_g);
-        let gs = 1.0 / (1.0 + (-sg[0]).exp());
-        let mut gv = vec![0.0; c.shared_inter];
-        let mut h = vec![0.0; c.shared_inter];
-        matmul(&mut gv, x, &layer.se_gate);
-        matmul(&mut h, x, &layer.se_up);
-        for i in 0..c.shared_inter {
-            h[i] = silu(gv[i]) * h[i];
-        }
-        let mut sy = vec![0.0; d];
-        matmul(&mut sy, &h, &layer.se_down);
-        self.spans.shared_ms += _shared_t.end();
+        let (sy, gs) = if let Some(v) = shared_ready.take() {
+            v
+        } else {
+            let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+            let v = self.shared_expert_value(layer, x);
+            self.spans.shared_ms += _shared_t.end();
+            v
+        };
         for dd in 0..d {
             out[dd] = acc[dd] + sy[dd] * gs;
         }
