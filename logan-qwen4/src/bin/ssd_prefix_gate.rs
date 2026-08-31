@@ -81,14 +81,19 @@ fn main() -> Result<(), String> {
     if new_tokens == 0 {
         return Err("QWEN_GATE_NEW must be > 0".into());
     }
+    let reuse_existing = std::env::var("QWEN_GATE_REUSE")
+        .map(|v| v != "0")
+        .unwrap_or(false);
     let dirty: Vec<u32> = prefix.iter().map(|&t| t.saturating_add(1)).collect();
     let store = PrefixCacheStore::from_env()?;
 
-    // A: canonical execution and durable cache creation.
+    // A: canonical execution and durable cache creation. With
+    // QWEN_GATE_REUSE=1 the old .lpfx is intentionally retained, proving a
+    // cache made by an earlier process remains valid.
     let (cfg_a, src_a, mut a) = load_model(package)?;
     let key = PrefixCacheKey::new(&src_a, &cfg_a, &prefix);
     let cache_path = store.path_for(&key);
-    if cache_path.exists() {
+    if cache_path.exists() && !reuse_existing {
         fs::remove_file(&cache_path)
             .map_err(|e| format!("remove old gate cache {}: {e}", cache_path.display()))?;
     }
@@ -150,13 +155,14 @@ fn main() -> Result<(), String> {
     };
     let perf_pass = ratio < 0.25;
 
-    println!("prefix_tokens={}", prefix.len());
+    println!("prefix_tokens={} reuse_existing={reuse_existing}", prefix.len());
     println!("cache_dir={}", store.root().display());
     println!("cache_file={}", write.path.display());
     println!(
-        "cache_payload={:.2} MiB file={:.2} MiB write_fsync={write_ms:.2} ms",
+        "cache_payload={:.2} MiB file={:.2} MiB write_fsync={write_ms:.2} ms already_existed={}",
         write.payload_bytes as f64 / (1024.0 * 1024.0),
         write.file_bytes as f64 / (1024.0 * 1024.0),
+        write.already_existed,
     );
     println!(
         "cold_prefix={cold_prefix_ms:.2} ms warmed_replay={replay_ms:.2} ms"
