@@ -9,6 +9,9 @@
 
 use logan_format::package::Package;
 
+pub mod snapshot;
+pub use snapshot::QwenStateSnapshot;
+
 /// One planned expert load: the exact record identity + absolute stream
 /// regions the validated plan resolved. The runtime performs the MetalIO
 /// load from this alone — no manifest/record lookups, no `recs.first()`,
