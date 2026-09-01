@@ -1,3 +1,4 @@
+# one-shot cleanup; self-deletes after materializing the narrow diff
 name: Cleanup Qwen4 materialization
 
 on:
