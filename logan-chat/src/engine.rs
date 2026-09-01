@@ -12,6 +12,15 @@ use logan_qwen4::plan::{RuntimeFeatures, RuntimeStats};
 use logan_qwen4::{load_cfg, Cfg, Model};
 use tokenizers::Tokenizer;
 
+/// Qwen3.8-Flash-Next's official non-thinking assistant generation prefix.
+///
+/// The model's chat template does not start generation directly after
+/// `<|im_start|>assistant\n`. Even with thinking disabled it emits an empty
+/// think block first. Omitting this prefix puts the model off-distribution and
+/// can produce multilingual/token-salad output from the first generated token.
+const ASSISTANT_NON_THINKING_PREFIX: &str =
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
 #[derive(Clone, Debug)]
 pub struct GenerationSettings {
     pub max_new: usize,
@@ -23,12 +32,15 @@ pub struct GenerationSettings {
 
 impl Default for GenerationSettings {
     fn default() -> Self {
+        // Qwen3.8-Flash-Next published non-thinking sampling defaults, except
+        // presence_penalty (not implemented in Logan's sampler yet). Keep the
+        // repeat penalty neutral rather than substituting a different penalty.
         Self {
             max_new: 256,
             temperature: 0.7,
-            top_p: 0.9,
-            top_k: 40,
-            repeat_penalty: 1.05,
+            top_p: 0.8,
+            top_k: 20,
+            repeat_penalty: 1.0,
         }
     }
 }
@@ -260,21 +272,15 @@ impl ChatWorker {
     }
 
     fn system_prefix(&self) -> String {
-        format!("<|im_start|>system\n{}<|im_end|>\n", self.system_prompt)
+        render_system_prefix(&self.system_prompt)
     }
 
     fn first_user_suffix(&self, user: &str) -> String {
-        format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            user
-        )
+        render_first_user_suffix(user)
     }
 
     fn continuation_prompt(&self, user: &str) -> String {
-        format!(
-            "\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            user
-        )
+        render_continuation_prompt(user)
     }
 
     fn run_turn(
@@ -287,15 +293,15 @@ impl ChatWorker {
         if user.trim().is_empty() {
             return Ok(());
         }
+
         let turn_t0 = Instant::now();
         let mut stats_before = self.model.runtime_stats();
         let live_reused = self.position;
         let mut forward_tokens = 0usize;
 
-        // Consume the final generated token / chat terminator from the previous
-        // turn only when another turn actually begins. This removes a full
-        // model forward from end-of-response latency while keeping live state
-        // causal when the conversation continues.
+        // The final sampled token (and possibly <|im_end|>) is deliberately
+        // not forwarded at response end. Consume it only when another turn
+        // arrives so end-of-response latency does not pay a useless forward.
         for token in std::mem::take(&mut self.pending) {
             if self.position >= self.model.context_limit() {
                 return Err("context is full; use /clear before continuing".into());
@@ -351,9 +357,7 @@ impl ChatWorker {
         }
 
         // First-turn system state is a high-value semantic checkpoint shared by
-        // every new chat using the same system prompt. If SSD restore already
-        // passed this boundary there is nothing to do; otherwise stop exactly
-        // at it, persist, then continue into the user suffix.
+        // every new chat using the same system prompt.
         if let Some(system_end) = system_boundary {
             while self.position < system_end {
                 let token = self.tokens[self.position];
@@ -424,8 +428,6 @@ impl ChatWorker {
         let mut stop_reason = StopReason::MaxTokens;
 
         for step in 0..settings.max_new {
-            // Sampling another visible token is not useful if there is no
-            // context slot left to consume it on a future step/turn.
             if self.position >= self.model.context_limit() {
                 stop_reason = StopReason::ContextFull;
                 break;
@@ -519,6 +521,18 @@ impl ChatWorker {
     }
 }
 
+fn render_system_prefix(system: &str) -> String {
+    format!("<|im_start|>system\n{system}<|im_end|>\n")
+}
+
+fn render_first_user_suffix(user: &str) -> String {
+    format!("<|im_start|>user\n{user}<|im_end|>\n{ASSISTANT_NON_THINKING_PREFIX}")
+}
+
+fn render_continuation_prompt(user: &str) -> String {
+    format!("\n<|im_start|>user\n{user}<|im_end|>\n{ASSISTANT_NON_THINKING_PREFIX}")
+}
+
 fn load_model(package: &Path, cfg: &Cfg) -> Result<Model, String> {
     let src = ColiSource::open(package)?;
     Model::load_coli(&src, cfg)
@@ -586,7 +600,7 @@ fn sample_token(
         .iter()
         .map(|(_, logit)| ((*logit - max_logit) as f64).exp())
         .collect();
-    let z: f64 = probs.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+    let z = probs.iter().sum::<f64>().max(f64::MIN_POSITIVE);
     for p in &mut probs {
         *p /= z;
     }
@@ -605,6 +619,7 @@ fn sample_token(
     }
     candidates.truncate(keep.max(1));
     probs.truncate(keep.max(1));
+
     let kept_z = probs.iter().sum::<f64>().max(f64::MIN_POSITIVE);
     let mut needle = rng.next_f64() * kept_z;
     for ((token, _), p) in candidates.iter().zip(&probs) {
@@ -645,6 +660,43 @@ impl TinyRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_non_thinking_generation_prefix_is_exact() {
+        assert_eq!(
+            ASSISTANT_NON_THINKING_PREFIX,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn first_turn_uses_qwen_non_thinking_template() {
+        assert_eq!(
+            render_system_prefix("Be concise."),
+            "<|im_start|>system\nBe concise.<|im_end|>\n"
+        );
+        assert_eq!(
+            render_first_user_suffix("Hi"),
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn continuation_starts_after_prior_im_end_newline() {
+        assert_eq!(
+            render_continuation_prompt("Again"),
+            "\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn non_thinking_sampling_defaults_match_qwen_guidance() {
+        let settings = GenerationSettings::default();
+        assert_eq!(settings.temperature, 0.7);
+        assert_eq!(settings.top_p, 0.8);
+        assert_eq!(settings.top_k, 20);
+        assert_eq!(settings.repeat_penalty, 1.0);
+    }
 
     #[test]
     fn repeat_penalty_applies_once_per_recent_token() {
