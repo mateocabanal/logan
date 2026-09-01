@@ -156,19 +156,27 @@ pub struct PrefixRestoreSummary {
 
 /// Restore the longest exact persistent prefix into an already-loaded model.
 ///
-/// This is the live-session seam used by interactive clients. A restore error
-/// is returned immediately because `restore` may have begun applying state;
-/// callers must reload a pristine model before replaying after an error.
+/// Live autoregressive clients need logits from the final prompt token to
+/// choose the first generated token, but `.lpfx` stores causal state only, not
+/// logits. Therefore this helper intentionally chooses a checkpoint STRICTLY
+/// shorter than `prompt`, guaranteeing at least one suffix token is forwarded
+/// after restore and produces the required logits.
+///
+/// A restore error is returned immediately because `restore` may have begun
+/// applying state; callers must reload a pristine model before replaying.
 pub fn restore_longest_prefix(
     model: &mut Model,
     prompt: &[u32],
 ) -> Result<Option<PrefixRestoreSummary>, String> {
-    if !auto_prefix_cache_enabled() || prompt.is_empty() {
+    if !auto_prefix_cache_enabled() || prompt.len() < 2 {
         return Ok(None);
     }
     let store = PrefixCacheStore::from_env()?;
     let salt = cache_salt();
-    let Some(key) = candidate_keys(&store, model, prompt, &salt)?.into_iter().next() else {
+    let Some(key) = candidate_keys(&store, model, prompt, &salt)?
+        .into_iter()
+        .find(|key| key.prefix_len() < prompt.len())
+    else {
         return Ok(None);
     };
     let stats = store.restore(model, &key)?;
