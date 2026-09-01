@@ -1,0 +1,34 @@
+name: add-low-space-journal
+
+on:
+  push:
+    branches:
+      - fix/true-low-space-inplace-recompile
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/true-low-space-inplace-recompile
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply journal patch
+        run: python3 tools/zz_add_lowspace_journal.py
+      - name: Format recompiler only
+        run: rustfmt --edition 2024 logan-compiler/src/recompile.rs
+      - name: Test compiler
+        run: cargo test -p logan-compiler --all-targets
+      - name: Commit journal patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add logan-compiler/src/recompile.rs
+          git rm -f tools/zz_add_lowspace_journal.py .github/workflows/zz-add-lowspace-journal.yml || true
+          git commit -m 'fix: journal low-space in-place recompilation'
+          git push origin HEAD:fix/true-low-space-inplace-recompile
