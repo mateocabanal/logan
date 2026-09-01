@@ -1244,6 +1244,7 @@ impl Model {
         let vdim = vd * vheads;
         let cdim = kdim * 2 + vdim;
         let kk = c.conv_kernel;
+        let profile_gdn_parts = logan_core::telemetry::enabled();
 
         // One-time aligned re-home (C calloc_checked/coli_wt intercept): move
         // the five BF16 GDN matrices into 16 KiB-aligned buffers so Metal can
@@ -1329,6 +1330,7 @@ impl Model {
         let mut a = vec![0.0; vheads];
         let mut b = vec![0.0; vheads];
         let mut z = vec![0.0; vdim];
+        let gdn_in_t0 = profile_gdn_parts.then(std::time::Instant::now);
 
         if let Some(gm) = self.gdn_metal[li].as_ref() {
             // SAFETY: GdnMetalLayer owns every aligned allocation for the
@@ -1369,7 +1371,11 @@ impl Model {
             matmul(&mut b, x, &layer.gdn_in_b);
             matmul(&mut z, x, &layer.gdn_in_z);
         }
+        if let Some(t0) = gdn_in_t0 {
+            self.spans.gdn_in_proj_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
 
+        let gdn_conv_t0 = profile_gdn_parts.then(std::time::Instant::now);
         let mut y = vec![0.0; cdim];
         if kk > 1 {
             // build_gdn_metal() is also the single-copy BF16 re-home on Apple,
@@ -1404,7 +1410,11 @@ impl Model {
                 y[ch] = silu(layer.gdn_conv1d[ch] * qkv[ch]);
             }
         }
+        if let Some(t0) = gdn_conv_t0 {
+            self.spans.gdn_conv_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
 
+        let gdn_prepare_t0 = profile_gdn_parts.then(std::time::Instant::now);
         let q_ = &y[..kdim];
         let k_ = &y[kdim..kdim * 2];
         let v_ = &y[kdim * 2..];
@@ -1430,7 +1440,11 @@ impl Model {
                 qh[h * kd + d] *= sc;
             }
         }
+        if let Some(t0) = gdn_prepare_t0 {
+            self.spans.gdn_prepare_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
 
+        let gdn_recur_t0 = profile_gdn_parts.then(std::time::Instant::now);
         let state_len = vheads * kd * vd;
         {
             // Same recurrence and reduction order as the previous snew path,
@@ -1479,7 +1493,11 @@ impl Model {
                 }
             }
         }
+        if let Some(t0) = gdn_recur_t0 {
+            self.spans.gdn_recur_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
 
+        let gdn_gate_t0 = profile_gdn_parts.then(std::time::Instant::now);
         let mut normed = vec![0.0; vdim];
         for h in 0..vheads {
             rmsnorm_gated_row(
@@ -1491,6 +1509,11 @@ impl Model {
                 c.output_gate,
             );
         }
+        if let Some(t0) = gdn_gate_t0 {
+            self.spans.gdn_gate_ms += t0.elapsed().as_secs_f64() * 1e3;
+        }
+
+        let gdn_out_t0 = profile_gdn_parts.then(std::time::Instant::now);
         if let Some(gm) = self.gdn_metal[li].as_ref() {
             // SAFETY: model-lifetime aligned BF16 storage.
             unsafe {
@@ -1504,6 +1527,9 @@ impl Model {
             }
         } else {
             matmul(out, &normed, &layer.gdn_out);
+        }
+        if let Some(t0) = gdn_out_t0 {
+            self.spans.gdn_out_proj_ms += t0.elapsed().as_secs_f64() * 1e3;
         }
     }
 
@@ -1536,16 +1562,20 @@ impl Model {
         let mut index_qk = None;
         let mut metal_ok = false;
 
-        if self.attn_metal[li].is_none() && !layer.is_gdn && crate::ffi::direct_available() {
+        let metal_enabled = std::env::var("QWEN_ATTN_METAL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
+        if metal_enabled
+            && self.attn_metal[li].is_none()
+            && !layer.is_gdn
+            && crate::ffi::direct_available()
+        {
             self.attn_metal[li] = Self::build_attn_metal(layer, &self.cfg);
         }
 
         if let Some(am) = self.attn_metal[li].as_ref() {
-            let gate = std::env::var("QWEN_ATTN_METAL")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-
-            if gate {
+            if metal_enabled {
                 // Only include index rows when this QSA layer actually has
                 // them packed. Otherwise retain Metal QKV and calculate the
                 // index projection on the CPU below.

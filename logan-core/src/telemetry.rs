@@ -18,6 +18,18 @@ pub struct TokenSpans {
     pub fill_ms: f64,
     /// GDN layer phase (Metal direct calls + CPU fallback), ms.
     pub gdn_ms: f64,
+    /// GDN input dense projections (qkv + z + a + b), ms.
+    pub gdn_in_proj_ms: f64,
+    /// GDN depthwise convolution + conv-state update, ms.
+    pub gdn_conv_ms: f64,
+    /// GDN q/k expansion, L2 normalization, and q scaling, ms.
+    pub gdn_prepare_ms: f64,
+    /// GDN recurrent-state decay/update/readout, ms.
+    pub gdn_recur_ms: f64,
+    /// GDN gated RMSNorm/output gate, ms.
+    pub gdn_gate_ms: f64,
+    /// GDN output dense projection, ms.
+    pub gdn_out_proj_ms: f64,
     /// Full-attention/QSA layer phase, ms.
     pub attn_ms: f64,
     /// Hyper-connection mixer phase (both hc_mix calls per layer), ms.
@@ -98,7 +110,7 @@ pub fn emit_request_summary(
         return;
     }
     eprintln!(
-        "logan profile: tokens={tokens} route={:.1} io={:.1} shared={:.1} gpu={:.1} fill={:.1} gdn={:.1} attn={:.1} hc={:.1} head={:.1} total={:.1} ms/tok | cache hits={cache_hits} misses={cache_misses} | gdn_metal_ok={} | metal encode={} submit={} wait={} kernel={} ns fused_calls={} fused_experts={} | mio loads={} bytes={} waits={} fails={}",
+        "logan profile: tokens={tokens} route={:.1} io={:.1} shared={:.1} gpu={:.1} fill={:.1} gdn={:.1} attn={:.1} hc={:.1} head={:.1} total={:.1} ms/tok | gdn_parts in={:.1} conv={:.1} prep={:.1} recur={:.1} gate={:.1} out={:.1} | cache hits={cache_hits} misses={cache_misses} | gdn_metal_ok={} | metal encode={} submit={} wait={} kernel={} ns fused_calls={} fused_experts={} | mio loads={} bytes={} waits={} fails={}",
         spans.route_ms / tokens.max(1) as f64,
         spans.io_ms / tokens.max(1) as f64,
         spans.shared_ms / tokens.max(1) as f64,
@@ -109,6 +121,12 @@ pub fn emit_request_summary(
         spans.hc_ms / tokens.max(1) as f64,
         spans.head_ms / tokens.max(1) as f64,
         spans.total_ms / tokens.max(1) as f64,
+        spans.gdn_in_proj_ms / tokens.max(1) as f64,
+        spans.gdn_conv_ms / tokens.max(1) as f64,
+        spans.gdn_prepare_ms / tokens.max(1) as f64,
+        spans.gdn_recur_ms / tokens.max(1) as f64,
+        spans.gdn_gate_ms / tokens.max(1) as f64,
+        spans.gdn_out_proj_ms / tokens.max(1) as f64,
         spans.gdn_metal_ok,
         metal.encode_ns,
         metal.submit_ns,
@@ -163,6 +181,7 @@ mod tests {
             head_ms: 0.0,
             gdn_metal_ok: 0,
             total_ms: 52.0,
+            ..Default::default()
         };
         let metal = MetalCounters {
             mio_loads: 61,
