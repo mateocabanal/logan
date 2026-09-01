@@ -27,6 +27,22 @@ on:
   workflow_dispatch:
 
 jobs:
+  ir:
+    name: logan-ir (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Test Logan IR
+        run: cargo test -p logan-ir --all-targets
+
   test:
     name: logan (${{ matrix.os }})
     strategy:
