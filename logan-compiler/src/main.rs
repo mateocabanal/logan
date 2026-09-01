@@ -284,8 +284,24 @@ fn run() -> logan_compiler::Result<()> {
                 .and_then(|v| v.get("model_type").and_then(|t| t.as_str()).map(str::to_owned))
                 .unwrap_or_else(|| "qwen4_exp_text".to_string());
             let out = match model_type.as_str() {
-                "qwen4_exp_text" | "qwen4_exp" => logan_qwen4::run_greedy(&package, &prompt_ids, max_new)
-                    .map_err(|e| logan_compiler::ColicError::Unsupported { stage: "run", detail: e })?,
+                "qwen4_exp_text" | "qwen4_exp" => {
+                    let cfg = logan_qwen4::load_cfg(&cfg_path).map_err(|e| {
+                        logan_compiler::ColicError::Unsupported {
+                            stage: "run",
+                            detail: e,
+                        }
+                    })?;
+                    logan_qwen4::plan::run_greedy_cached_coli(
+                        &package,
+                        &cfg,
+                        &prompt_ids,
+                        max_new,
+                    )
+                    .map_err(|e| logan_compiler::ColicError::Unsupported {
+                        stage: "run",
+                        detail: e,
+                    })?
+                }
                 _ => {
                     // Default to the Qwen3 MoE engine for other qwen model
                     // types; unknown architectures are reported honestly.
