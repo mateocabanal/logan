@@ -10,17 +10,18 @@
 use logan_format::package::Package;
 
 pub mod prefix_cache;
+pub mod prefix_runtime;
 pub mod snapshot;
 pub use prefix_cache::{
     digest_hex, live_prefix_state_digest, CacheRestoreStats, CacheWriteStats, PrefixCacheKey,
     PrefixCacheStore,
 };
+pub use prefix_runtime::{auto_prefix_cache_enabled, run_greedy_cached_coli};
 pub use snapshot::QwenStateSnapshot;
 
 /// One planned expert load: the exact record identity + absolute stream
 /// regions the validated plan resolved. The runtime performs the MetalIO
-/// load from this alone — no manifest/record lookups, no `recs.first()`,
-/// no layout math at miss time.
+/// load from this alone — no manifest/record lookups, no layout math at miss time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedExpert {
     pub shard_id: u32,
