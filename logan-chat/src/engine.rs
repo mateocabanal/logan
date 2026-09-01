@@ -183,15 +183,17 @@ struct ChatWorker {
     system_prompt: String,
     im_end_id: u32,
     eos_id: Option<u32>,
-    /// Logical chat token history. This intentionally does not contain the
-    /// synthetic decode-driver repeats described below.
+    /// Logical chat token history.
     tokens: Vec<u32>,
     /// Number of logical `tokens` already consumed by the model.
     consumed: usize,
-    /// Next physical model position. This can exceed `consumed` because
-    /// Logan's validated Qwen4 decode driver repeats the final prompt token at
-    /// the first decode position without adding that repeat to logical history.
+    /// Next physical model position. In the corrected causal driver this
+    /// advances one-for-one with consumed logical tokens.
     position: usize,
+    /// Logits emitted by the most recently consumed logical token. These are
+    /// the logits that predict the NEXT token; keeping them avoids replaying
+    /// the final prompt token at a synthetic duplicate position.
+    last_logits: Option<Vec<f32>>,
     turns: usize,
     rng: TinyRng,
 }
@@ -243,6 +245,7 @@ impl ChatWorker {
             tokens: Vec::new(),
             consumed: 0,
             position: 0,
+            last_logits: None,
             turns: 0,
             rng: TinyRng::new(),
         })
@@ -255,6 +258,7 @@ impl ChatWorker {
         self.tokens.clear();
         self.consumed = 0;
         self.position = 0;
+        self.last_logits = None;
         self.turns = 0;
         Ok(())
     }
@@ -263,6 +267,7 @@ impl ChatWorker {
         self.model = load_model(&self.package, &self.cfg)?;
         self.consumed = 0;
         self.position = 0;
+        self.last_logits = None;
         Ok(())
     }
 
@@ -295,7 +300,7 @@ impl ChatWorker {
                 .tokens
                 .get(self.consumed)
                 .ok_or_else(|| "logical/model cursor drift".to_string())?;
-            self.model.forward_token(token as usize, self.position);
+            self.last_logits = Some(self.model.forward_token(token as usize, self.position));
             self.consumed += 1;
             self.position += 1;
             forwards += 1;
@@ -319,9 +324,8 @@ impl ChatWorker {
         let live_reused = self.consumed;
         let mut forward_tokens = 0usize;
 
-        // Consume the last sampled token / terminator left outstanding by the
-        // previous turn. `consumed`, rather than model position, indexes logical
-        // history because the canonical decode driver inserts synthetic repeats.
+        // Consume any sampled token / turn terminator left outstanding by the
+        // previous turn so the live recurrent/KV state exactly matches history.
         forward_tokens += self.consume_logical_until(self.tokens.len())?;
 
         let (input_ids, system_boundary) = if self.turns == 0 {
@@ -347,6 +351,10 @@ impl ChatWorker {
                     cache_restore_ms = hit.restore_ms;
                     self.consumed = hit.cached_tokens;
                     self.position = hit.cached_tokens;
+                    // Prefix files contain causal state but no logits. The
+                    // restore helper guarantees a strict prefix, so consuming
+                    // the remaining suffix below will repopulate last_logits.
+                    self.last_logits = None;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -370,9 +378,9 @@ impl ChatWorker {
             ));
         }
 
-        // First-turn system state is a high-value checkpoint and still has a
-        // one-to-one logical-token/model-position mapping, so it is safe to
-        // persist using the normal prefix cache format.
+        // First-turn system state is a high-value checkpoint. Causal state and
+        // logical position are one-to-one, so the ordinary prefix format is
+        // exact and reusable.
         if let Some(system_end) = system_boundary {
             if self.consumed < system_end {
                 forward_tokens += self.consume_logical_until(system_end)?;
@@ -396,11 +404,8 @@ impl ChatWorker {
         let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1e3;
         let prompt_forward_tokens = forward_tokens;
 
-        // A normal prefix snapshot is only valid while logical and physical
-        // positions are identical. After the first canonical decode bootstrap,
-        // live chat state contains synthetic driver positions, so later-turn SSD
-        // persistence is intentionally skipped rather than writing a subtly
-        // inconsistent checkpoint.
+        // Persist the exact completed prompt before generation. Unlike the old
+        // synthetic-repeat driver, logical and physical positions remain equal.
         if self.position == self.consumed {
             match persist_prefix_boundary(&self.model, &self.tokens) {
                 Ok(Some(write)) if !write.already_existed => {
@@ -430,22 +435,13 @@ impl ChatWorker {
             metrics: metrics.clone(),
         });
 
-        // IMPORTANT: mirror Logan's validated Qwen4 greedy driver exactly.
-        // `run_greedy_cached_coli()` prefills every prompt token, then forwards
-        // the final prompt token AGAIN at position prompt.len() and uses those
-        // logits for the first generated token. The TUI previously sampled the
-        // logits returned by the final prefill forward, which does not match the
-        // runtime's passing token-identity path and produced garbage text.
-        let last_prompt = *self
-            .tokens
-            .last()
-            .ok_or_else(|| "chat prompt produced no tokens".to_string())?;
-        if self.position >= self.model.context_limit() {
-            return Err("context is full before decode bootstrap".into());
-        }
-        let mut logits = self.model.forward_token(last_prompt as usize, self.position);
-        self.position += 1;
-        forward_tokens += 1;
+        // Causal-LM decode starts from logits emitted by the FINAL prompt
+        // token. Refeeding that token at prompt.len() duplicates it in the
+        // recurrent/KV state and changes the model's context.
+        let mut logits = self
+            .last_logits
+            .take()
+            .ok_or_else(|| "chat prompt produced no final-token logits".to_string())?;
 
         let generation_t0 = Instant::now();
         let tokenizer = self.tokenizer.clone();
@@ -518,9 +514,8 @@ impl ChatWorker {
                 break;
             }
 
-            // The just-sampled token is the next outstanding logical token.
-            // Consume it at the next physical model position before sampling
-            // again, exactly like the canonical greedy loop's `last = next`.
+            // Consume the just-sampled token at its real logical/physical
+            // position to obtain logits for the following token.
             logits = self.model.forward_token(next as usize, self.position);
             self.position += 1;
             self.consumed += 1;
