@@ -9,7 +9,12 @@
 
 use logan_format::package::Package;
 
+pub mod prefix_cache;
 pub mod snapshot;
+pub use prefix_cache::{
+    digest_hex, live_prefix_state_digest, CacheRestoreStats, CacheWriteStats, PrefixCacheKey,
+    PrefixCacheStore,
+};
 pub use snapshot::QwenStateSnapshot;
 
 /// One planned expert load: the exact record identity + absolute stream

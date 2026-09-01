@@ -147,6 +147,7 @@ dependencies = [
  "logan-format",
  "logan-metal",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
