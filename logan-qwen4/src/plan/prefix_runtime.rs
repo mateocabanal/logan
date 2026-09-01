@@ -30,7 +30,6 @@ fn set_if_unset(name: &str, value: &str) {
 /// runners/tests that need to establish policy before model construction.
 pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_GDN_SINGLE_COPY", "1");
-    set_if_unset("QWEN_ATTN_METAL", "1");
     set_if_unset("QWEN_QSA_INDEX_METAL", "1");
     set_if_unset("QWEN_APPLE8_DIRECT", "1");
     set_if_unset("QWEN_APPLE8_OVERLAP", "1");
@@ -38,13 +37,20 @@ pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_PREFIX_CACHE", "1");
     set_if_unset("QWEN_PREFIX_CACHE_WRITE", "1");
 
-    // Measured Apple Silicon winner: BNNS BF16 dense execution beats the
-    // current Metal GDN path while preserving exact greedy output.
+    // Measured Apple Silicon winners: BNNS BF16 dense execution beats the
+    // current Metal GDN path, and the generic Metal BF16 attention path pays
+    // synchronous weight-buffer staging/waits that are substantially slower
+    // than BNNS at decode batch S=1. Explicit env values remain authoritative.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         set_if_unset("QWEN_BNNS_BF16", "1");
         set_if_unset("QWEN_GDN_METAL", "0");
+        set_if_unset("QWEN_ATTN_METAL", "0");
     }
+
+    // Non-Apple targets keep the existing generic Metal-attention policy.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    set_if_unset("QWEN_ATTN_METAL", "1");
 }
 
 /// Automatic prefix caching is default-on after real-model validation. Set
