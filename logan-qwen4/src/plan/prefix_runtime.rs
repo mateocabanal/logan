@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::colisource::ColiSource;
 use crate::{Cfg, Model};
 
-use super::{PrefixCacheKey, PrefixCacheStore};
+use super::{CacheWriteStats, PrefixCacheKey, PrefixCacheStore};
 
 fn set_if_unset(name: &str, value: &str) {
     if std::env::var_os(name).is_none() {
@@ -26,7 +26,8 @@ fn set_if_unset(name: &str, value: &str) {
 
 /// Apply the fastest configuration that has already passed real-model A/B
 /// validation. Explicit user values always win, so every path remains opt-out.
-fn apply_max_performance_defaults() {
+/// Interactive/library clients should call this before `Model::load_coli`.
+pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_GDN_SINGLE_COPY", "1");
     set_if_unset("QWEN_ATTN_METAL", "1");
     set_if_unset("QWEN_QSA_INDEX_METAL", "1");
@@ -144,6 +145,58 @@ fn candidate_keys(
         }
     }
     Ok(out)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PrefixRestoreSummary {
+    pub cached_tokens: usize,
+    pub restore_ms: f64,
+    pub payload_bytes: u64,
+}
+
+/// Restore the longest exact persistent prefix into an already-loaded model.
+///
+/// This is the live-session seam used by interactive clients. A restore error
+/// is returned immediately because `restore` may have begun applying state;
+/// callers must reload a pristine model before replaying after an error.
+pub fn restore_longest_prefix(
+    model: &mut Model,
+    prompt: &[u32],
+) -> Result<Option<PrefixRestoreSummary>, String> {
+    if !auto_prefix_cache_enabled() || prompt.is_empty() {
+        return Ok(None);
+    }
+    let store = PrefixCacheStore::from_env()?;
+    let salt = cache_salt();
+    let Some(key) = candidate_keys(&store, model, prompt, &salt)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let stats = store.restore(model, &key)?;
+    Ok(Some(PrefixRestoreSummary {
+        cached_tokens: key.prefix_len(),
+        restore_ms: stats.total.as_secs_f64() * 1e3,
+        payload_bytes: stats.payload_bytes,
+    }))
+}
+
+/// Persist an exact completed prompt boundary for future process/session reuse.
+/// Existing immutable entries are cheap no-ops. Returns `None` when writes are
+/// disabled or the boundary is below the configured minimum length.
+pub fn persist_prefix_boundary(
+    model: &Model,
+    prompt: &[u32],
+) -> Result<Option<CacheWriteStats>, String> {
+    if !auto_prefix_cache_enabled()
+        || !writes_enabled()
+        || prompt.is_empty()
+        || prompt.len() < min_persist_tokens()
+    {
+        return Ok(None);
+    }
+    let store = PrefixCacheStore::from_env()?;
+    let salt = cache_salt();
+    let key = PrefixCacheKey::with_salt(model, prompt, &salt)?;
+    store.store(model, &key).map(Some)
 }
 
 /// Normal .coli greedy path with automatic persistent prefix reuse.
