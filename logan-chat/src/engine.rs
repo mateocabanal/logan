@@ -98,7 +98,7 @@ pub enum EngineEvent {
         metrics: TurnMetrics,
     },
     Token {
-        text: String,
+        chunk: String,
         token_id: u32,
         metrics: TurnMetrics,
         stats: RuntimeStats,
@@ -259,12 +259,6 @@ impl ChatWorker {
             .map_err(|e| format!("tokenize: {e}"))
     }
 
-    fn decode(&self, ids: &[u32]) -> Result<String, String> {
-        self.tokenizer
-            .decode(ids, true)
-            .map_err(|e| format!("decode: {e}"))
-    }
-
     fn system_prefix(&self) -> String {
         format!("<|im_start|>system\n{}<|im_end|>\n", self.system_prompt)
     }
@@ -422,8 +416,10 @@ impl ChatWorker {
             return Err("chat prompt produced no logits".into());
         };
         let generation_t0 = Instant::now();
-        let mut generated = Vec::with_capacity(settings.max_new);
+        let tokenizer = self.tokenizer.clone();
+        let mut decode_stream = tokenizer.decode_stream(true);
         let mut text = String::new();
+        let mut generated_tokens = 0usize;
         let mut first_token_seen = false;
         let mut stop_reason = StopReason::MaxTokens;
 
@@ -455,22 +451,26 @@ impl ChatWorker {
                 break;
             }
 
-            generated.push(next);
             self.tokens.push(next);
-            text = self.decode(&generated)?;
+            generated_tokens += 1;
+            let chunk = decode_stream
+                .step(next)
+                .map_err(|e| format!("decode token {next}: {e}"))?
+                .unwrap_or_default();
+            text.push_str(&chunk);
 
             if !first_token_seen {
                 metrics.first_token_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
                 first_token_seen = true;
             }
-            metrics.generated_tokens = generated.len();
+            metrics.generated_tokens = generated_tokens;
             metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
             metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
             metrics.context_tokens = self.tokens.len();
             metrics.forward_tokens = forward_tokens;
             let stats = self.model.runtime_stats().delta_from(&stats_before);
             let _ = events.send(EngineEvent::Token {
-                text: text.clone(),
+                chunk,
                 token_id: next,
                 metrics: metrics.clone(),
                 stats,
@@ -496,7 +496,7 @@ impl ChatWorker {
         }
 
         self.turns += 1;
-        metrics.generated_tokens = generated.len();
+        metrics.generated_tokens = generated_tokens;
         metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
         metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
         metrics.context_tokens = self.tokens.len();
@@ -639,5 +639,29 @@ impl TinyRng {
 
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeat_penalty_applies_once_per_recent_token() {
+        let mut logits = vec![0.0, 4.0, -4.0];
+        apply_repeat_penalty(&mut logits, &[1, 1, 2, 2], 2.0);
+        assert_eq!(logits[1], 2.0);
+        assert_eq!(logits[2], -8.0);
+    }
+
+    #[test]
+    fn greedy_sampling_returns_max_logit() {
+        let mut logits = vec![1.0, 7.0, 3.0];
+        let settings = GenerationSettings {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut rng = TinyRng(1);
+        assert_eq!(sample_token(&mut logits, &[], &settings, &mut rng), 1);
     }
 }
