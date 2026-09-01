@@ -45,9 +45,7 @@ pub struct CpuConfig {
 impl Default for CpuConfig {
     fn default() -> Self {
         Self {
-            workers: thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            workers: thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
             queue_capacity: 64,
         }
     }
@@ -298,14 +296,11 @@ fn worker_loop(
         // jobs (the runtime path) report through the sink instead, so their
         // records never pile up undrained.
         if job.completion.is_none() || !job.retained.is_empty() {
-            completed
-                .lock()
-                .expect("completed lock")
-                .push_back(Completed {
-                    ticket: job.ticket,
-                    outcome: outcome.clone(),
-                    released: job.retained,
-                });
+            completed.lock().expect("completed lock").push_back(Completed {
+                ticket: job.ticket,
+                outcome: outcome.clone(),
+                released: job.retained,
+            });
         }
         if let Some(sink) = &job.completion {
             report_to_sink(&pending_sink, sink, job.ticket, outcome);
@@ -333,11 +328,10 @@ fn report_to_sink(
                 thread::yield_now();
             }
             Err(CompletionSendError::Full) => {
-                pending.lock().expect("pending sink lock").push_back((
-                    sink.clone(),
-                    ticket,
-                    outcome,
-                ));
+                pending
+                    .lock()
+                    .expect("pending sink lock")
+                    .push_back((sink.clone(), ticket, outcome));
                 return;
             }
             Err(CompletionSendError::Closed) => return,
@@ -403,19 +397,13 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        assert_eq!(
-            all.len(),
-            count,
-            "timed out waiting for {count} completions"
-        );
+        assert_eq!(all.len(), count, "timed out waiting for {count} completions");
         all
     }
 
     #[test]
     fn default_worker_count_is_machine_derived_and_config_is_validated() {
-        let expected = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let expected = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         assert_eq!(CpuConfig::default().workers, expected);
         assert!(CpuConfig::default().queue_capacity > 0);
         let handler = ok_handler();
@@ -460,10 +448,7 @@ mod tests {
         }
         let completed = wait_for_completions(&executor, 5);
         let tickets: Vec<_> = completed.iter().map(|record| record.ticket).collect();
-        assert_eq!(
-            tickets,
-            vec![Ticket(0), Ticket(1), Ticket(2), Ticket(3), Ticket(4)]
-        );
+        assert_eq!(tickets, vec![Ticket(0), Ticket(1), Ticket(2), Ticket(3), Ticket(4)]);
         assert!(completed.iter().all(|record| record.outcome == Outcome::Ok));
         assert!(completed.iter().all(|record| record.released.is_empty()));
         // Every ticket completes exactly once: a second drain is empty.
@@ -565,11 +550,9 @@ mod tests {
         gate.store(true, AtomicOrdering::SeqCst);
         // Only the running jobs report; the cancelled ones never run.
         let completed = wait_for_completions(&executor, 2);
-        assert!(
-            completed
-                .iter()
-                .all(|record| { record.ticket == Ticket(0) || record.ticket == Ticket(1) })
-        );
+        assert!(completed.iter().all(|record| {
+            record.ticket == Ticket(0) || record.ticket == Ticket(1)
+        }));
         assert_eq!(
             executor.drain_completed().len(),
             0,
@@ -656,10 +639,7 @@ mod tests {
             },
             pool,
         };
-        let load = match residency
-            .begin_load(expert.clone(), 40, SessionId(1))
-            .unwrap()
-        {
+        let load = match residency.begin_load(expert.clone(), 40, SessionId(1)).unwrap() {
             LoadDisposition::Started { load_id } => load_id,
             other => panic!("unexpected {other:?}"),
         };
@@ -717,11 +697,9 @@ mod tests {
         assert_eq!(completed[0].outcome, Outcome::Ok);
         assert_eq!(completed[0].released.len(), 1);
         let effects = core.complete(ticket, Outcome::Ok).unwrap();
-        assert!(
-            effects
-                .iter()
-                .any(|effect| { matches!(effect, Effect::Wake { session: id } if *id == session) })
-        );
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::Wake { session: id } if *id == session)
+        }));
         assert_eq!(core.total_inflight(), 0);
 
         // Lease release on the scheduler side: unpinned, evictable, whole.

@@ -144,34 +144,21 @@ mod tests {
     fn caps_route_by_accepted_action_kind() {
         let mut registry = DeviceRegistry::new();
         registry
-            .register(target(
-                5,
-                DeviceKind::Gpu,
-                vec![ActionKind::Cpu, ActionKind::Accelerator],
-            ))
+            .register(target(5, DeviceKind::Gpu, vec![ActionKind::Cpu, ActionKind::Accelerator]))
             .unwrap();
         registry
             .register(target(3, DeviceKind::Cpu, vec![ActionKind::Cpu]))
             .unwrap();
         // Ascending id order: CPU-only device wins the CPU route.
+        assert_eq!(registry.find_capable(ActionKind::Cpu).unwrap().device, DeviceId(3));
         assert_eq!(
-            registry.find_capable(ActionKind::Cpu).unwrap().device,
-            DeviceId(3)
-        );
-        assert_eq!(
-            registry
-                .find_capable(ActionKind::Accelerator)
-                .unwrap()
-                .device,
+            registry.find_capable(ActionKind::Accelerator).unwrap().device,
             DeviceId(5)
         );
         assert_eq!(registry.find_capable(ActionKind::Io), None);
         // Unregister removes the route.
         registry.unregister(DeviceId(3)).unwrap();
-        assert_eq!(
-            registry.find_capable(ActionKind::Cpu).unwrap().device,
-            DeviceId(5)
-        );
+        assert_eq!(registry.find_capable(ActionKind::Cpu).unwrap().device, DeviceId(5));
     }
 
     #[test]

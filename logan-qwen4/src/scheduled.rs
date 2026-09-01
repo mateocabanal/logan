@@ -27,9 +27,9 @@ use logan_core::sched::{
         CompletionDisposition, DeviceId, ExpertKey, LoadCompletion, LoadDisposition, LoadResult,
         MemoryPoolId, RepresentationKey, ResidencyManager, ResidencyState,
     },
-    Action, ActionKind, BoundedExecutor, Budget, CompletionSendError, DispatchRequest, ExecutorSet,
-    Outcome, RuntimeConfig, RuntimeHandle, RuntimeReply, RuntimeRequest, SchedulerRuntime,
-    SubmitResult,
+    Action, ActionKind, BoundedExecutor, Budget, CompletionSendError, DispatchRequest,
+    ExecutorSet, Outcome, RuntimeConfig, RuntimeHandle, RuntimeReply, RuntimeRequest,
+    SchedulerRuntime, SubmitResult,
 };
 
 use crate::plan::Plan;
@@ -50,10 +50,7 @@ fn encode_op(kind: u8, token: usize, pos: usize) -> Vec<u8> {
 
 fn decode_op(payload: &[u8]) -> Result<(u8, usize, usize), String> {
     if payload.len() != OP_BYTES {
-        return Err(format!(
-            "invalid scheduled Qwen action: {} bytes",
-            payload.len()
-        ));
+        return Err(format!("invalid scheduled Qwen action: {} bytes", payload.len()));
     }
     let token = u64::from_le_bytes(payload[1..9].try_into().unwrap()) as usize;
     let pos = u64::from_le_bytes(payload[9..17].try_into().unwrap()) as usize;
@@ -101,9 +98,9 @@ fn execute_op(model: &mut Model, plan: &Plan, payload: &[u8]) -> Result<SchedOut
             }
         },
         (OP_LOAD, li, ei) => {
-            let planned = plan
-                .planned(li, ei)
-                .ok_or_else(|| format!("planned expert ({li},{ei}) is not in the run plan"))?;
+            let planned = plan.planned(li, ei).ok_or_else(|| {
+                format!("planned expert ({li},{ei}) is not in the run plan")
+            })?;
             model.load_expert_planned(li as i32, ei as i32, planned)?;
             Ok(SchedOutcome::Token(None))
         }
@@ -168,10 +165,7 @@ impl QwenExecutor {
                         None
                     }
                 };
-                if std::env::var("LOGAN_PROFILE")
-                    .map(|v| v != "0")
-                    .unwrap_or(false)
-                {
+                if std::env::var("LOGAN_PROFILE").map(|v| v != "0").unwrap_or(false) {
                     eprintln!(
                         "logan load: {:.1} s (package open + weights)",
                         t_open.elapsed().as_secs_f64()
@@ -216,10 +210,7 @@ fn send_completion(request: &DispatchRequest, outcome: Outcome) {
     // The runtime channel is bounded. Retry happens on this worker, never on
     // the scheduler owner; each attempt remains nonblocking.
     loop {
-        match request
-            .completion
-            .try_complete(request.ticket, outcome.clone())
-        {
+        match request.completion.try_complete(request.ticket, outcome.clone()) {
             Ok(()) | Err(CompletionSendError::Closed) => return,
             Err(CompletionSendError::Full) => thread::yield_now(),
         }
@@ -308,7 +299,10 @@ fn submit_and_complete(
         handle,
         RuntimeRequest::Submit {
             session,
-            action: Action { kind, payload },
+            action: Action {
+                kind,
+                payload,
+            },
         },
     )?;
     let ticket = match reply {
@@ -565,11 +559,7 @@ fn run_session_inner(
 /// Decode a `.coli` package through the bounded scheduler runtime
 /// (QWEN_SCHED=1). The plan is resolved once from the validated package; the
 /// worker owns the model + MetalIO; the scheduler thread never blocks on I/O.
-pub fn run_greedy_scheduled(
-    package_dir: &Path,
-    prompt: &[u32],
-    max_new: usize,
-) -> Result<Vec<u32>, String> {
+pub fn run_greedy_scheduled(package_dir: &Path, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
     let cfg = crate::load_cfg(&package_dir.join("config.json"))?;
     let coli = crate::colisource::ColiSource::open(package_dir)?;
     let plan = Arc::new(Plan::resolve(coli.pkg_ref(), cfg.layers, cfg.experts)?);
@@ -586,19 +576,12 @@ pub fn run_greedy_scheduled(
     );
     let (handle, runtime) = SchedulerRuntime::spawn(
         Budget::default(),
-        RuntimeConfig {
-            command_capacity: 64,
-        },
+        RuntimeConfig { command_capacity: 64 },
         executors,
     )
     .map_err(|error| format!("scheduler startup failed: {error:?}"))?;
     let result = run_session(&handle, &plan, &completed, prompt, max_new);
-    let shutdown = request(
-        &handle,
-        RuntimeRequest::Shutdown {
-            mode: logan_core::sched::ShutdownMode::Drain,
-        },
-    );
+    let shutdown = request(&handle, RuntimeRequest::Shutdown { mode: logan_core::sched::ShutdownMode::Drain });
     let joined = runtime.join();
     if let Err(error) = joined {
         return Err(format!("scheduler thread failed: {error:?}"));
@@ -623,28 +606,12 @@ mod tests {
         Plan {
             layers: vec![
                 vec![
-                    crate::plan::PlannedExpert {
-                        shard_id: 0,
-                        regions: size,
-                        dims: [(1, 1); 3],
-                    },
-                    crate::plan::PlannedExpert {
-                        shard_id: 1,
-                        regions: size,
-                        dims: [(1, 1); 3],
-                    },
+                    crate::plan::PlannedExpert { shard_id: 0, regions: size, dims: [(1, 1); 3] },
+                    crate::plan::PlannedExpert { shard_id: 1, regions: size, dims: [(1, 1); 3] },
                 ],
                 vec![
-                    crate::plan::PlannedExpert {
-                        shard_id: 2,
-                        regions: size,
-                        dims: [(1, 1); 3],
-                    },
-                    crate::plan::PlannedExpert {
-                        shard_id: 3,
-                        regions: size,
-                        dims: [(1, 1); 3],
-                    },
+                    crate::plan::PlannedExpert { shard_id: 2, regions: size, dims: [(1, 1); 3] },
+                    crate::plan::PlannedExpert { shard_id: 3, regions: size, dims: [(1, 1); 3] },
                 ],
             ],
             max_slot_bytes: 300,
@@ -693,9 +660,7 @@ mod tests {
         );
         let (handle, runtime) = SchedulerRuntime::spawn(
             Budget::default(),
-            RuntimeConfig {
-                command_capacity: 8,
-            },
+            RuntimeConfig { command_capacity: 8 },
             executors,
         )
         .unwrap();
@@ -708,14 +673,8 @@ mod tests {
 
     #[test]
     fn action_encoding_round_trips() {
-        assert_eq!(
-            decode_op(&encode_op(OP_DECODE, 123, 456)).unwrap(),
-            (OP_DECODE, 123, 456)
-        );
-        assert_eq!(
-            decode_op(&encode_op(OP_LOAD, 7, 9)).unwrap(),
-            (OP_LOAD, 7, 9)
-        );
+        assert_eq!(decode_op(&encode_op(OP_DECODE, 123, 456)).unwrap(), (OP_DECODE, 123, 456));
+        assert_eq!(decode_op(&encode_op(OP_LOAD, 7, 9)).unwrap(), (OP_LOAD, 7, 9));
     }
 
     #[test]
@@ -736,26 +695,15 @@ mod tests {
         let mut bridge = ResidencyBridge::new(&plan).unwrap();
         assert_eq!(bridge.state(0, 1), ResidencyState::Absent);
         // Reserve the exact planned representation.
-        let load_id = bridge
-            .request_load(session, 0, 1)
-            .unwrap()
-            .expect("started load");
+        let load_id = bridge.request_load(session, 0, 1).unwrap().expect("started load");
         assert_eq!(bridge.state(0, 1), ResidencyState::Loading { load_id });
         // Publish on successful completion.
         bridge.publish(load_id).unwrap();
-        assert!(matches!(
-            bridge.state(0, 1),
-            ResidencyState::Resident { .. }
-        ));
+        assert!(matches!(bridge.state(0, 1), ResidencyState::Resident { .. }));
         let stats = bridge.residency.pool_stats(MemoryPoolId(0)).unwrap();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.resident_bytes, 300);
-        let _ = request(
-            &handle,
-            RuntimeRequest::Shutdown {
-                mode: logan_core::sched::ShutdownMode::Cancel,
-            },
-        );
+        let _ = request(&handle, RuntimeRequest::Shutdown { mode: logan_core::sched::ShutdownMode::Cancel });
         runtime.join().unwrap();
     }
 
@@ -771,16 +719,8 @@ mod tests {
         // (V1 view has no eviction path). A re-reported cold expert must
         // NOT deadlock the driver: physical-only load, no lifecycle.
         assert!(bridge.request_load(session, 0, 1).unwrap().is_none());
-        assert!(matches!(
-            bridge.state(0, 1),
-            ResidencyState::Resident { .. }
-        ));
-        let _ = request(
-            &handle,
-            RuntimeRequest::Shutdown {
-                mode: logan_core::sched::ShutdownMode::Cancel,
-            },
-        );
+        assert!(matches!(bridge.state(0, 1), ResidencyState::Resident { .. }));
+        let _ = request(&handle, RuntimeRequest::Shutdown { mode: logan_core::sched::ShutdownMode::Cancel });
         runtime.join().unwrap();
     }
 
@@ -807,14 +747,8 @@ mod tests {
         let (io, io_rx) = scripted_pair();
         let accel = io.clone();
         let executors = ExecutorSet::new(Box::new(io), Box::new(ClosedExecutor), Box::new(accel));
-        let (handle, runtime) = SchedulerRuntime::spawn(
-            Budget::default(),
-            RuntimeConfig {
-                command_capacity: 16,
-            },
-            executors,
-        )
-        .unwrap();
+        let (handle, runtime) =
+            SchedulerRuntime::spawn(Budget::default(), RuntimeConfig { command_capacity: 16 }, executors).unwrap();
 
         // Responder thread: scripted worker. First decode block reports cold
         // expert (0,1); the load succeeds; the resubmitted decode emits 42.
@@ -831,10 +765,7 @@ mod tests {
                     (OP_DECODE, _, _) => {
                         decode_calls += 1;
                         if decode_calls == 1 {
-                            SchedOutcome::NeedExperts {
-                                layer: 0,
-                                experts: vec![1],
-                            }
+                            SchedOutcome::NeedExperts { layer: 0, experts: vec![1] }
                         } else {
                             SchedOutcome::Token(Some(42))
                         }
@@ -843,9 +774,7 @@ mod tests {
                     (kind, a, b) => panic!("unexpected scripted action ({kind},{a},{b})"),
                 };
                 completed_worker.push(dispatch.ticket, Ok(outcome));
-                let _ = dispatch
-                    .completion
-                    .try_complete(dispatch.ticket, Outcome::Ok);
+                let _ = dispatch.completion.try_complete(dispatch.ticket, Outcome::Ok);
             }
         });
 
@@ -859,10 +788,7 @@ mod tests {
 
         // The cold expert went Absent -> Loading -> Resident through the
         // ticket lifecycle, and the view saw exactly one load.
-        assert!(matches!(
-            bridge.state(0, 1),
-            ResidencyState::Resident { .. }
-        ));
+        assert!(matches!(bridge.state(0, 1), ResidencyState::Resident { .. }));
         let stats = bridge.residency.pool_stats(MemoryPoolId(0)).unwrap();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.loads_started, 1);
@@ -870,12 +796,7 @@ mod tests {
         // The token the resumed forward emitted came from the resubmitted
         // decode action, not the blocked one (covered by the script above).
 
-        let _ = request(
-            &handle,
-            RuntimeRequest::Shutdown {
-                mode: logan_core::sched::ShutdownMode::Drain,
-            },
-        );
+        let _ = request(&handle, RuntimeRequest::Shutdown { mode: logan_core::sched::ShutdownMode::Drain });
         runtime.join().unwrap();
         responder.join().unwrap();
     }
@@ -887,18 +808,12 @@ mod tests {
         // token stream exactly — the extraction/block-seam byte-identity
         // guarantee, enforced in CI. Cold loads are covered by the sim test
         // above and the real-model gate.
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/qwen4_moe_tiny");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/qwen4_moe_tiny");
         let cfg = crate::load_cfg(&dir.join("config.json")).unwrap();
         let st = crate::StFile::open(&dir.join("model.safetensors")).unwrap();
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let max_new = 8usize;
-        let canonical = crate::run_greedy_with(
-            crate::Model::load(&st, &cfg).unwrap(),
-            cfg.clone(),
-            &prompt,
-            max_new,
-        );
+        let canonical = crate::run_greedy_with(crate::Model::load(&st, &cfg).unwrap(), cfg.clone(), &prompt, max_new);
         let mut sched = crate::Model::load(&st, &cfg).unwrap();
         sched.enable_sched_mode();
         let mut out = Vec::new();

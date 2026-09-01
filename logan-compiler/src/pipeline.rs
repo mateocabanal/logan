@@ -734,9 +734,7 @@ fn check_uma_pool(
     resident_bytes: u64,
     expert_cache_bytes: u64,
 ) -> Result<u64> {
-    let pool = machine
-        .ram_bytes
-        .unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
+    let pool = machine.ram_bytes.unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
     let demand = resident_bytes
         .checked_add(expert_cache_bytes)
         .ok_or_else(|| ColicError::Usage("memory demand overflows u64".into()))?;
@@ -778,11 +776,7 @@ fn build_physical_plan(
     let mut largest_expert_decoded = 0_u64;
     for (source, record) in sources.iter().zip(records) {
         let (name, layer, expert_id, dtype, shape) = match source {
-            ExactSource::Tensor {
-                name,
-                layer,
-                tensor,
-            } => (
+            ExactSource::Tensor { name, layer, tensor } => (
                 name.clone(),
                 i32::from(*layer),
                 -1,
@@ -804,20 +798,18 @@ fn build_physical_plan(
                 largest_expert_decoded = largest_expert_decoded.max(record.decoded_bytes);
                 (
                     format!("layers.{}.ffn.experts.{}", expert.layer, expert.expert),
-                    i32::try_from(expert.layer)
-                        .map_err(|_| ColicError::Usage("expert layer exceeds i32".into()))?,
-                    i32::try_from(expert.expert)
-                        .map_err(|_| ColicError::Usage("expert id exceeds i32".into()))?,
+                    i32::try_from(expert.layer).map_err(|_| {
+                        ColicError::Usage("expert layer exceeds i32".into())
+                    })?,
+                    i32::try_from(expert.expert).map_err(|_| {
+                        ColicError::Usage("expert id exceeds i32".into())
+                    })?,
                     if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
                         KIND_APPLE8
                     } else {
                         "mxfp4"
                     },
-                    vec![
-                        3,
-                        u64::from(expert.gate.rows),
-                        u64::from(expert.gate.columns),
-                    ],
+                    vec![3, u64::from(expert.gate.rows), u64::from(expert.gate.columns)],
                 )
             }
         };
@@ -851,11 +843,9 @@ fn build_physical_plan(
             ));
         }
         match placed {
-            Placement::Resident => {
-                resident_bytes = resident_bytes
-                    .checked_add(record.decoded_bytes)
-                    .ok_or_else(|| ColicError::Usage("resident bytes overflow u64".into()))?
-            }
+            Placement::Resident => resident_bytes = resident_bytes
+                .checked_add(record.decoded_bytes)
+                .ok_or_else(|| ColicError::Usage("resident bytes overflow u64".into()))?,
             Placement::Streamed => {}
             Placement::Gpu => {}
         }
@@ -899,11 +889,7 @@ fn build_physical_plan(
         quant,
         ram_budget_bytes: pool,
     };
-    Ok(PlanArtifact::new(
-        package_fingerprint.to_string(),
-        graph,
-        memory,
-    ))
+    Ok(PlanArtifact::new(package_fingerprint.to_string(), graph, memory))
 }
 
 pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Result<()> {
@@ -1015,11 +1001,9 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
             &machine,
             &inventory.source_fingerprint,
         )?;
-        fs::write(plan_path, plan.to_bytes().map_err(ColicError::Usage)?).map_err(|source| {
-            ColicError::Io {
-                path: plan_path.clone(),
-                source,
-            }
+        fs::write(plan_path, plan.to_bytes().map_err(ColicError::Usage)?).map_err(|source| ColicError::Io {
+            path: plan_path.clone(),
+            source,
         })?;
     }
     if request.verify {

@@ -2,25 +2,15 @@ use std::path::PathBuf;
 
 use crate::{
     error::{ColicError, Result},
-    pipeline::{
-        CodecRequest, CompileRequest, OptimizationProfile, QuantFloor, QuantRequest, TargetRequest,
-    },
+    pipeline::{CodecRequest, CompileRequest, OptimizationProfile, QuantFloor, QuantRequest, TargetRequest},
 };
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    InspectSource {
-        source: PathBuf,
-    },
-    Verify {
-        package: PathBuf,
-    },
+    InspectSource { source: PathBuf },
+    Verify { package: PathBuf },
     Compile(CompileRequest),
-    Run {
-        package: std::path::PathBuf,
-        prompt: String,
-        max_new: usize,
-    },
+    Run { package: std::path::PathBuf, prompt: String, max_new: usize },
     Help,
 }
 
@@ -52,34 +42,19 @@ where
         "compile" => parse_compile(args),
         "run" => {
             let package = std::path::PathBuf::from(
-                args.next()
-                    .ok_or_else(|| ColicError::Usage("run requires PACKAGE_DIR".into()))?,
+                args.next().ok_or_else(|| ColicError::Usage("run requires PACKAGE_DIR".into()))?,
             );
             let mut prompt = String::from("1 2 3 4 5");
             let mut max_new = 16;
             let mut it = args;
             while let Some(flag) = it.next() {
                 match flag.as_str() {
-                    "--prompt" => {
-                        prompt = it
-                            .next()
-                            .ok_or_else(|| ColicError::Usage("--prompt needs a value".into()))?
-                    }
-                    "--max-new" => {
-                        max_new = it
-                            .next()
-                            .ok_or_else(|| ColicError::Usage("--max-new needs a value".into()))?
-                            .parse()
-                            .map_err(|_| ColicError::Usage("--max-new must be a number".into()))?
-                    }
+                    "--prompt" => prompt = it.next().ok_or_else(|| ColicError::Usage("--prompt needs a value".into()))?,
+                    "--max-new" => max_new = it.next().ok_or_else(|| ColicError::Usage("--max-new needs a value".into()))?.parse().map_err(|_| ColicError::Usage("--max-new must be a number".into()))?,
                     other => return Err(ColicError::Usage(format!("unknown run flag {other}"))),
                 }
             }
-            Ok(Command::Run {
-                package,
-                prompt,
-                max_new,
-            })
+            Ok(Command::Run { package, prompt, max_new })
         }
         "verify" => {
             let package = args

@@ -16,6 +16,7 @@ fn c_tree_present() -> bool {
         .is_dir()
 }
 
+
 fn temp_root() -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -74,10 +75,7 @@ fn fixture(rows: u32, columns: u32) -> PackedMatrix {
 
 #[test]
 fn rust_and_c_apple8_packers_are_byte_identical() {
-    if !c_tree_present() {
-        eprintln!("skipped: C oracle tree absent");
-        return;
-    }
+    if !c_tree_present() { eprintln!("skipped: C oracle tree absent"); return; }
     let root = temp_root();
     fs::create_dir_all(&root).unwrap();
     let oracle = compile_c_oracle(&root);

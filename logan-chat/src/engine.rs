@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use logan_qwen4::colisource::ColiSource;
@@ -9,7 +9,7 @@ use logan_qwen4::plan::prefix_runtime::{
     apply_max_performance_defaults, persist_prefix_boundary, restore_longest_prefix,
 };
 use logan_qwen4::plan::{RuntimeFeatures, RuntimeStats};
-use logan_qwen4::{Cfg, Model, load_cfg};
+use logan_qwen4::{load_cfg, Cfg, Model};
 use tokenizers::Tokenizer;
 
 /// Qwen3.8-Flash-Next's official non-thinking assistant generation prefix.
@@ -17,7 +17,8 @@ use tokenizers::Tokenizer;
 /// The model's chat template does not start generation directly after
 /// `<|im_start|>assistant\n`. Even with thinking disabled it emits an empty
 /// think block first.
-const ASSISTANT_NON_THINKING_PREFIX: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const ASSISTANT_NON_THINKING_PREFIX: &str =
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
 #[derive(Clone, Debug)]
 pub struct GenerationSettings {
@@ -144,7 +145,8 @@ pub fn spawn(package: PathBuf, system_prompt: String) -> EngineHandle {
             match command {
                 EngineCommand::Send { text, settings } => {
                     worker_cancel.store(false, Ordering::Relaxed);
-                    if let Err(error) = worker.run_turn(&text, &settings, &worker_cancel, &event_tx)
+                    if let Err(error) =
+                        worker.run_turn(&text, &settings, &worker_cancel, &event_tx)
                     {
                         let _ = event_tx.send(EngineEvent::Error(error));
                     }

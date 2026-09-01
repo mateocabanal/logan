@@ -52,27 +52,22 @@ fn main() {
             .parse()
             .unwrap();
         let t0 = std::time::Instant::now();
-        let out = if std::env::var("QWEN_SCHED")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
-            logan_qwen4::scheduled::run_greedy_scheduled(dir, &prompt, max_new).unwrap_or_else(
-                |e| {
+        let out = if std::env::var("QWEN_SCHED").map(|v| v == "1").unwrap_or(false) {
+            logan_qwen4::scheduled::run_greedy_scheduled(dir, &prompt, max_new)
+                .unwrap_or_else(|e| {
                     eprintln!("scheduled decode error: {e}");
                     std::process::exit(1);
-                },
-            )
+                })
         } else {
             // Canonical direct path. When QWEN_PREFIX_CACHE=1 (or an explicit
             // LOGAN_PREFIX_CACHE_DIR is supplied), this restores the longest
             // previously persisted request-prefix and evaluates only the
             // uncached suffix. Cache failures reload/replay from a fresh model.
-            logan_qwen4::plan::run_greedy_cached_coli(dir, &cfg, &prompt, max_new).unwrap_or_else(
-                |e| {
+            logan_qwen4::plan::run_greedy_cached_coli(dir, &cfg, &prompt, max_new)
+                .unwrap_or_else(|e| {
                     eprintln!("decode error: {e}");
                     std::process::exit(1);
-                },
-            )
+                })
         };
         if logan_core::telemetry::enabled() {
             eprintln!(

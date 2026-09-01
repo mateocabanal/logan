@@ -175,6 +175,9 @@ mod tests {
         let bytes = plan.to_bytes().unwrap();
         let back = PlanArtifact::from_bytes(&bytes).unwrap();
         assert_eq!(back.memory.placement.len(), 2);
-        assert_eq!(back.memory.quant[0].1.kind, "mxfp4-tile8x32");
+        assert_eq!(
+            back.memory.quant[0].1.kind,
+            "mxfp4-tile8x32"
+        );
     }
 }

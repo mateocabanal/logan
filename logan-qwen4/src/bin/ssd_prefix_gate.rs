@@ -5,7 +5,9 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use logan_qwen4::colisource::ColiSource;
-use logan_qwen4::plan::{digest_hex, live_prefix_state_digest, PrefixCacheKey, PrefixCacheStore};
+use logan_qwen4::plan::{
+    digest_hex, live_prefix_state_digest, PrefixCacheKey, PrefixCacheStore,
+};
 use logan_qwen4::{load_cfg, Model};
 
 fn parse_tokens(name: &str, default: &str) -> Vec<u32> {
@@ -107,8 +109,12 @@ fn main() -> Result<(), String> {
 
     let a_tail_t0 = Instant::now();
     prefill(&mut a, &suffix, prefix.len());
-    let (a_tokens, a_logits) =
-        generate_trace(&mut a, *suffix.last().unwrap(), prompt_len, new_tokens);
+    let (a_tokens, a_logits) = generate_trace(
+        &mut a,
+        *suffix.last().unwrap(),
+        prompt_len,
+        new_tokens,
+    );
     let a_tail_ms = a_tail_t0.elapsed().as_secs_f64() * 1e3;
     let uncached_e2e_ms = cold_prefix_ms + a_tail_ms;
     let a_final = live_prefix_state_digest(&a, prompt_len + new_tokens)?;
@@ -138,8 +144,12 @@ fn main() -> Result<(), String> {
 
     let c_tail_t0 = Instant::now();
     prefill(&mut c, &suffix, prefix.len());
-    let (c_tokens, c_logits) =
-        generate_trace(&mut c, *suffix.last().unwrap(), prompt_len, new_tokens);
+    let (c_tokens, c_logits) = generate_trace(
+        &mut c,
+        *suffix.last().unwrap(),
+        prompt_len,
+        new_tokens,
+    );
     let c_tail_ms = c_tail_t0.elapsed().as_secs_f64() * 1e3;
     let c_final = live_prefix_state_digest(&c, prompt_len + new_tokens)?;
 
@@ -163,10 +173,7 @@ fn main() -> Result<(), String> {
     // the cold-expert disadvantage of the restored model.
     let e2e_perf_pass = e2e_ratio < 0.80;
 
-    println!(
-        "prefix_tokens={} reuse_existing={reuse_existing}",
-        prefix.len()
-    );
+    println!("prefix_tokens={} reuse_existing={reuse_existing}", prefix.len());
     println!("cache_dir={}", store.root().display());
     println!("cache_file={}", write.path.display());
     println!(

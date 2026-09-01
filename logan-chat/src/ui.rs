@@ -1,11 +1,11 @@
-use ratatui::Frame;
 use ratatui::buffer::CellWidth;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
+use ratatui::Frame;
 
-use crate::app::{App, Role, generation_rate};
+use crate::app::{generation_rate, App, Role};
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -68,10 +68,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(
-            &app.model_name,
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(&app.model_name, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(format!("  ·  {cache}  ·  "), Style::default().fg(MUTED)),
         Span::styled(&app.status, status_style),
     ]);
@@ -107,7 +104,10 @@ fn transcript_text(app: &App) -> Text<'static> {
         };
         lines.push(Line::from(Span::styled(label, style)));
         if message.content.is_empty() && message.role == Role::Assistant && app.generating {
-            lines.push(Line::from(Span::styled("▌", Style::default().fg(ACCENT))));
+            lines.push(Line::from(Span::styled(
+                "▌",
+                Style::default().fg(ACCENT),
+            )));
         } else {
             for raw in message.content.lines() {
                 lines.push(Line::from(raw.to_string()));
@@ -252,13 +252,21 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 
     section(&mut lines, "PHASE / FORWARD");
-    kv(&mut lines, "GDN", format!("{:.1} ms", s.gdn_ms / forwards));
+    kv(
+        &mut lines,
+        "GDN",
+        format!("{:.1} ms", s.gdn_ms / forwards),
+    );
     kv(
         &mut lines,
         "attention",
         format!("{:.1} ms", s.attn_ms / forwards),
     );
-    kv(&mut lines, "HC", format!("{:.1} ms", s.hc_ms / forwards));
+    kv(
+        &mut lines,
+        "HC",
+        format!("{:.1} ms", s.hc_ms / forwards),
+    );
     kv(
         &mut lines,
         "head",
@@ -302,7 +310,11 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "attention Metal",
         yesno(app.features.attn_metal),
     );
-    kv(&mut lines, "QSA Metal", yesno(app.features.qsa_index_metal));
+    kv(
+        &mut lines,
+        "QSA Metal",
+        yesno(app.features.qsa_index_metal),
+    );
     kv(&mut lines, "GDN Metal", yesno(app.features.gdn_metal));
     kv(
         &mut lines,
@@ -314,7 +326,11 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "shared overlap",
         yesno(app.features.shared_io_overlap),
     );
-    kv(&mut lines, "prefix cache", yesno(app.features.prefix_cache));
+    kv(
+        &mut lines,
+        "prefix cache",
+        yesno(app.features.prefix_cache),
+    );
     kv(
         &mut lines,
         "cache writes",
@@ -394,7 +410,10 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         " Enter send   ↑/↓ history   PgUp/PgDn chat   Shift+PgUp/PgDn stats   F1 help   Ctrl+C quit "
     };
-    frame.render_widget(Paragraph::new(text).style(Style::default().fg(MUTED)), area);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(MUTED)),
+        area,
+    );
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {

@@ -6,7 +6,7 @@
 //! 0x0103, which is rANS-compressed tiles), and grouped INT4 (MATH 0x0022:
 //! biased signed nibbles + LE f32 scale per 32 columns).
 
-use crate::verify::{Result, invalid, usage};
+use crate::verify::{invalid, usage, Result};
 
 // ---------------------------------------------------------------------------
 // rANS256 (bit-exact port of colic/src/codec/rans256.rs decode surface)
@@ -98,10 +98,10 @@ impl RansTable {
             return invalid("invalid rANS codec/table reference");
         }
         let count = u32_at(manifest, 160)? as usize;
-        let region_offset = usize::try_from(u64_at(manifest, 168)?)
-            .map_err(|_| usage("codec table offset exceeds usize"))?;
-        let region_bytes = usize::try_from(u64_at(manifest, 176)?)
-            .map_err(|_| usage("codec table size exceeds usize"))?;
+        let region_offset =
+            usize::try_from(u64_at(manifest, 168)?).map_err(|_| usage("codec table offset exceeds usize"))?;
+        let region_bytes =
+            usize::try_from(u64_at(manifest, 176)?).map_err(|_| usage("codec table size exceeds usize"))?;
         let region_end = region_offset
             .checked_add(region_bytes)
             .ok_or_else(|| usage("codec table region overflows usize"))?;
@@ -127,10 +127,10 @@ impl RansTable {
             {
                 return invalid("invalid rANS codec table descriptor");
             }
-            let data_offset = usize::try_from(u64_at(region, desc + 16)?)
-                .map_err(|_| usage("codec table data offset exceeds usize"))?;
-            let data_bytes = usize::try_from(u64_at(region, desc + 24)?)
-                .map_err(|_| usage("codec table data size exceeds usize"))?;
+            let data_offset =
+                usize::try_from(u64_at(region, desc + 16)?).map_err(|_| usage("codec table data offset exceeds usize"))?;
+            let data_bytes =
+                usize::try_from(u64_at(region, desc + 24)?).map_err(|_| usage("codec table data size exceeds usize"))?;
             let blob_end = data_offset
                 .checked_add(data_bytes)
                 .ok_or_else(|| usage("codec table data span overflows usize"))?;
@@ -150,7 +150,9 @@ impl RansTable {
     /// bytes. Bit-exact with colic's `decode_bytes`.
     pub fn decode_record(&self, record: &[u8], expected_bytes: usize) -> Result<Vec<u8>> {
         let parsed = ParsedRansRecord::parse(record)?;
-        if parsed.packed_bytes != expected_bytes || parsed.n_symbols != expected_bytes * 2 {
+        if parsed.packed_bytes != expected_bytes
+            || parsed.n_symbols != expected_bytes * 2
+        {
             return invalid("rANS decoded length does not match matrix descriptor");
         }
         let slots = self.slot_to_symbol()?;
@@ -159,8 +161,7 @@ impl RansTable {
             let begin = parsed.offsets[stream] as usize;
             let end = parsed.offsets[stream + 1] as usize;
             let symbols = stream_symbol_count(parsed.n_symbols, stream);
-            let decoded =
-                decode_stream_checked(&parsed.payload[begin..end], symbols, self, &slots)?;
+            let decoded = decode_stream_checked(&parsed.payload[begin..end], symbols, self, &slots)?;
             for (index, symbol) in decoded.into_iter().enumerate() {
                 let logical = stream + index * RANS_N_STREAMS;
                 let byte = &mut output[logical / 2];
@@ -218,9 +219,7 @@ impl<'a> ParsedRansRecord<'a> {
         if expected != record.len() || header + payload_bytes > record.len() {
             return invalid("rANS record length mismatch");
         }
-        if record[16 + (RANS_N_STREAMS + 1) * 4..header]
-            .iter()
-            .any(|b| *b != 0)
+        if record[16 + (RANS_N_STREAMS + 1) * 4..header].iter().any(|b| *b != 0)
             || record[header + payload_bytes..].iter().any(|b| *b != 0)
         {
             return invalid("rANS record padding is nonzero");
@@ -338,8 +337,7 @@ pub fn apple8_mxfp4_decode(tiles: &[u8], rows: u64, columns: u64) -> Result<Vec<
             let tile = rt * col_tiles + ct;
             let base = (tile * APPLE8_TILE_BYTES) as usize;
             let weights = &tiles[base..base + APPLE8_WEIGHT_BYTES as usize];
-            let scales =
-                &tiles[base + APPLE8_WEIGHT_BYTES as usize..base + APPLE8_TILE_BYTES as usize];
+            let scales = &tiles[base + APPLE8_WEIGHT_BYTES as usize..base + APPLE8_TILE_BYTES as usize];
             for r in 0..APPLE8_TILE_ROWS as usize {
                 let scale = f32::from_bits(u32::from(scales[r]) << 23);
                 for c in 0..APPLE8_TILE_COLUMNS as usize {
@@ -517,18 +515,12 @@ mod tests {
 
     #[test]
     fn rans_record_rejects_truncation() {
-        let table = RansTable {
-            freq: [0; 16],
-            start: [0; 16],
-        };
+        let table = RansTable { freq: [0; 16], start: [0; 16] };
         assert!(table.decode_record(&[0; 10], 1).is_err());
         // invalid table (freqs don't sum to M) fails at slot construction
         let mut freq = [0_u32; 16];
         freq[0] = RANS_M;
-        let table = RansTable {
-            freq,
-            start: [0; 16],
-        };
+        let table = RansTable { freq, start: [0; 16] };
         assert!(table.decode_record(&[0; 1100], 1).is_err());
     }
 }
