@@ -201,7 +201,7 @@ pub fn run_greedy_cached_coli(
     // and keeping it here makes correctness simple. Async persistence can be
     // added independently after this integration is validated.
     if let Some(store) = &store {
-        if writes_enabled() && prompt.len() >= min_persist_tokens() {
+        if writes_enabled() && !prompt.is_empty() && prompt.len() >= min_persist_tokens() {
             match PrefixCacheKey::with_salt(&model, prompt, &salt)
                 .and_then(|key| store.store(&model, &key))
             {
