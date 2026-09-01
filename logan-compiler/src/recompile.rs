@@ -1,0 +1,1356 @@
+//! Offline COLI -> COLI recompilation.
+//!
+//! This path deliberately lives in the compiler rather than the runtime. It
+//! can losslessly retarget MXFP4 experts between canonical row-major storage
+//! and the Apple8 tile ABI, freshly quantize BF16 experts to MXFP4, and (only
+//! with an explicit opt-in) requantize INT4-G32 experts to MXFP4. Unaffected
+//! records are copied byte-for-byte and the original source-model fingerprint
+//! is preserved.
+
+use std::{
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
+
+use logan_format::{
+    codecs::{
+        self, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID, RANS_TABLE_ID, RansTable,
+    },
+    package::{Package, RecordInfo},
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    codec::rans256,
+    error::{ColicError, Result},
+    quant::mxfp4::{self, PackedMatrix},
+    storage::{self, LoweredRecord, ManifestRecord, PlannedRecord},
+    target::{self, TargetProfile},
+    target_registry,
+};
+
+const EXPERT_HEADER_BYTES: usize = 64;
+const EXPERT_DESC_BYTES: usize = 128;
+const EXPERT_MATRICES: usize = 3;
+const EXPERT_DATA_OFFSET: usize = EXPERT_HEADER_BYTES + EXPERT_DESC_BYTES * EXPERT_MATRICES;
+const DATA_ALIGNMENT: u64 = 16;
+const MATH_BF16: u16 = 0x0003;
+const MATH_MXFP4: u16 = 0x0020;
+const SCALE_NONE: u16 = 0x0000;
+const SCALE_E8M0: u16 = 0x0004;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantMode {
+    Keep,
+    Mxfp4,
+}
+
+impl QuantMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "keep" => Ok(Self::Keep),
+            "mxfp4" => Ok(Self::Mxfp4),
+            other => Err(ColicError::Usage(format!(
+                "unknown recompile quant mode `{other}` (expected `keep` or `mxfp4`)"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Mxfp4 => "mxfp4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecMode {
+    /// Preserve compressed bytes for records that can be copied unchanged.
+    /// Rewritten records are currently emitted raw.
+    Keep,
+    /// Rewrite supported compressed Apple8 experts as raw target-native bytes.
+    None,
+}
+
+impl CodecMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "keep" => Ok(Self::Keep),
+            "none" => Ok(Self::None),
+            other => Err(ColicError::Usage(format!(
+                "unknown recompile codec mode `{other}` (expected `keep` or `none`)"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecompileRequest {
+    pub source: PathBuf,
+    pub output: PathBuf,
+    /// `source` preserves the package profile; otherwise this is an explicit
+    /// registered target profile name. There is intentionally no env-var
+    /// override or hidden native selection in this API.
+    pub target: String,
+    pub quant: QuantMode,
+    pub codec: CodecMode,
+    pub allow_requantize: bool,
+    /// Force target-layout reconstruction even when the package already uses
+    /// the requested representation.
+    pub repack: bool,
+    pub verify: bool,
+    pub force: bool,
+}
+
+impl RecompileRequest {
+    pub fn new(source: PathBuf, output: PathBuf) -> Self {
+        Self {
+            source,
+            output,
+            target: "source".into(),
+            quant: QuantMode::Keep,
+            codec: CodecMode::Keep,
+            allow_requantize: false,
+            repack: false,
+            verify: false,
+            force: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecompileSummary {
+    pub source_profile: String,
+    pub target_profile: String,
+    pub records: usize,
+    pub copied_records: usize,
+    pub rewritten_experts: usize,
+    pub requantized_experts: usize,
+    pub source_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertTarget {
+    CanonicalMxfp4,
+    Apple8Mxfp4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixKind {
+    Bf16,
+    CanonicalMxfp4,
+    Apple8Mxfp4,
+    Int4G32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatrixDesc {
+    role: u16,
+    math: u16,
+    scale: u16,
+    weight_codec: u16,
+    scale_codec: u16,
+    layout: u16,
+    rows: u32,
+    cols: u32,
+    weight_table: u32,
+    scale_table: u32,
+    weight_offset: u64,
+    weight_stored: u64,
+    weight_decoded: u64,
+    scale_offset: u64,
+    scale_stored: u64,
+    scale_decoded: u64,
+}
+
+impl MatrixDesc {
+    fn kind(self) -> Result<MatrixKind> {
+        match (self.math, self.scale, self.layout) {
+            (MATH_BF16, SCALE_NONE, 0) => Ok(MatrixKind::Bf16),
+            (MATH_MXFP4, SCALE_E8M0, 0) => Ok(MatrixKind::CanonicalMxfp4),
+            (MATH_MXFP4, SCALE_E8M0, target_registry::APPLE8_MXFP4_TILE_LAYOUT) => {
+                Ok(MatrixKind::Apple8Mxfp4)
+            }
+            (INT4_MATH_FORMAT, INT4_SCALE_FORMAT, 0) => Ok(MatrixKind::Int4G32),
+            _ => Err(ColicError::unsupported(
+                "COLI recompilation",
+                format!(
+                    "unsupported expert matrix representation math=0x{:04x} scale=0x{:04x} layout=0x{:04x}",
+                    self.math, self.scale, self.layout
+                ),
+            )),
+        }
+    }
+
+    fn uses_rans(self) -> bool {
+        self.weight_codec == RANS_CODEC_ID || self.scale_codec == RANS_CODEC_ID
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ActionKind {
+    Copy,
+    Rewrite {
+        descs: [MatrixDesc; EXPERT_MATRICES],
+        target: ExpertTarget,
+        requantized: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct Action {
+    source: RecordInfo,
+    kind: ActionKind,
+    lowered: LoweredRecord,
+    keeps_rans_table: bool,
+}
+
+pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
+    if request.source == request.output && !request.force {
+        return Err(ColicError::Usage(
+            "recompiling in place requires --force; using a separate output path is safer".into(),
+        ));
+    }
+
+    let package = Package::open(&request.source)?;
+    let target = resolve_target(&package, &request.target)?;
+    let target_kind = if target.name == target_registry::APPLE8_PROFILE_NAME {
+        ExpertTarget::Apple8Mxfp4
+    } else {
+        ExpertTarget::CanonicalMxfp4
+    };
+
+    let mut actions = Vec::with_capacity(package.records().len());
+    let mut copied_records = 0_usize;
+    let mut rewritten_experts = 0_usize;
+    let mut requantized_experts = 0_usize;
+
+    for record in package.records() {
+        let action = plan_record(&package, record, request, target, target_kind)?;
+        match action.kind {
+            ActionKind::Copy => copied_records += 1,
+            ActionKind::Rewrite { requantized, .. } => {
+                rewritten_experts += 1;
+                if requantized {
+                    requantized_experts += 1;
+                }
+            }
+        }
+        actions.push(action);
+    }
+
+    let lowered = actions.iter().map(|action| action.lowered.clone()).collect::<Vec<_>>();
+    let plan = storage::plan_records(&lowered, target, 4 * 1024 * 1024 * 1024)?;
+    let fingerprint = *package.fingerprint();
+    let temporary = storage::temporary_package_path(&request.output)?;
+
+    let write_result = write_package(&package, &actions, &plan, target, fingerprint, request, &temporary);
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    if request.force {
+        storage::replace_package(&temporary, &request.output)?;
+    } else {
+        storage::publish_package(&temporary, &request.output)?;
+    }
+
+    if request.verify {
+        crate::verify::verify_package(&request.output)?;
+        crate::verify_target::verify_target_layouts(&request.output)?;
+    }
+
+    Ok(RecompileSummary {
+        source_profile: package.profile().to_owned(),
+        target_profile: target.name.to_owned(),
+        records: actions.len(),
+        copied_records,
+        rewritten_experts,
+        requantized_experts,
+        source_fingerprint: hex_fingerprint(package.fingerprint()),
+    })
+}
+
+fn resolve_target(package: &Package, requested: &str) -> Result<TargetProfile> {
+    let name = if requested == "source" {
+        package.profile()
+    } else {
+        requested
+    };
+    let target = target::PROFILES
+        .iter()
+        .find(|profile| profile.name == name)
+        .copied()
+        .ok_or_else(|| ColicError::Usage(format!("unknown recompile target profile `{name}`")))?;
+    if requested != "source" && !target.compiler_emission_supported {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            format!("target profile `{name}` does not support compiler emission"),
+        ));
+    }
+    Ok(target)
+}
+
+fn plan_record(
+    package: &Package,
+    record: &RecordInfo,
+    request: &RecompileRequest,
+    target_profile: TargetProfile,
+    target_kind: ExpertTarget,
+) -> Result<Action> {
+    if record.kind != 2 {
+        if record.codec != 0 {
+            return Err(ColicError::unsupported(
+                "COLI recompilation",
+                format!(
+                    "record {} uses record-level codec {}; only expert-internal rANS is currently transcodable",
+                    record.id, record.codec
+                ),
+            ));
+        }
+        return Ok(Action {
+            source: record.clone(),
+            kind: ActionKind::Copy,
+            lowered: LoweredRecord {
+                id: record.id,
+                kind: record.kind,
+                stored_bytes: record.stored,
+                decoded_bytes: record.decoded,
+            },
+            keeps_rans_table: false,
+        });
+    }
+
+    let descs = expert_descs(package, record)?;
+    let kinds = [descs[0].kind()?, descs[1].kind()?, descs[2].kind()?];
+    let all_mxfp4 = kinds.iter().all(|kind| {
+        matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4)
+    });
+    let requantized = kinds.iter().any(|kind| *kind == MatrixKind::Int4G32);
+    if requantized && request.quant == QuantMode::Mxfp4 && !request.allow_requantize {
+        return Err(ColicError::Usage(format!(
+            "expert layer={} expert={} is already quantized INT4-G32; pass --allow-requantize to convert it to MXFP4",
+            record.layer, record.expert
+        )));
+    }
+
+    let target_changed = package.profile() != target_profile.name;
+    let quantizes = request.quant == QuantMode::Mxfp4
+        && kinds.iter().any(|kind| !matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4));
+    let layout_mismatch = all_mxfp4
+        && kinds.iter().any(|kind| match target_kind {
+            ExpertTarget::Apple8Mxfp4 => *kind != MatrixKind::Apple8Mxfp4,
+            ExpertTarget::CanonicalMxfp4 => *kind != MatrixKind::CanonicalMxfp4,
+        });
+    let has_rans = descs.iter().any(|desc| desc.uses_rans());
+    let strips_codec = request.codec == CodecMode::None && has_rans;
+    let repacks = request.repack && all_mxfp4;
+
+    if request.quant == QuantMode::Keep && (target_changed || layout_mismatch) && !all_mxfp4 {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            format!(
+                "retargeting layer={} expert={} would change a non-MXFP4 representation; use --quant mxfp4{}",
+                record.layer,
+                record.expert,
+                if requantized { " --allow-requantize" } else { "" }
+            ),
+        ));
+    }
+
+    if request.quant == QuantMode::Mxfp4 {
+        for kind in kinds {
+            if !matches!(
+                kind,
+                MatrixKind::Bf16
+                    | MatrixKind::CanonicalMxfp4
+                    | MatrixKind::Apple8Mxfp4
+                    | MatrixKind::Int4G32
+            ) {
+                return Err(ColicError::unsupported(
+                    "COLI recompilation",
+                    "MXFP4 conversion does not support this source representation",
+                ));
+            }
+        }
+    }
+
+    let rewrite = quantizes || layout_mismatch || strips_codec || repacks || (target_changed && all_mxfp4);
+    if !rewrite {
+        return Ok(Action {
+            source: record.clone(),
+            kind: ActionKind::Copy,
+            lowered: LoweredRecord {
+                id: record.id,
+                kind: record.kind,
+                stored_bytes: record.stored,
+                decoded_bytes: record.decoded,
+            },
+            keeps_rans_table: has_rans,
+        });
+    }
+
+    if request.quant == QuantMode::Keep && !all_mxfp4 {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            "requested transform requires MXFP4 but --quant keep forbids changing the mathematical format",
+        ));
+    }
+
+    let (stored_bytes, decoded_bytes) = match target_kind {
+        ExpertTarget::Apple8Mxfp4 => apple8_sizes(&descs)?,
+        ExpertTarget::CanonicalMxfp4 => canonical_mxfp4_sizes(&descs)?,
+    };
+    Ok(Action {
+        source: record.clone(),
+        kind: ActionKind::Rewrite {
+            descs,
+            target: target_kind,
+            requantized,
+        },
+        lowered: LoweredRecord {
+            id: record.id,
+            kind: record.kind,
+            stored_bytes,
+            decoded_bytes,
+        },
+        keeps_rans_table: false,
+    })
+}
+
+fn write_package(
+    package: &Package,
+    actions: &[Action],
+    plan: &storage::StoragePlan,
+    target: TargetProfile,
+    fingerprint: [u8; 32],
+    request: &RecompileRequest,
+    temporary: &Path,
+) -> Result<()> {
+    let mut metadata = Vec::with_capacity(actions.len());
+    let mut header_crcs = Vec::with_capacity(plan.shards as usize);
+
+    for shard_id in 0..plan.shards {
+        let path = temporary.join(format!("data-{shard_id:05}.coli"));
+        let mut writer = storage::DataShardWriter::create(
+            &path,
+            shard_id,
+            plan.record_alignment,
+            fingerprint,
+        )?;
+        for (index, planned) in plan
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, planned)| planned.shard_id == shard_id)
+        {
+            let action = actions
+                .get(index)
+                .ok_or_else(|| ColicError::Usage("recompile action/plan order mismatch".into()))?;
+            metadata.push(write_action(package, &mut writer, planned, action, request)?);
+        }
+        writer.finish()?;
+        let mut header = [0_u8; storage::DATA_SHARD_HEADER_BYTES as usize];
+        File::open(&path)
+            .map_err(|source| ColicError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .read_exact(&mut header)
+            .map_err(|source| ColicError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        header_crcs.push(u32::from_le_bytes(header[72..76].try_into().unwrap()));
+    }
+
+    let mut manifest = storage::encode_manifest_with_records(
+        plan,
+        target.name,
+        fingerprint,
+        &metadata,
+        &header_crcs,
+    )?;
+    if actions.iter().any(|action| action.keeps_rans_table) {
+        let table = rans256::table_from_manifest(package.manifest_ref(), RANS_TABLE_ID, RANS_CODEC_ID)?;
+        manifest = rans256::manifest_table_region(manifest, Some(&table))?;
+    }
+    let manifest_path = temporary.join("manifest.coli");
+    fs::write(&manifest_path, manifest).map_err(|source| ColicError::Io {
+        path: manifest_path,
+        source,
+    })?;
+    copy_json_metadata(&request.source, temporary)?;
+    write_provenance(package, target, actions, request, temporary)?;
+    Ok(())
+}
+
+fn write_action(
+    package: &Package,
+    writer: &mut storage::DataShardWriter,
+    planned: &PlannedRecord,
+    action: &Action,
+    request: &RecompileRequest,
+) -> Result<ManifestRecord> {
+    match &action.kind {
+        ActionKind::Copy => {
+            let shard = package
+                .shard_path(action.source.shard_id)
+                .ok_or_else(|| ColicError::Usage("source shard id is invalid".into()))?;
+            let shard = PathBuf::from(shard);
+            let offset = action.source.offset;
+            let bytes = action.source.stored;
+            writer.write_record_stream(planned, |output| {
+                let mut input = File::open(&shard).map_err(|source| ColicError::Io {
+                    path: shard.clone(),
+                    source,
+                })?;
+                input.seek(SeekFrom::Start(offset)).map_err(|source| ColicError::Io {
+                    path: shard.clone(),
+                    source,
+                })?;
+                let copied = io::copy(&mut input.take(bytes), output).map_err(|source| {
+                    ColicError::Io {
+                        path: shard.clone(),
+                        source,
+                    }
+                })?;
+                Ok(copied)
+            })?;
+            Ok(ManifestRecord {
+                id: action.source.id,
+                name: action.source.name.clone(),
+                layer: action.source.layer,
+                expert: action.source.expert,
+                kind: action.source.kind,
+                codec: action.source.codec,
+                math_format: action.source.math_format,
+                scale_format: action.source.scale_format,
+                layout: action.source.layout,
+                flags: action.source.flags,
+                stored_crc32c: action.source.stored_crc,
+                logical_crc32c: action.source.logical_crc,
+                codec_table_id: 0,
+            })
+        }
+        ActionKind::Rewrite { descs, target, .. } => {
+            let packed = [
+                matrix_to_mxfp4(package, &action.source, descs[0], request.allow_requantize)?,
+                matrix_to_mxfp4(package, &action.source, descs[1], request.allow_requantize)?,
+                matrix_to_mxfp4(package, &action.source, descs[2], request.allow_requantize)?,
+            ];
+            let payload = match target {
+                ExpertTarget::Apple8Mxfp4 => build_apple8_expert(
+                    action.source.layer,
+                    action.source.expert,
+                    [&packed[0], &packed[1], &packed[2]],
+                )?,
+                ExpertTarget::CanonicalMxfp4 => build_canonical_mxfp4_expert(
+                    action.source.layer,
+                    action.source.expert,
+                    [&packed[0], &packed[1], &packed[2]],
+                )?,
+            };
+            if payload.len() as u64 != planned.record.stored_bytes {
+                return Err(ColicError::Usage(format!(
+                    "rewritten expert {}:{} produced {} bytes, planned {}",
+                    action.source.layer,
+                    action.source.expert,
+                    payload.len(),
+                    planned.record.stored_bytes
+                )));
+            }
+            writer.write_record(planned, &payload)?;
+            Ok(ManifestRecord {
+                id: action.source.id,
+                name: action.source.name.clone(),
+                layer: action.source.layer,
+                expert: action.source.expert,
+                kind: 2,
+                codec: 0,
+                math_format: 0xfffe,
+                scale_format: 0xfffe,
+                layout: 0xfffe,
+                flags: 0,
+                stored_crc32c: storage::crc32c(&payload),
+                logical_crc32c: 0,
+                codec_table_id: 0,
+            })
+        }
+    }
+}
+
+fn expert_descs(package: &Package, record: &RecordInfo) -> Result<[MatrixDesc; EXPERT_MATRICES]> {
+    let head = package.read_payload_range(record, 0, 32)?;
+    if head.get(..8) != Some(b"COLIEXPT") || u16_at(&head, 8)? != 1 || u32_at(&head, 12)? != 64 {
+        return Err(ColicError::Usage(format!(
+            "expert record {} has an invalid COLIEXPT header",
+            record.id
+        )));
+    }
+    if u16_at(&head, 24)? as usize != EXPERT_MATRICES {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            "only three-matrix routed expert records are currently supported",
+        ));
+    }
+    let desc_size = u32_at(&head, 28)? as usize;
+    if desc_size != EXPERT_DESC_BYTES {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            format!("expert descriptor size {desc_size} is not the v1 128-byte descriptor"),
+        ));
+    }
+    let prefix = package.read_payload_range(
+        record,
+        0,
+        EXPERT_HEADER_BYTES + EXPERT_MATRICES * EXPERT_DESC_BYTES,
+    )?;
+    let mut result = Vec::with_capacity(EXPERT_MATRICES);
+    for index in 0..EXPERT_MATRICES {
+        let d = EXPERT_HEADER_BYTES + index * EXPERT_DESC_BYTES;
+        let rows = u64_at(&prefix, d + 16)?;
+        let cols = u64_at(&prefix, d + 24)?;
+        result.push(MatrixDesc {
+            role: u16_at(&prefix, d)?,
+            math: u16_at(&prefix, d + 4)?,
+            scale: u16_at(&prefix, d + 6)?,
+            weight_codec: u16_at(&prefix, d + 8)?,
+            scale_codec: u16_at(&prefix, d + 10)?,
+            layout: u16_at(&prefix, d + 12)?,
+            rows: rows
+                .try_into()
+                .map_err(|_| ColicError::Usage("matrix rows exceed u32".into()))?,
+            cols: cols
+                .try_into()
+                .map_err(|_| ColicError::Usage("matrix columns exceed u32".into()))?,
+            weight_table: u32_at(&prefix, d + 40)?,
+            scale_table: u32_at(&prefix, d + 44)?,
+            weight_offset: u64_at(&prefix, d + 48)?,
+            weight_stored: u64_at(&prefix, d + 56)?,
+            weight_decoded: u64_at(&prefix, d + 64)?,
+            scale_offset: u64_at(&prefix, d + 72)?,
+            scale_stored: u64_at(&prefix, d + 80)?,
+            scale_decoded: u64_at(&prefix, d + 88)?,
+        });
+    }
+    let result: [MatrixDesc; EXPERT_MATRICES] = result.try_into().unwrap();
+    for (index, desc) in result.iter().enumerate() {
+        if desc.role != (index + 1) as u16 {
+            return Err(ColicError::Usage(format!(
+                "expert record {} matrix {} has unexpected role {}",
+                record.id, index, desc.role
+            )));
+        }
+        validate_component(record, desc.weight_offset, desc.weight_stored)?;
+        if desc.scale_stored != 0 {
+            validate_component(record, desc.scale_offset, desc.scale_stored)?;
+        }
+    }
+    Ok(result)
+}
+
+fn validate_component(record: &RecordInfo, offset: u64, bytes: u64) -> Result<()> {
+    if offset
+        .checked_add(bytes)
+        .is_none_or(|end| end > record.stored)
+    {
+        return Err(ColicError::Usage(format!(
+            "record {} contains an out-of-range expert component",
+            record.id
+        )));
+    }
+    Ok(())
+}
+
+fn matrix_to_mxfp4(
+    package: &Package,
+    record: &RecordInfo,
+    desc: MatrixDesc,
+    allow_requantize: bool,
+) -> Result<PackedMatrix> {
+    match desc.kind()? {
+        MatrixKind::CanonicalMxfp4 => read_canonical_mxfp4(package, record, desc),
+        MatrixKind::Apple8Mxfp4 => read_apple8_mxfp4(package, record, desc),
+        MatrixKind::Bf16 => quantize_bf16(package, record, desc),
+        MatrixKind::Int4G32 if allow_requantize => requantize_int4(package, record, desc),
+        MatrixKind::Int4G32 => Err(ColicError::Usage(
+            "INT4-G32 -> MXFP4 requires --allow-requantize".into(),
+        )),
+    }
+}
+
+fn read_canonical_mxfp4(
+    package: &Package,
+    record: &RecordInfo,
+    desc: MatrixDesc,
+) -> Result<PackedMatrix> {
+    if desc.weight_codec != 0 || desc.scale_codec != 0 {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            "canonical MXFP4 with an inner codec is not currently supported",
+        ));
+    }
+    let weights = read_component(package, record, desc.weight_offset, desc.weight_stored)?;
+    let scales = read_component(package, record, desc.scale_offset, desc.scale_stored)?;
+    validate_mxfp4_lengths(desc.rows, desc.cols, &weights, &scales)?;
+    Ok(PackedMatrix {
+        rows: desc.rows,
+        columns: desc.cols,
+        weights,
+        scales,
+    })
+}
+
+fn read_apple8_mxfp4(
+    package: &Package,
+    record: &RecordInfo,
+    desc: MatrixDesc,
+) -> Result<PackedMatrix> {
+    if desc.scale_codec != 0 || desc.scale_stored != 0 || desc.scale_decoded != 0 {
+        return Err(ColicError::Usage(
+            "Apple8 MXFP4 must embed scales in the tile payload".into(),
+        ));
+    }
+    let stored = read_component(package, record, desc.weight_offset, desc.weight_stored)?;
+    let expected = target::apple8_tile_bytes(desc.rows, desc.cols)?;
+    let tiles = match desc.weight_codec {
+        0 => {
+            if desc.weight_stored != expected || desc.weight_decoded != expected {
+                return Err(ColicError::Usage(
+                    "raw Apple8 matrix length does not match its geometry".into(),
+                ));
+            }
+            stored
+        }
+        RANS_CODEC_ID => {
+            if desc.weight_table != RANS_TABLE_ID {
+                return Err(ColicError::unsupported(
+                    "COLI recompilation",
+                    format!("unsupported rANS table id {}", desc.weight_table),
+                ));
+            }
+            let table = RansTable::from_manifest(
+                package.manifest_ref(),
+                desc.weight_table,
+                desc.weight_codec,
+            )?;
+            let decoded = codecs::apple8_decode(
+                &stored,
+                &table,
+                u64::from(desc.rows),
+                u64::from(desc.cols),
+            )?;
+            if decoded.len() as u64 != expected || desc.weight_decoded != expected {
+                return Err(ColicError::Usage(
+                    "decoded Apple8 matrix length does not match its geometry".into(),
+                ));
+            }
+            decoded
+        }
+        other => {
+            return Err(ColicError::unsupported(
+                "COLI recompilation",
+                format!("unsupported Apple8 weight codec {other}"),
+            ));
+        }
+    };
+    detile_apple8(desc.rows, desc.cols, &tiles)
+}
+
+fn quantize_bf16(package: &Package, record: &RecordInfo, desc: MatrixDesc) -> Result<PackedMatrix> {
+    if desc.weight_codec != 0 || desc.scale_stored != 0 || desc.scale_codec != 0 {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            "BF16 expert quantization requires raw unscaled BF16 source matrices",
+        ));
+    }
+    let source = read_component(package, record, desc.weight_offset, desc.weight_stored)?;
+    let row_bytes = usize::try_from(u64::from(desc.cols) * 2)
+        .map_err(|_| ColicError::Usage("BF16 row exceeds usize".into()))?;
+    let expected = (desc.rows as usize)
+        .checked_mul(row_bytes)
+        .ok_or_else(|| ColicError::Usage("BF16 matrix size overflows usize".into()))?;
+    if source.len() != expected {
+        return Err(ColicError::Usage("BF16 expert matrix length does not match geometry".into()));
+    }
+    let mut weights = Vec::new();
+    let mut scales = Vec::new();
+    for row in source.chunks_exact(row_bytes) {
+        mxfp4::quantize_bf16_row(row, &mut weights, &mut scales)?;
+    }
+    Ok(PackedMatrix {
+        rows: desc.rows,
+        columns: desc.cols,
+        weights,
+        scales,
+    })
+}
+
+fn requantize_int4(package: &Package, record: &RecordInfo, desc: MatrixDesc) -> Result<PackedMatrix> {
+    if desc.weight_codec != 0 || desc.scale_codec != 0 {
+        return Err(ColicError::unsupported(
+            "COLI recompilation",
+            "INT4-G32 requantization currently requires raw weight and scale payloads",
+        ));
+    }
+    let weights = read_component(package, record, desc.weight_offset, desc.weight_stored)?;
+    let scales = read_component(package, record, desc.scale_offset, desc.scale_stored)?;
+    let values = codecs::int4_grouped_decode(
+        &weights,
+        &scales,
+        desc.rows as usize,
+        desc.cols as usize,
+    )?;
+    let mut packed = Vec::new();
+    let mut e8m0 = Vec::new();
+    for row in values.chunks_exact(desc.cols as usize) {
+        quantize_f32_row(row, &mut packed, &mut e8m0)?;
+    }
+    Ok(PackedMatrix {
+        rows: desc.rows,
+        columns: desc.cols,
+        weights: packed,
+        scales: e8m0,
+    })
+}
+
+fn read_component(
+    package: &Package,
+    record: &RecordInfo,
+    offset: u64,
+    bytes: u64,
+) -> Result<Vec<u8>> {
+    let bytes: usize = bytes
+        .try_into()
+        .map_err(|_| ColicError::Usage("expert component exceeds usize".into()))?;
+    package.read_payload_range(record, offset, bytes).map_err(Into::into)
+}
+
+fn validate_mxfp4_lengths(rows: u32, cols: u32, weights: &[u8], scales: &[u8]) -> Result<()> {
+    let expected_weights = (rows as usize)
+        .checked_mul((cols as usize).div_ceil(2))
+        .ok_or_else(|| ColicError::Usage("MXFP4 weight size overflows usize".into()))?;
+    let expected_scales = (rows as usize)
+        .checked_mul((cols as usize).div_ceil(mxfp4::GROUP_SIZE))
+        .ok_or_else(|| ColicError::Usage("MXFP4 scale size overflows usize".into()))?;
+    if weights.len() != expected_weights || scales.len() != expected_scales {
+        return Err(ColicError::Usage(format!(
+            "MXFP4 buffers have {}/{} bytes; expected {expected_weights}/{expected_scales}",
+            weights.len(),
+            scales.len()
+        )));
+    }
+    Ok(())
+}
+
+fn detile_apple8(rows: u32, cols: u32, tiles: &[u8]) -> Result<PackedMatrix> {
+    let expected = target::apple8_tile_bytes(rows, cols)? as usize;
+    if tiles.len() != expected {
+        return Err(ColicError::Usage("Apple8 tile buffer has the wrong size".into()));
+    }
+    let row_bytes = (cols as usize).div_ceil(2);
+    let groups = (cols as usize).div_ceil(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
+    let mut weights = vec![0_u8; rows as usize * row_bytes];
+    let mut scales = vec![0_u8; rows as usize * groups];
+    for row in 0..rows as usize {
+        let weight_row = row * row_bytes;
+        let scale_row = row * groups;
+        let tile_row = row / target_registry::APPLE8_MXFP4_TILE_ROWS as usize;
+        let within_row = row % target_registry::APPLE8_MXFP4_TILE_ROWS as usize;
+        for group in 0..groups {
+            let tile_index = tile_row
+                .checked_mul(groups)
+                .and_then(|value| value.checked_add(group))
+                .ok_or_else(|| ColicError::Usage("Apple8 tile index overflows usize".into()))?;
+            let tile = tile_index
+                .checked_mul(target_registry::APPLE8_MXFP4_TILE_BYTES as usize)
+                .ok_or_else(|| ColicError::Usage("Apple8 tile offset overflows usize".into()))?;
+            let column = group * target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize;
+            let logical_columns = (cols as usize - column)
+                .min(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
+            let copy_bytes = logical_columns.div_ceil(2);
+            let src = tile + within_row * target_registry::APPLE8_MXFP4_WEIGHT_ROW_BYTES as usize;
+            let dst = weight_row + column / 2;
+            weights[dst..dst + copy_bytes].copy_from_slice(&tiles[src..src + copy_bytes]);
+            scales[scale_row + group] = tiles[
+                tile + target_registry::APPLE8_MXFP4_WEIGHT_BYTES as usize + within_row
+            ];
+        }
+    }
+    Ok(PackedMatrix {
+        rows,
+        columns: cols,
+        weights,
+        scales,
+    })
+}
+
+fn pack_apple8(matrix: &PackedMatrix) -> Result<Vec<u8>> {
+    validate_mxfp4_lengths(matrix.rows, matrix.columns, &matrix.weights, &matrix.scales)?;
+    let row_bytes = (matrix.columns as usize).div_ceil(2);
+    let groups = (matrix.columns as usize).div_ceil(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
+    let mut output = vec![
+        0_u8;
+        usize::try_from(target::apple8_tile_bytes(matrix.rows, matrix.columns)?)
+            .map_err(|_| ColicError::Usage("Apple8 matrix exceeds usize".into()))?
+    ];
+    for row in 0..matrix.rows as usize {
+        let weight_row = row * row_bytes;
+        let scale_row = row * groups;
+        let tile_row = row / target_registry::APPLE8_MXFP4_TILE_ROWS as usize;
+        let within_row = row % target_registry::APPLE8_MXFP4_TILE_ROWS as usize;
+        for group in 0..groups {
+            let tile_index = tile_row
+                .checked_mul(groups)
+                .and_then(|value| value.checked_add(group))
+                .ok_or_else(|| ColicError::Usage("Apple8 tile index overflows usize".into()))?;
+            let tile = tile_index
+                .checked_mul(target_registry::APPLE8_MXFP4_TILE_BYTES as usize)
+                .ok_or_else(|| ColicError::Usage("Apple8 tile offset overflows usize".into()))?;
+            let column = group * target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize;
+            let logical_columns = (matrix.columns as usize - column)
+                .min(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
+            let copy_bytes = logical_columns.div_ceil(2);
+            let src = weight_row + column / 2;
+            let dst = tile + within_row * target_registry::APPLE8_MXFP4_WEIGHT_ROW_BYTES as usize;
+            output[dst..dst + copy_bytes].copy_from_slice(&matrix.weights[src..src + copy_bytes]);
+            output[tile + target_registry::APPLE8_MXFP4_WEIGHT_BYTES as usize + within_row] =
+                matrix.scales[scale_row + group];
+        }
+    }
+    Ok(output)
+}
+
+fn build_canonical_mxfp4_expert(
+    layer: i32,
+    expert: i32,
+    matrices: [&PackedMatrix; EXPERT_MATRICES],
+) -> Result<Vec<u8>> {
+    let mut payload = vec![0_u8; EXPERT_DATA_OFFSET];
+    expert_header(&mut payload, layer, expert);
+    let mut resident = 0_u64;
+    for (index, matrix) in matrices.into_iter().enumerate() {
+        let weight_offset = append_aligned(&mut payload, &matrix.weights, DATA_ALIGNMENT)?;
+        let scale_offset = append_aligned(&mut payload, &matrix.scales, DATA_ALIGNMENT)?;
+        let d = EXPERT_HEADER_BYTES + index * EXPERT_DESC_BYTES;
+        put_u16(&mut payload, d, (index + 1) as u16);
+        put_u16(&mut payload, d + 4, MATH_MXFP4);
+        put_u16(&mut payload, d + 6, SCALE_E8M0);
+        put_u64(&mut payload, d + 16, matrix.rows as u64);
+        put_u64(&mut payload, d + 24, matrix.columns as u64);
+        put_u32(&mut payload, d + 32, 1);
+        put_u32(&mut payload, d + 36, mxfp4::GROUP_SIZE as u32);
+        put_u64(&mut payload, d + 48, weight_offset);
+        put_u64(&mut payload, d + 56, matrix.weights.len() as u64);
+        put_u64(&mut payload, d + 64, matrix.weights.len() as u64);
+        put_u64(&mut payload, d + 72, scale_offset);
+        put_u64(&mut payload, d + 80, matrix.scales.len() as u64);
+        put_u64(&mut payload, d + 88, matrix.scales.len() as u64);
+        let mut logical = Vec::with_capacity(matrix.weights.len() + matrix.scales.len());
+        logical.extend_from_slice(&matrix.weights);
+        logical.extend_from_slice(&matrix.scales);
+        put_u32(&mut payload, d + 96, storage::crc32c(&logical));
+        resident = resident
+            .checked_add(logical.len() as u64)
+            .ok_or_else(|| ColicError::Usage("MXFP4 resident size overflows u64".into()))?;
+    }
+    put_u64(&mut payload, 48, resident);
+    Ok(payload)
+}
+
+fn build_apple8_expert(
+    layer: i32,
+    expert: i32,
+    matrices: [&PackedMatrix; EXPERT_MATRICES],
+) -> Result<Vec<u8>> {
+    let mut payload = vec![0_u8; EXPERT_DATA_OFFSET];
+    expert_header(&mut payload, layer, expert);
+    let mut resident = 0_u64;
+    for (index, matrix) in matrices.into_iter().enumerate() {
+        let tiles = pack_apple8(matrix)?;
+        let weight_offset = append_aligned(
+            &mut payload,
+            &tiles,
+            target_registry::APPLE8_MXFP4_MATRIX_ALIGNMENT,
+        )?;
+        let d = EXPERT_HEADER_BYTES + index * EXPERT_DESC_BYTES;
+        put_u16(&mut payload, d, (index + 1) as u16);
+        put_u16(&mut payload, d + 4, target_registry::APPLE8_MXFP4_MATH_FORMAT);
+        put_u16(&mut payload, d + 6, target_registry::APPLE8_MXFP4_SCALE_FORMAT);
+        put_u16(&mut payload, d + 12, target_registry::APPLE8_MXFP4_TILE_LAYOUT);
+        put_u64(&mut payload, d + 16, matrix.rows as u64);
+        put_u64(&mut payload, d + 24, matrix.columns as u64);
+        put_u32(&mut payload, d + 32, target_registry::APPLE8_MXFP4_SCALE_BLOCK_ROWS);
+        put_u32(&mut payload, d + 36, target_registry::APPLE8_MXFP4_SCALE_BLOCK_COLUMNS);
+        put_u64(&mut payload, d + 48, weight_offset);
+        put_u64(&mut payload, d + 56, tiles.len() as u64);
+        put_u64(&mut payload, d + 64, tiles.len() as u64);
+        put_u32(&mut payload, d + 96, storage::crc32c(&tiles));
+        put_u32(&mut payload, d + 104, target_registry::APPLE8_MXFP4_GROUP_SIZE);
+        resident = resident
+            .checked_add(tiles.len() as u64)
+            .ok_or_else(|| ColicError::Usage("Apple8 resident size overflows u64".into()))?;
+    }
+    put_u64(&mut payload, 48, resident);
+    Ok(payload)
+}
+
+fn expert_header(payload: &mut [u8], layer: i32, expert: i32) {
+    payload[..8].copy_from_slice(b"COLIEXPT");
+    put_u16(payload, 8, 1);
+    put_u32(payload, 12, EXPERT_HEADER_BYTES as u32);
+    put_i32(payload, 16, layer);
+    put_i32(payload, 20, expert);
+    put_u16(payload, 24, EXPERT_MATRICES as u16);
+    put_u32(payload, 28, EXPERT_DESC_BYTES as u32);
+    put_u64(payload, 32, EXPERT_HEADER_BYTES as u64);
+    put_u64(payload, 40, EXPERT_DATA_OFFSET as u64);
+}
+
+fn canonical_mxfp4_sizes(descs: &[MatrixDesc; EXPERT_MATRICES]) -> Result<(u64, u64)> {
+    let mut stored = EXPERT_DATA_OFFSET as u64;
+    let mut decoded = 0_u64;
+    for desc in descs {
+        let weights = u64::from(desc.rows)
+            .checked_mul(u64::from(desc.cols).div_ceil(2))
+            .ok_or_else(|| ColicError::Usage("MXFP4 weight size overflows u64".into()))?;
+        let scales = u64::from(desc.rows)
+            .checked_mul(u64::from(desc.cols).div_ceil(mxfp4::GROUP_SIZE as u64))
+            .ok_or_else(|| ColicError::Usage("MXFP4 scale size overflows u64".into()))?;
+        stored = storage::align_up(stored, DATA_ALIGNMENT)?
+            .checked_add(weights)
+            .ok_or_else(|| ColicError::Usage("MXFP4 record size overflows u64".into()))?;
+        stored = storage::align_up(stored, DATA_ALIGNMENT)?
+            .checked_add(scales)
+            .ok_or_else(|| ColicError::Usage("MXFP4 record size overflows u64".into()))?;
+        decoded = decoded
+            .checked_add(weights)
+            .and_then(|value| value.checked_add(scales))
+            .ok_or_else(|| ColicError::Usage("MXFP4 decoded size overflows u64".into()))?;
+    }
+    Ok((stored, decoded))
+}
+
+fn apple8_sizes(descs: &[MatrixDesc; EXPERT_MATRICES]) -> Result<(u64, u64)> {
+    let mut stored = EXPERT_DATA_OFFSET as u64;
+    let mut decoded = 0_u64;
+    for desc in descs {
+        let bytes = target::apple8_tile_bytes(desc.rows, desc.cols)?;
+        stored = storage::align_up(stored, target_registry::APPLE8_MXFP4_MATRIX_ALIGNMENT)?
+            .checked_add(bytes)
+            .ok_or_else(|| ColicError::Usage("Apple8 record size overflows u64".into()))?;
+        decoded = decoded
+            .checked_add(bytes)
+            .ok_or_else(|| ColicError::Usage("Apple8 decoded size overflows u64".into()))?;
+    }
+    Ok((stored, decoded))
+}
+
+fn append_aligned(output: &mut Vec<u8>, bytes: &[u8], alignment: u64) -> Result<u64> {
+    let offset = storage::align_up(output.len() as u64, alignment)?;
+    output.resize(
+        offset
+            .try_into()
+            .map_err(|_| ColicError::Usage("record offset exceeds usize".into()))?,
+        0,
+    );
+    output.extend_from_slice(bytes);
+    Ok(offset)
+}
+
+fn quantize_f32_row(values: &[f32], weights: &mut Vec<u8>, scales: &mut Vec<u8>) -> Result<()> {
+    let mut nibbles = Vec::with_capacity(values.len());
+    for (group_index, group) in values.chunks(mxfp4::GROUP_SIZE).enumerate() {
+        if group.iter().any(|value| !value.is_finite()) {
+            return Err(ColicError::Usage(format!(
+                "MXFP4 requantization refuses non-finite value in group {group_index}"
+            )));
+        }
+        let (scale_code, scale) = choose_scale(group);
+        scales.push(scale_code);
+        for value in group {
+            nibbles.push(quantize_value(*value, scale));
+        }
+    }
+    for pair in nibbles.chunks(2) {
+        let low = pair[0] & 0x0f;
+        let high = pair.get(1).copied().unwrap_or(0) & 0x0f;
+        weights.push(low | (high << 4));
+    }
+    Ok(())
+}
+
+fn choose_scale(values: &[f32]) -> (u8, f32) {
+    let max_abs = values.iter().fold(0.0_f32, |acc, value| acc.max(value.abs()));
+    if max_abs == 0.0 {
+        return (127, 1.0);
+    }
+    let bits = max_abs.to_bits();
+    let biased = ((bits >> 23) & 0xff) as i32;
+    let max_exp = if biased == 0 {
+        let mantissa = bits & 0x007f_ffff;
+        (31 - mantissa.leading_zeros() as i32) - 149
+    } else {
+        biased - 127
+    };
+    let mut scale_exp = (max_exp - 2).clamp(-126, 127);
+    let mut scale_code = (scale_exp + 127) as u8;
+    let mut scale = mxfp4::runtime_e8m0_to_f32(scale_code);
+    if max_abs > mxfp4::MAX_E2M1 * scale && scale_exp < 127 {
+        scale_exp += 1;
+        scale_code = (scale_exp + 127) as u8;
+        scale = mxfp4::runtime_e8m0_to_f32(scale_code);
+    }
+    (scale_code, scale)
+}
+
+fn quantize_value(value: f32, scale: f32) -> u8 {
+    let magnitude = (value.abs() / scale).min(mxfp4::MAX_E2M1);
+    let mut best_code = 0_u8;
+    let mut best_error = f32::INFINITY;
+    for (code, candidate) in mxfp4::E2M1_MAGNITUDES.iter().copied().enumerate() {
+        let error = (magnitude - candidate).abs();
+        if error < best_error || (error == best_error && (code & 1) == 0 && (best_code & 1) != 0) {
+            best_error = error;
+            best_code = code as u8;
+        }
+    }
+    if value.is_sign_negative() {
+        best_code | 0x8
+    } else {
+        best_code
+    }
+}
+
+fn copy_json_metadata(source: &Path, output: &Path) -> Result<()> {
+    let entries = fs::read_dir(source).map_err(|source_error| ColicError::Io {
+        path: source.to_owned(),
+        source: source_error,
+    })?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source_error| ColicError::Io {
+            path: source.to_owned(),
+            source: source_error,
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == "recompile.json" || !name.ends_with(".json") {
+            continue;
+        }
+        if entry
+            .file_type()
+            .map_err(|source_error| ColicError::Io {
+                path: path.clone(),
+                source: source_error,
+            })?
+            .is_file()
+        {
+            files.push((name.to_owned(), path));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, source_path) in files {
+        let destination = output.join(name);
+        fs::copy(&source_path, &destination).map_err(|source_error| ColicError::Io {
+            path: source_path,
+            source: source_error,
+        })?;
+    }
+    Ok(())
+}
+
+fn write_provenance(
+    package: &Package,
+    target: TargetProfile,
+    actions: &[Action],
+    request: &RecompileRequest,
+    output: &Path,
+) -> Result<()> {
+    let parent_manifest = package.manifest_ref();
+    let parent_manifest_sha256 = format!("{:x}", Sha256::digest(parent_manifest));
+    let rewritten = actions
+        .iter()
+        .filter(|action| matches!(action.kind, ActionKind::Rewrite { .. }))
+        .count();
+    let requantized = actions
+        .iter()
+        .filter(|action| matches!(action.kind, ActionKind::Rewrite { requantized: true, .. }))
+        .count();
+    let provenance = json!({
+        "version": 1,
+        "operation": "coli-recompile",
+        "source_model_fingerprint": hex_fingerprint(package.fingerprint()),
+        "parent_manifest_sha256": parent_manifest_sha256,
+        "parent_profile": package.profile(),
+        "target_profile": target.name,
+        "quant": request.quant.as_str(),
+        "codec": request.codec.as_str(),
+        "allow_requantize": request.allow_requantize,
+        "repack": request.repack,
+        "rewritten_experts": rewritten,
+        "requantized_experts": requantized,
+    });
+    let path = output.join("recompile.json");
+    let bytes = serde_json::to_vec_pretty(&provenance)
+        .map_err(|error| ColicError::Usage(format!("cannot encode recompile provenance: {error}")))?;
+    fs::write(&path, bytes).map_err(|source| ColicError::Io { path, source })
+}
+
+fn hex_fingerprint(bytes: &[u8; 32]) -> String {
+    let mut result = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut result, "{byte:02x}");
+    }
+    result
+}
+
+fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
+    Ok(u16::from_le_bytes(
+        bytes
+            .get(offset..offset + 2)
+            .ok_or_else(|| ColicError::Usage("truncated u16 in expert record".into()))?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| ColicError::Usage("truncated u32 in expert record".into()))?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        bytes
+            .get(offset..offset + 8)
+            .ok_or_else(|| ColicError::Usage("truncated u64 in expert record".into()))?
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+fn put_u16(buffer: &mut [u8], offset: usize, value: u16) {
+    buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn put_u32(buffer: &mut [u8], offset: usize, value: u32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+fn put_u64(buffer: &mut [u8], offset: usize, value: u64) {
+    buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+fn put_i32(buffer: &mut [u8], offset: usize, value: i32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packed(rows: u32, columns: u32) -> PackedMatrix {
+        let row_bytes = (columns as usize).div_ceil(2);
+        let groups = (columns as usize).div_ceil(mxfp4::GROUP_SIZE);
+        PackedMatrix {
+            rows,
+            columns,
+            weights: (0..rows as usize * row_bytes)
+                .map(|index| index.wrapping_mul(37) as u8)
+                .collect(),
+            scales: (0..rows as usize * groups)
+                .map(|index| 120_u8.wrapping_add(index as u8))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn apple8_tile_roundtrip_is_bit_exact() {
+        for (rows, columns) in [(1, 32), (8, 32), (9, 33), (17, 97)] {
+            let source = packed(rows, columns);
+            let tiles = pack_apple8(&source).unwrap();
+            let decoded = detile_apple8(rows, columns, &tiles).unwrap();
+            assert_eq!(decoded, source);
+        }
+    }
+
+    #[test]
+    fn canonical_and_apple8_size_plans_match_builders() {
+        let matrices = [packed(9, 33), packed(9, 33), packed(33, 9)];
+        let descs = [
+            MatrixDesc {
+                role: 1,
+                math: MATH_MXFP4,
+                scale: SCALE_E8M0,
+                weight_codec: 0,
+                scale_codec: 0,
+                layout: 0,
+                rows: 9,
+                cols: 33,
+                weight_table: 0,
+                scale_table: 0,
+                weight_offset: 0,
+                weight_stored: 0,
+                weight_decoded: 0,
+                scale_offset: 0,
+                scale_stored: 0,
+                scale_decoded: 0,
+            },
+            MatrixDesc {
+                role: 2,
+                rows: 9,
+                cols: 33,
+                ..zero_desc()
+            },
+            MatrixDesc {
+                role: 3,
+                rows: 33,
+                cols: 9,
+                ..zero_desc()
+            },
+        ];
+        let canonical = build_canonical_mxfp4_expert(0, 0, [&matrices[0], &matrices[1], &matrices[2]]).unwrap();
+        let apple = build_apple8_expert(0, 0, [&matrices[0], &matrices[1], &matrices[2]]).unwrap();
+        assert_eq!(canonical.len() as u64, canonical_mxfp4_sizes(&descs).unwrap().0);
+        assert_eq!(apple.len() as u64, apple8_sizes(&descs).unwrap().0);
+    }
+
+    fn zero_desc() -> MatrixDesc {
+        MatrixDesc {
+            role: 0,
+            math: MATH_MXFP4,
+            scale: SCALE_E8M0,
+            weight_codec: 0,
+            scale_codec: 0,
+            layout: 0,
+            rows: 0,
+            cols: 0,
+            weight_table: 0,
+            scale_table: 0,
+            weight_offset: 0,
+            weight_stored: 0,
+            weight_decoded: 0,
+            scale_offset: 0,
+            scale_stored: 0,
+            scale_decoded: 0,
+        }
+    }
+}
