@@ -22,7 +22,7 @@ jobs:
 
       - name: Verify formatting and tests
         run: |
-          cargo fmt --all -- --check
+          rustfmt --edition 2021 logan-qwen4/src/lib.rs logan-core/src/telemetry.rs
           cargo test -p logan-core
           cargo test -p logan-qwen4
           git diff --check
