@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     if show_side {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(48), Constraint::Length(40)])
+            .constraints([Constraint::Min(48), Constraint::Length(42)])
             .split(rows[1]);
         draw_transcript(frame, app, columns[0]);
         draw_stats(frame, app, columns[1]);
@@ -54,7 +54,11 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Style::default().fg(WARN)
     };
-    let cache = if app.features.prefix_cache { "SSD cache" } else { "cache off" };
+    let cache = if app.features.prefix_cache {
+        "SSD cache"
+    } else {
+        "cache off"
+    };
     let line = Line::from(vec![
         Span::styled(
             " LOGAN CHAT ",
@@ -88,7 +92,9 @@ fn transcript_text(app: &App) -> Text<'static> {
         let (label, style) = match message.role {
             Role::User => (
                 "YOU",
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
             ),
             Role::Assistant => (
                 "QWEN",
@@ -98,7 +104,10 @@ fn transcript_text(app: &App) -> Text<'static> {
         };
         lines.push(Line::from(Span::styled(label, style)));
         if message.content.is_empty() && message.role == Role::Assistant && app.generating {
-            lines.push(Line::from(Span::styled("▌", Style::default().fg(ACCENT))));
+            lines.push(Line::from(Span::styled(
+                "▌",
+                Style::default().fg(ACCENT),
+            )));
         } else {
             for raw in message.content.lines() {
                 lines.push(Line::from(raw.to_string()));
@@ -124,7 +133,9 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let visible = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible);
     let from_bottom = usize::from(app.transcript_scroll).min(max_scroll);
-    let y = max_scroll.saturating_sub(from_bottom).min(u16::MAX as usize) as u16;
+    let y = max_scroll
+        .saturating_sub(from_bottom)
+        .min(u16::MAX as usize) as u16;
     let paragraph = base.block(block).scroll((y, 0));
     frame.render_widget(paragraph, area);
 }
@@ -146,23 +157,53 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let gauge = Gauge::default()
         .block(Block::default().title(" Context ").borders(Borders::ALL))
         .gauge_style(Style::default().fg(if ratio > 0.9 { WARN } else { ACCENT }))
-        .label(format!("{context} / {}  ({:.1}%)", app.context_limit, ratio * 100.0))
+        .label(format!(
+            "{context} / {}  ({:.1}%)",
+            app.context_limit,
+            ratio * 100.0
+        ))
         .ratio(ratio);
     frame.render_widget(gauge, chunks[0]);
 
     let s = &app.last_stats;
     let forwards = metrics.forward_tokens.max(1) as f64;
     let mut lines = Vec::<Line<'static>>::new();
+
     section(&mut lines, "TURN");
-    kv(&mut lines, "generated", format!("{} tok", metrics.generated_tokens));
-    kv(&mut lines, "decode", format!("{:.2} tok/s", generation_rate(metrics)));
+    kv(&mut lines, "input", format!("{} tok", metrics.input_tokens));
+    kv(
+        &mut lines,
+        "prompt forward",
+        format!("{} tok", metrics.forwarded_prompt_tokens),
+    );
+    kv(
+        &mut lines,
+        "generated",
+        format!("{} tok", metrics.generated_tokens),
+    );
+    kv(
+        &mut lines,
+        "decode",
+        format!("{:.2} tok/s", generation_rate(metrics)),
+    );
     kv(&mut lines, "TTFT", fmt_ms(metrics.first_token_ms));
     kv(&mut lines, "prompt", fmt_ms(metrics.prompt_ms));
     kv(&mut lines, "wall", fmt_ms(metrics.total_ms));
-    kv(&mut lines, "live reused", format!("{} tok", metrics.live_reused_tokens));
-    kv(&mut lines, "SSD reused", format!("{} tok", metrics.ssd_cached_tokens));
+    kv(
+        &mut lines,
+        "live reused",
+        format!("{} tok", metrics.live_reused_tokens),
+    );
+    kv(
+        &mut lines,
+        "SSD reused",
+        format!("{} tok", metrics.ssd_cached_tokens),
+    );
     kv(&mut lines, "SSD restore", fmt_ms(metrics.cache_restore_ms));
     kv(&mut lines, "cache write", fmt_ms(metrics.cache_write_ms));
+    if let Some(reason) = &metrics.stop_reason {
+        kv(&mut lines, "stop", reason.label().to_string());
+    }
 
     section(&mut lines, "EXPERT LRU");
     kv(
@@ -172,7 +213,11 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     kv(&mut lines, "hits", s.expert_hits.to_string());
     kv(&mut lines, "misses", s.expert_misses.to_string());
-    kv(&mut lines, "hit rate", format!("{:.1}%", s.expert_hit_rate() * 100.0));
+    kv(
+        &mut lines,
+        "hit rate",
+        format!("{:.1}%", s.expert_hit_rate() * 100.0),
+    );
     kv(&mut lines, "evictions", s.expert_evictions.to_string());
 
     section(&mut lines, "METAL");
@@ -180,6 +225,7 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
     kv(&mut lines, "overlap", yesno(s.features.metal_overlap));
     kv(&mut lines, "fused calls", s.fused_calls.to_string());
     kv(&mut lines, "fused experts", s.fused_experts.to_string());
+    kv(&mut lines, "GDN metal", s.gdn_metal_ok.to_string());
     kv(&mut lines, "kernel", fmt_ns(s.metal_kernel_ns));
     kv(&mut lines, "GPU wait", fmt_ns(s.metal_wait_ns));
     kv(&mut lines, "encode", fmt_ns(s.metal_encode_ns));
@@ -190,18 +236,67 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
     kv(&mut lines, "read", fmt_bytes(s.mio_bytes));
     kv(&mut lines, "waits", s.mio_waits.to_string());
     kv(&mut lines, "fails", s.mio_fails.to_string());
-    kv(&mut lines, "avg latency", format!("{:.2} ms", s.mio_avg_latency_ms()));
+    kv(
+        &mut lines,
+        "avg latency",
+        format!("{:.2} ms", s.mio_avg_latency_ms()),
+    );
     kv(&mut lines, "outstanding", s.mio_outstanding.to_string());
+    kv(&mut lines, "peak out", s.mio_peak_outstanding.to_string());
+    kv(&mut lines, "prefetch", s.mio_prefetch_loads.to_string());
+    kv(&mut lines, "prefetch used", s.mio_prefetch_used.to_string());
+    kv(
+        &mut lines,
+        "prefetch waste",
+        s.mio_prefetch_wasted.to_string(),
+    );
 
     section(&mut lines, "PHASE / FORWARD");
-    kv(&mut lines, "GDN", format!("{:.1} ms", s.gdn_ms / forwards));
-    kv(&mut lines, "attention", format!("{:.1} ms", s.attn_ms / forwards));
-    kv(&mut lines, "HC", format!("{:.1} ms", s.hc_ms / forwards));
-    kv(&mut lines, "head", format!("{:.1} ms", s.head_ms / forwards));
-    kv(&mut lines, "expert I/O", format!("{:.1} ms", s.io_ms / forwards));
-    kv(&mut lines, "shared", format!("{:.1} ms", s.shared_ms / forwards));
-    kv(&mut lines, "GPU MoE", format!("{:.1} ms", s.gpu_ms / forwards));
-    kv(&mut lines, "route", format!("{:.1} ms", s.route_ms / forwards));
+    kv(
+        &mut lines,
+        "GDN",
+        format!("{:.1} ms", s.gdn_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "attention",
+        format!("{:.1} ms", s.attn_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "HC",
+        format!("{:.1} ms", s.hc_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "head",
+        format!("{:.1} ms", s.head_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "expert I/O",
+        format!("{:.1} ms", s.io_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "shared",
+        format!("{:.1} ms", s.shared_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "GPU MoE",
+        format!("{:.1} ms", s.gpu_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "route",
+        format!("{:.1} ms", s.route_ms / forwards),
+    );
+    kv(
+        &mut lines,
+        "fill",
+        format!("{:.1} ms", s.fill_ms / forwards),
+    );
 
     section(&mut lines, "CACHE / MEMORY");
     kv(&mut lines, "entries", app.cache_entries.to_string());
@@ -210,15 +305,45 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     section(&mut lines, "FAST PATHS");
     kv(&mut lines, "BNNS BF16", yesno(app.features.bnns_bf16));
-    kv(&mut lines, "attention Metal", yesno(app.features.attn_metal));
-    kv(&mut lines, "QSA Metal", yesno(app.features.qsa_index_metal));
+    kv(
+        &mut lines,
+        "attention Metal",
+        yesno(app.features.attn_metal),
+    );
+    kv(
+        &mut lines,
+        "QSA Metal",
+        yesno(app.features.qsa_index_metal),
+    );
     kv(&mut lines, "GDN Metal", yesno(app.features.gdn_metal));
-    kv(&mut lines, "shared overlap", yesno(app.features.shared_io_overlap));
-    kv(&mut lines, "prefix cache", yesno(app.features.prefix_cache));
+    kv(
+        &mut lines,
+        "GDN single copy",
+        yesno(app.features.gdn_single_copy),
+    );
+    kv(
+        &mut lines,
+        "shared overlap",
+        yesno(app.features.shared_io_overlap),
+    );
+    kv(
+        &mut lines,
+        "prefix cache",
+        yesno(app.features.prefix_cache),
+    );
+    kv(
+        &mut lines,
+        "cache writes",
+        yesno(app.features.prefix_cache_write),
+    );
 
     section(&mut lines, "SAMPLING");
     kv(&mut lines, "max new", app.settings.max_new.to_string());
-    kv(&mut lines, "temperature", format!("{:.2}", app.settings.temperature));
+    kv(
+        &mut lines,
+        "temperature",
+        format!("{:.2}", app.settings.temperature),
+    );
     kv(&mut lines, "top-p", format!("{:.2}", app.settings.top_p));
     kv(&mut lines, "top-k", app.settings.top_k.to_string());
     kv(
@@ -231,8 +356,13 @@ fn draw_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let paragraph = Paragraph::new(Text::from(lines))
-        .block(Block::default().title(" Runtime Stats ").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+        .block(
+            Block::default()
+                .title(" Runtime Stats · Shift+PgUp/PgDn ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.stats_scroll, 0));
     frame.render_widget(paragraph, chunks[1]);
 }
 
@@ -267,16 +397,18 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     if app.loaded && !app.generating && !app.show_help && inner.width > 0 && inner.height > 0 {
         let xoff = current_line.cell_width().min(inner.width.saturating_sub(1));
-        let yoff = row.saturating_sub(scroll).min(inner.height.saturating_sub(1) as usize) as u16;
+        let yoff = row
+            .saturating_sub(scroll)
+            .min(inner.height.saturating_sub(1) as usize) as u16;
         frame.set_cursor_position((inner.x + xoff, inner.y + yoff));
     }
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = if app.generating {
-        " Esc cancel   PgUp/PgDn scroll   Tab stats   Ctrl+C quit "
+        " Esc cancel   PgUp/PgDn chat   Shift+PgUp/PgDn stats   Tab stats   Ctrl+C quit "
     } else {
-        " Enter send   ↑/↓ history   PgUp/PgDn scroll   Tab stats   F1 help   Ctrl+C quit "
+        " Enter send   ↑/↓ history   PgUp/PgDn chat   Shift+PgUp/PgDn stats   F1 help   Ctrl+C quit "
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(MUTED)),
@@ -285,22 +417,23 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 74, 76);
+    let popup = centered(area, 74, 78);
     frame.render_widget(Clear, popup);
     let help = Text::from(vec![
         Line::from(Span::styled(
             "KEYS",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("Enter       send message"),
-        Line::from("Ctrl+J      insert newline"),
-        Line::from("Esc         cancel generation / close help"),
-        Line::from("↑ / ↓       prompt history"),
-        Line::from("PgUp/PgDn   scroll conversation"),
-        Line::from("Tab         toggle runtime stats"),
-        Line::from("Ctrl+W      delete previous word"),
-        Line::from("Ctrl+U      clear prompt"),
-        Line::from("Ctrl+C      quit"),
+        Line::from("Enter             send message"),
+        Line::from("Ctrl+J            insert newline"),
+        Line::from("Esc               cancel generation / close help"),
+        Line::from("↑ / ↓             prompt history"),
+        Line::from("PgUp/PgDn         scroll conversation"),
+        Line::from("Shift+PgUp/PgDn   scroll runtime stats"),
+        Line::from("Tab               toggle runtime stats"),
+        Line::from("Ctrl+W            delete previous word"),
+        Line::from("Ctrl+U            clear prompt"),
+        Line::from("Ctrl+C            quit"),
         Line::default(),
         Line::from(Span::styled(
             "COMMANDS",
