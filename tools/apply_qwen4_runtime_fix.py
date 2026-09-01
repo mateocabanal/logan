@@ -42,3 +42,17 @@ if count != 1:
     raise SystemExit(f"aligned GDN init: expected one source match, found {count}")
 path.write_text(text.replace(old, new, 1))
 print(f"patched {path.relative_to(ROOT)} aligned-state initialization")
+
+# Prefix files written before this fix contain causal state produced with the
+# wrong SiLU GDN output gate even though their package config already says
+# output_gate_type=sigmoid. Package/config hashing therefore cannot distinguish
+# those bad entries. Bump the numerical-state ABI so they become clean misses.
+cache_path = ROOT / "logan-qwen4" / "src" / "plan" / "prefix_cache.rs"
+cache_text = cache_path.read_text()
+old_abi = "const STATE_ABI_VERSION: u32 = 1;"
+new_abi = "const STATE_ABI_VERSION: u32 = 2;"
+count = cache_text.count(old_abi)
+if count != 1:
+    raise SystemExit(f"prefix state ABI: expected one v1 constant, found {count}")
+cache_path.write_text(cache_text.replace(old_abi, new_abi, 1))
+print(f"patched {cache_path.relative_to(ROOT)} state ABI v1 -> v2")
