@@ -11,12 +11,17 @@ use logan_format::package::Package;
 
 pub mod prefix_cache;
 pub mod prefix_runtime;
+pub mod runtime_stats;
 pub mod snapshot;
 pub use prefix_cache::{
     digest_hex, live_prefix_state_digest, CacheRestoreStats, CacheWriteStats, PrefixCacheKey,
     PrefixCacheStore,
 };
-pub use prefix_runtime::{auto_prefix_cache_enabled, run_greedy_cached_coli};
+pub use prefix_runtime::{
+    apply_max_performance_defaults, auto_prefix_cache_enabled, persist_prefix_boundary,
+    restore_longest_prefix, run_greedy_cached_coli, PrefixRestoreSummary,
+};
+pub use runtime_stats::{RuntimeFeatures, RuntimeStats};
 pub use snapshot::QwenStateSnapshot;
 
 /// One planned expert load: the exact record identity + absolute stream

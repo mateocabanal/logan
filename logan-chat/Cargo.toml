@@ -1,0 +1,16 @@
+[package]
+name = "logan-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "logan-chat"
+path = "src/main.rs"
+
+[dependencies]
+logan-qwen4 = { path = "../logan-qwen4" }
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29"
+tokenizers = "0.23.1"
+libc = "0.2"
