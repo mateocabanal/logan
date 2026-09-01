@@ -4,7 +4,7 @@ mod ui;
 
 use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use app::{App, UiAction};
 use crossterm::event::{
@@ -50,30 +50,63 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     app.settings = args.settings;
     app.show_stats = args.show_stats;
 
+    let mut terminal = enter_terminal()?;
+    let result = event_loop(&mut terminal, &mut app, &handle);
+    let _ = handle.tx.send(EngineCommand::Shutdown);
+    let cleanup = leave_terminal(&mut terminal);
+
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(
+    if let Err(error) = execute!(
         out,
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
-    )?;
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
     let backend = CrosstermBackend::new(out);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    match Terminal::new(backend) {
+        Ok(mut terminal) => {
+            terminal.clear()?;
+            Ok(terminal)
+        }
+        Err(error) => {
+            let _ = disable_raw_mode();
+            let mut out = stdout();
+            let _ = execute!(
+                out,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
+            Err(error)
+        }
+    }
+}
 
-    let result = event_loop(&mut terminal, &mut app, &handle);
-
-    let _ = handle.tx.send(EngineCommand::Shutdown);
-    disable_raw_mode()?;
-    execute!(
+fn leave_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    result
+    );
+    let cursor_result = terminal.show_cursor();
+    raw_result?;
+    screen_result?;
+    cursor_result?;
+    Ok(())
 }
 
 fn event_loop(
@@ -82,15 +115,10 @@ fn event_loop(
     handle: &engine::EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tick = Duration::from_millis(50);
-    let mut last_housekeeping = Instant::now();
 
     loop {
         while let Ok(event) = handle.rx.try_recv() {
             app.on_engine_event(event);
-        }
-        if last_housekeeping.elapsed() >= Duration::from_secs(1) {
-            app.refresh_cache_usage();
-            last_housekeeping = Instant::now();
         }
 
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -244,10 +272,9 @@ fn dispatch(
         UiAction::None => Ok(false),
         UiAction::Quit => Ok(true),
         UiAction::Send(command) => {
-            handle
-                .tx
-                .send(command)
-                .map_err(|_| "inference worker exited")?;
+            handle.tx.send(command).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "inference worker exited")
+            })?;
             Ok(false)
         }
     }
