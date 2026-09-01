@@ -29,7 +29,7 @@ insert = r'''
             id: 1,
             kind: 2,
             stored_bytes: payload.len() as u64,
-            decoded_bytes: payload.len() as u64,
+            decoded_bytes: u64::from_le_bytes(payload[48..56].try_into().unwrap()),
         };
         let source_plan = storage::plan_records(
             &[lowered],
