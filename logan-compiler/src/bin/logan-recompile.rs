@@ -28,11 +28,10 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn parse<I>(args: I) -> Result<RecompileRequest>
+fn parse<I>(mut args: I) -> Result<RecompileRequest>
 where
-    I: IntoIterator<Item = String>,
+    I: Iterator<Item = String>,
 {
-    let mut args = args.into_iter();
     let source = args
         .next()
         .ok_or_else(|| ColicError::Usage("recompile requires PACKAGE_DIR".into()))?;
