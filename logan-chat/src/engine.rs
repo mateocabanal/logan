@@ -16,8 +16,7 @@ use tokenizers::Tokenizer;
 ///
 /// The model's chat template does not start generation directly after
 /// `<|im_start|>assistant\n`. Even with thinking disabled it emits an empty
-/// think block first. Omitting this prefix puts the model off-distribution and
-/// can produce multilingual/token-salad output from the first generated token.
+/// think block first.
 const ASSISTANT_NON_THINKING_PREFIX: &str =
     "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
@@ -32,9 +31,6 @@ pub struct GenerationSettings {
 
 impl Default for GenerationSettings {
     fn default() -> Self {
-        // Qwen3.8-Flash-Next published non-thinking sampling defaults, except
-        // presence_penalty (not implemented in Logan's sampler yet). Keep the
-        // repeat penalty neutral rather than substituting a different penalty.
         Self {
             max_new: 256,
             temperature: 0.7,
@@ -187,8 +183,14 @@ struct ChatWorker {
     system_prompt: String,
     im_end_id: u32,
     eos_id: Option<u32>,
+    /// Logical chat token history. This intentionally does not contain the
+    /// synthetic decode-driver repeats described below.
     tokens: Vec<u32>,
-    pending: Vec<u32>,
+    /// Number of logical `tokens` already consumed by the model.
+    consumed: usize,
+    /// Next physical model position. This can exceed `consumed` because
+    /// Logan's validated Qwen4 decode driver repeats the final prompt token at
+    /// the first decode position without adding that repeat to logical history.
     position: usize,
     turns: usize,
     rng: TinyRng,
@@ -239,7 +241,7 @@ impl ChatWorker {
             im_end_id,
             eos_id,
             tokens: Vec::new(),
-            pending: Vec::new(),
+            consumed: 0,
             position: 0,
             turns: 0,
             rng: TinyRng::new(),
@@ -251,7 +253,7 @@ impl ChatWorker {
         self.model = load_model(&self.package, &self.cfg)?;
         self.system_prompt = system_prompt;
         self.tokens.clear();
-        self.pending.clear();
+        self.consumed = 0;
         self.position = 0;
         self.turns = 0;
         Ok(())
@@ -259,8 +261,8 @@ impl ChatWorker {
 
     fn reload_pristine(&mut self) -> Result<(), String> {
         self.model = load_model(&self.package, &self.cfg)?;
+        self.consumed = 0;
         self.position = 0;
-        self.pending.clear();
         Ok(())
     }
 
@@ -283,6 +285,24 @@ impl ChatWorker {
         render_continuation_prompt(user)
     }
 
+    fn consume_logical_until(&mut self, end: usize) -> Result<usize, String> {
+        let mut forwards = 0usize;
+        while self.consumed < end {
+            if self.position >= self.model.context_limit() {
+                return Err("context is full; use /clear before continuing".into());
+            }
+            let token = *self
+                .tokens
+                .get(self.consumed)
+                .ok_or_else(|| "logical/model cursor drift".to_string())?;
+            self.model.forward_token(token as usize, self.position);
+            self.consumed += 1;
+            self.position += 1;
+            forwards += 1;
+        }
+        Ok(forwards)
+    }
+
     fn run_turn(
         &mut self,
         user: &str,
@@ -296,20 +316,13 @@ impl ChatWorker {
 
         let turn_t0 = Instant::now();
         let mut stats_before = self.model.runtime_stats();
-        let live_reused = self.position;
+        let live_reused = self.consumed;
         let mut forward_tokens = 0usize;
 
-        // The final sampled token (and possibly <|im_end|>) is deliberately
-        // not forwarded at response end. Consume it only when another turn
-        // arrives so end-of-response latency does not pay a useless forward.
-        for token in std::mem::take(&mut self.pending) {
-            if self.position >= self.model.context_limit() {
-                return Err("context is full; use /clear before continuing".into());
-            }
-            self.model.forward_token(token as usize, self.position);
-            self.position += 1;
-            forward_tokens += 1;
-        }
+        // Consume the last sampled token / terminator left outstanding by the
+        // previous turn. `consumed`, rather than model position, indexes logical
+        // history because the canonical decode driver inserts synthetic repeats.
+        forward_tokens += self.consume_logical_until(self.tokens.len())?;
 
         let (input_ids, system_boundary) = if self.turns == 0 {
             let system_ids = self.encode(&self.system_prefix())?;
@@ -326,12 +339,13 @@ impl ChatWorker {
         let mut cache_restore_ms = 0.0;
         let mut cache_write_ms = 0.0;
 
-        if self.turns == 0 && self.position == 0 {
+        if self.turns == 0 && self.consumed == 0 && self.position == 0 {
             self.tokens = input_ids.clone();
             match restore_longest_prefix(&mut self.model, &self.tokens) {
                 Ok(Some(hit)) => {
                     cached_tokens = hit.cached_tokens;
                     cache_restore_ms = hit.restore_ms;
+                    self.consumed = hit.cached_tokens;
                     self.position = hit.cached_tokens;
                 }
                 Ok(None) => {}
@@ -348,24 +362,22 @@ impl ChatWorker {
         }
 
         let target_end = self.tokens.len();
-        if target_end > self.model.context_limit() {
+        let remaining_prompt = target_end.saturating_sub(self.consumed);
+        if self.position.saturating_add(remaining_prompt) >= self.model.context_limit() {
             return Err(format!(
-                "context {} exceeds model limit {}; use /clear or a smaller history",
-                target_end,
-                self.model.context_limit()
+                "prompt would exhaust context at model position {}; use /clear or a smaller history",
+                self.position.saturating_add(remaining_prompt)
             ));
         }
 
-        // First-turn system state is a high-value semantic checkpoint shared by
-        // every new chat using the same system prompt.
+        // First-turn system state is a high-value checkpoint and still has a
+        // one-to-one logical-token/model-position mapping, so it is safe to
+        // persist using the normal prefix cache format.
         if let Some(system_end) = system_boundary {
-            while self.position < system_end {
-                let token = self.tokens[self.position];
-                self.model.forward_token(token as usize, self.position);
-                self.position += 1;
-                forward_tokens += 1;
+            if self.consumed < system_end {
+                forward_tokens += self.consume_logical_until(system_end)?;
             }
-            if self.position == system_end {
+            if self.consumed == system_end && self.position == self.consumed {
                 match persist_prefix_boundary(&self.model, &self.tokens[..system_end]) {
                     Ok(Some(write)) if !write.already_existed => {
                         cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
@@ -380,45 +392,61 @@ impl ChatWorker {
             }
         }
 
-        let mut logits = None;
-        while self.position < target_end {
-            let token = self.tokens[self.position];
-            logits = Some(self.model.forward_token(token as usize, self.position));
-            self.position += 1;
-            forward_tokens += 1;
-        }
+        forward_tokens += self.consume_logical_until(target_end)?;
         let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1e3;
+        let prompt_forward_tokens = forward_tokens;
 
-        match persist_prefix_boundary(&self.model, &self.tokens) {
-            Ok(Some(write)) if !write.already_existed => {
-                cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let _ = events.send(EngineEvent::Warning(format!(
-                    "prefix cache write failed (non-fatal): {error}"
-                )));
+        // A normal prefix snapshot is only valid while logical and physical
+        // positions are identical. After the first canonical decode bootstrap,
+        // live chat state contains synthetic driver positions, so later-turn SSD
+        // persistence is intentionally skipped rather than writing a subtly
+        // inconsistent checkpoint.
+        if self.position == self.consumed {
+            match persist_prefix_boundary(&self.model, &self.tokens) {
+                Ok(Some(write)) if !write.already_existed => {
+                    cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = events.send(EngineEvent::Warning(format!(
+                        "prefix cache write failed (non-fatal): {error}"
+                    )));
+                }
             }
         }
 
         let mut metrics = TurnMetrics {
             input_tokens,
-            forwarded_prompt_tokens: forward_tokens,
+            forwarded_prompt_tokens: prompt_forward_tokens,
             live_reused_tokens: live_reused,
             ssd_cached_tokens: cached_tokens,
             cache_restore_ms,
             cache_write_ms,
             prompt_ms,
-            context_tokens: self.tokens.len(),
+            context_tokens: self.position,
             ..Default::default()
         };
         let _ = events.send(EngineEvent::TurnStarted {
             metrics: metrics.clone(),
         });
 
-        let Some(mut logits) = logits else {
-            return Err("chat prompt produced no logits".into());
-        };
+        // IMPORTANT: mirror Logan's validated Qwen4 greedy driver exactly.
+        // `run_greedy_cached_coli()` prefills every prompt token, then forwards
+        // the final prompt token AGAIN at position prompt.len() and uses those
+        // logits for the first generated token. The TUI previously sampled the
+        // logits returned by the final prefill forward, which does not match the
+        // runtime's passing token-identity path and produced garbage text.
+        let last_prompt = *self
+            .tokens
+            .last()
+            .ok_or_else(|| "chat prompt produced no tokens".to_string())?;
+        if self.position >= self.model.context_limit() {
+            return Err("context is full before decode bootstrap".into());
+        }
+        let mut logits = self.model.forward_token(last_prompt as usize, self.position);
+        self.position += 1;
+        forward_tokens += 1;
+
         let generation_t0 = Instant::now();
         let tokenizer = self.tokenizer.clone();
         let mut decode_stream = tokenizer.decode_stream(true);
@@ -428,10 +456,6 @@ impl ChatWorker {
         let mut stop_reason = StopReason::MaxTokens;
 
         for step in 0..settings.max_new {
-            if self.position >= self.model.context_limit() {
-                stop_reason = StopReason::ContextFull;
-                break;
-            }
             if cancel.load(Ordering::Relaxed) {
                 stop_reason = StopReason::Cancelled;
                 self.append_chat_closure();
@@ -442,13 +466,11 @@ impl ChatWorker {
 
             if next == self.im_end_id {
                 self.tokens.push(next);
-                self.pending.push(next);
                 stop_reason = StopReason::EndOfTurn;
                 break;
             }
             if self.eos_id == Some(next) {
                 self.tokens.push(next);
-                self.pending.push(next);
                 stop_reason = StopReason::Eos;
                 break;
             }
@@ -468,7 +490,7 @@ impl ChatWorker {
             metrics.generated_tokens = generated_tokens;
             metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
             metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
-            metrics.context_tokens = self.tokens.len();
+            metrics.context_tokens = self.position;
             metrics.forward_tokens = forward_tokens;
             let stats = self.model.runtime_stats().delta_from(&stats_before);
             let _ = events.send(EngineEvent::Token {
@@ -479,21 +501,29 @@ impl ChatWorker {
             });
 
             if step + 1 >= settings.max_new {
-                self.pending.push(next);
                 self.append_chat_closure();
                 stop_reason = StopReason::MaxTokens;
                 break;
             }
 
             if cancel.load(Ordering::Relaxed) {
-                self.pending.push(next);
                 self.append_chat_closure();
                 stop_reason = StopReason::Cancelled;
                 break;
             }
 
+            if self.position >= self.model.context_limit() {
+                self.append_chat_closure();
+                stop_reason = StopReason::ContextFull;
+                break;
+            }
+
+            // The just-sampled token is the next outstanding logical token.
+            // Consume it at the next physical model position before sampling
+            // again, exactly like the canonical greedy loop's `last = next`.
             logits = self.model.forward_token(next as usize, self.position);
             self.position += 1;
+            self.consumed += 1;
             forward_tokens += 1;
         }
 
@@ -501,7 +531,7 @@ impl ChatWorker {
         metrics.generated_tokens = generated_tokens;
         metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
         metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
-        metrics.context_tokens = self.tokens.len();
+        metrics.context_tokens = self.position;
         metrics.forward_tokens = forward_tokens;
         metrics.stop_reason = Some(stop_reason);
         let stats = self.model.runtime_stats().delta_from(&stats_before);
@@ -516,7 +546,6 @@ impl ChatWorker {
     fn append_chat_closure(&mut self) {
         if self.tokens.last().copied() != Some(self.im_end_id) {
             self.tokens.push(self.im_end_id);
-            self.pending.push(self.im_end_id);
         }
     }
 }
@@ -682,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_starts_after_prior_im_end_newline() {
+    fn continuation_uses_same_generation_prefix() {
         assert_eq!(
             render_continuation_prompt("Again"),
             "\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
