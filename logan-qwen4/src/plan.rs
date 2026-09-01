@@ -123,12 +123,22 @@ mod tests {
         let plan = Plan {
             layers: vec![
                 vec![
-                    PlannedExpert { shard_id: 0, regions: [(0, 100), (0, 100), (0, 100)], dims: [(1, 1); 3] },
-                    PlannedExpert { shard_id: 1, regions: [(0, 50), (0, 50), (0, 50)], dims: [(1, 1); 3] },
+                    PlannedExpert {
+                        shard_id: 0,
+                        regions: [(0, 100), (0, 100), (0, 100)],
+                        dims: [(1, 1); 3],
+                    },
+                    PlannedExpert {
+                        shard_id: 1,
+                        regions: [(0, 50), (0, 50), (0, 50)],
+                        dims: [(1, 1); 3],
+                    },
                 ],
-                vec![
-                    PlannedExpert { shard_id: 2, regions: [(0, 400), (0, 400), (0, 400)], dims: [(1, 1); 3] },
-                ],
+                vec![PlannedExpert {
+                    shard_id: 2,
+                    regions: [(0, 400), (0, 400), (0, 400)],
+                    dims: [(1, 1); 3],
+                }],
             ],
             max_slot_bytes: 1200,
         };

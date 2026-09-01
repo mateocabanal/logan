@@ -12,13 +12,34 @@ fn main() {
     for t in targets {
         let rec = pkg.record_by_name(t).expect(t);
         let payload = pkg.read_tensor_payload(rec).expect("payload");
-        println!("== {t}: stored={} decoded={} payload={}", rec.stored, rec.decoded, payload.len());
-        let hex: Vec<String> = payload.iter().take(32).map(|b| format!("{b:02x}")).collect();
+        println!(
+            "== {t}: stored={} decoded={} payload={}",
+            rec.stored,
+            rec.decoded,
+            payload.len()
+        );
+        let hex: Vec<String> = payload
+            .iter()
+            .take(32)
+            .map(|b| format!("{b:02x}"))
+            .collect();
         println!("  head: {}", hex.join(" "));
         // try i32, f32, bf16
-        let i32s: Vec<i32> = payload.chunks_exact(4).take(6).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect();
-        let f32s: Vec<f32> = payload.chunks_exact(4).take(6).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-        let bf16s: Vec<u16> = payload.chunks_exact(2).take(6).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect();
+        let i32s: Vec<i32> = payload
+            .chunks_exact(4)
+            .take(6)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let f32s: Vec<f32> = payload
+            .chunks_exact(4)
+            .take(6)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let bf16s: Vec<u16> = payload
+            .chunks_exact(2)
+            .take(6)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         println!("  i32: {i32s:?}  f32: {f32s:?}  bf16: {bf16s:?}");
     }
 }

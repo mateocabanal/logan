@@ -136,8 +136,13 @@ impl ColiSource {
 
     /// Dense vector tensor -> BF16 bytes.
     pub fn vec(&self, name: &str, want: usize) -> Result<Vec<u8>, String> {
-        let rec = self.rec(name).ok_or_else(|| format!("missing dense tensor {name}"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        let rec = self
+            .rec(name)
+            .ok_or_else(|| format!("missing dense tensor {name}"))?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         if payload.len() != want * 2 {
             return Err(format!(
                 "{name}: payload {} bytes != expected {}",
@@ -150,8 +155,13 @@ impl ColiSource {
 
     /// Dense matrix -> BF16 bytes, rows x cols.
     pub fn wt(&self, name: &str, o: usize, i: usize) -> Result<ColiWt, String> {
-        let rec = self.rec(name).ok_or_else(|| format!("missing dense matrix {name}"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        let rec = self
+            .rec(name)
+            .ok_or_else(|| format!("missing dense matrix {name}"))?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         let want = o * i * 2; // BF16
         if payload.len() != want {
             return Err(format!(
@@ -324,15 +334,26 @@ impl ColiSource {
     /// config-derived prime math diverges on the real model (row 173M vs
     /// computed 160M capacity), so .coli mode reads these instead.
     pub fn ple_metadata(&self, layer: i32) -> Result<(Vec<i64>, Vec<i64>, Vec<u64>), String> {
-        let sizes = self.i64_tensor(&format!("layers.{layer}.ple.ple_embedding.ngram_heads_vocab_sizes"))?;
-        let offsets = self.i64_tensor(&format!("layers.{layer}.ple.ple_embedding.ngram_heads_offsets"))?;
-        let mult = self.i64_tensor(&format!("layers.{layer}.ple.ple_embedding.layer_multipliers"))?;
+        let sizes = self.i64_tensor(&format!(
+            "layers.{layer}.ple.ple_embedding.ngram_heads_vocab_sizes"
+        ))?;
+        let offsets = self.i64_tensor(&format!(
+            "layers.{layer}.ple.ple_embedding.ngram_heads_offsets"
+        ))?;
+        let mult = self.i64_tensor(&format!(
+            "layers.{layer}.ple.ple_embedding.layer_multipliers"
+        ))?;
         Ok((sizes, offsets, mult.into_iter().map(|m| m as u64).collect()))
     }
 
     fn i64_tensor(&self, name: &str) -> Result<Vec<i64>, String> {
-        let rec = self.rec(name).ok_or_else(|| format!("missing PLE metadata {name}"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        let rec = self
+            .rec(name)
+            .ok_or_else(|| format!("missing PLE metadata {name}"))?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         // i64 records (8 bytes/elem: 16 heads x 8 = 128 bytes for
         // vocab_sizes/offsets; 3 x 8 = 24 for multipliers).
         if payload.len() % 8 != 0 {
@@ -382,9 +403,14 @@ impl ColiSource {
     /// Global BF16 scale for the F8 ngram table.
     pub fn ple_ngram_scale(&self, layer: i32) -> Result<f32, String> {
         let rec = self
-            .rec(&format!("layers.{layer}.ple.ple_embedding.ngram_embedding.weight_scale"))
+            .rec(&format!(
+                "layers.{layer}.ple.ple_embedding.ngram_embedding.weight_scale"
+            ))
             .ok_or_else(|| format!("missing ngram weight_scale"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         if payload.len() != 2 {
             return Err(format!("weight_scale payload {} != 2", payload.len()));
         }
@@ -398,12 +424,11 @@ impl ColiSource {
         let exp = ((b >> 3) & 0x0f) as i32;
         let mant = (b & 0x07) as f32;
         match exp {
-            0 => sign * mant * 0.001953125,   // subnormal: 2^-9
-            0x0f => sign * f32::INFINITY,     // NaN/Inf
+            0 => sign * mant * 0.001953125, // subnormal: 2^-9
+            0x0f => sign * f32::INFINITY,   // NaN/Inf
             e => sign * (1.0 + mant * 0.125) * 2f32.powi(e - 7),
         }
     }
-
 }
 
 /// f32 -> BF16 (top 16 bits, round-to-nearest-even), as 2 LE bytes.

@@ -17,7 +17,7 @@ use crate::Model;
 
 const MAGIC: &[u8; 8] = b"LOGANPFX";
 const FORMAT_VERSION: u32 = 1;
-const STATE_ABI_VERSION: u32 = 1;
+const STATE_ABI_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 256;
 const CHECKSUM_OFF: usize = 224;
 const CHECKSUM_BYTES: usize = 32;
@@ -118,9 +118,11 @@ impl PrefixCacheStore {
     }
 
     pub fn path_for(&self, key: &PrefixCacheKey) -> PathBuf {
-        self.root
-            .join(key.model_hex())
-            .join(format!("{:08}-{}.lpfx", key.prefix_len, key.prefix_hex()))
+        self.root.join(key.model_hex()).join(format!(
+            "{:08}-{}.lpfx",
+            key.prefix_len,
+            key.prefix_hex()
+        ))
     }
 
     /// Persist the live state at exactly `key.prefix_len()` completed token
@@ -233,8 +235,8 @@ impl PrefixCacheStore {
 
         let total_started = Instant::now();
         let path = self.path_for(key);
-        let mut file = File::open(&path)
-            .map_err(|e| format!("open prefix cache {}: {e}", path.display()))?;
+        let mut file =
+            File::open(&path).map_err(|e| format!("open prefix cache {}: {e}", path.display()))?;
         let nocache = maybe_enable_nocache(&file)?;
 
         let verify_started = Instant::now();
@@ -411,12 +413,8 @@ fn expected_payload_bytes(model: &Model, prefix_len: usize) -> Result<u64, Strin
     let cdim = cfg.lin_k_dim as u128 * cfg.lin_k_heads as u128 * 2
         + cfg.lin_v_dim as u128 * cfg.lin_v_heads as u128;
     let conv = cdim * cfg.conv_kernel.saturating_sub(1) as u128;
-    let kv_per_layer = 2u128
-        * cfg.kv_heads as u128
-        * prefix_len as u128
-        * cfg.head_dim as u128;
-    let idx_per_layer =
-        prefix_len as u128 * cfg.idx_kv_heads as u128 * cfg.idx_head_dim as u128;
+    let kv_per_layer = 2u128 * cfg.kv_heads as u128 * prefix_len as u128 * cfg.head_dim as u128;
+    let idx_per_layer = prefix_len as u128 * cfg.idx_kv_heads as u128 * cfg.idx_head_dim as u128;
     let f32_elems = gdn * (state + conv)
         + attn * kv_per_layer
         + qsa * idx_per_layer
@@ -598,7 +596,9 @@ fn visit_live_payload(
         }
         if let Some(gm) = model.gdn_metal[li].as_ref() {
             unsafe {
-                visit(f32_as_bytes(std::slice::from_raw_parts(gm.state, state_len)))?;
+                visit(f32_as_bytes(std::slice::from_raw_parts(
+                    gm.state, state_len,
+                )))?;
                 visit(f32_as_bytes(std::slice::from_raw_parts(
                     gm.conv_state,
                     conv_len,
@@ -689,11 +689,7 @@ fn restore_payload_into(
         if let Some(gm) = model.gdn_metal[li].as_ref() {
             unsafe {
                 std::ptr::copy_nonoverlapping(model.gdn_s[li].as_ptr(), gm.state, state_len);
-                std::ptr::copy_nonoverlapping(
-                    model.gdn_conv[li].as_ptr(),
-                    gm.conv_state,
-                    conv_len,
-                );
+                std::ptr::copy_nonoverlapping(model.gdn_conv[li].as_ptr(), gm.conv_state, conv_len);
             }
         }
     }
@@ -753,9 +749,7 @@ fn f32_as_bytes(v: &[f32]) -> &[u8] {
 }
 
 fn f32_as_bytes_mut(v: &mut [f32]) -> &mut [u8] {
-    unsafe {
-        std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v))
-    }
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
 fn i64_as_bytes(v: &[i64]) -> &[u8] {
@@ -763,9 +757,7 @@ fn i64_as_bytes(v: &[i64]) -> &[u8] {
 }
 
 fn i64_as_bytes_mut(v: &mut [i64]) -> &mut [u8] {
-    unsafe {
-        std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v))
-    }
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
 fn maybe_enable_nocache(file: &File) -> Result<bool, String> {

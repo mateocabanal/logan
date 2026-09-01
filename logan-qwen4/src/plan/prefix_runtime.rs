@@ -289,7 +289,10 @@ pub fn run_greedy_cached_coli(
     if let Some(store) = &store {
         match candidate_keys(store, &model, prompt, &salt) {
             Ok(keys) if keys.is_empty() => {
-                eprintln!("[qwen4-rs] prefix-cache miss prompt_tokens={}", prompt.len());
+                eprintln!(
+                    "[qwen4-rs] prefix-cache miss prompt_tokens={}",
+                    prompt.len()
+                );
             }
             Ok(keys) => {
                 // Try longest first. A damaged/stale entry never poisons the

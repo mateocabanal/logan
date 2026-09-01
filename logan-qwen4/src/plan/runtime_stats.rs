@@ -86,7 +86,9 @@ impl RuntimeStats {
             gdn_metal_ok: self.gdn_metal_ok.saturating_sub(before.gdn_metal_ok),
             expert_hits: self.expert_hits.saturating_sub(before.expert_hits),
             expert_misses: self.expert_misses.saturating_sub(before.expert_misses),
-            expert_evictions: self.expert_evictions.saturating_sub(before.expert_evictions),
+            expert_evictions: self
+                .expert_evictions
+                .saturating_sub(before.expert_evictions),
             expert_resident: self.expert_resident,
             expert_capacity: self.expert_capacity,
             metal_encode_ns: self.metal_encode_ns.saturating_sub(before.metal_encode_ns),

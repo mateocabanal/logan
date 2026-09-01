@@ -915,7 +915,11 @@ fn cdim_total(cfg: &Cfg) -> usize {
 
 /// Standalone greedy runner for `logan run` on a Qwen3 MoE package dir
 /// (safetensors fixture or .coli package dir with config.json).
-pub fn run_greedy(package_dir: &std::path::Path, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
+pub fn run_greedy(
+    package_dir: &std::path::Path,
+    prompt: &[u32],
+    max_new: usize,
+) -> Result<Vec<u32>, String> {
     let cfg = load_cfg(&package_dir.join("config.json"))?;
     let st = StFile::open(&package_dir.join("model.safetensors"))?;
     let mut model = Model::load(&st, &cfg)?;

@@ -496,10 +496,11 @@ impl SchedulerCore {
             }
         }
         for (ticket, (session, _generation)) in &self.inflight {
-            assert!(self
-                .sessions
-                .get(session)
-                .is_some_and(|record| record.inflight.contains(ticket)));
+            assert!(
+                self.sessions
+                    .get(session)
+                    .is_some_and(|record| record.inflight.contains(ticket))
+            );
         }
     }
 }

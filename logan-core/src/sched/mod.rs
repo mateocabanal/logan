@@ -30,7 +30,9 @@ pub use residency::{
     LoadResult, LoadWake, MemoryPoolId, PoolStats, RepresentationKey, ResidencyError,
     ResidencyManager, ResidencyState,
 };
-pub use residency_sim::{ResidencyOp, ResidencyOutcome, ResidencyReplayError, ResidencySimulator, ResidencyTraceEvent};
+pub use residency_sim::{
+    ResidencyOp, ResidencyOutcome, ResidencyReplayError, ResidencySimulator, ResidencyTraceEvent,
+};
 pub use runtime::{
     BoundedExecutor, CompletionSendError, CompletionSink, DispatchRequest, ExecutorSet,
     RequestSendError, RuntimeConfig, RuntimeConfigError, RuntimeHandle, RuntimeReply,

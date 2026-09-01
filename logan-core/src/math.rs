@@ -277,7 +277,16 @@ mod tests {
             .flat_map(|&v| bf16_bytes(v))
             .collect();
         let mut y = [0.0f32; 1];
-        matmul(&mut y, &x, &Wt { f: vec![], bytes: Some(w), o: 1, i: 3 });
+        matmul(
+            &mut y,
+            &x,
+            &Wt {
+                f: vec![],
+                bytes: Some(w),
+                o: 1,
+                i: 3,
+            },
+        );
         // 1*1 + 2*0.5 + 3*2 = 8 (bf16 rounding ~1e-3)
         assert!((y[0] - 8.0).abs() < 0.01);
     }
@@ -285,7 +294,12 @@ mod tests {
     #[test]
     fn matmul_f32_path() {
         let x = [1.0f32, 2.0];
-        let w = Wt { f: vec![1.0, 0.0, 0.0, 1.0], bytes: None, o: 2, i: 2 };
+        let w = Wt {
+            f: vec![1.0, 0.0, 0.0, 1.0],
+            bytes: None,
+            o: 2,
+            i: 2,
+        };
         let mut y = [0.0f32; 2];
         matmul(&mut y, &x, &w);
         assert_eq!(y, [1.0, 2.0]);

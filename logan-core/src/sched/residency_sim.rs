@@ -14,14 +14,36 @@ use super::residency::{
 /// One deterministic residency operation accepted by the simulator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResidencyOp {
-    AddPool { pool: MemoryPoolId, budget: usize },
-    AddDevice { device: DeviceId, pools: Vec<MemoryPoolId> },
-    BeginLoad { key: ExpertKey, bytes: usize, waiter: SessionId },
-    CancelWaiter { load_id: LoadId, session: SessionId },
-    CompleteLoad { completion: LoadCompletion },
-    Acquire { key: ExpertKey, owner: SessionId },
-    Release { lease: Lease },
-    Evict { pool: MemoryPoolId },
+    AddPool {
+        pool: MemoryPoolId,
+        budget: usize,
+    },
+    AddDevice {
+        device: DeviceId,
+        pools: Vec<MemoryPoolId>,
+    },
+    BeginLoad {
+        key: ExpertKey,
+        bytes: usize,
+        waiter: SessionId,
+    },
+    CancelWaiter {
+        load_id: LoadId,
+        session: SessionId,
+    },
+    CompleteLoad {
+        completion: LoadCompletion,
+    },
+    Acquire {
+        key: ExpertKey,
+        owner: SessionId,
+    },
+    Release {
+        lease: Lease,
+    },
+    Evict {
+        pool: MemoryPoolId,
+    },
 }
 
 /// Deterministic result of one simulated residency operation.
@@ -90,9 +112,9 @@ impl ResidencySimulator {
             ResidencyOp::CancelWaiter { load_id, session } => {
                 ResidencyOutcome::WaiterCancelled(self.manager.cancel_waiter(*load_id, *session))
             }
-            ResidencyOp::CompleteLoad { completion } => ResidencyOutcome::Completion(
-                self.manager.complete_load(completion.clone()),
-            ),
+            ResidencyOp::CompleteLoad { completion } => {
+                ResidencyOutcome::Completion(self.manager.complete_load(completion.clone()))
+            }
             ResidencyOp::Acquire { key, owner } => {
                 ResidencyOutcome::Lease(self.manager.acquire(key, *owner))
             }
@@ -239,9 +261,7 @@ mod tests {
             ResidencyOutcome::Evicted(Ok(None))
         );
         assert_eq!(
-            simulator.apply(ResidencyOp::Release {
-                lease: wake_lease,
-            }),
+            simulator.apply(ResidencyOp::Release { lease: wake_lease }),
             ResidencyOutcome::Released(Ok(()))
         );
         assert_eq!(
@@ -256,9 +276,9 @@ mod tests {
                 result: LoadResult::Success,
             },
         }) {
-            ResidencyOutcome::Completion(Ok(CompletionDisposition::Published { wakes, .. })) => {
-                wakes[0].result.clone().expect("waiter got a lease")
-            }
+            ResidencyOutcome::Completion(Ok(CompletionDisposition::Published {
+                wakes, ..
+            })) => wakes[0].result.clone().expect("waiter got a lease"),
             other => panic!("unexpected result: {other:?}"),
         };
         // Re-pin via an explicit acquire; eviction blocked until release.
@@ -306,7 +326,9 @@ mod tests {
                 result: LoadResult::Success,
             },
         }) {
-            ResidencyOutcome::Completion(Ok(CompletionDisposition::Published { wakes, .. })) => wakes,
+            ResidencyOutcome::Completion(Ok(CompletionDisposition::Published {
+                wakes, ..
+            })) => wakes,
             other => panic!("unexpected result: {other:?}"),
         };
         for wake in wakes {
@@ -316,7 +338,10 @@ mod tests {
                 ResidencyOutcome::Released(Ok(()))
             );
         }
-        assert!(matches!(simulator.state(key), ResidencyState::Resident { .. }));
+        assert!(matches!(
+            simulator.state(key),
+            ResidencyState::Resident { .. }
+        ));
     }
 
     #[test]
@@ -346,7 +371,10 @@ mod tests {
             }),
             ResidencyOutcome::Load(Err(ResidencyError::BudgetExceeded { .. }))
         ));
-        assert!(matches!(simulator.state(&a), ResidencyState::Resident { .. }));
+        assert!(matches!(
+            simulator.state(&a),
+            ResidencyState::Resident { .. }
+        ));
         assert!(matches!(simulator.state(&b), ResidencyState::Absent));
         assert_eq!(simulator.pool_stats(pool).unwrap().evictions, 1);
         // Releasing the pin makes a evictable; c now fits and loads.
@@ -355,10 +383,7 @@ mod tests {
             ResidencyOutcome::Released(Ok(()))
         );
         let lc = started(&mut simulator, &c, 60, SessionId(3));
-        assert!(matches!(
-            simulator.state(&a),
-            ResidencyState::Absent
-        ));
+        assert!(matches!(simulator.state(&a), ResidencyState::Absent));
         simulator.apply(ResidencyOp::CompleteLoad {
             completion: LoadCompletion {
                 load_id: lc,
@@ -401,7 +426,10 @@ mod tests {
         assert_eq!(stats.reserved_loading_bytes, 0);
         assert_eq!(stats.resident_bytes, 0);
         assert_eq!(stats.failures, 1);
-        assert!(matches!(simulator.state(&expert), ResidencyState::Failed { .. }));
+        assert!(matches!(
+            simulator.state(&expert),
+            ResidencyState::Failed { .. }
+        ));
         ResidencySimulator::replay(simulator.trace()).unwrap();
     }
 }

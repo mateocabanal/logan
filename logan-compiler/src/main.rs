@@ -225,9 +225,10 @@ fn run() -> logan_compiler::Result<()> {
         Command::InspectSource { source } => {
             eprintln!("logan: source discovery...");
             let mut progress = ConsoleProgress::new();
-            let inventory = logan_compiler::source::discover_with_progress(&source, &mut |update| {
-                progress.source_file(&update);
-            })?;
+            let inventory =
+                logan_compiler::source::discover_with_progress(&source, &mut |update| {
+                    progress.source_file(&update);
+                })?;
             println!("source={}", inventory.root.display());
             println!("files={}", inventory.files.len());
             println!("tensors={}", inventory.tensors.len());
@@ -256,22 +257,29 @@ fn run() -> logan_compiler::Result<()> {
             eprintln!("logan: verification...");
             let mut progress = ConsoleProgress::new();
             progress.verification_started = Some(Instant::now());
-            let summary = logan_compiler::verify::verify_package_with_progress(&package, &mut |update| {
-                progress.verification(update);
-            })?;
+            let summary =
+                logan_compiler::verify::verify_package_with_progress(&package, &mut |update| {
+                    progress.verification(update);
+                })?;
             logan_compiler::verify_target::verify_target_layouts(&package)?;
             println!("package={}", package.display());
             println!("shards={}", summary.shards);
             println!("records={}", summary.records);
             Ok(())
         }
-        Command::Run { package, prompt, max_new } => {
+        Command::Run {
+            package,
+            prompt,
+            max_new,
+        } => {
             let prompt_ids: Vec<u32> = prompt
                 .split_whitespace()
-                .map(|t| t.parse().unwrap_or_else(|_| {
-                    eprintln!("logan: invalid token id: {t}");
-                    std::process::exit(2);
-                }))
+                .map(|t| {
+                    t.parse().unwrap_or_else(|_| {
+                        eprintln!("logan: invalid token id: {t}");
+                        std::process::exit(2);
+                    })
+                })
                 .collect();
             // Architecture dispatch (engine-neutral): read the package's
             // config.json model_type and hand the decode to the matching
@@ -281,7 +289,11 @@ fn run() -> logan_compiler::Result<()> {
             let model_type: String = std::fs::read_to_string(&cfg_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("model_type").and_then(|t| t.as_str()).map(str::to_owned))
+                .and_then(|v| {
+                    v.get("model_type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned)
+                })
                 .unwrap_or_else(|| "qwen4_exp_text".to_string());
             let out = match model_type.as_str() {
                 "qwen4_exp_text" | "qwen4_exp" => {
@@ -291,16 +303,11 @@ fn run() -> logan_compiler::Result<()> {
                             detail: e,
                         }
                     })?;
-                    logan_qwen4::plan::run_greedy_cached_coli(
-                        &package,
-                        &cfg,
-                        &prompt_ids,
-                        max_new,
-                    )
-                    .map_err(|e| logan_compiler::ColicError::Unsupported {
-                        stage: "run",
-                        detail: e,
-                    })?
+                    logan_qwen4::plan::run_greedy_cached_coli(&package, &cfg, &prompt_ids, max_new)
+                        .map_err(|e| logan_compiler::ColicError::Unsupported {
+                            stage: "run",
+                            detail: e,
+                        })?
                 }
                 _ => {
                     // Default to the Qwen3 MoE engine for other qwen model
@@ -311,7 +318,7 @@ fn run() -> logan_compiler::Result<()> {
                             return Err(logan_compiler::ColicError::Unsupported {
                                 stage: "run",
                                 detail: format!("model_type={model_type}: {qwen_err}"),
-                            })
+                            });
                         }
                     }
                 }

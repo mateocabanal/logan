@@ -13,11 +13,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use engine::{EngineCommand, GenerationSettings};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 struct Args {
     package: PathBuf,
@@ -192,7 +192,9 @@ fn handle_key(
             app.transcript_scroll = app.transcript_scroll.saturating_sub(12);
         }
         KeyCode::Enter
-            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
             if app.loaded && !app.generating {
                 app.insert_char('\n');
