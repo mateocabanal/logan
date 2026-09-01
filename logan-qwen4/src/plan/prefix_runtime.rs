@@ -1,7 +1,7 @@
 //! Automatic persistent-prefix reuse for normal .coli greedy requests.
 //!
 //! Policy is deliberately small and reversible:
-//! - opt-in until a disk-budget/eviction policy exists;
+//! - validated performance features are on unless explicitly disabled;
 //! - restore the longest previously persisted request-prefix;
 //! - evaluate only the uncached prompt suffix;
 //! - persist the completed input-prompt boundary before generation;
@@ -18,12 +18,41 @@ use crate::{Cfg, Model};
 
 use super::{PrefixCacheKey, PrefixCacheStore};
 
-/// Automatic prefix caching remains opt-in until cache size/eviction is
-/// bounded. Explicitly setting a cache directory also counts as opting in.
+fn set_if_unset(name: &str, value: &str) {
+    if std::env::var_os(name).is_none() {
+        std::env::set_var(name, value);
+    }
+}
+
+/// Apply the fastest configuration that has already passed real-model A/B
+/// validation. Explicit user values always win, so every path remains opt-out.
+fn apply_max_performance_defaults() {
+    set_if_unset("QWEN_GDN_SINGLE_COPY", "1");
+    set_if_unset("QWEN_ATTN_METAL", "1");
+    set_if_unset("QWEN_QSA_INDEX_METAL", "1");
+    set_if_unset("QWEN_APPLE8_DIRECT", "1");
+    set_if_unset("QWEN_APPLE8_OVERLAP", "1");
+    set_if_unset("QWEN_SHARED_IO_OVERLAP", "1");
+    set_if_unset("QWEN_PREFIX_CACHE", "1");
+    set_if_unset("QWEN_PREFIX_CACHE_WRITE", "1");
+
+    // Measured Apple Silicon winner: BNNS BF16 dense execution beats the
+    // current Metal GDN path while preserving exact greedy output.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        set_if_unset("QWEN_BNNS_BF16", "1");
+        set_if_unset("QWEN_GDN_METAL", "0");
+    }
+}
+
+/// Automatic prefix caching is default-on after real-model validation. Set
+/// QWEN_PREFIX_CACHE=0 to opt out. The explicit cache directory still selects
+/// where persistent checkpoints live, but is no longer required to enable the
+/// feature.
 pub fn auto_prefix_cache_enabled() -> bool {
     std::env::var("QWEN_PREFIX_CACHE")
         .map(|v| v != "0")
-        .unwrap_or_else(|_| std::env::var_os("LOGAN_PREFIX_CACHE_DIR").is_some())
+        .unwrap_or(true)
 }
 
 fn writes_enabled() -> bool {
@@ -119,16 +148,17 @@ fn candidate_keys(
 
 /// Normal .coli greedy path with automatic persistent prefix reuse.
 ///
-/// When caching is disabled this is intentionally the old forward loop. When
-/// enabled, previous complete request prompts serve as semantic checkpoints:
-/// an append-only conversation naturally finds the previous request as its
-/// longest reusable prefix.
+/// Validated performance defaults are applied before model load. Explicit env
+/// values are preserved, so every fast path remains opt-out for A/B, fallback,
+/// and debugging.
 pub fn run_greedy_cached_coli(
     package_dir: &Path,
     cfg: &Cfg,
     prompt: &[u32],
     max_new: usize,
 ) -> Result<Vec<u32>, String> {
+    apply_max_performance_defaults();
+
     let profile = logan_core::telemetry::enabled();
     let total_t0 = Instant::now();
     let mut model = load_model(package_dir, cfg)?;
@@ -196,10 +226,8 @@ pub fn run_greedy_cached_coli(
         model.forward_token(t as usize, i);
     }
 
-    // Persist only complete input-prompt boundaries. This is synchronous in
-    // v1; the measured ~0.4 s write cost is tiny relative to current replay,
-    // and keeping it here makes correctness simple. Async persistence can be
-    // added independently after this integration is validated.
+    // Persist only complete input-prompt boundaries. This remains synchronous
+    // for now; QWEN_PREFIX_CACHE_WRITE=0 opts out independently of cache reads.
     if let Some(store) = &store {
         if writes_enabled() && !prompt.is_empty() && prompt.len() >= min_persist_tokens() {
             match PrefixCacheKey::with_salt(&model, prompt, &salt)
@@ -262,5 +290,14 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn explicit_opt_out_is_preserved() {
+        let name = "LOGAN_TEST_PERF_DEFAULT";
+        std::env::set_var(name, "0");
+        set_if_unset(name, "1");
+        assert_eq!(std::env::var(name).unwrap(), "0");
+        std::env::remove_var(name);
     }
 }
