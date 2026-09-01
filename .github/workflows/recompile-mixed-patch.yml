@@ -184,17 +184,8 @@ jobs:
           text = text.replace("request.quant == QuantMode::Mxfp4", "quant == QuantMode::Mxfp4")
           text = text.replace("request.quant == QuantMode::Keep", "quant == QuantMode::Keep")
 
-          old_publish = '''    if request.force {
-              storage::replace_package(&temporary, &request.output)?;
-          } else {
-              storage::publish_package(&temporary, &request.output)?;
-          }
-
-          if request.verify {
-              crate::verify::verify_package(&request.output)?;
-              crate::verify_target::verify_target_layouts(&request.output)?;
-          }
-          '''
+          publish_start = text.index("    if request.force {", text.index("let write_result"))
+          summary_start = text.index("    Ok(RecompileSummary {", publish_start)
           new_publish = '''    // Verification happens against the fully staged sibling package before
               // publication. In-place recompilation always verifies, even without --verify,
               // so a bad rewrite can never replace the source artifact.
@@ -212,8 +203,9 @@ jobs:
               } else {
                   storage::publish_package(&temporary, &request.output)?;
               }
+
           '''
-          text = replace_once(text, old_publish, new_publish, "pre-publication verification")
+          text = text[:publish_start] + new_publish + text[summary_start:]
           text = replace_once(
               text,
               '        "quant": request.quant.as_str(),\n',
