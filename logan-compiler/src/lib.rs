@@ -12,6 +12,7 @@ pub mod model;
 pub mod passes;
 pub mod pipeline;
 pub mod quant;
+pub mod recompile;
 pub mod source;
 pub mod storage;
 pub mod target;
