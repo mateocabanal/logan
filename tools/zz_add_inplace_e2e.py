@@ -17,7 +17,7 @@ insert = r'''
         ));
         fs::create_dir_all(&root).unwrap();
 
-        let matrices = [packed(9, 33), packed(9, 33), packed(33, 9)];
+        let matrices = [packed(9, 32), packed(9, 32), packed(32, 32)];
         let payload = build_apple8_expert(
             0,
             0,
