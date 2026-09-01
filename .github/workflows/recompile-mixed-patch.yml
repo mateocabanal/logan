@@ -21,17 +21,12 @@ jobs:
           from pathlib import Path
           path = Path('logan-compiler/src/recompile.rs')
           text = path.read_text()
-          old = '''                if requantized {
-                      " --allow-requantize"
-                  } else {
-          '''
-          new = '''                if source_quantized {
-                      " --allow-requantize"
-                  } else {
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected one diagnostic match, found {text.count(old)}')
-          path.write_text(text.replace(old, new, 1))
+          value = text.index('" --allow-requantize"')
+          branch = text.rfind('if requantized {', 0, value)
+          if branch < 0:
+              raise SystemExit('requantization diagnostic branch not found')
+          text = text[:branch] + text[branch:].replace('if requantized {', 'if source_quantized {', 1)
+          path.write_text(text)
           PY
           cargo fmt --all
       - name: Test compiler
