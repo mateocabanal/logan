@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'logan-compiler/**'
+      - 'logan-ir/**'
       - 'logan-abi/**'
       - 'logan-format/**'
       - 'Cargo.toml'
@@ -15,6 +16,7 @@ on:
     branches: [main]
     paths:
       - 'logan-compiler/**'
+      - 'logan-ir/**'
       - 'logan-abi/**'
       - 'logan-format/**'
       - 'Cargo.toml'
