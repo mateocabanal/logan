@@ -509,7 +509,7 @@ fn plan_record(
                 "retargeting layer={} expert={} would change a non-MXFP4 representation; use --quant mxfp4{}",
                 record.layer,
                 record.expert,
-                if requantized {
+                if source_quantized {
                     " --allow-requantize"
                 } else {
                     ""
