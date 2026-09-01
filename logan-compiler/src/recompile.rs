@@ -8,8 +8,8 @@
 //! is preserved.
 
 use std::{
-    fs::{self, File},
-    io::{self, Read, Seek, SeekFrom},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -24,7 +24,7 @@ use crate::{
     codec::rans256,
     error::{ColicError, Result},
     quant::mxfp4::{self, PackedMatrix},
-    storage::{self, LoweredRecord, ManifestRecord, PlannedRecord},
+    storage::{self, LoweredRecord, ManifestRecord, PlannedRecord, StoragePlan},
     target::{self, TargetProfile},
     target_registry,
 };
@@ -376,40 +376,56 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
         .iter()
         .map(|action| action.lowered.clone())
         .collect::<Vec<_>>();
-    let plan = storage::plan_records(&lowered, target, 4 * 1024 * 1024 * 1024)?;
     let fingerprint = *package.fingerprint();
-    let temporary = storage::temporary_package_path(&request.output)?;
 
-    let write_result = write_package(
-        &package,
-        &actions,
-        &plan,
-        target,
-        fingerprint,
-        request,
-        &temporary,
-    );
-    if let Err(error) = write_result {
-        let _ = fs::remove_dir_all(&temporary);
-        return Err(error);
-    }
+    if request.source == request.output {
+        // True low-space mode: preserve every record's existing physical slot
+        // and rewrite only the selected records. This avoids materializing a
+        // second package. A full space/layout preflight runs before any write.
+        let (plan, shard_sizes) = plan_in_place(&package, &actions, target)?;
+        write_package_in_place(
+            &package,
+            &actions,
+            &plan,
+            &shard_sizes,
+            target,
+            fingerprint,
+            request,
+        )?;
+        crate::verify::verify_package(&request.output)?;
+        crate::verify_target::verify_target_layouts(&request.output)?;
+    } else {
+        let plan = storage::plan_records(&lowered, target, 4 * 1024 * 1024 * 1024)?;
+        let temporary = storage::temporary_package_path(&request.output)?;
 
-    // Verify the complete sibling artifact before it becomes visible. In-place
-    // recompilation always verifies, even without --verify, so a malformed
-    // rewrite can never replace the source package.
-    if request.verify || request.source == request.output {
-        let verification = crate::verify::verify_package(&temporary)
-            .and_then(|_| crate::verify_target::verify_target_layouts(&temporary));
-        if let Err(error) = verification {
+        let write_result = write_package(
+            &package,
+            &actions,
+            &plan,
+            target,
+            fingerprint,
+            request,
+            &temporary,
+        );
+        if let Err(error) = write_result {
             let _ = fs::remove_dir_all(&temporary);
             return Err(error);
         }
-    }
 
-    if request.force {
-        storage::replace_package(&temporary, &request.output)?;
-    } else {
-        storage::publish_package(&temporary, &request.output)?;
+        if request.verify {
+            let verification = crate::verify::verify_package(&temporary)
+                .and_then(|_| crate::verify_target::verify_target_layouts(&temporary));
+            if let Err(error) = verification {
+                let _ = fs::remove_dir_all(&temporary);
+                return Err(error);
+            }
+        }
+
+        if request.force {
+            storage::replace_package(&temporary, &request.output)?;
+        } else {
+            storage::publish_package(&temporary, &request.output)?;
+        }
     }
 
     Ok(RecompileSummary {
@@ -579,6 +595,356 @@ fn plan_record(
     })
 }
 
+/// Builds a storage plan that reuses the source package's shard IDs and record
+/// offsets. The entire transform is rejected before mutation if any target
+/// record would exceed the physical slot currently available to it.
+fn plan_in_place(
+    package: &Package,
+    actions: &[Action],
+    target: TargetProfile,
+) -> Result<(StoragePlan, Vec<u64>)> {
+    let shard_count = u32_at(package.manifest_ref(), 40)?;
+    if shard_count == 0 {
+        return Err(ColicError::Usage("COLI package has no data shards".into()));
+    }
+    let mut shard_sizes = Vec::with_capacity(shard_count as usize);
+    for shard_id in 0..shard_count {
+        let path = package
+            .shard_path(shard_id)
+            .ok_or_else(|| ColicError::Usage("source shard id is invalid".into()))?;
+        let path = PathBuf::from(path);
+        let bytes = fs::metadata(&path)
+            .map_err(|source| ColicError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        shard_sizes.push(bytes);
+    }
+
+    if actions.len() != package.records().len() {
+        return Err(ColicError::Usage(
+            "in-place action count does not match package records".into(),
+        ));
+    }
+
+    let mut planned = Vec::with_capacity(actions.len());
+    let mut projected_stored_bytes = 0_u64;
+    for action in actions {
+        let source = &action.source;
+        let shard_size = *shard_sizes
+            .get(source.shard_id as usize)
+            .ok_or_else(|| ColicError::Usage("record refers to an invalid source shard".into()))?;
+        if source.offset % target.record_alignment != 0 {
+            return Err(ColicError::Usage(format!(
+                "record {} offset {} is not aligned for target {} ({} bytes); low-space --in-place cannot relocate records",
+                source.id, source.offset, target.name, target.record_alignment
+            )));
+        }
+        let slot_end = package
+            .records()
+            .iter()
+            .filter(|other| other.shard_id == source.shard_id && other.offset > source.offset)
+            .map(|other| other.offset)
+            .min()
+            .unwrap_or(shard_size);
+        if slot_end < source.offset {
+            return Err(ColicError::Usage(format!(
+                "record {} has an invalid physical slot",
+                source.id
+            )));
+        }
+        let capacity = slot_end - source.offset;
+        if action.lowered.stored_bytes > capacity {
+            return Err(ColicError::Usage(format!(
+                "record {} (layer={} expert={}) needs {} bytes but its in-place slot holds {} ({} bytes short); use a separate output path or choose a non-growing transform",
+                source.id,
+                source.layer,
+                source.expert,
+                action.lowered.stored_bytes,
+                capacity,
+                action.lowered.stored_bytes - capacity
+            )));
+        }
+        projected_stored_bytes = projected_stored_bytes
+            .checked_add(action.lowered.stored_bytes)
+            .ok_or_else(|| ColicError::Usage("in-place stored-byte total overflows u64".into()))?;
+        planned.push(PlannedRecord {
+            record: action.lowered.clone(),
+            shard_id: source.shard_id,
+            payload_offset: source.offset,
+        });
+    }
+
+    let shard_size_limit = shard_sizes.iter().copied().max().unwrap_or(0);
+    Ok((
+        StoragePlan {
+            record_alignment: target.record_alignment,
+            shard_size_limit,
+            shards: shard_count,
+            records: planned,
+            projected_stored_bytes,
+            // Existing gaps are deliberately retained in low-space mode.
+            projected_padding_bytes: 0,
+        },
+        shard_sizes,
+    ))
+}
+
+/// Rewrites a package without creating a second package directory. Record
+/// offsets and shard lengths stay fixed; only rewritten payload bytes, shard
+/// headers, the manifest, and provenance are replaced.
+fn write_package_in_place(
+    package: &Package,
+    actions: &[Action],
+    plan: &StoragePlan,
+    shard_sizes: &[u64],
+    target: TargetProfile,
+    fingerprint: [u8; 32],
+    request: &RecompileRequest,
+) -> Result<()> {
+    if actions.len() != plan.records.len() {
+        return Err(ColicError::Usage(
+            "in-place action/plan order mismatch".into(),
+        ));
+    }
+
+    let mut metadata = Vec::with_capacity(actions.len());
+    for (action, planned) in actions.iter().zip(&plan.records) {
+        if planned.shard_id != action.source.shard_id
+            || planned.payload_offset != action.source.offset
+        {
+            return Err(ColicError::Usage(
+                "low-space in-place plan attempted to relocate a record".into(),
+            ));
+        }
+        match &action.kind {
+            ActionKind::Copy => metadata.push(copy_manifest_record(action)),
+            ActionKind::Rewrite {
+                descs,
+                target: expert_target,
+                ..
+            } => {
+                let packed = [
+                    matrix_to_mxfp4(package, &action.source, descs[0], request.allow_requantize)?,
+                    matrix_to_mxfp4(package, &action.source, descs[1], request.allow_requantize)?,
+                    matrix_to_mxfp4(package, &action.source, descs[2], request.allow_requantize)?,
+                ];
+                let payload = match expert_target {
+                    ExpertTarget::Apple8Mxfp4 => build_apple8_expert(
+                        action.source.layer,
+                        action.source.expert,
+                        [&packed[0], &packed[1], &packed[2]],
+                    )?,
+                    ExpertTarget::CanonicalMxfp4 => build_canonical_mxfp4_expert(
+                        action.source.layer,
+                        action.source.expert,
+                        [&packed[0], &packed[1], &packed[2]],
+                    )?,
+                };
+                if payload.len() as u64 != planned.record.stored_bytes {
+                    return Err(ColicError::Usage(format!(
+                        "rewritten expert {}:{} produced {} bytes, planned {}",
+                        action.source.layer,
+                        action.source.expert,
+                        payload.len(),
+                        planned.record.stored_bytes
+                    )));
+                }
+                let shard_path = PathBuf::from(
+                    package
+                        .shard_path(planned.shard_id)
+                        .ok_or_else(|| ColicError::Usage("source shard id is invalid".into()))?,
+                );
+                let mut shard = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&shard_path)
+                    .map_err(|source| ColicError::Io {
+                        path: shard_path.clone(),
+                        source,
+                    })?;
+                shard
+                    .seek(SeekFrom::Start(planned.payload_offset))
+                    .map_err(|source| ColicError::Io {
+                        path: shard_path.clone(),
+                        source,
+                    })?;
+                shard.write_all(&payload).map_err(|source| ColicError::Io {
+                    path: shard_path.clone(),
+                    source,
+                })?;
+                shard.sync_data().map_err(|source| ColicError::Io {
+                    path: shard_path,
+                    source,
+                })?;
+                metadata.push(rewritten_manifest_record(action, &payload));
+            }
+        }
+    }
+
+    let mut header_crcs = Vec::with_capacity(plan.shards as usize);
+    for shard_id in 0..plan.shards {
+        let file_bytes = *shard_sizes
+            .get(shard_id as usize)
+            .ok_or_else(|| ColicError::Usage("missing source shard size".into()))?;
+        let header = storage::encode_data_shard_header(
+            shard_id,
+            file_bytes,
+            plan.record_alignment,
+            fingerprint,
+        )?;
+        let path = PathBuf::from(
+            package
+                .shard_path(shard_id)
+                .ok_or_else(|| ColicError::Usage("source shard id is invalid".into()))?,
+        );
+        let mut shard = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| ColicError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        shard
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| ColicError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        shard.write_all(&header).map_err(|source| ColicError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        shard
+            .sync_data()
+            .map_err(|source| ColicError::Io { path, source })?;
+        header_crcs.push(u32::from_le_bytes(header[72..76].try_into().unwrap()));
+    }
+
+    let mut manifest = storage::encode_manifest_with_records(
+        plan,
+        target.name,
+        fingerprint,
+        &metadata,
+        &header_crcs,
+    )?;
+    if actions.iter().any(|action| action.keeps_rans_table) {
+        let table =
+            rans256::table_from_manifest(package.manifest_ref(), RANS_TABLE_ID, RANS_CODEC_ID)?;
+        manifest = rans256::manifest_table_region(manifest, Some(&table))?;
+    }
+    patch_manifest_shard_sizes(&mut manifest, shard_sizes)?;
+
+    // POSIX rename replaces the old manifest atomically. Windows rename does
+    // not replace an existing file, so use a tiny next-manifest file and copy
+    // it over; this still avoids any model-sized temporary storage.
+    let manifest_path = request.source.join("manifest.coli");
+    let next_manifest = request.source.join("manifest.coli.recompile-next");
+    {
+        let mut file = File::create(&next_manifest).map_err(|source| ColicError::Io {
+            path: next_manifest.clone(),
+            source,
+        })?;
+        file.write_all(&manifest).map_err(|source| ColicError::Io {
+            path: next_manifest.clone(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| ColicError::Io {
+            path: next_manifest.clone(),
+            source,
+        })?;
+    }
+    #[cfg(not(windows))]
+    fs::rename(&next_manifest, &manifest_path).map_err(|source| ColicError::Io {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    #[cfg(windows)]
+    {
+        fs::copy(&next_manifest, &manifest_path).map_err(|source| ColicError::Io {
+            path: manifest_path.clone(),
+            source,
+        })?;
+        File::open(&manifest_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| ColicError::Io {
+                path: manifest_path.clone(),
+                source,
+            })?;
+        fs::remove_file(&next_manifest).map_err(|source| ColicError::Io {
+            path: next_manifest,
+            source,
+        })?;
+    }
+
+    write_provenance(package, target, actions, request, &request.output)
+}
+
+fn copy_manifest_record(action: &Action) -> ManifestRecord {
+    ManifestRecord {
+        id: action.source.id,
+        name: action.source.name.clone(),
+        layer: action.source.layer,
+        expert: action.source.expert,
+        kind: action.source.kind,
+        codec: action.source.codec,
+        math_format: action.source.math_format,
+        scale_format: action.source.scale_format,
+        layout: action.source.layout,
+        flags: action.source.flags,
+        stored_crc32c: action.source.stored_crc,
+        logical_crc32c: action.source.logical_crc,
+        codec_table_id: 0,
+    }
+}
+
+fn rewritten_manifest_record(action: &Action, payload: &[u8]) -> ManifestRecord {
+    ManifestRecord {
+        id: action.source.id,
+        name: action.source.name.clone(),
+        layer: action.source.layer,
+        expert: action.source.expert,
+        kind: 2,
+        codec: 0,
+        math_format: 0xfffe,
+        scale_format: 0xfffe,
+        layout: 0xfffe,
+        flags: 0,
+        stored_crc32c: storage::crc32c(payload),
+        logical_crc32c: 0,
+        codec_table_id: 0,
+    }
+}
+
+fn patch_manifest_shard_sizes(manifest: &mut [u8], shard_sizes: &[u64]) -> Result<()> {
+    let shard_count = u32_at(manifest, 40)? as usize;
+    if shard_count != shard_sizes.len() {
+        return Err(ColicError::Usage(
+            "in-place shard-size count does not match manifest".into(),
+        ));
+    }
+    let table = usize::try_from(u64_at(manifest, 48)?)
+        .map_err(|_| ColicError::Usage("manifest shard-table offset exceeds usize".into()))?;
+    let table_bytes = usize::try_from(u64_at(manifest, 56)?)
+        .map_err(|_| ColicError::Usage("manifest shard-table size exceeds usize".into()))?;
+    if table
+        .checked_add(table_bytes)
+        .is_none_or(|end| end > manifest.len())
+        || table_bytes != shard_count * 64
+    {
+        return Err(ColicError::Usage("manifest shard table is invalid".into()));
+    }
+    for (shard_id, file_bytes) in shard_sizes.iter().copied().enumerate() {
+        put_u64(manifest, table + shard_id * 64 + 16, file_bytes);
+    }
+    manifest[144..148].fill(0);
+    let crc = storage::crc32c(manifest);
+    put_u32(manifest, 144, crc);
+    Ok(())
+}
+
 fn write_package(
     package: &Package,
     actions: &[Action],
@@ -682,21 +1048,7 @@ fn write_action(
                     })?;
                 Ok(copied)
             })?;
-            Ok(ManifestRecord {
-                id: action.source.id,
-                name: action.source.name.clone(),
-                layer: action.source.layer,
-                expert: action.source.expert,
-                kind: action.source.kind,
-                codec: action.source.codec,
-                math_format: action.source.math_format,
-                scale_format: action.source.scale_format,
-                layout: action.source.layout,
-                flags: action.source.flags,
-                stored_crc32c: action.source.stored_crc,
-                logical_crc32c: action.source.logical_crc,
-                codec_table_id: 0,
-            })
+            Ok(copy_manifest_record(action))
         }
         ActionKind::Rewrite { descs, target, .. } => {
             let packed = [
@@ -726,21 +1078,7 @@ fn write_action(
                 )));
             }
             writer.write_record(planned, &payload)?;
-            Ok(ManifestRecord {
-                id: action.source.id,
-                name: action.source.name.clone(),
-                layer: action.source.layer,
-                expert: action.source.expert,
-                kind: 2,
-                codec: 0,
-                math_format: 0xfffe,
-                scale_format: 0xfffe,
-                layout: 0xfffe,
-                flags: 0,
-                stored_crc32c: storage::crc32c(&payload),
-                logical_crc32c: 0,
-                codec_table_id: 0,
-            })
+            Ok(rewritten_manifest_record(action, &payload))
         }
     }
 }
@@ -1573,6 +1911,52 @@ mod tests {
         assert!(QuantRule::parse("layer:9-3=mxfp4").is_err());
         assert!(QuantRule::parse("dense=mxfp4").is_err());
         assert!(QuantRule::parse("layer:2=bogus").is_err());
+    }
+
+    #[test]
+    fn patch_manifest_shard_sizes_preserves_physical_file_lengths() {
+        let plan = StoragePlan {
+            record_alignment: 4096,
+            shard_size_limit: 16 * 1024,
+            shards: 1,
+            records: vec![PlannedRecord {
+                record: LoweredRecord {
+                    id: 1,
+                    kind: 1,
+                    stored_bytes: 32,
+                    decoded_bytes: 32,
+                },
+                shard_id: 0,
+                payload_offset: 4096,
+            }],
+            projected_stored_bytes: 32,
+            projected_padding_bytes: 0,
+        };
+        let records = [ManifestRecord {
+            id: 1,
+            name: None,
+            layer: -1,
+            expert: -1,
+            kind: 1,
+            codec: 0,
+            math_format: 0,
+            scale_format: 0,
+            layout: 0,
+            flags: 0,
+            stored_crc32c: 0,
+            logical_crc32c: 0,
+            codec_table_id: 0,
+        }];
+        let mut manifest =
+            storage::encode_manifest_with_records(&plan, "test-profile", [7; 32], &records, &[123])
+                .unwrap();
+        patch_manifest_shard_sizes(&mut manifest, &[12 * 1024]).unwrap();
+        let table = u64_at(&manifest, 48).unwrap() as usize;
+        assert_eq!(u64_at(&manifest, table + 16).unwrap(), 12 * 1024);
+        let expected = u32_at(&manifest, 144).unwrap();
+        let mut crc_bytes = manifest.clone();
+        crc_bytes[144..148].fill(0);
+        assert_eq!(storage::crc32c(&crc_bytes), expected);
     }
 
     fn zero_desc() -> MatrixDesc {
