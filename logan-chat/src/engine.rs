@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -38,6 +39,7 @@ pub enum StopReason {
     Eos,
     MaxTokens,
     Cancelled,
+    ContextFull,
 }
 
 impl StopReason {
@@ -47,6 +49,7 @@ impl StopReason {
             Self::Eos => "eos",
             Self::MaxTokens => "max-tokens",
             Self::Cancelled => "cancelled",
+            Self::ContextFull => "context-full",
         }
     }
 }
@@ -134,12 +137,9 @@ pub fn spawn(package: PathBuf, system_prompt: String) -> EngineHandle {
             match command {
                 EngineCommand::Send { text, settings } => {
                     worker_cancel.store(false, Ordering::Relaxed);
-                    if let Err(error) = worker.run_turn(
-                        &text,
-                        &settings,
-                        &worker_cancel,
-                        &event_tx,
-                    ) {
+                    if let Err(error) =
+                        worker.run_turn(&text, &settings, &worker_cancel, &event_tx)
+                    {
                         let _ = event_tx.send(EngineEvent::Error(error));
                     }
                 }
@@ -173,7 +173,6 @@ struct ChatWorker {
     model: Model,
     tokenizer: Tokenizer,
     system_prompt: String,
-    model_name: String,
     im_end_id: u32,
     eos_id: Option<u32>,
     tokens: Vec<u32>,
@@ -213,7 +212,7 @@ impl ChatWorker {
             .unwrap_or_default();
 
         let _ = events.send(EngineEvent::Ready {
-            model_name: model_name.clone(),
+            model_name,
             context_limit: stats.context_limit,
             features: stats.features.clone(),
             cache_dir,
@@ -225,7 +224,6 @@ impl ChatWorker {
             model,
             tokenizer,
             system_prompt,
-            model_name,
             im_end_id,
             eos_id,
             tokens: Vec::new(),
@@ -267,10 +265,14 @@ impl ChatWorker {
             .map_err(|e| format!("decode: {e}"))
     }
 
-    fn initial_prompt(&self, user: &str) -> String {
+    fn system_prefix(&self) -> String {
+        format!("<|im_start|>system\n{}<|im_end|>\n", self.system_prompt)
+    }
+
+    fn first_user_suffix(&self, user: &str) -> String {
         format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            self.system_prompt, user
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            user
         )
     }
 
@@ -292,31 +294,37 @@ impl ChatWorker {
             return Ok(());
         }
         let turn_t0 = Instant::now();
-        let stats_before = self.model.runtime_stats();
+        let mut stats_before = self.model.runtime_stats();
         let live_reused = self.position;
         let mut forward_tokens = 0usize;
 
         // Consume the final generated token / chat terminator from the previous
         // turn only when another turn actually begins. This removes a full
         // model forward from end-of-response latency while keeping live state
-        // byte-for-byte causal when the conversation continues.
+        // causal when the conversation continues.
         for token in std::mem::take(&mut self.pending) {
+            if self.position >= self.model.context_limit() {
+                return Err("context is full; use /clear before continuing".into());
+            }
             self.model.forward_token(token as usize, self.position);
             self.position += 1;
             forward_tokens += 1;
         }
 
-        let prompt_text = if self.turns == 0 {
-            self.initial_prompt(user)
+        let (input_ids, system_boundary) = if self.turns == 0 {
+            let system_ids = self.encode(&self.system_prefix())?;
+            let mut all = system_ids.clone();
+            all.extend(self.encode(&self.first_user_suffix(user))?);
+            (all, Some(system_ids.len()))
         } else {
-            self.continuation_prompt(user)
+            (self.encode(&self.continuation_prompt(user))?, None)
         };
-        let input_ids = self.encode(&prompt_text)?;
         let input_tokens = input_ids.len();
 
         let prompt_start = Instant::now();
         let mut cached_tokens = 0usize;
         let mut cache_restore_ms = 0.0;
+        let mut cache_write_ms = 0.0;
 
         if self.turns == 0 && self.position == 0 {
             self.tokens = input_ids.clone();
@@ -332,6 +340,7 @@ impl ChatWorker {
                         "persistent prefix rejected; replaying from a fresh model: {error}"
                     )));
                     self.reload_pristine()?;
+                    stats_before = self.model.runtime_stats();
                 }
             }
         } else {
@@ -347,6 +356,32 @@ impl ChatWorker {
             ));
         }
 
+        // First-turn system state is a high-value semantic checkpoint shared by
+        // every new chat using the same system prompt. If SSD restore already
+        // passed this boundary there is nothing to do; otherwise stop exactly
+        // at it, persist, then continue into the user suffix.
+        if let Some(system_end) = system_boundary {
+            while self.position < system_end {
+                let token = self.tokens[self.position];
+                self.model.forward_token(token as usize, self.position);
+                self.position += 1;
+                forward_tokens += 1;
+            }
+            if self.position == system_end {
+                match persist_prefix_boundary(&self.model, &self.tokens[..system_end]) {
+                    Ok(Some(write)) if !write.already_existed => {
+                        cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = events.send(EngineEvent::Warning(format!(
+                            "system-prefix cache write failed (non-fatal): {error}"
+                        )));
+                    }
+                }
+            }
+        }
+
         let mut logits = None;
         while self.position < target_end {
             let token = self.tokens[self.position];
@@ -356,14 +391,11 @@ impl ChatWorker {
         }
         let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1e3;
 
-        let mut cache_write_ms = 0.0;
         match persist_prefix_boundary(&self.model, &self.tokens) {
-            Ok(Some(write)) => {
-                if !write.already_existed {
-                    cache_write_ms = write.elapsed.as_secs_f64() * 1e3;
-                }
+            Ok(Some(write)) if !write.already_existed => {
+                cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(error) => {
                 let _ = events.send(EngineEvent::Warning(format!(
                     "prefix cache write failed (non-fatal): {error}"
@@ -396,18 +428,19 @@ impl ChatWorker {
         let mut stop_reason = StopReason::MaxTokens;
 
         for step in 0..settings.max_new {
+            // Sampling another visible token is not useful if there is no
+            // context slot left to consume it on a future step/turn.
+            if self.position >= self.model.context_limit() {
+                stop_reason = StopReason::ContextFull;
+                break;
+            }
             if cancel.load(Ordering::Relaxed) {
                 stop_reason = StopReason::Cancelled;
                 self.append_chat_closure();
                 break;
             }
 
-            let next = sample_token(
-                &mut logits,
-                &self.tokens,
-                settings,
-                &mut self.rng,
-            );
+            let next = sample_token(&mut logits, &self.tokens, settings, &mut self.rng);
 
             if next == self.im_end_id {
                 self.tokens.push(next);
@@ -496,7 +529,11 @@ fn apply_repeat_penalty(logits: &mut [f32], history: &[u32], penalty: f32) {
         return;
     }
     let start = history.len().saturating_sub(256);
+    let mut seen = HashSet::with_capacity(history.len() - start);
     for &token in &history[start..] {
+        if !seen.insert(token) {
+            continue;
+        }
         let Some(logit) = logits.get_mut(token as usize) else {
             continue;
         };
