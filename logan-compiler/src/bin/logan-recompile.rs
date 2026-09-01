@@ -106,6 +106,7 @@ mod tests {
                 "--repack",
                 "--verify",
             ]
+            .into_iter()
             .map(str::to_owned),
         )
         .unwrap();
