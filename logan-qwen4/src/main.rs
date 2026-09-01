@@ -59,15 +59,15 @@ fn main() {
                     std::process::exit(1);
                 })
         } else {
-            let src = logan_qwen4::colisource::ColiSource::open(dir).unwrap_or_else(|e| {
-                eprintln!("coli error: {e}");
-                std::process::exit(1);
-            });
-            let model = logan_qwen4::Model::load_coli(&src, &cfg).unwrap_or_else(|e| {
-                eprintln!("model error: {e}");
-                std::process::exit(1);
-            });
-            logan_qwen4::run_greedy_with(model, cfg, &prompt, max_new)
+            // Canonical direct path. When QWEN_PREFIX_CACHE=1 (or an explicit
+            // LOGAN_PREFIX_CACHE_DIR is supplied), this restores the longest
+            // previously persisted request-prefix and evaluates only the
+            // uncached suffix. Cache failures reload/replay from a fresh model.
+            logan_qwen4::plan::run_greedy_cached_coli(dir, &cfg, &prompt, max_new)
+                .unwrap_or_else(|e| {
+                    eprintln!("decode error: {e}");
+                    std::process::exit(1);
+                })
         };
         if logan_core::telemetry::enabled() {
             eprintln!(
