@@ -27,7 +27,7 @@ jobs:
             case "$f" in
               logan-qwen4/src/lib.rs|logan-qwen4/src/plan/prefix_runtime.rs|logan-qwen4/src/plan/prefix_cache.rs)
                 ;;
-              tools/apply_qwen4_sigmoid_fix.py|tools/apply_qwen4_runtime_fix.py|.github/workflows/materialize-qwen4-runtime-fix.yml)
+              tools/apply_qwen4_sigmoid_fix.py|tools/apply_qwen4_runtime_fix.py|.github/workflows/materialize-qwen4-runtime-fix.yml|.github/workflows/cleanup-qwen4-materialization.yml)
                 ;;
               *)
                 git checkout "$BASE" -- "$f"
