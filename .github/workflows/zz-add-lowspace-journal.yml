@@ -19,7 +19,9 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply journal patch
-        run: python3 tools/zz_add_lowspace_journal.py
+        run: |
+          python3 tools/zz_add_lowspace_journal.py
+          python3 tools/zz_fix_lowspace_journal.py
       - name: Format recompiler only
         run: rustfmt --edition 2024 logan-compiler/src/recompile.rs
       - name: Test compiler
@@ -29,6 +31,6 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add logan-compiler/src/recompile.rs
-          git rm -f tools/zz_add_lowspace_journal.py .github/workflows/zz-add-lowspace-journal.yml || true
+          git rm -f tools/zz_add_lowspace_journal.py tools/zz_fix_lowspace_journal.py .github/workflows/zz-add-lowspace-journal.yml || true
           git commit -m 'fix: journal low-space in-place recompilation'
           git push origin HEAD:fix/true-low-space-inplace-recompile
