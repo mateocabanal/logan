@@ -39,6 +39,10 @@ impl Model {
     /// Loads from a `.coli` package. Dense matrices resident as BF16 bytes;
     /// experts + ngram fetched on demand (16 GB M2 budget).
     pub fn load_coli(src: &ColiSource, cfg: &Cfg) -> Result<Model, String> {
+        // Max-performance is the library default, not a runner convention.
+        // Explicit environment values are preserved, so every fast path
+        // remains individually opt-out for debugging and A/B tests.
+        crate::plan::prefix_runtime::apply_max_performance_defaults();
         let mut cfg = cfg.clone();
         // Bring up the Metal backend once (experts GEMV via FFI).
         crate::ffi::metal_init();

@@ -26,7 +26,8 @@ fn set_if_unset(name: &str, value: &str) {
 
 /// Apply the fastest configuration that has already passed real-model A/B
 /// validation. Explicit user values always win, so every path remains opt-out.
-/// Interactive/library clients should call this before `Model::load_coli`.
+/// `Model::load_coli` invokes this automatically; it remains public for
+/// runners/tests that need to establish policy before model construction.
 pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_GDN_SINGLE_COPY", "1");
     set_if_unset("QWEN_ATTN_METAL", "1");

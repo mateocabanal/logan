@@ -316,8 +316,16 @@ fn hash_numerical_policy(h: &mut Sha256, model: &Model) {
     // `metal_direct` is resolved at model load and therefore more exact than
     // re-reading QWEN_APPLE8_DIRECT here.
     h.update([model.metal_direct as u8]);
+    // Hash the backend that can actually execute this checkpoint.
+    // Qwen3.8 sigmoid gating deliberately declines the historical SiLU
+    // Metal GDN kernel, so QWEN_GDN_METAL=0/1 are numerically identical
+    // for this model and should share one prefix-cache namespace.
+    let effective_gdn_metal = env_bool("QWEN_GDN_METAL", true)
+        && model.cfg.output_gate == crate::OutputGate::Silu;
+    h.update(b"QWEN_GDN_METAL");
+    h.update([0]);
+    h.update([effective_gdn_metal as u8]);
     for (name, default) in [
-        ("QWEN_GDN_METAL", true),
         ("QWEN_BNNS_BF16", false),
         ("QWEN_ATTN_METAL", true),
         ("QWEN_QSA_INDEX_METAL", true),
@@ -365,6 +373,10 @@ fn model_digest(model: &Model) -> Result<[u8; 32], String> {
     usize_field!(cfg.conv_kernel);
     usize_field!(cfg.vocab);
     h.update(cfg.eps.to_bits().to_le_bytes());
+    h.update([match cfg.output_gate {
+        crate::OutputGate::Silu => 0,
+        crate::OutputGate::Sigmoid => 1,
+    }]);
     usize_field!(cfg.hc_count);
     usize_field!(cfg.hc_lowrank);
     usize_field!(cfg.idx_n_heads);

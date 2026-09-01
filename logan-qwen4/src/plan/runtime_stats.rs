@@ -184,7 +184,8 @@ impl Model {
                 metal_direct: self.metal_direct,
                 metal_overlap: self.metal_overlap,
                 bnns_bf16: env_bool("QWEN_BNNS_BF16", false),
-                gdn_metal: env_bool("QWEN_GDN_METAL", true),
+                gdn_metal: env_bool("QWEN_GDN_METAL", true)
+            && self.cfg.output_gate == crate::OutputGate::Silu,
                 gdn_single_copy: env_bool("QWEN_GDN_SINGLE_COPY", true),
                 attn_metal: env_bool("QWEN_ATTN_METAL", true),
                 qsa_index_metal: env_bool("QWEN_QSA_INDEX_METAL", true),
