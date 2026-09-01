@@ -6,7 +6,8 @@ use crate::{
         CodecRequest, CompileRequest, OptimizationProfile, QuantFloor, QuantRequest, TargetRequest,
     },
     recompile::{
-        CodecMode as RecompileCodecMode, QuantMode as RecompileQuantMode, RecompileRequest,
+        CodecMode as RecompileCodecMode, QuantMode as RecompileQuantMode, QuantRule,
+        RecompileRequest,
     },
 };
 
@@ -28,7 +29,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR -o OUTPUT [--target source|PROFILE] [--quant keep|mxfp4] [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|PROFILE] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -66,18 +67,16 @@ where
             while let Some(flag) = it.next() {
                 match flag.as_str() {
                     "--prompt" => {
-                        prompt = it.next().ok_or_else(|| {
-                            ColicError::Usage("--prompt needs a value".into())
-                        })?
+                        prompt = it
+                            .next()
+                            .ok_or_else(|| ColicError::Usage("--prompt needs a value".into()))?
                     }
                     "--max-new" => {
                         max_new = it
                             .next()
                             .ok_or_else(|| ColicError::Usage("--max-new needs a value".into()))?
                             .parse()
-                            .map_err(|_| {
-                                ColicError::Usage("--max-new must be a number".into())
-                            })?
+                            .map_err(|_| ColicError::Usage("--max-new must be a number".into()))?
                     }
                     other => return Err(ColicError::Usage(format!("unknown run flag {other}"))),
                 }
@@ -121,17 +120,14 @@ where
                 .ok_or_else(|| ColicError::Usage(format!("{flag} requires a value")))
         };
         match flag.as_str() {
-            "--target" => {
-                request.target = TargetRequest::parse(&value(&mut args, "--target")?)?
-            }
+            "--target" => request.target = TargetRequest::parse(&value(&mut args, "--target")?)?,
             "--quant" => request.quant = QuantRequest::parse(&value(&mut args, "--quant")?)?,
             "--quant-floor" => {
                 request.quant_floor = QuantFloor::parse(&value(&mut args, "--quant-floor")?)?
             }
             "--codec" => request.codec = CodecRequest::parse(&value(&mut args, "--codec")?)?,
             "--opt" => {
-                request.optimization =
-                    OptimizationProfile::parse(&value(&mut args, "--opt")?)?;
+                request.optimization = OptimizationProfile::parse(&value(&mut args, "--opt")?)?;
             }
             "--plan" => request.plan = Some(PathBuf::from(value(&mut args, "--plan")?)),
             "-o" | "--output" => {
@@ -167,11 +163,13 @@ where
     let mut output = None;
     let mut target = "source".to_owned();
     let mut quant = RecompileQuantMode::Keep;
+    let mut quant_rules = Vec::new();
     let mut codec = RecompileCodecMode::Keep;
     let mut allow_requantize = false;
     let mut repack = false;
     let mut verify = false;
     let mut force = false;
+    let mut in_place = false;
 
     while let Some(flag) = args.next() {
         let value = |args: &mut I, flag: &str| {
@@ -181,16 +179,16 @@ where
         match flag.as_str() {
             "-o" | "--output" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--target" => target = value(&mut args, "--target")?,
-            "--quant" => {
-                quant = RecompileQuantMode::parse(&value(&mut args, "--quant")?)?
+            "--quant" => quant = RecompileQuantMode::parse(&value(&mut args, "--quant")?)?,
+            "--quant-rule" => {
+                quant_rules.push(QuantRule::parse(&value(&mut args, "--quant-rule")?)?)
             }
-            "--codec" => {
-                codec = RecompileCodecMode::parse(&value(&mut args, "--codec")?)?
-            }
+            "--codec" => codec = RecompileCodecMode::parse(&value(&mut args, "--codec")?)?,
             "--allow-requantize" => allow_requantize = true,
             "--repack" => repack = true,
             "--verify" => verify = true,
             "--force" => force = true,
+            "--in-place" => in_place = true,
             other => {
                 return Err(ColicError::Usage(format!(
                     "unknown recompile option `{other}`"
@@ -199,18 +197,29 @@ where
         }
     }
 
-    let output = output
-        .ok_or_else(|| ColicError::Usage("recompile requires -o/--output".into()))?;
+    if in_place && output.is_some() {
+        return Err(ColicError::Usage(
+            "recompile --in-place cannot be combined with -o/--output".into(),
+        ));
+    }
+    let output = if in_place {
+        source.clone()
+    } else {
+        output.ok_or_else(|| {
+            ColicError::Usage("recompile requires -o/--output or --in-place".into())
+        })?
+    };
     Ok(Command::Recompile(RecompileRequest {
         source,
         output,
         target,
         quant,
+        quant_rules,
         codec,
         allow_requantize,
         repack,
         verify,
-        force,
+        force: force || in_place,
     }))
 }
 
@@ -222,19 +231,8 @@ mod tests {
     fn parses_deterministic_compile_request() {
         let command = parse(
             [
-                "compile",
-                "fixture",
-                "--target",
-                "native",
-                "--quant",
-                "exact",
-                "--codec",
-                "none",
-                "--opt",
-                "latency",
-                "-o",
-                "out.coli",
-                "--verify",
+                "compile", "fixture", "--target", "native", "--quant", "exact", "--codec", "none",
+                "--opt", "latency", "-o", "out.coli", "--verify",
             ]
             .map(str::to_owned),
         )
@@ -284,6 +282,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_mixed_quant_rules_and_in_place() {
+        let command = parse(
+            [
+                "recompile",
+                "model.coli",
+                "--in-place",
+                "--quant",
+                "keep",
+                "--quant-rule",
+                "layer:0-7=mxfp4",
+                "--quant-rule",
+                "expert:0=keep",
+                "--allow-requantize",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(request) = command else {
+            panic!("expected recompile")
+        };
+        assert_eq!(request.source, PathBuf::from("model.coli"));
+        assert_eq!(request.output, request.source);
+        assert_eq!(request.quant_rules.len(), 2);
+        assert!(request.allow_requantize);
+        assert!(request.force);
+    }
+
+    #[test]
+    fn recompile_rejects_output_with_in_place() {
+        assert!(
+            parse(["recompile", "model.coli", "--in-place", "-o", "other.coli"].map(str::to_owned))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn recompile_requires_an_output_argument() {
         assert!(parse(["recompile", "old.coli"].map(str::to_owned)).is_err());
     }
@@ -292,8 +326,7 @@ mod tests {
     fn portable_target_is_rejected() {
         assert!(
             parse(
-                ["compile", "fixture", "--target", "portable-v1", "--dry-run"]
-                    .map(str::to_owned)
+                ["compile", "fixture", "--target", "portable-v1", "--dry-run"].map(str::to_owned)
             )
             .is_err()
         );

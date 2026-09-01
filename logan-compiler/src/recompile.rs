@@ -14,9 +14,7 @@ use std::{
 };
 
 use logan_format::{
-    codecs::{
-        self, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID, RANS_TABLE_ID, RansTable,
-    },
+    codecs::{self, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID, RANS_TABLE_ID, RansTable},
     package::{Package, RecordInfo},
 };
 use serde_json::json;
@@ -66,6 +64,119 @@ impl QuantMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuantSelector {
+    All,
+    Layer { first: i32, last: i32 },
+    Expert { first: i32, last: i32 },
+    Pair { layer: i32, expert: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuantRule {
+    selector: QuantSelector,
+    mode: QuantMode,
+}
+
+impl QuantRule {
+    pub fn parse(value: &str) -> Result<Self> {
+        let (selector, mode) = value.rsplit_once('=').ok_or_else(|| {
+            ColicError::Usage(format!(
+                "invalid quant rule `{value}` (expected SELECTOR=keep|mxfp4)"
+            ))
+        })?;
+        let mode = QuantMode::parse(mode)?;
+        let selector = if selector == "all" {
+            QuantSelector::All
+        } else if let Some((layer, expert)) = selector.split_once('/') {
+            let layer = layer.strip_prefix("layer:").ok_or_else(|| {
+                ColicError::Usage(format!("invalid quant-rule selector `{selector}`"))
+            })?;
+            let expert = expert.strip_prefix("expert:").ok_or_else(|| {
+                ColicError::Usage(format!("invalid quant-rule selector `{selector}`"))
+            })?;
+            QuantSelector::Pair {
+                layer: parse_nonnegative_index(layer, "layer")?,
+                expert: parse_nonnegative_index(expert, "expert")?,
+            }
+        } else if let Some(range) = selector
+            .strip_prefix("layer:")
+            .or_else(|| selector.strip_prefix("layers:"))
+        {
+            let (first, last) = parse_nonnegative_range(range, "layer")?;
+            QuantSelector::Layer { first, last }
+        } else if let Some(range) = selector
+            .strip_prefix("expert:")
+            .or_else(|| selector.strip_prefix("experts:"))
+        {
+            let (first, last) = parse_nonnegative_range(range, "expert")?;
+            QuantSelector::Expert { first, last }
+        } else {
+            return Err(ColicError::Usage(format!(
+                "invalid quant-rule selector `{selector}` (expected all, layer:N[-M], expert:N[-M], or layer:N/expert:M)"
+            )));
+        };
+        Ok(Self { selector, mode })
+    }
+
+    fn matches(&self, record: &RecordInfo) -> bool {
+        if record.kind != 2 {
+            return false;
+        }
+        match self.selector {
+            QuantSelector::All => true,
+            QuantSelector::Layer { first, last } => (first..=last).contains(&record.layer),
+            QuantSelector::Expert { first, last } => (first..=last).contains(&record.expert),
+            QuantSelector::Pair { layer, expert } => {
+                record.layer == layer && record.expert == expert
+            }
+        }
+    }
+
+    fn as_spec(&self) -> String {
+        let selector = match self.selector {
+            QuantSelector::All => "all".to_owned(),
+            QuantSelector::Layer { first, last } if first == last => format!("layer:{first}"),
+            QuantSelector::Layer { first, last } => format!("layer:{first}-{last}"),
+            QuantSelector::Expert { first, last } if first == last => format!("expert:{first}"),
+            QuantSelector::Expert { first, last } => format!("expert:{first}-{last}"),
+            QuantSelector::Pair { layer, expert } => format!("layer:{layer}/expert:{expert}"),
+        };
+        format!("{selector}={}", self.mode.as_str())
+    }
+}
+
+fn parse_nonnegative_index(value: &str, what: &str) -> Result<i32> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| ColicError::Usage(format!("quant-rule {what} `{value}` is not an integer")))?;
+    if parsed < 0 {
+        return Err(ColicError::Usage(format!(
+            "quant-rule {what} must be non-negative"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_nonnegative_range(value: &str, what: &str) -> Result<(i32, i32)> {
+    let (first, last) = match value.split_once('-') {
+        Some((first, last)) => (
+            parse_nonnegative_index(first, what)?,
+            parse_nonnegative_index(last, what)?,
+        ),
+        None => {
+            let value = parse_nonnegative_index(value, what)?;
+            (value, value)
+        }
+    };
+    if first > last {
+        return Err(ColicError::Usage(format!(
+            "quant-rule {what} range starts after it ends"
+        )));
+    }
+    Ok((first, last))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecMode {
     /// Preserve compressed bytes for records that can be copied unchanged.
@@ -103,6 +214,8 @@ pub struct RecompileRequest {
     /// override or hidden native selection in this API.
     pub target: String,
     pub quant: QuantMode,
+    /// Ordered routed-expert overrides. Later matching rules win.
+    pub quant_rules: Vec<QuantRule>,
     pub codec: CodecMode,
     pub allow_requantize: bool,
     /// Force target-layout reconstruction even when the package already uses
@@ -119,6 +232,7 @@ impl RecompileRequest {
             output,
             target: "source".into(),
             quant: QuantMode::Keep,
+            quant_rules: Vec::new(),
             codec: CodecMode::Keep,
             allow_requantize: false,
             repack: false,
@@ -126,6 +240,15 @@ impl RecompileRequest {
             force: false,
         }
     }
+}
+
+fn effective_quant(request: &RecompileRequest, record: &RecordInfo) -> QuantMode {
+    request
+        .quant_rules
+        .iter()
+        .filter(|rule| rule.matches(record))
+        .last()
+        .map_or(request.quant, |rule| rule.mode)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,26 +372,44 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
         actions.push(action);
     }
 
-    let lowered = actions.iter().map(|action| action.lowered.clone()).collect::<Vec<_>>();
+    let lowered = actions
+        .iter()
+        .map(|action| action.lowered.clone())
+        .collect::<Vec<_>>();
     let plan = storage::plan_records(&lowered, target, 4 * 1024 * 1024 * 1024)?;
     let fingerprint = *package.fingerprint();
     let temporary = storage::temporary_package_path(&request.output)?;
 
-    let write_result = write_package(&package, &actions, &plan, target, fingerprint, request, &temporary);
+    let write_result = write_package(
+        &package,
+        &actions,
+        &plan,
+        target,
+        fingerprint,
+        request,
+        &temporary,
+    );
     if let Err(error) = write_result {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
+    }
+
+    // Verify the complete sibling artifact before it becomes visible. In-place
+    // recompilation always verifies, even without --verify, so a malformed
+    // rewrite can never replace the source package.
+    if request.verify || request.source == request.output {
+        let verification = crate::verify::verify_package(&temporary)
+            .and_then(|_| crate::verify_target::verify_target_layouts(&temporary));
+        if let Err(error) = verification {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
     }
 
     if request.force {
         storage::replace_package(&temporary, &request.output)?;
     } else {
         storage::publish_package(&temporary, &request.output)?;
-    }
-
-    if request.verify {
-        crate::verify::verify_package(&request.output)?;
-        crate::verify_target::verify_target_layouts(&request.output)?;
     }
 
     Ok(RecompileSummary {
@@ -334,11 +475,13 @@ fn plan_record(
 
     let descs = expert_descs(package, record)?;
     let kinds = [descs[0].kind()?, descs[1].kind()?, descs[2].kind()?];
-    let all_mxfp4 = kinds.iter().all(|kind| {
-        matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4)
-    });
-    let requantized = kinds.iter().any(|kind| *kind == MatrixKind::Int4G32);
-    if requantized && request.quant == QuantMode::Mxfp4 && !request.allow_requantize {
+    let all_mxfp4 = kinds
+        .iter()
+        .all(|kind| matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4));
+    let quant = effective_quant(request, record);
+    let source_quantized = kinds.iter().any(|kind| *kind == MatrixKind::Int4G32);
+    let requantized = source_quantized && quant == QuantMode::Mxfp4;
+    if requantized && !request.allow_requantize {
         return Err(ColicError::Usage(format!(
             "expert layer={} expert={} is already quantized INT4-G32; pass --allow-requantize to convert it to MXFP4",
             record.layer, record.expert
@@ -346,8 +489,10 @@ fn plan_record(
     }
 
     let target_changed = package.profile() != target_profile.name;
-    let quantizes = request.quant == QuantMode::Mxfp4
-        && kinds.iter().any(|kind| !matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4));
+    let quantizes = quant == QuantMode::Mxfp4
+        && kinds
+            .iter()
+            .any(|kind| !matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4));
     let layout_mismatch = all_mxfp4
         && kinds.iter().any(|kind| match target_kind {
             ExpertTarget::Apple8Mxfp4 => *kind != MatrixKind::Apple8Mxfp4,
@@ -357,19 +502,23 @@ fn plan_record(
     let strips_codec = request.codec == CodecMode::None && has_rans;
     let repacks = request.repack && all_mxfp4;
 
-    if request.quant == QuantMode::Keep && (target_changed || layout_mismatch) && !all_mxfp4 {
+    if quant == QuantMode::Keep && (target_changed || layout_mismatch) && !all_mxfp4 {
         return Err(ColicError::unsupported(
             "COLI recompilation",
             format!(
                 "retargeting layer={} expert={} would change a non-MXFP4 representation; use --quant mxfp4{}",
                 record.layer,
                 record.expert,
-                if requantized { " --allow-requantize" } else { "" }
+                if requantized {
+                    " --allow-requantize"
+                } else {
+                    ""
+                }
             ),
         ));
     }
 
-    if request.quant == QuantMode::Mxfp4 {
+    if quant == QuantMode::Mxfp4 {
         for kind in kinds {
             if !matches!(
                 kind,
@@ -386,7 +535,8 @@ fn plan_record(
         }
     }
 
-    let rewrite = quantizes || layout_mismatch || strips_codec || repacks || (target_changed && all_mxfp4);
+    let rewrite =
+        quantizes || layout_mismatch || strips_codec || repacks || (target_changed && all_mxfp4);
     if !rewrite {
         return Ok(Action {
             source: record.clone(),
@@ -401,7 +551,7 @@ fn plan_record(
         });
     }
 
-    if request.quant == QuantMode::Keep && !all_mxfp4 {
+    if quant == QuantMode::Keep && !all_mxfp4 {
         return Err(ColicError::unsupported(
             "COLI recompilation",
             "requested transform requires MXFP4 but --quant keep forbids changing the mathematical format",
@@ -443,12 +593,8 @@ fn write_package(
 
     for shard_id in 0..plan.shards {
         let path = temporary.join(format!("data-{shard_id:05}.coli"));
-        let mut writer = storage::DataShardWriter::create(
-            &path,
-            shard_id,
-            plan.record_alignment,
-            fingerprint,
-        )?;
+        let mut writer =
+            storage::DataShardWriter::create(&path, shard_id, plan.record_alignment, fingerprint)?;
         for (index, planned) in plan
             .records
             .iter()
@@ -458,7 +604,13 @@ fn write_package(
             let action = actions
                 .get(index)
                 .ok_or_else(|| ColicError::Usage("recompile action/plan order mismatch".into()))?;
-            metadata.push(write_action(package, &mut writer, planned, action, request)?);
+            metadata.push(write_action(
+                package,
+                &mut writer,
+                planned,
+                action,
+                request,
+            )?);
         }
         writer.finish()?;
         let mut header = [0_u8; storage::DATA_SHARD_HEADER_BYTES as usize];
@@ -483,7 +635,8 @@ fn write_package(
         &header_crcs,
     )?;
     if actions.iter().any(|action| action.keeps_rans_table) {
-        let table = rans256::table_from_manifest(package.manifest_ref(), RANS_TABLE_ID, RANS_CODEC_ID)?;
+        let table =
+            rans256::table_from_manifest(package.manifest_ref(), RANS_TABLE_ID, RANS_CODEC_ID)?;
         manifest = rans256::manifest_table_region(manifest, Some(&table))?;
     }
     let manifest_path = temporary.join("manifest.coli");
@@ -516,16 +669,17 @@ fn write_action(
                     path: shard.clone(),
                     source,
                 })?;
-                input.seek(SeekFrom::Start(offset)).map_err(|source| ColicError::Io {
-                    path: shard.clone(),
-                    source,
-                })?;
-                let copied = io::copy(&mut input.take(bytes), output).map_err(|source| {
-                    ColicError::Io {
+                input
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(|source| ColicError::Io {
                         path: shard.clone(),
                         source,
-                    }
-                })?;
+                    })?;
+                let copied =
+                    io::copy(&mut input.take(bytes), output).map_err(|source| ColicError::Io {
+                        path: shard.clone(),
+                        source,
+                    })?;
                 Ok(copied)
             })?;
             Ok(ManifestRecord {
@@ -746,12 +900,8 @@ fn read_apple8_mxfp4(
                 desc.weight_table,
                 desc.weight_codec,
             )?;
-            let decoded = codecs::apple8_decode(
-                &stored,
-                &table,
-                u64::from(desc.rows),
-                u64::from(desc.cols),
-            )?;
+            let decoded =
+                codecs::apple8_decode(&stored, &table, u64::from(desc.rows), u64::from(desc.cols))?;
             if decoded.len() as u64 != expected || desc.weight_decoded != expected {
                 return Err(ColicError::Usage(
                     "decoded Apple8 matrix length does not match its geometry".into(),
@@ -783,7 +933,9 @@ fn quantize_bf16(package: &Package, record: &RecordInfo, desc: MatrixDesc) -> Re
         .checked_mul(row_bytes)
         .ok_or_else(|| ColicError::Usage("BF16 matrix size overflows usize".into()))?;
     if source.len() != expected {
-        return Err(ColicError::Usage("BF16 expert matrix length does not match geometry".into()));
+        return Err(ColicError::Usage(
+            "BF16 expert matrix length does not match geometry".into(),
+        ));
     }
     let mut weights = Vec::new();
     let mut scales = Vec::new();
@@ -798,7 +950,11 @@ fn quantize_bf16(package: &Package, record: &RecordInfo, desc: MatrixDesc) -> Re
     })
 }
 
-fn requantize_int4(package: &Package, record: &RecordInfo, desc: MatrixDesc) -> Result<PackedMatrix> {
+fn requantize_int4(
+    package: &Package,
+    record: &RecordInfo,
+    desc: MatrixDesc,
+) -> Result<PackedMatrix> {
     if desc.weight_codec != 0 || desc.scale_codec != 0 {
         return Err(ColicError::unsupported(
             "COLI recompilation",
@@ -807,12 +963,8 @@ fn requantize_int4(package: &Package, record: &RecordInfo, desc: MatrixDesc) -> 
     }
     let weights = read_component(package, record, desc.weight_offset, desc.weight_stored)?;
     let scales = read_component(package, record, desc.scale_offset, desc.scale_stored)?;
-    let values = codecs::int4_grouped_decode(
-        &weights,
-        &scales,
-        desc.rows as usize,
-        desc.cols as usize,
-    )?;
+    let values =
+        codecs::int4_grouped_decode(&weights, &scales, desc.rows as usize, desc.cols as usize)?;
     let mut packed = Vec::new();
     let mut e8m0 = Vec::new();
     for row in values.chunks_exact(desc.cols as usize) {
@@ -835,7 +987,9 @@ fn read_component(
     let bytes: usize = bytes
         .try_into()
         .map_err(|_| ColicError::Usage("expert component exceeds usize".into()))?;
-    package.read_payload_range(record, offset, bytes).map_err(Into::into)
+    package
+        .read_payload_range(record, offset, bytes)
+        .map_err(Into::into)
 }
 
 fn validate_mxfp4_lengths(rows: u32, cols: u32, weights: &[u8], scales: &[u8]) -> Result<()> {
@@ -858,7 +1012,9 @@ fn validate_mxfp4_lengths(rows: u32, cols: u32, weights: &[u8], scales: &[u8]) -
 fn detile_apple8(rows: u32, cols: u32, tiles: &[u8]) -> Result<PackedMatrix> {
     let expected = target::apple8_tile_bytes(rows, cols)? as usize;
     if tiles.len() != expected {
-        return Err(ColicError::Usage("Apple8 tile buffer has the wrong size".into()));
+        return Err(ColicError::Usage(
+            "Apple8 tile buffer has the wrong size".into(),
+        ));
     }
     let row_bytes = (cols as usize).div_ceil(2);
     let groups = (cols as usize).div_ceil(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
@@ -878,15 +1034,14 @@ fn detile_apple8(rows: u32, cols: u32, tiles: &[u8]) -> Result<PackedMatrix> {
                 .checked_mul(target_registry::APPLE8_MXFP4_TILE_BYTES as usize)
                 .ok_or_else(|| ColicError::Usage("Apple8 tile offset overflows usize".into()))?;
             let column = group * target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize;
-            let logical_columns = (cols as usize - column)
-                .min(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
+            let logical_columns =
+                (cols as usize - column).min(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
             let copy_bytes = logical_columns.div_ceil(2);
             let src = tile + within_row * target_registry::APPLE8_MXFP4_WEIGHT_ROW_BYTES as usize;
             let dst = weight_row + column / 2;
             weights[dst..dst + copy_bytes].copy_from_slice(&tiles[src..src + copy_bytes]);
-            scales[scale_row + group] = tiles[
-                tile + target_registry::APPLE8_MXFP4_WEIGHT_BYTES as usize + within_row
-            ];
+            scales[scale_row + group] =
+                tiles[tile + target_registry::APPLE8_MXFP4_WEIGHT_BYTES as usize + within_row];
         }
     }
     Ok(PackedMatrix {
@@ -900,7 +1055,8 @@ fn detile_apple8(rows: u32, cols: u32, tiles: &[u8]) -> Result<PackedMatrix> {
 fn pack_apple8(matrix: &PackedMatrix) -> Result<Vec<u8>> {
     validate_mxfp4_lengths(matrix.rows, matrix.columns, &matrix.weights, &matrix.scales)?;
     let row_bytes = (matrix.columns as usize).div_ceil(2);
-    let groups = (matrix.columns as usize).div_ceil(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
+    let groups =
+        (matrix.columns as usize).div_ceil(target_registry::APPLE8_MXFP4_TILE_COLUMNS as usize);
     let mut output = vec![
         0_u8;
         usize::try_from(target::apple8_tile_bytes(matrix.rows, matrix.columns)?)
@@ -987,18 +1143,42 @@ fn build_apple8_expert(
         )?;
         let d = EXPERT_HEADER_BYTES + index * EXPERT_DESC_BYTES;
         put_u16(&mut payload, d, (index + 1) as u16);
-        put_u16(&mut payload, d + 4, target_registry::APPLE8_MXFP4_MATH_FORMAT);
-        put_u16(&mut payload, d + 6, target_registry::APPLE8_MXFP4_SCALE_FORMAT);
-        put_u16(&mut payload, d + 12, target_registry::APPLE8_MXFP4_TILE_LAYOUT);
+        put_u16(
+            &mut payload,
+            d + 4,
+            target_registry::APPLE8_MXFP4_MATH_FORMAT,
+        );
+        put_u16(
+            &mut payload,
+            d + 6,
+            target_registry::APPLE8_MXFP4_SCALE_FORMAT,
+        );
+        put_u16(
+            &mut payload,
+            d + 12,
+            target_registry::APPLE8_MXFP4_TILE_LAYOUT,
+        );
         put_u64(&mut payload, d + 16, matrix.rows as u64);
         put_u64(&mut payload, d + 24, matrix.columns as u64);
-        put_u32(&mut payload, d + 32, target_registry::APPLE8_MXFP4_SCALE_BLOCK_ROWS);
-        put_u32(&mut payload, d + 36, target_registry::APPLE8_MXFP4_SCALE_BLOCK_COLUMNS);
+        put_u32(
+            &mut payload,
+            d + 32,
+            target_registry::APPLE8_MXFP4_SCALE_BLOCK_ROWS,
+        );
+        put_u32(
+            &mut payload,
+            d + 36,
+            target_registry::APPLE8_MXFP4_SCALE_BLOCK_COLUMNS,
+        );
         put_u64(&mut payload, d + 48, weight_offset);
         put_u64(&mut payload, d + 56, tiles.len() as u64);
         put_u64(&mut payload, d + 64, tiles.len() as u64);
         put_u32(&mut payload, d + 96, storage::crc32c(&tiles));
-        put_u32(&mut payload, d + 104, target_registry::APPLE8_MXFP4_GROUP_SIZE);
+        put_u32(
+            &mut payload,
+            d + 104,
+            target_registry::APPLE8_MXFP4_GROUP_SIZE,
+        );
         resident = resident
             .checked_add(tiles.len() as u64)
             .ok_or_else(|| ColicError::Usage("Apple8 resident size overflows u64".into()))?;
@@ -1093,7 +1273,9 @@ fn quantize_f32_row(values: &[f32], weights: &mut Vec<u8>, scales: &mut Vec<u8>)
 }
 
 fn choose_scale(values: &[f32]) -> (u8, f32) {
-    let max_abs = values.iter().fold(0.0_f32, |acc, value| acc.max(value.abs()));
+    let max_abs = values
+        .iter()
+        .fold(0.0_f32, |acc, value| acc.max(value.abs()));
     if max_abs == 0.0 {
         return (127, 1.0);
     }
@@ -1189,7 +1371,15 @@ fn write_provenance(
         .count();
     let requantized = actions
         .iter()
-        .filter(|action| matches!(action.kind, ActionKind::Rewrite { requantized: true, .. }))
+        .filter(|action| {
+            matches!(
+                action.kind,
+                ActionKind::Rewrite {
+                    requantized: true,
+                    ..
+                }
+            )
+        })
         .count();
     let provenance = json!({
         "version": 1,
@@ -1199,6 +1389,8 @@ fn write_provenance(
         "parent_profile": package.profile(),
         "target_profile": target.name,
         "quant": request.quant.as_str(),
+        "quant_rules": request.quant_rules.iter().map(|rule| rule.as_spec()).collect::<Vec<_>>(),
+        "in_place": request.source == request.output,
         "codec": request.codec.as_str(),
         "allow_requantize": request.allow_requantize,
         "repack": request.repack,
@@ -1206,8 +1398,9 @@ fn write_provenance(
         "requantized_experts": requantized,
     });
     let path = output.join("recompile.json");
-    let bytes = serde_json::to_vec_pretty(&provenance)
-        .map_err(|error| ColicError::Usage(format!("cannot encode recompile provenance: {error}")))?;
+    let bytes = serde_json::to_vec_pretty(&provenance).map_err(|error| {
+        ColicError::Usage(format!("cannot encode recompile provenance: {error}"))
+    })?;
     fs::write(&path, bytes).map_err(|source| ColicError::Io { path, source })
 }
 
@@ -1327,10 +1520,59 @@ mod tests {
                 ..zero_desc()
             },
         ];
-        let canonical = build_canonical_mxfp4_expert(0, 0, [&matrices[0], &matrices[1], &matrices[2]]).unwrap();
+        let canonical =
+            build_canonical_mxfp4_expert(0, 0, [&matrices[0], &matrices[1], &matrices[2]]).unwrap();
         let apple = build_apple8_expert(0, 0, [&matrices[0], &matrices[1], &matrices[2]]).unwrap();
-        assert_eq!(canonical.len() as u64, canonical_mxfp4_sizes(&descs).unwrap().0);
+        assert_eq!(
+            canonical.len() as u64,
+            canonical_mxfp4_sizes(&descs).unwrap().0
+        );
         assert_eq!(apple.len() as u64, apple8_sizes(&descs).unwrap().0);
+    }
+
+    #[test]
+    fn mixed_quant_rules_are_ordered_and_last_match_wins() {
+        let mut request =
+            RecompileRequest::new(PathBuf::from("old.coli"), PathBuf::from("new.coli"));
+        request.quant = QuantMode::Keep;
+        request.quant_rules = vec![
+            QuantRule::parse("layer:4-7=mxfp4").unwrap(),
+            QuantRule::parse("expert:3=keep").unwrap(),
+            QuantRule::parse("layer:6/expert:3=mxfp4").unwrap(),
+        ];
+        let record = RecordInfo {
+            id: 1,
+            kind: 2,
+            codec: 0,
+            math_format: 0,
+            scale_format: 0,
+            layout: 0,
+            flags: 0,
+            shard_id: 0,
+            name: None,
+            layer: 6,
+            expert: 3,
+            offset: 0,
+            stored: 0,
+            decoded: 0,
+            stored_crc: 0,
+            logical_crc: 0,
+        };
+        assert_eq!(effective_quant(&request, &record), QuantMode::Mxfp4);
+
+        let mut other = record.clone();
+        other.layer = 5;
+        assert_eq!(effective_quant(&request, &other), QuantMode::Keep);
+
+        other.expert = 8;
+        assert_eq!(effective_quant(&request, &other), QuantMode::Mxfp4);
+    }
+
+    #[test]
+    fn quant_rule_parser_rejects_reversed_and_unknown_selectors() {
+        assert!(QuantRule::parse("layer:9-3=mxfp4").is_err());
+        assert!(QuantRule::parse("dense=mxfp4").is_err());
+        assert!(QuantRule::parse("layer:2=bogus").is_err());
     }
 
     fn zero_desc() -> MatrixDesc {
