@@ -1,4 +1,4 @@
-name: recompile-mixed-patch
+name: recompile-mixed-finalize
 
 on:
   push:
@@ -8,23 +8,39 @@ permissions:
   contents: write
 
 jobs:
-  patch:
+  finalize:
     if: github.actor != 'github-actions[bot]'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: feat/recompile-mixed-inplace
-      - name: Apply patch
-        run: python3 .github/scripts/apply_recompile_mixed.py
-      - name: Format and test compiler
+      - name: Fix diagnostics
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('logan-compiler/src/recompile.rs')
+          text = path.read_text()
+          old = '''                if requantized {
+                      " --allow-requantize"
+                  } else {
+          '''
+          new = '''                if source_quantized {
+                      " --allow-requantize"
+                  } else {
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one diagnostic match, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
           cargo fmt --all
-          cargo test -p logan-compiler --all-targets
-      - name: Commit patch
+      - name: Test compiler
+        run: cargo test -p logan-compiler --all-targets
+      - name: Remove patch scaffolding and commit
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add logan-compiler/src/recompile.rs logan-compiler/src/cli.rs
-          git commit -m "feat: add mixed quant rules and safe in-place recompile"
+          git rm .github/workflows/recompile-mixed-patch.yml .github/scripts/apply_recompile_mixed.py
+          git add logan-compiler/src/recompile.rs
+          git commit -m "chore: finalize mixed recompile implementation"
           git push origin HEAD:feat/recompile-mixed-inplace
