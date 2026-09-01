@@ -179,6 +179,12 @@ fn handle_key(
         KeyCode::Tab => {
             app.show_stats = !app.show_stats;
         }
+        KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.scroll_stats_up();
+        }
+        KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.scroll_stats_down();
+        }
         KeyCode::PageUp => {
             app.transcript_scroll = app.transcript_scroll.saturating_add(12);
         }
