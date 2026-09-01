@@ -41,6 +41,7 @@ pub struct App {
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub transcript_scroll: u16,
+    pub stats_scroll: u16,
     pub show_stats: bool,
     pub show_help: bool,
     pub system_prompt: String,
@@ -72,6 +73,7 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             transcript_scroll: 0,
+            stats_scroll: 0,
             show_stats: true,
             show_help: false,
             system_prompt,
@@ -123,7 +125,7 @@ impl App {
                 self.status = "generating — Esc cancels".into();
             }
             EngineEvent::Token {
-                text,
+                chunk,
                 token_id,
                 metrics,
                 stats,
@@ -131,7 +133,7 @@ impl App {
                 self.last_token_id = Some(token_id);
                 self.live_metrics = metrics;
                 self.last_stats = stats;
-                self.set_streaming_assistant(text);
+                self.append_streaming_assistant(&chunk);
                 self.status = format!(
                     "generating {} tokens · {:.2} tok/s",
                     self.live_metrics.generated_tokens,
@@ -143,7 +145,7 @@ impl App {
                 metrics,
                 stats,
             } => {
-                self.set_streaming_assistant(text);
+                self.finalize_streaming_assistant(text);
                 self.last_metrics = metrics.clone();
                 self.live_metrics = metrics;
                 self.last_stats = stats;
@@ -169,7 +171,10 @@ impl App {
                 self.live_metrics = TurnMetrics::default();
                 self.last_stats = RuntimeStats::default();
                 self.last_token_id = None;
+                self.transcript_scroll = 0;
+                self.stats_scroll = 0;
                 self.status = "new session ready".into();
+                self.refresh_cache_usage();
             }
             EngineEvent::Error(error) => {
                 self.messages.push(Message {
@@ -183,12 +188,31 @@ impl App {
         }
     }
 
-    fn set_streaming_assistant(&mut self, text: String) {
-        if let Some(last) = self.messages.last_mut() {
-            if last.role == Role::Assistant {
-                last.content = text;
-                return;
-            }
+    fn append_streaming_assistant(&mut self, chunk: &str) {
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+        {
+            message.content.push_str(chunk);
+            return;
+        }
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: chunk.to_string(),
+        });
+    }
+
+    fn finalize_streaming_assistant(&mut self, text: String) {
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+        {
+            message.content = text;
+            return;
         }
         self.messages.push(Message {
             role: Role::Assistant,
@@ -247,6 +271,7 @@ impl App {
             "clear" | "new" => {
                 self.messages.clear();
                 self.transcript_scroll = 0;
+                self.stats_scroll = 0;
                 self.resetting = true;
                 self.status = "resetting model state".into();
                 UiAction::Send(EngineCommand::Reset {
@@ -256,6 +281,8 @@ impl App {
             "system" if !arg.is_empty() => {
                 self.system_prompt = arg.to_string();
                 self.messages.clear();
+                self.transcript_scroll = 0;
+                self.stats_scroll = 0;
                 self.resetting = true;
                 self.status = "reloading with new system prompt".into();
                 UiAction::Send(EngineCommand::Reset {
@@ -307,7 +334,7 @@ impl App {
                 set(&mut self.settings, v);
                 self.notice(&format!("{label}: {v}"));
             }
-            _ => self.notice(&format!("/{label} expects {min}..={max}")),
+            _ => self.notice(&format!("{label} expects {min}..={max}")),
         }
         UiAction::None
     }
@@ -466,6 +493,14 @@ impl App {
             self.cancel.store(true, Ordering::Relaxed);
             self.status = "cancelling after current token".into();
         }
+    }
+
+    pub fn scroll_stats_up(&mut self) {
+        self.stats_scroll = self.stats_scroll.saturating_add(6);
+    }
+
+    pub fn scroll_stats_down(&mut self) {
+        self.stats_scroll = self.stats_scroll.saturating_sub(6);
     }
 
     pub fn refresh_cache_usage(&mut self) {
