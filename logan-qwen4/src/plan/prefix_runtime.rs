@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::colisource::ColiSource;
 use crate::{Cfg, Model};
 
-use super::{PrefixCacheKey, PrefixCacheStore};
+use super::{CacheWriteStats, PrefixCacheKey, PrefixCacheStore};
 
 fn set_if_unset(name: &str, value: &str) {
     if std::env::var_os(name).is_none() {
@@ -26,7 +26,9 @@ fn set_if_unset(name: &str, value: &str) {
 
 /// Apply the fastest configuration that has already passed real-model A/B
 /// validation. Explicit user values always win, so every path remains opt-out.
-fn apply_max_performance_defaults() {
+/// `Model::load_coli` invokes this automatically; it remains public for
+/// runners/tests that need to establish policy before model construction.
+pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_GDN_SINGLE_COPY", "1");
     set_if_unset("QWEN_ATTN_METAL", "1");
     set_if_unset("QWEN_QSA_INDEX_METAL", "1");
@@ -90,16 +92,18 @@ fn parse_entry_prefix_len(name: &str) -> Option<usize> {
 }
 
 /// Return exact keys for all cache files that could be prefixes of `prompt`,
-/// longest first. Filenames are only a cheap candidate-length index; every
-/// candidate is recomputed from the exact model + token prefix and the normal
-/// restore path still validates its header and full payload checksum.
+/// longest first. A state-only checkpoint equal to the complete prompt cannot
+/// provide the final prompt logits, so only STRICT prefixes are candidates for
+/// generation. Filenames are only a cheap candidate-length index; every key is
+/// recomputed from the exact model + token prefix and restore validates the
+/// header and full payload checksum.
 fn candidate_keys(
     store: &PrefixCacheStore,
     model: &Model,
     prompt: &[u32],
     salt: &[u8],
 ) -> Result<Vec<PrefixCacheKey>, String> {
-    if prompt.is_empty() {
+    if prompt.len() < 2 {
         return Ok(Vec::new());
     }
 
@@ -130,7 +134,7 @@ fn candidate_keys(
             continue;
         };
         if let Some(n) = parse_entry_prefix_len(&name) {
-            if n <= prompt.len() {
+            if n < prompt.len() {
                 lengths.insert(n);
             }
         }
@@ -144,6 +148,102 @@ fn candidate_keys(
         }
     }
     Ok(out)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PrefixRestoreSummary {
+    pub cached_tokens: usize,
+    pub restore_ms: f64,
+    pub payload_bytes: u64,
+}
+
+/// Restore the longest exact persistent prefix into an already-loaded model.
+///
+/// `.lpfx` stores causal state only, not logits. Candidate lookup therefore
+/// intentionally chooses a checkpoint STRICTLY shorter than `prompt`, so at
+/// least one suffix token is forwarded after restore and supplies the logits
+/// needed to select the first generated token.
+///
+/// A restore error is returned immediately because `restore` may have begun
+/// applying state; callers must reload a pristine model before replaying.
+pub fn restore_longest_prefix(
+    model: &mut Model,
+    prompt: &[u32],
+) -> Result<Option<PrefixRestoreSummary>, String> {
+    if !auto_prefix_cache_enabled() || prompt.len() < 2 {
+        return Ok(None);
+    }
+    let store = PrefixCacheStore::from_env()?;
+    let salt = cache_salt();
+    let Some(key) = candidate_keys(&store, model, prompt, &salt)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let stats = store.restore(model, &key)?;
+    Ok(Some(PrefixRestoreSummary {
+        cached_tokens: key.prefix_len(),
+        restore_ms: stats.total.as_secs_f64() * 1e3,
+        payload_bytes: stats.payload_bytes,
+    }))
+}
+
+/// Persist an exact completed prompt boundary for future process/session reuse.
+/// Existing immutable entries are cheap no-ops. Returns `None` when writes are
+/// disabled or the boundary is below the configured minimum length.
+pub fn persist_prefix_boundary(
+    model: &Model,
+    prompt: &[u32],
+) -> Result<Option<CacheWriteStats>, String> {
+    if !auto_prefix_cache_enabled()
+        || !writes_enabled()
+        || prompt.is_empty()
+        || prompt.len() < min_persist_tokens()
+    {
+        return Ok(None);
+    }
+    let store = PrefixCacheStore::from_env()?;
+    let salt = cache_salt();
+    let key = PrefixCacheKey::with_salt(model, prompt, &salt)?;
+    store.store(model, &key).map(Some)
+}
+
+fn prefill_suffix(model: &mut Model, prompt: &[u32], start: usize) -> Option<Vec<f32>> {
+    let mut logits = None;
+    for (i, &token) in prompt.iter().enumerate().skip(start) {
+        logits = Some(model.forward_token(token as usize, i));
+    }
+    logits
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+/// Decode from logits produced by the FINAL prompt token. For token `n+1`,
+/// feed generated token `n` at its real position; never replay the final
+/// prompt token at a synthetic extra position.
+fn generate_from_logits(
+    model: &mut Model,
+    mut logits: Vec<f32>,
+    prompt_len: usize,
+    max_new: usize,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(max_new);
+    for step in 0..max_new {
+        let next = argmax(&logits);
+        out.push(next);
+        if step + 1 < max_new {
+            logits = model.forward_token(next as usize, prompt_len + step);
+        }
+    }
+    out
 }
 
 /// Normal .coli greedy path with automatic persistent prefix reuse.
@@ -163,11 +263,14 @@ pub fn run_greedy_cached_coli(
     let total_t0 = Instant::now();
     let mut model = load_model(package_dir, cfg)?;
 
+    if prompt.is_empty() || max_new == 0 {
+        return Ok(Vec::new());
+    }
+
     if !auto_prefix_cache_enabled() {
-        for (i, &t) in prompt.iter().enumerate() {
-            model.forward_token(t as usize, i);
-        }
-        let out = generate(&mut model, prompt, max_new);
+        let logits = prefill_suffix(&mut model, prompt, 0)
+            .ok_or_else(|| "Qwen4 decode requires a non-empty prompt".to_string())?;
+        let out = generate_from_logits(&mut model, logits, prompt.len(), max_new);
         if profile {
             model.profile_summary(max_new, total_t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -187,7 +290,10 @@ pub fn run_greedy_cached_coli(
     if let Some(store) = &store {
         match candidate_keys(store, &model, prompt, &salt) {
             Ok(keys) if keys.is_empty() => {
-                eprintln!("[qwen4-rs] prefix-cache miss prompt_tokens={}", prompt.len());
+                eprintln!(
+                    "[qwen4-rs] prefix-cache miss prompt_tokens={}",
+                    prompt.len()
+                );
             }
             Ok(keys) => {
                 // Try longest first. A damaged/stale entry never poisons the
@@ -222,14 +328,13 @@ pub fn run_greedy_cached_coli(
         }
     }
 
-    for (i, &t) in prompt.iter().enumerate().skip(prompt_start) {
-        model.forward_token(t as usize, i);
-    }
+    let logits = prefill_suffix(&mut model, prompt, prompt_start)
+        .ok_or_else(|| "prefix cache restored full prompt without logits".to_string())?;
 
     // Persist only complete input-prompt boundaries. This remains synchronous
     // for now; QWEN_PREFIX_CACHE_WRITE=0 opts out independently of cache reads.
     if let Some(store) = &store {
-        if writes_enabled() && !prompt.is_empty() && prompt.len() >= min_persist_tokens() {
+        if writes_enabled() && prompt.len() >= min_persist_tokens() {
             match PrefixCacheKey::with_salt(&model, prompt, &salt)
                 .and_then(|key| store.store(&model, &key))
             {
@@ -245,29 +350,11 @@ pub fn run_greedy_cached_coli(
         }
     }
 
-    let out = generate(&mut model, prompt, max_new);
+    let out = generate_from_logits(&mut model, logits, prompt.len(), max_new);
     if profile {
         model.profile_summary(max_new, total_t0.elapsed().as_secs_f64() * 1e3);
     }
     Ok(out)
-}
-
-fn generate(model: &mut Model, prompt: &[u32], max_new: usize) -> Vec<u32> {
-    let mut out = Vec::with_capacity(max_new);
-    let mut last = *prompt.last().unwrap_or(&0);
-    let start = prompt.len();
-    for pos in start..start + max_new {
-        let logits = model.forward_token(last as usize, pos);
-        let next = logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i as u32)
-            .unwrap();
-        out.push(next);
-        last = next;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -299,5 +386,10 @@ mod tests {
         set_if_unset(name, "1");
         assert_eq!(std::env::var(name).unwrap(), "0");
         std::env::remove_var(name);
+    }
+
+    #[test]
+    fn argmax_chooses_largest_logit() {
+        assert_eq!(argmax(&[-2.0, 7.0, 3.0]), 1);
     }
 }
