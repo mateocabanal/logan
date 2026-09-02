@@ -8,10 +8,15 @@
 
 pub mod context;
 pub mod graph;
+pub mod optimizer;
 pub mod plan;
 
 pub use context::{
     ContextConstraint, ContextConstraintKind, ContextPlan, ContextStateBytes, PlannerMemoryBudget,
 };
 pub use graph::{AttentionKind, Graph, Node, NodeId, Op, Value, ValueId, ValueType};
-pub use plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec};
+pub use optimizer::{
+    ContextCandidate, DecisionGroup, OptimizeInput, ParetoPlan, PhysicalOption, PlanDecision,
+    PlanMetrics, optimize, select_plan,
+};
+pub use plan::{MemoryPlan, OptimizationRecord, Placement, PlanArtifact, QuantSpec};
