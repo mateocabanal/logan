@@ -5,10 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::Graph;
+use crate::{graph::Graph, optimizer::ParetoPlan};
 
 /// Artifact format version. Bump on any breaking change to the schema.
-pub const PLAN_ARTIFACT_VERSION: u32 = 1;
+pub const PLAN_ARTIFACT_VERSION: u32 = 2;
 
 /// Where a weight lives at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +44,13 @@ pub struct MemoryPlan {
     pub ram_budget_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptimizationRecord {
+    pub cost_model_version: String,
+    pub selected: ParetoPlan,
+    pub alternatives: Vec<ParetoPlan>,
+}
+
 /// The full plan artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanArtifact {
@@ -53,6 +60,10 @@ pub struct PlanArtifact {
     pub package_fingerprint: String,
     pub graph: Graph,
     pub memory: MemoryPlan,
+    /// Present when the compiler selected this physical plan from a Pareto
+    /// frontier. Decisions include per-group representation/layout/placement
+    /// and deterministic reasoning for reproducibility.
+    pub optimization: Option<OptimizationRecord>,
 }
 
 impl PlanArtifact {
@@ -62,7 +73,13 @@ impl PlanArtifact {
             package_fingerprint,
             graph,
             memory,
+            optimization: None,
         }
+    }
+
+    pub fn with_optimization(mut self, optimization: OptimizationRecord) -> Self {
+        self.optimization = Some(optimization);
+        self
     }
 
     /// Serialize to a compact binary form (bincode-style framing via serde).
@@ -99,7 +116,7 @@ impl PlanArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Op, ValueType};
+    use crate::{graph::{Op, ValueType}, optimizer::{PlanDecision, PlanMetrics}};
     use std::collections::BTreeMap;
 
     fn sample_plan() -> PlanArtifact {
@@ -154,6 +171,37 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_record_round_trips() {
+        let selected = crate::optimizer::ParetoPlan {
+            id: "p-test".into(),
+            label: Some("balanced".into()),
+            metrics: PlanMetrics {
+                quality_loss: 1,
+                latency_cost: 2,
+                resident_bytes: 3,
+                package_bytes: 4,
+                context_tokens: 5,
+                representation_switches: 0,
+            },
+            decisions: vec![PlanDecision {
+                group: "layers.0.experts".into(),
+                option_id: "mxfp4".into(),
+                representation: "mxfp4".into(),
+                layout: "canonical".into(),
+                placement: Placement::Streamed,
+                reason: "frontier".into(),
+            }],
+        };
+        let plan = sample_plan().with_optimization(OptimizationRecord {
+            cost_model_version: "test-v1".into(),
+            selected: selected.clone(),
+            alternatives: vec![selected],
+        });
+        let back = PlanArtifact::from_bytes(&plan.to_bytes().unwrap()).unwrap();
+        assert_eq!(plan, back);
+    }
+
+    #[test]
     fn fingerprint_guard() {
         let plan = sample_plan();
         assert!(plan.check_fingerprint("abc123").is_ok());
@@ -164,7 +212,6 @@ mod tests {
     fn version_guard() {
         let plan = sample_plan();
         let mut bytes = plan.to_bytes().unwrap();
-        // corrupt the version field (first 4 bytes, little-endian u32)
         bytes[0] = 99;
         assert!(PlanArtifact::from_bytes(&bytes).is_err());
     }
@@ -175,9 +222,6 @@ mod tests {
         let bytes = plan.to_bytes().unwrap();
         let back = PlanArtifact::from_bytes(&bytes).unwrap();
         assert_eq!(back.memory.placement.len(), 2);
-        assert_eq!(
-            back.memory.quant[0].1.kind,
-            "mxfp4-tile8x32"
-        );
+        assert_eq!(back.memory.quant[0].1.kind, "mxfp4-tile8x32");
     }
 }
