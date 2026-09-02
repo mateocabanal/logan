@@ -10,6 +10,15 @@
 // MetalIO + direct paths compile to the same sources as c/ (byte-identical
 // copies, verified by md5 in the port session).
 fn main() {
+    // The Objective-C++ sources are intentionally present on every checkout so
+    // the Rust workspace has one source tree. Presence is not a capability
+    // probe: clang on Linux can see these files but cannot build Apple's ARC /
+    // framework runtime. Non-macOS targets use the Rust stub decliners in
+    // logan-metal instead.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+
     let out = std::env::var("OUT_DIR").unwrap();
     let metal_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("metal");
     let src = metal_dir.join("backend_metal.mm");
