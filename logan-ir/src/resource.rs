@@ -187,14 +187,18 @@ impl ResourcePlan {
                 return Err("mutable state cannot use immutable package-record backing".into());
             }
             (DataMutability::Immutable, BackingKind::RuntimeStateFile) => {
-                return Err("immutable package data should not require mutable state-file backing".into());
+                return Err(
+                    "immutable package data should not require mutable state-file backing".into(),
+                );
             }
             _ => {}
         }
         match self.backing.kind {
             BackingKind::PackageRecord | BackingKind::ResidentOnly => {
                 if self.backing.storage_pool.is_some() {
-                    return Err("package/resident-only backing must not bind a runtime storage pool".into());
+                    return Err(
+                        "package/resident-only backing must not bind a runtime storage pool".into(),
+                    );
                 }
             }
             BackingKind::RuntimeStateFile | BackingKind::DevicePersistent => {
@@ -396,7 +400,10 @@ mod tests {
             storage_pools: vec![],
         };
         assert!(budget.validate().is_ok());
-        assert_eq!(budget.memory_capacity(&MemoryPoolId::new("uma0")), Some(16 * 1024));
+        assert_eq!(
+            budget.memory_capacity(&MemoryPoolId::new("uma0")),
+            Some(16 * 1024)
+        );
     }
 
     #[test]
@@ -419,7 +426,13 @@ mod tests {
             }],
         };
         assert!(budget.validate().is_ok());
-        assert_eq!(budget.memory_capacity(&MemoryPoolId::new("host")), Some(64 * 1024));
-        assert_eq!(budget.memory_capacity(&MemoryPoolId::new("gpu0-vram")), Some(8 * 1024));
+        assert_eq!(
+            budget.memory_capacity(&MemoryPoolId::new("host")),
+            Some(64 * 1024)
+        );
+        assert_eq!(
+            budget.memory_capacity(&MemoryPoolId::new("gpu0-vram")),
+            Some(8 * 1024)
+        );
     }
 }

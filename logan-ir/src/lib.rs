@@ -30,6 +30,6 @@ pub use resource::{
 pub use tiered_optimizer::{
     MemoryPoolUsage, StoragePoolUsage, TIERED_COST_MODEL_V1, TieredCandidateGroup,
     TieredContextCandidate, TieredOptimizerInput, TieredParetoPlan, TieredPlanDecision,
-    TieredPlanMetrics, TieredRejectedCandidate, TieredRepresentationCandidate,
-    TieredResourceUsage, select_tiered_plan, tiered_material_plans, tiered_pareto_plans,
+    TieredPlanMetrics, TieredRejectedCandidate, TieredRepresentationCandidate, TieredResourceUsage,
+    select_tiered_plan, tiered_material_plans, tiered_pareto_plans,
 };

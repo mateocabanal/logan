@@ -81,21 +81,21 @@ pub struct TieredResourceUsage {
 
 impl TieredResourceUsage {
     pub fn minimum_working_set_bytes(&self) -> u64 {
-        self.memory_pools
-            .iter()
-            .fold(0_u64, |total, pool| total.saturating_add(pool.minimum_working_set_bytes))
+        self.memory_pools.iter().fold(0_u64, |total, pool| {
+            total.saturating_add(pool.minimum_working_set_bytes)
+        })
     }
 
     pub fn target_resident_bytes(&self) -> u64 {
-        self.memory_pools
-            .iter()
-            .fold(0_u64, |total, pool| total.saturating_add(pool.target_resident_bytes))
+        self.memory_pools.iter().fold(0_u64, |total, pool| {
+            total.saturating_add(pool.target_resident_bytes)
+        })
     }
 
     pub fn mutable_backing_bytes(&self) -> u64 {
-        self.storage_pools
-            .iter()
-            .fold(0_u64, |total, pool| total.saturating_add(pool.mutable_backing_bytes))
+        self.storage_pools.iter().fold(0_u64, |total, pool| {
+            total.saturating_add(pool.mutable_backing_bytes)
+        })
     }
 
     pub fn storage_traffic_bytes_per_step(&self) -> u64 {
@@ -159,7 +159,11 @@ struct ResourceAcc {
 }
 
 impl ResourceAcc {
-    fn add_resource(&mut self, budget: &ResourceBudget, resource: &ResourcePlan) -> Result<bool, String> {
+    fn add_resource(
+        &mut self,
+        budget: &ResourceBudget,
+        resource: &ResourcePlan,
+    ) -> Result<bool, String> {
         resource.validate()?;
         let memory_capacity = budget
             .memory_capacity(&resource.residency.memory_pool)
@@ -232,7 +236,11 @@ impl ResourceAcc {
         Ok(true)
     }
 
-    fn add_resources(&mut self, budget: &ResourceBudget, resources: &[ResourcePlan]) -> Result<bool, String> {
+    fn add_resources(
+        &mut self,
+        budget: &ResourceBudget,
+        resources: &[ResourcePlan],
+    ) -> Result<bool, String> {
         for resource in resources {
             if !self.add_resource(budget, resource)? {
                 return Ok(false);
@@ -273,8 +281,11 @@ impl ResourceAcc {
     }
 
     fn no_worse_than(&self, other: &Self) -> bool {
-        for (pool, right) in &other.memory {
-            let left = self.memory.get(pool).cloned().unwrap_or_default();
+        // A plan that consumes a pool the other plan does not use is not
+        // automatically better just because aggregate bytes are smaller.
+        // Compare each pool independently; a missing pool is zero usage.
+        for (pool, left) in &self.memory {
+            let right = other.memory.get(pool).cloned().unwrap_or_default();
             let Some(left_min) = left.minimum_working_set_bytes() else {
                 return false;
             };
@@ -285,8 +296,8 @@ impl ResourceAcc {
                 return false;
             }
         }
-        for (pool, right) in &other.storage {
-            if self.storage.get(pool).copied().unwrap_or(0) > *right {
+        for (pool, left) in &self.storage {
+            if *left > other.storage.get(pool).copied().unwrap_or(0) {
                 return false;
             }
         }
@@ -423,7 +434,9 @@ pub fn tiered_pareto_plans(input: &TieredOptimizerInput) -> Result<Vec<TieredPar
         }
     }
     if raw.is_empty() {
-        return Err("no optimizer plan satisfies the context and tiered resource constraints".into());
+        return Err(
+            "no optimizer plan satisfies the context and tiered resource constraints".into(),
+        );
     }
 
     let keep = (0..raw.len())
@@ -445,7 +458,9 @@ pub fn tiered_pareto_plans(input: &TieredOptimizerInput) -> Result<Vec<TieredPar
     Ok(plans)
 }
 
-pub fn tiered_material_plans(input: &TieredOptimizerInput) -> Result<Vec<TieredParetoPlan>, String> {
+pub fn tiered_material_plans(
+    input: &TieredOptimizerInput,
+) -> Result<Vec<TieredParetoPlan>, String> {
     let frontier = tiered_pareto_plans(input)?;
     if frontier.is_empty() {
         return Ok(Vec::new());
@@ -505,7 +520,10 @@ pub fn tiered_material_plans(input: &TieredOptimizerInput) -> Result<Vec<TieredP
     Ok(chosen)
 }
 
-pub fn select_tiered_plan<'a>(plans: &'a [TieredParetoPlan], selector: &str) -> Option<&'a TieredParetoPlan> {
+pub fn select_tiered_plan<'a>(
+    plans: &'a [TieredParetoPlan],
+    selector: &str,
+) -> Option<&'a TieredParetoPlan> {
     plans
         .iter()
         .find(|plan| plan.id == selector || plan.labels.iter().any(|label| label == selector))
@@ -547,12 +565,15 @@ fn prune_states(mut states: Vec<State>) -> Vec<State> {
     let mut kept = Vec::<State>::new();
     'candidate: for state in states {
         for existing in &kept {
-            if existing.last_dispatch_class == state.last_dispatch_class && state_dominates(existing, &state) {
+            if existing.last_dispatch_class == state.last_dispatch_class
+                && state_dominates(existing, &state)
+            {
                 continue 'candidate;
             }
         }
         kept.retain(|existing| {
-            existing.last_dispatch_class != state.last_dispatch_class || !state_dominates(&state, existing)
+            existing.last_dispatch_class != state.last_dispatch_class
+                || !state_dominates(&state, existing)
         });
         kept.push(state);
     }
@@ -592,25 +613,75 @@ fn metrics_dominate(left: &TieredPlanMetrics, right: &TieredPlanMetrics) -> bool
 }
 
 fn usage_no_worse(left: &TieredResourceUsage, right: &TieredResourceUsage) -> bool {
-    left.minimum_working_set_bytes() <= right.minimum_working_set_bytes()
-        && left.target_resident_bytes() <= right.target_resident_bytes()
-        && left.mutable_backing_bytes() <= right.mutable_backing_bytes()
-        && left.immutable_package_backing_bytes <= right.immutable_package_backing_bytes
+    for left_pool in &left.memory_pools {
+        let right_pool = right
+            .memory_pools
+            .iter()
+            .find(|pool| pool.pool == left_pool.pool);
+        let (right_min, right_target) = right_pool
+            .map(|pool| (pool.minimum_working_set_bytes, pool.target_resident_bytes))
+            .unwrap_or((0, 0));
+        if left_pool.minimum_working_set_bytes > right_min
+            || left_pool.target_resident_bytes > right_target
+        {
+            return false;
+        }
+    }
+    for left_pool in &left.storage_pools {
+        let right_bytes = right
+            .storage_pools
+            .iter()
+            .find(|pool| pool.pool == left_pool.pool)
+            .map(|pool| pool.mutable_backing_bytes)
+            .unwrap_or(0);
+        if left_pool.mutable_backing_bytes > right_bytes {
+            return false;
+        }
+    }
+    left.immutable_package_backing_bytes <= right.immutable_package_backing_bytes
         && left.storage_read_bytes_per_step <= right.storage_read_bytes_per_step
         && left.storage_write_bytes_per_step <= right.storage_write_bytes_per_step
 }
 
 fn usage_strictly_better(left: &TieredResourceUsage, right: &TieredResourceUsage) -> bool {
-    usage_no_worse(left, right)
-        && (left.minimum_working_set_bytes() < right.minimum_working_set_bytes()
-            || left.target_resident_bytes() < right.target_resident_bytes()
-            || left.mutable_backing_bytes() < right.mutable_backing_bytes()
-            || left.immutable_package_backing_bytes < right.immutable_package_backing_bytes
-            || left.storage_read_bytes_per_step < right.storage_read_bytes_per_step
-            || left.storage_write_bytes_per_step < right.storage_write_bytes_per_step)
+    if !usage_no_worse(left, right) {
+        return false;
+    }
+    if left.immutable_package_backing_bytes < right.immutable_package_backing_bytes
+        || left.storage_read_bytes_per_step < right.storage_read_bytes_per_step
+        || left.storage_write_bytes_per_step < right.storage_write_bytes_per_step
+    {
+        return true;
+    }
+    for right_pool in &right.memory_pools {
+        let left_pool = left
+            .memory_pools
+            .iter()
+            .find(|pool| pool.pool == right_pool.pool);
+        let (left_min, left_target) = left_pool
+            .map(|pool| (pool.minimum_working_set_bytes, pool.target_resident_bytes))
+            .unwrap_or((0, 0));
+        if left_min < right_pool.minimum_working_set_bytes
+            || left_target < right_pool.target_resident_bytes
+        {
+            return true;
+        }
+    }
+    right.storage_pools.iter().any(|right_pool| {
+        left.storage_pools
+            .iter()
+            .find(|pool| pool.pool == right_pool.pool)
+            .map(|pool| pool.mutable_backing_bytes)
+            .unwrap_or(0)
+            < right_pool.mutable_backing_bytes
+    })
 }
 
-fn build_plan(input: &TieredOptimizerInput, metrics: TieredPlanMetrics, choices: &[usize]) -> TieredParetoPlan {
+fn build_plan(
+    input: &TieredOptimizerInput,
+    metrics: TieredPlanMetrics,
+    choices: &[usize],
+) -> TieredParetoPlan {
     let decisions = input
         .groups
         .iter()
@@ -654,7 +725,11 @@ fn build_plan(input: &TieredOptimizerInput, metrics: TieredPlanMetrics, choices:
     }
 }
 
-fn stable_plan_id(cost_model: &str, metrics: &TieredPlanMetrics, decisions: &[TieredPlanDecision]) -> String {
+fn stable_plan_id(
+    cost_model: &str,
+    metrics: &TieredPlanMetrics,
+    decisions: &[TieredPlanDecision],
+) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     fn feed(hash: &mut u64, bytes: &[u8]) {
         for byte in bytes {
@@ -706,13 +781,21 @@ fn balanced_index(plans: &[TieredParetoPlan]) -> usize {
     let quality = ranks(plans, |plan| plan.metrics.quality_loss_ppm, false);
     let context = ranks(plans, |plan| plan.metrics.context_tokens, true);
     let latency = ranks(plans, |plan| plan.metrics.latency_cost, false);
-    let resident = ranks(plans, |plan| plan.metrics.resource_usage.target_resident_bytes(), false);
+    let resident = ranks(
+        plans,
+        |plan| plan.metrics.resource_usage.target_resident_bytes(),
+        false,
+    );
     let traffic = ranks(
         plans,
         |plan| plan.metrics.resource_usage.storage_traffic_bytes_per_step(),
         false,
     );
-    let backing = ranks(plans, |plan| plan.metrics.resource_usage.mutable_backing_bytes(), false);
+    let backing = ranks(
+        plans,
+        |plan| plan.metrics.resource_usage.mutable_backing_bytes(),
+        false,
+    );
     (0..plans.len())
         .min_by_key(|&index| {
             let dimensions = [
@@ -732,11 +815,18 @@ fn balanced_index(plans: &[TieredParetoPlan]) -> usize {
         .unwrap_or(0)
 }
 
-fn ranks(plans: &[TieredParetoPlan], value: impl Fn(&TieredParetoPlan) -> u64, reverse: bool) -> Vec<usize> {
+fn ranks(
+    plans: &[TieredParetoPlan],
+    value: impl Fn(&TieredParetoPlan) -> u64,
+    reverse: bool,
+) -> Vec<usize> {
     let mut order = (0..plans.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
         let value = value(&plans[index]);
-        (if reverse { u64::MAX - value } else { value }, plans[index].id.clone())
+        (
+            if reverse { u64::MAX - value } else { value },
+            plans[index].id.clone(),
+        )
     });
     let mut ranks = vec![0; plans.len()];
     let mut previous = None;
@@ -757,8 +847,12 @@ fn state_sort_key(state: &State) -> (u64, u64, u64, u64, u64, u16, Vec<usize>) {
     (
         state.quality_loss_ppm,
         state.latency_cost,
-        usage.as_ref().map_or(u64::MAX, TieredResourceUsage::target_resident_bytes),
-        usage.as_ref().map_or(u64::MAX, TieredResourceUsage::mutable_backing_bytes),
+        usage
+            .as_ref()
+            .map_or(u64::MAX, TieredResourceUsage::target_resident_bytes),
+        usage
+            .as_ref()
+            .map_or(u64::MAX, TieredResourceUsage::mutable_backing_bytes),
         state.package_bytes,
         state.last_dispatch_class,
         state.choices.clone(),
@@ -798,7 +892,10 @@ mod tests {
         }
     }
 
-    fn empty_input(resource_budget: ResourceBudget, context: TieredContextCandidate) -> TieredOptimizerInput {
+    fn empty_input(
+        resource_budget: ResourceBudget,
+        context: TieredContextCandidate,
+    ) -> TieredOptimizerInput {
         TieredOptimizerInput {
             cost_model: TIERED_COST_MODEL_V1.into(),
             groups: Vec::new(),
@@ -885,7 +982,10 @@ mod tests {
     fn irreducible_working_set_still_has_to_fit_ram() {
         let context = TieredContextCandidate {
             tokens: 4096,
-            resources: vec![ResourcePlan::resident_only(18 * GIB, MemoryPoolId::new("uma0"))],
+            resources: vec![ResourcePlan::resident_only(
+                18 * GIB,
+                MemoryPoolId::new("uma0"),
+            )],
             latency_cost: 0,
         };
         assert!(tiered_pareto_plans(&empty_input(budget(16, 100), context)).is_err());
@@ -906,7 +1006,10 @@ mod tests {
                 key: "layer0".into(),
                 options: vec![TieredRepresentationCandidate {
                     id: "stream0".into(),
-                    quant: QuantSpec { kind: "exact".into(), scale: None },
+                    quant: QuantSpec {
+                        kind: "exact".into(),
+                        scale: None,
+                    },
                     layout: 0,
                     legacy_placement: Placement::Streamed,
                     resource: ResourcePlan::immutable_package(
@@ -927,7 +1030,10 @@ mod tests {
                 key: "layer1".into(),
                 options: vec![TieredRepresentationCandidate {
                     id: "stream1".into(),
-                    quant: QuantSpec { kind: "exact".into(), scale: None },
+                    quant: QuantSpec {
+                        kind: "exact".into(),
+                        scale: None,
+                    },
                     layout: 0,
                     legacy_placement: Placement::Streamed,
                     resource: ResourcePlan::immutable_package(
@@ -949,6 +1055,68 @@ mod tests {
         let usage = &plans[0].metrics.resource_usage;
         assert_eq!(usage.minimum_working_set_bytes(), 4 * GIB);
         assert_eq!(usage.target_resident_bytes(), 8 * GIB);
+    }
+
+    #[test]
+    fn pareto_dominance_does_not_merge_distinct_memory_pools() {
+        let resource_budget = ResourceBudget {
+            memory_pools: vec![
+                MemoryPoolBudget {
+                    id: MemoryPoolId::new("host"),
+                    capacity_bytes: 8 * GIB,
+                },
+                MemoryPoolBudget {
+                    id: MemoryPoolId::new("gpu0"),
+                    capacity_bytes: 8 * GIB,
+                },
+            ],
+            storage_pools: vec![],
+        };
+        let mut input = empty_input(
+            resource_budget,
+            TieredContextCandidate {
+                tokens: 4096,
+                resources: Vec::new(),
+                latency_cost: 0,
+            },
+        );
+        input.groups = vec![TieredCandidateGroup {
+            key: "placement".into(),
+            options: vec![
+                TieredRepresentationCandidate {
+                    id: "host".into(),
+                    quant: QuantSpec {
+                        kind: "exact".into(),
+                        scale: None,
+                    },
+                    layout: 0,
+                    legacy_placement: Placement::Resident,
+                    resource: ResourcePlan::resident_only(4 * GIB, MemoryPoolId::new("host")),
+                    package_bytes: 1,
+                    latency_cost: 10,
+                    quality_loss_ppm: 0,
+                    dispatch_class: 1,
+                    rationale: "host".into(),
+                },
+                TieredRepresentationCandidate {
+                    id: "gpu".into(),
+                    quant: QuantSpec {
+                        kind: "exact".into(),
+                        scale: None,
+                    },
+                    layout: 0,
+                    legacy_placement: Placement::Gpu,
+                    resource: ResourcePlan::resident_only(4 * GIB, MemoryPoolId::new("gpu0")),
+                    package_bytes: 1,
+                    latency_cost: 10,
+                    quality_loss_ppm: 0,
+                    dispatch_class: 2,
+                    rationale: "gpu".into(),
+                },
+            ],
+        }];
+        let frontier = tiered_pareto_plans(&input).unwrap();
+        assert_eq!(frontier.len(), 2);
     }
 
     #[test]
@@ -975,6 +1143,9 @@ mod tests {
             latency_cost: 0,
         };
         let plans = tiered_pareto_plans(&empty_input(resource_budget, context)).unwrap();
-        assert_eq!(plans[0].metrics.resource_usage.target_resident_bytes(), 12 * GIB);
+        assert_eq!(
+            plans[0].metrics.resource_usage.target_resident_bytes(),
+            12 * GIB
+        );
     }
 }
