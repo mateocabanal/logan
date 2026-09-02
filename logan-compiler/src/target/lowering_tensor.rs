@@ -114,6 +114,21 @@ fn copy_tensor_stream<W: Write>(
     output_state: &mut u32,
     logical_state: Option<&mut u32>,
 ) -> Result<()> {
+    if let Some(bits) = parse_const_bf16_dtype(&tensor.dtype) {
+        let bytes = bits.to_le_bytes();
+        output.write_all(&bytes).map_err(|source| ColicError::Io {
+            path: tensor.source.clone(), source,
+        })?;
+        *output_state = crc32c_state(*output_state, &bytes);
+        if let Some(state) = logical_state {
+            *state = crc32c_state(*state, &bytes);
+        }
+        return Ok(());
+    }
+    if let Some(scale_bits) = parse_ple_quant_dtype(&tensor.dtype) {
+        return copy_bf16_to_e4m3(tensor, scale_bits, output, output_state, logical_state);
+    }
+
     let mut input = File::open(&tensor.source).map_err(|source| ColicError::Io {
         path: tensor.source.clone(), source,
     })?;
@@ -138,6 +153,124 @@ fn copy_tensor_stream<W: Write>(
         remaining -= count as u64;
     }
     Ok(())
+}
+
+fn copy_bf16_to_e4m3<W: Write>(
+    tensor: &source::TensorRef,
+    scale_bits: u16,
+    output: &mut W,
+    output_state: &mut u32,
+    logical_state: Option<&mut u32>,
+) -> Result<()> {
+    let input_bytes = tensor
+        .len
+        .checked_mul(2)
+        .ok_or_else(|| ColicError::Usage("PLE BF16 input byte size overflows u64".into()))?;
+    let mut input = File::open(&tensor.source).map_err(|source| ColicError::Io {
+        path: tensor.source.clone(), source,
+    })?;
+    input.seek(SeekFrom::Start(tensor.offset)).map_err(|source| ColicError::Io {
+        path: tensor.source.clone(), source,
+    })?;
+    let lut = ple_bf16_to_e4m3_lut(scale_bits);
+    let mut remaining = input_bytes;
+    let mut src = vec![0_u8; 8 * 1024 * 1024];
+    let mut dst = vec![0_u8; src.len() / 2];
+    let mut logical_state = logical_state;
+    while remaining != 0 {
+        let mut count = remaining.min(src.len() as u64) as usize;
+        count &= !1;
+        if count == 0 {
+            return Err(ColicError::Usage("odd BF16 PLE input length".into()));
+        }
+        input.read_exact(&mut src[..count]).map_err(|source| ColicError::Io {
+            path: tensor.source.clone(), source,
+        })?;
+        let elements = count / 2;
+        for (index, pair) in src[..count].chunks_exact(2).enumerate() {
+            let bf16 = u16::from_le_bytes([pair[0], pair[1]]);
+            let encoded = lut[bf16 as usize];
+            if encoded > 0xff {
+                let value = f32::from_bits((bf16 as u32) << 16);
+                let scale = f32::from_bits((scale_bits as u32) << 16);
+                return Err(ColicError::unsupported(
+                    "Qwen4 PLE BF16->E4M3 lowering",
+                    format!("value {value} exceeds derived E4M3 scale {scale}; refusing saturation"),
+                ));
+            }
+            dst[index] = encoded as u8;
+        }
+        let bytes = &dst[..elements];
+        output.write_all(bytes).map_err(|source| ColicError::Io {
+            path: tensor.source.clone(), source,
+        })?;
+        *output_state = crc32c_state(*output_state, bytes);
+        if let Some(state) = logical_state.as_deref_mut() {
+            *state = crc32c_state(*state, bytes);
+        }
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
+fn ple_bf16_to_e4m3_lut(scale_bits: u16) -> std::sync::Arc<Vec<u16>> {
+    use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
+    static LUTS: OnceLock<Mutex<HashMap<u16, Arc<Vec<u16>>>>> = OnceLock::new();
+    let cache = LUTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(lut) = cache.lock().unwrap().get(&scale_bits).cloned() {
+        return lut;
+    }
+    let scale = f32::from_bits((scale_bits as u32) << 16);
+    let lut = Arc::new(
+        (0..=u16::MAX)
+            .map(|bits| encode_bf16_e4m3(bits, scale))
+            .collect::<Vec<_>>(),
+    );
+    cache.lock().unwrap().insert(scale_bits, lut.clone());
+    lut
+}
+
+fn encode_bf16_e4m3(bits: u16, scale: f32) -> u16 {
+    let value = f32::from_bits((bits as u32) << 16);
+    if !value.is_finite() || !(scale.is_finite() && scale > 0.0) {
+        return 0x100;
+    }
+    let scaled = value.abs() / scale;
+    if scaled > 240.0 + f32::EPSILON * 240.0 {
+        return 0x100;
+    }
+    let mut best = 0_u8;
+    let mut best_error = f32::INFINITY;
+    for code in 0_u8..=0x77 {
+        let candidate = e4m3_positive(code);
+        let error = (candidate - scaled).abs();
+        if error < best_error {
+            best_error = error;
+            best = code;
+        }
+    }
+    (best | if value.is_sign_negative() { 0x80 } else { 0 }) as u16
+}
+
+fn e4m3_positive(code: u8) -> f32 {
+    let exp = ((code >> 3) & 0x0f) as i32;
+    let mant = (code & 0x07) as f32;
+    match exp {
+        0 => mant * 0.001953125,
+        e => (1.0 + mant * 0.125) * 2f32.powi(e - 7),
+    }
+}
+
+fn parse_ple_quant_dtype(dtype: &str) -> Option<u16> {
+    dtype
+        .strip_prefix(crate::model::qwen4_exp::PLE_BF16_TO_F8_PREFIX)
+        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+}
+
+fn parse_const_bf16_dtype(dtype: &str) -> Option<u16> {
+    dtype
+        .strip_prefix(crate::model::qwen4_exp::PLE_CONST_BF16_PREFIX)
+        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
 }
 
 pub fn crc32c_combine(mut left: u32, right: u32, mut right_len: u64) -> u32 {
@@ -194,6 +327,20 @@ fn append_aligned(output: &mut Vec<u8>, bytes: &[u8]) -> Result<u64> {
 }
 
 fn read_tensor(tensor: &source::TensorRef) -> Result<Vec<u8>> {
+    if let Some(bits) = parse_const_bf16_dtype(&tensor.dtype) {
+        return Ok(bits.to_le_bytes().to_vec());
+    }
+    if let Some(scale_bits) = parse_ple_quant_dtype(&tensor.dtype) {
+        let mut output = std::io::Cursor::new(Vec::with_capacity(
+            tensor
+                .len
+                .try_into()
+                .map_err(|_| ColicError::Usage("PLE output too large".into()))?,
+        ));
+        let mut state = !0_u32;
+        copy_bf16_to_e4m3(tensor, scale_bits, &mut output, &mut state, None)?;
+        return Ok(output.into_inner());
+    }
     let mut bytes = vec![0; tensor.len.try_into().map_err(|_| ColicError::Usage(
         "tensor is too large for the current record-lowering address space".into()
     ))?];
@@ -202,6 +349,12 @@ fn read_tensor(tensor: &source::TensorRef) -> Result<Vec<u8>> {
 }
 
 pub fn math_format_for_dtype(dtype: &str) -> Result<u16> {
+    if parse_ple_quant_dtype(dtype).is_some() {
+        return Ok(0x10);
+    }
+    if parse_const_bf16_dtype(dtype).is_some() {
+        return Ok(3);
+    }
     match dtype {
         "F32" => Ok(1),
         "F16" => Ok(2),
@@ -250,4 +403,22 @@ fn put_u64(buffer: &mut [u8], offset: usize, value: u64) {
 }
 fn put_i32(buffer: &mut [u8], offset: usize, value: i32) {
     buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod qwen4_ple_quant_tests {
+    use super::*;
+
+    #[test]
+    fn qwen4_pseudo_dtype_parsing_round_trips_scale() {
+        let dtype = format!("{}3d80", crate::model::qwen4_exp::PLE_BF16_TO_F8_PREFIX);
+        assert_eq!(parse_ple_quant_dtype(&dtype), Some(0x3d80));
+        let dtype = format!("{}3d80", crate::model::qwen4_exp::PLE_CONST_BF16_PREFIX);
+        assert_eq!(parse_const_bf16_dtype(&dtype), Some(0x3d80));
+    }
+
+    #[test]
+    fn e4m3_encoder_refuses_saturation() {
+        assert!(encode_bf16_e4m3(0x4180, 0.0625) > 0xff); // BF16 16.0 / 1/16 = 256
+    }
 }
