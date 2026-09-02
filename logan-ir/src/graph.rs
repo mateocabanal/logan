@@ -213,27 +213,23 @@ mod tests {
     fn tiny_graph() -> Graph {
         let mut g = Graph::new();
         let x = g.add_value(
-            ValueType {
-                shape: vec![1, 64],
-                dtype: "f32".into(),
-            },
+            ValueType { shape: vec![1, 64], dtype: "f32".into() },
             Some("input".into()),
         );
         let w = g.add_value(
-            ValueType {
-                shape: vec![64, 64],
-                dtype: "bf16".into(),
-            },
+            ValueType { shape: vec![64, 64], dtype: "bf16".into() },
             Some("layers.0.mlp.gate.weight".into()),
         );
         let y = g.add_value(
-            ValueType {
-                shape: vec![1, 64],
-                dtype: "f32".into(),
-            },
+            ValueType { shape: vec![1, 64], dtype: "f32".into() },
             None,
         );
-        g.add_node(Op::MatMul, vec![x, w], vec![y], BTreeMap::new());
+        g.add_node(
+            Op::MatMul,
+            vec![x, w],
+            vec![y],
+            BTreeMap::new(),
+        );
         g.inputs = vec![x];
         g.outputs = vec![y];
         g
@@ -249,27 +245,9 @@ mod tests {
     #[test]
     fn topo_order_chain() {
         let mut g = Graph::new();
-        let a = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
-        let b = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
-        let c = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
+        let a = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
+        let b = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
+        let c = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
         g.add_node(Op::Silu, vec![a], vec![b], BTreeMap::new());
         g.add_node(Op::Softmax, vec![b], vec![c], BTreeMap::new());
         let order = g.topo_order().unwrap();
@@ -279,20 +257,8 @@ mod tests {
     #[test]
     fn topo_order_detects_cycle() {
         let mut g = Graph::new();
-        let a = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
-        let b = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
+        let a = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
+        let b = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
         g.add_node(Op::Add, vec![a, b], vec![a], BTreeMap::new()); // a -> a cycle
         assert!(g.topo_order().is_err());
     }
@@ -307,33 +273,10 @@ mod tests {
     #[test]
     fn extension_node_schedules_by_deps() {
         let mut g = Graph::new();
-        let a = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
-        let b = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
-        let c = g.add_value(
-            ValueType {
-                shape: vec![1],
-                dtype: "f32".into(),
-            },
-            None,
-        );
-        g.add_node(
-            Op::Extension("qwen4.ple".into()),
-            vec![a],
-            vec![b],
-            BTreeMap::new(),
-        );
+        let a = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
+        let b = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
+        let c = g.add_value(ValueType { shape: vec![1], dtype: "f32".into() }, None);
+        g.add_node(Op::Extension("qwen4.ple".into()), vec![a], vec![b], BTreeMap::new());
         g.add_node(Op::Add, vec![b, a], vec![c], BTreeMap::new());
         let order = g.topo_order().unwrap();
         assert_eq!(order, vec![0, 1]);
