@@ -1,23 +1,26 @@
-//! The plan artifact: graph + placement + quant + memory plan, serialized
-//! beside the `.coli` package. `logan compile` emits it; `logan run`
-//! executes it. Versioned and fingerprint-pinned so a stale plan is
-//! rejected pre-load (the compiler already rejects mismatches pre-emission).
+//! The plan artifact: graph + representation + tiered resource plan,
+//! serialized beside the `.coli` package. `logan compile` emits it; `logan run`
+//! executes it. Versioned and fingerprint-pinned so a stale plan is rejected
+//! pre-load.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{graph::Graph, optimizer::ParetoPlan};
+use crate::{graph::Graph, optimizer::ParetoPlan, resource::ResourcePlan};
 
 /// Artifact format version. Bump on any breaking change to the schema.
-pub const PLAN_ARTIFACT_VERSION: u32 = 3;
+pub const PLAN_ARTIFACT_VERSION: u32 = 4;
 
-/// Where a weight lives at runtime.
+/// Transitional compatibility projection for runtimes that have not migrated
+/// to `ResourcePlan` yet.
+///
+/// This enum is intentionally no longer the authoritative capacity model:
+/// `Gpu` conflates execution visibility with storage and `Streamed` conflates
+/// backing with residency. New optimizer/resource decisions live in
+/// `MemoryPlan::resources`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Placement {
-    /// Resident in RAM (dense weights, small tensors).
     Resident,
-    /// Streamed from disk on demand (experts, PLE shards).
     Streamed,
-    /// GPU-visible zero-copy (page-aligned, wrapped by Metal).
     Gpu,
 }
 
@@ -32,18 +35,38 @@ pub struct QuantSpec {
     pub scale: Option<String>,
 }
 
-/// Memory plan: the compiler's placement/representation decisions, replayable
-/// by the runtime without re-running the optimizer.
+/// Physical resource plan replayable by the runtime without re-running the
+/// optimizer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
-    /// value name -> placement
+    /// Transitional value name -> legacy placement projection.
     pub placement: Vec<(String, Placement)>,
-    /// value name -> quant
+    /// value name -> quant representation.
     pub quant: Vec<(String, QuantSpec)>,
     /// value name -> physical execution layout id (0 means canonical/none).
     pub layout: Vec<(String, u16)>,
-    /// Peak resident budget the plan was built for (bytes).
+    /// value/state name -> authoritative backing/residency/access contract.
+    pub resources: Vec<(String, ResourcePlan)>,
+    /// Fast resident-pool target/budget the plan was optimized against.
+    /// This is not a whole-model capacity ceiling.
     pub ram_budget_bytes: u64,
+}
+
+impl MemoryPlan {
+    pub fn resource(&self, name: &str) -> Option<&ResourcePlan> {
+        self.resources
+            .iter()
+            .find_map(|(candidate, plan)| (candidate == name).then_some(plan))
+    }
+
+    pub fn validate_resources(&self) -> Result<(), String> {
+        for (name, resource) in &self.resources {
+            resource
+                .validate()
+                .map_err(|detail| format!("resource `{name}`: {detail}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// The full plan artifact.
@@ -78,6 +101,7 @@ impl PlanArtifact {
 
     /// Serialize to a compact binary form (bincode-style framing via serde).
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        self.memory.validate_resources()?;
         bincode::serialize(self).map_err(|e| format!("plan serialize: {e}"))
     }
 
@@ -90,6 +114,7 @@ impl PlanArtifact {
                 plan.version, PLAN_ARTIFACT_VERSION
             ));
         }
+        plan.memory.validate_resources()?;
         Ok(plan)
     }
 
@@ -110,7 +135,10 @@ impl PlanArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Op, ValueType};
+    use crate::{
+        graph::{Op, ValueType},
+        resource::{MemoryPoolId, ResourcePlan, StoragePoolId},
+    };
     use std::collections::BTreeMap;
 
     fn sample_plan() -> PlanArtifact {
@@ -152,6 +180,31 @@ mod tests {
                 },
             )],
             layout: vec![("layers.0.mlp.gate.weight".into(), 0x0103)],
+            resources: vec![
+                (
+                    "layers.0.mlp.gate.weight".into(),
+                    ResourcePlan::immutable_package(
+                        4096,
+                        MemoryPoolId::new("uma0"),
+                        512,
+                        1024,
+                        4096,
+                    ),
+                ),
+                (
+                    "kv".into(),
+                    ResourcePlan::mutable_file_backed(
+                        16 * 1024,
+                        StoragePoolId::new("ssd0"),
+                        MemoryPoolId::new("uma0"),
+                        1024,
+                        4 * 1024,
+                        4096,
+                        12 * 1024,
+                        256,
+                    ),
+                ),
+            ],
             ram_budget_bytes: 4 * 1024 * 1024 * 1024,
         };
         PlanArtifact::new("abc123".into(), g, memory)
@@ -163,6 +216,7 @@ mod tests {
         let bytes = plan.to_bytes().unwrap();
         let back = PlanArtifact::from_bytes(&bytes).unwrap();
         assert_eq!(plan, back);
+        assert_eq!(back.version, 4);
     }
 
     #[test]
@@ -182,13 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn placement_quant_and_layout_round_trip() {
+    fn resource_axes_round_trip_independently_from_legacy_placement() {
         let plan = sample_plan();
         let bytes = plan.to_bytes().unwrap();
         let back = PlanArtifact::from_bytes(&bytes).unwrap();
         assert_eq!(back.memory.placement.len(), 2);
         assert_eq!(back.memory.quant[0].1.kind, "mxfp4-tile8x32");
         assert_eq!(back.memory.layout[0].1, 0x0103);
+        let kv = back.memory.resource("kv").unwrap();
+        assert_eq!(kv.backing.bytes, 16 * 1024);
+        assert_eq!(kv.residency.target_resident_bytes, 4 * 1024);
+        assert_eq!(kv.mutable_backing_bytes(), 16 * 1024);
         assert!(back.optimizer.is_none());
     }
 }

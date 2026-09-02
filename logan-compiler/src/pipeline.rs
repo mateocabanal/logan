@@ -1067,6 +1067,10 @@ fn build_physical_plan(
         placement,
         quant,
         layout,
+        // #93 makes ResourcePlan authoritative. Existing compiler lowering is
+        // migrated incrementally; until a value has an explicit resource
+        // decision, legacy placement remains the compatibility projection.
+        resources: Vec::new(),
         ram_budget_bytes: pool,
     };
     let artifact = PlanArtifact::new(package_fingerprint.to_string(), graph, memory);
