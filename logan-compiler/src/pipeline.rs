@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
 
 use logan_ir::{
-    ContextConstraint,
+    ContextConstraint, ParetoPlan,
     graph::{Graph, Op, ValueType},
     plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec},
 };
@@ -28,9 +28,12 @@ pub struct CompileRequest {
     /// Compile-time context intent. CLI callers must supply exactly one of
     /// --max-context or --require-context.
     pub context: Option<ContextConstraint>,
-    /// Enter hardware-specialized planning. Candidate search lands in #82;
-    /// until then this is rejected rather than silently behaving like a fixed quant.
+    /// Enter hardware-specialized Pareto planning.
     pub optimize: bool,
+    /// Stable Pareto plan id or UX alias (`quality`, `balanced`, `long-context`, `latency`).
+    pub plan_choice: Option<String>,
+    /// Optional precomputed calibration-score JSON consumed by the optimizer.
+    pub calibration: Option<PathBuf>,
     pub dry_run: bool,
     pub verify: bool,
     pub force: bool,
@@ -54,6 +57,8 @@ impl CompileRequest {
             optimization: OptimizationProfile::Default,
             context: None,
             optimize: false,
+            plan_choice: None,
+            calibration: None,
             dry_run: false,
             verify: false,
             force: false,
@@ -109,6 +114,25 @@ impl QuantRequest {
 enum ExpertQuantization {
     Exact,
     Mxfp4,
+}
+
+#[derive(Debug, Clone)]
+struct ExpertQuantizationPlan {
+    default: ExpertQuantization,
+    by_layer: BTreeMap<u32, ExpertQuantization>,
+}
+
+impl ExpertQuantizationPlan {
+    fn uniform(default: ExpertQuantization) -> Self {
+        Self {
+            default,
+            by_layer: BTreeMap::new(),
+        }
+    }
+
+    fn for_expert(&self, layer: u32) -> ExpertQuantization {
+        self.by_layer.get(&layer).copied().unwrap_or(self.default)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +209,7 @@ pub struct DryRunSummary {
     pub source_tensors: usize,
     pub source_stored_bytes: u64,
     pub plan: StoragePlan,
+    pub optimizer_plans: Vec<ParetoPlan>,
 }
 pub struct NoProgress;
 impl ProgressSink for NoProgress {
@@ -246,6 +271,93 @@ fn resolve_expert_quantization(
     }
 }
 
+fn optimizer_quantization_plan(
+    request: &CompileRequest,
+    model: &SemanticModel,
+    target_profile: target::TargetProfile,
+    machine: &target::MachineProfile,
+    allow_default_selection: bool,
+) -> Result<(ExpertQuantizationPlan, Option<ParetoPlan>, Vec<ParetoPlan>)> {
+    if !request.optimize {
+        return Ok((
+            ExpertQuantizationPlan::uniform(resolve_expert_quantization(request, model)?),
+            None,
+            Vec::new(),
+        ));
+    }
+    let context = request.context.ok_or_else(|| {
+        ColicError::Usage("optimized compile requires --max-context or --require-context".into())
+    })?;
+    let optimization = crate::optimize::compile_plans(
+        model,
+        target_profile,
+        machine,
+        context,
+        request.calibration.as_deref(),
+        None,
+    )?;
+    let selected = match request.plan_choice.as_deref() {
+        Some(selector) => optimization.select(selector)?,
+        None if allow_default_selection => optimization.balanced_or_first()?,
+        None => {
+            return Err(ColicError::Usage(
+                "optimized compile requires --plan-choice NAME|ID in non-interactive code paths; run --dry-run to list plans".into(),
+            ));
+        }
+    };
+    let by_layer = crate::optimize::selected_layer_quantization(&selected)?
+        .into_iter()
+        .map(|(layer, mxfp4)| {
+            (
+                layer,
+                if mxfp4 {
+                    ExpertQuantization::Mxfp4
+                } else {
+                    ExpertQuantization::Exact
+                },
+            )
+        })
+        .collect();
+    Ok((
+        ExpertQuantizationPlan {
+            default: ExpertQuantization::Exact,
+            by_layer,
+        },
+        Some(selected),
+        optimization.plans,
+    ))
+}
+
+pub fn preview_optimization(request: &CompileRequest) -> Result<Vec<ParetoPlan>> {
+    validate_supported_options(request)?;
+    if !request.optimize {
+        return Err(ColicError::Usage(
+            "optimization preview requires --optimize".into(),
+        ));
+    }
+    let inventory = source::discover(&request.source)?;
+    let model = build_semantic_ir(&inventory)?.ok_or_else(|| {
+        ColicError::unsupported(
+            Stage::SemanticIr.as_str(),
+            "no supported architecture frontend matched this source model",
+        )
+    })?;
+    let machine = target::MachineProfile::probe();
+    let target_profile = target::resolve(&request.target, &machine)?;
+    let context = request.context.ok_or_else(|| {
+        ColicError::Usage("optimized compile requires --max-context or --require-context".into())
+    })?;
+    Ok(crate::optimize::compile_plans(
+        &model,
+        target_profile,
+        &machine,
+        context,
+        request.calibration.as_deref(),
+        None,
+    )?
+    .plans)
+}
+
 pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
     validate_supported_options(request)?;
     let inventory = source::discover(&request.source)?;
@@ -255,15 +367,18 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
             "no supported architecture frontend matched this source model",
         )
     })?;
-    let quantization = resolve_expert_quantization(request, &model)?;
-    let target_profile = target::resolve(&request.target, &target::MachineProfile::probe())?;
-    let records = record_inventory(&model, quantization, target_profile)?;
+    let machine = target::MachineProfile::probe();
+    let target_profile = target::resolve(&request.target, &machine)?;
+    let (quantization, _selected, optimizer_plans) =
+        optimizer_quantization_plan(request, &model, target_profile, &machine, true)?;
+    let records = record_inventory(&model, &quantization, target_profile)?;
     let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     Ok(DryRunSummary {
         target_name: target_profile.name,
         source_tensors: inventory.tensors.len(),
         source_stored_bytes: inventory.source_stored_bytes,
         plan,
+        optimizer_plans,
     })
 }
 
@@ -271,14 +386,14 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
 pub fn exact_record_inventory(model: &SemanticModel) -> Result<Vec<LoweredRecord>> {
     record_inventory(
         model,
-        ExpertQuantization::Exact,
+        &ExpertQuantizationPlan::uniform(ExpertQuantization::Exact),
         target::LINUX_X86_64_AVX2_V1,
     )
 }
 
 fn record_inventory(
     model: &SemanticModel,
-    expert_quantization: ExpertQuantization,
+    expert_quantization: &ExpertQuantizationPlan,
     target_profile: target::TargetProfile,
 ) -> Result<Vec<LoweredRecord>> {
     let mut records = Vec::new();
@@ -294,6 +409,7 @@ fn record_inventory(
         }
     }
     for expert in model.routed_experts.values() {
+        let expert_quantization = expert_quantization.for_expert(expert.layer);
         let (stored_bytes, decoded_bytes) = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1
         {
             match expert_quantization {
@@ -496,7 +612,7 @@ enum ExactSource {
 
 fn exact_sources(
     model: &SemanticModel,
-    expert_quantization: ExpertQuantization,
+    expert_quantization: &ExpertQuantizationPlan,
 ) -> Vec<ExactSource> {
     let mut sources = Vec::new();
     sources.extend(
@@ -516,16 +632,13 @@ fn exact_sources(
             tensor: tensor.clone(),
         }));
     }
-    sources.extend(
-        model
-            .routed_experts
-            .values()
-            .cloned()
-            .map(|expert| ExactSource::Expert {
-                expert: Box::new(expert),
-                quantization: expert_quantization,
-            }),
-    );
+    sources.extend(model.routed_experts.values().cloned().map(|expert| {
+        let quantization = expert_quantization.for_expert(expert.layer);
+        ExactSource::Expert {
+            expert: Box::new(expert),
+            quantization,
+        }
+    }));
     sources.extend(
         model
             .resident_tensors
@@ -713,6 +826,26 @@ fn dense_quant_kind(dtype: &str) -> &'static str {
     }
 }
 
+fn exact_expert_quant_kind(expert: &crate::ir::RoutedExpert) -> &'static str {
+    let matrices = [&expert.gate, &expert.up, &expert.down];
+    if matrices.iter().all(|matrix| {
+        matrix.source.dtype == "I8"
+            && matrix
+                .scale
+                .as_ref()
+                .is_some_and(|scale| matches!(scale.dtype.as_str(), "F8_E8M0" | "F8_E8M0FNU"))
+    }) {
+        "mxfp4"
+    } else if matrices
+        .iter()
+        .all(|matrix| matrix.source.dtype == "BF16" && matrix.scale.is_none())
+    {
+        KIND_BF16
+    } else {
+        KIND_EXACT
+    }
+}
+
 /// Bit width of a representation kind; `None` means >= 16-bit (never
 /// narrower than the bf16 floor).
 fn narrow_bits(kind: &str) -> Option<u32> {
@@ -743,7 +876,9 @@ fn check_uma_pool(
     resident_bytes: u64,
     expert_cache_bytes: u64,
 ) -> Result<u64> {
-    let pool = machine.ram_bytes.unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
+    let pool = machine
+        .ram_bytes
+        .unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
     let demand = resident_bytes
         .checked_add(expert_cache_bytes)
         .ok_or_else(|| ColicError::Usage("memory demand overflows u64".into()))?;
@@ -767,11 +902,11 @@ fn check_uma_pool(
 fn build_physical_plan(
     sources: &[ExactSource],
     records: &[LoweredRecord],
-    expert_quantization: ExpertQuantization,
     target: target::TargetProfile,
     quant_floor: QuantFloor,
     machine: &target::MachineProfile,
     package_fingerprint: &str,
+    optimizer: Option<&ParetoPlan>,
 ) -> Result<PlanArtifact> {
     if sources.len() != records.len() {
         return Err(ColicError::Usage(
@@ -781,60 +916,65 @@ fn build_physical_plan(
     let mut graph = Graph::new();
     let mut placement = Vec::with_capacity(records.len());
     let mut quant = Vec::with_capacity(records.len());
+    let mut layout = Vec::with_capacity(records.len());
     let mut resident_bytes = 0_u64;
     let mut largest_expert_decoded = 0_u64;
     for (source, record) in sources.iter().zip(records) {
         let (name, layer, expert_id, dtype, shape) = match source {
-            ExactSource::Tensor { name, layer, tensor } => (
+            ExactSource::Tensor {
+                name,
+                layer,
+                tensor,
+            } => (
                 name.clone(),
                 i32::from(*layer),
                 -1,
                 dense_quant_kind(&tensor.dtype),
                 tensor.shape.clone(),
             ),
-            ExactSource::Expert { expert, .. } => {
+            ExactSource::Expert {
+                expert,
+                quantization,
+            } => {
                 let stored_verified = if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
                     target::apple8_expert_stored_bytes(expert)?
                 } else {
-                    mxfp4_record::stored_bytes(expert)?
+                    match quantization {
+                        ExpertQuantization::Exact => target::exact_expert_stored_bytes(expert)?,
+                        ExpertQuantization::Mxfp4 => mxfp4_record::stored_bytes(expert)?,
+                    }
                 };
                 if record.stored_bytes != stored_verified {
                     return Err(ColicError::Usage(format!(
-                        "Apple8 expert record {} planned {} bytes but the verified tile math says {stored_verified}",
+                        "expert record {} planned {} bytes but selected representation requires {stored_verified}",
                         record.id, record.stored_bytes
                     )));
                 }
                 largest_expert_decoded = largest_expert_decoded.max(record.decoded_bytes);
+                let dtype = if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
+                    KIND_APPLE8
+                } else {
+                    match quantization {
+                        ExpertQuantization::Exact => exact_expert_quant_kind(expert),
+                        ExpertQuantization::Mxfp4 => "mxfp4",
+                    }
+                };
                 (
                     format!("layers.{}.ffn.experts.{}", expert.layer, expert.expert),
-                    i32::try_from(expert.layer).map_err(|_| {
-                        ColicError::Usage("expert layer exceeds i32".into())
-                    })?,
-                    i32::try_from(expert.expert).map_err(|_| {
-                        ColicError::Usage("expert id exceeds i32".into())
-                    })?,
-                    if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
-                        KIND_APPLE8
-                    } else {
-                        "mxfp4"
-                    },
-                    vec![3, u64::from(expert.gate.rows), u64::from(expert.gate.columns)],
+                    i32::try_from(expert.layer)
+                        .map_err(|_| ColicError::Usage("expert layer exceeds i32".into()))?,
+                    i32::try_from(expert.expert)
+                        .map_err(|_| ColicError::Usage("expert id exceeds i32".into()))?,
+                    dtype,
+                    vec![
+                        3,
+                        u64::from(expert.gate.rows),
+                        u64::from(expert.gate.columns),
+                    ],
                 )
             }
         };
-        let kind = match source {
-            ExactSource::Expert { .. } => {
-                if target == target::MACOS_ARM64_METAL_APPLE8_V1 {
-                    KIND_APPLE8
-                } else {
-                    match expert_quantization {
-                        ExpertQuantization::Exact => KIND_EXACT,
-                        ExpertQuantization::Mxfp4 => "mxfp4",
-                    }
-                }
-            }
-            ExactSource::Tensor { .. } => dtype,
-        };
+        let kind = dtype;
         let placed = match source {
             ExactSource::Expert { .. } => Placement::Streamed,
             ExactSource::Tensor { .. } => Placement::Resident,
@@ -852,9 +992,11 @@ fn build_physical_plan(
             ));
         }
         match placed {
-            Placement::Resident => resident_bytes = resident_bytes
-                .checked_add(record.decoded_bytes)
-                .ok_or_else(|| ColicError::Usage("resident bytes overflow u64".into()))?,
+            Placement::Resident => {
+                resident_bytes = resident_bytes
+                    .checked_add(record.decoded_bytes)
+                    .ok_or_else(|| ColicError::Usage("resident bytes overflow u64".into()))?
+            }
             Placement::Streamed => {}
             Placement::Gpu => {}
         }
@@ -878,6 +1020,16 @@ fn build_physical_plan(
         }
         graph.add_node(Op::LoadWeight, vec![], vec![value], attrs);
         placement.push((name.clone(), placed));
+        layout.push((
+            name.clone(),
+            if matches!(source, ExactSource::Expert { .. })
+                && target == target::MACOS_ARM64_METAL_APPLE8_V1
+            {
+                crate::target_registry::APPLE8_MXFP4_TILE_LAYOUT
+            } else {
+                0
+            },
+        ));
         quant.push((
             name,
             QuantSpec {
@@ -886,19 +1038,40 @@ fn build_physical_plan(
             },
         ));
     }
-    let pool = check_uma_pool(
-        machine,
-        resident_bytes,
-        expert_cache_slots()
-            .checked_mul(largest_expert_decoded)
-            .unwrap_or(u64::MAX),
-    )?;
+    let pool = if let Some(optimizer) = optimizer {
+        let pool = machine
+            .ram_bytes
+            .unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
+        if optimizer.metrics.resident_bytes > pool {
+            return Err(ColicError::unsupported(
+                Stage::StoragePlanning.as_str(),
+                format!(
+                    "selected optimizer plan needs {} resident bytes but the machine budget is {pool}",
+                    optimizer.metrics.resident_bytes
+                ),
+            ));
+        }
+        pool
+    } else {
+        check_uma_pool(
+            machine,
+            resident_bytes,
+            expert_cache_slots()
+                .checked_mul(largest_expert_decoded)
+                .unwrap_or(u64::MAX),
+        )?
+    };
     let memory = MemoryPlan {
         placement,
         quant,
+        layout,
         ram_budget_bytes: pool,
     };
-    Ok(PlanArtifact::new(package_fingerprint.to_string(), graph, memory))
+    let artifact = PlanArtifact::new(package_fingerprint.to_string(), graph, memory);
+    Ok(match optimizer {
+        Some(optimizer) => artifact.with_optimizer(optimizer.clone()),
+        None => artifact,
+    })
 }
 
 pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Result<()> {
@@ -918,17 +1091,18 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
             "no supported architecture frontend matched this source model",
         )
     })?;
-    let expert_quantization = resolve_expert_quantization(request, &model)?;
     progress.stage(Stage::TargetPlanning);
     let machine = target::MachineProfile::probe();
     let target_profile = target::resolve(&request.target, &machine)?;
+    let (expert_quantization, selected_optimizer, _optimizer_plans) =
+        optimizer_quantization_plan(request, &model, target_profile, &machine, false)?;
     let output = request
         .output
         .as_ref()
         .ok_or_else(|| ColicError::Usage("compile requires an output package path".into()))?;
     progress.stage(Stage::StoragePlanning);
-    let sources = exact_sources(&model, expert_quantization);
-    let records = record_inventory(&model, expert_quantization, target_profile)?;
+    let sources = exact_sources(&model, &expert_quantization);
+    let records = record_inventory(&model, &expert_quantization, target_profile)?;
     let plan = storage::plan_records(&records, target_profile, 4 * 1024 * 1024 * 1024)?;
     let fingerprint = source::fingerprint_bytes(&inventory.source_fingerprint)?;
     let temporary = storage::temporary_package_path(output)?;
@@ -1004,15 +1178,17 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         let plan = build_physical_plan(
             &sources,
             &records,
-            expert_quantization,
             target_profile,
             request.quant_floor,
             &machine,
             &inventory.source_fingerprint,
+            selected_optimizer.as_ref(),
         )?;
-        fs::write(plan_path, plan.to_bytes().map_err(ColicError::Usage)?).map_err(|source| ColicError::Io {
-            path: plan_path.clone(),
-            source,
+        fs::write(plan_path, plan.to_bytes().map_err(ColicError::Usage)?).map_err(|source| {
+            ColicError::Io {
+                path: plan_path.clone(),
+                source,
+            }
         })?;
     }
     if request.verify {
@@ -1024,10 +1200,27 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
 
 fn validate_supported_options(request: &CompileRequest) -> Result<()> {
     if request.optimize {
-        return Err(ColicError::unsupported(
-            Stage::TargetPlanning.as_str(),
-            "--optimize is wired to the shared context contract, but mixed-representation Pareto search is not implemented yet (see #82); refusing to pretend a fixed quant is optimized",
-        ));
+        if request.context.is_none() {
+            return Err(ColicError::Usage(
+                "optimized compile requires --max-context or --require-context".into(),
+            ));
+        }
+        if !matches!(request.quant, QuantRequest::Exact) {
+            return Err(ColicError::Usage(
+                "--optimize owns routed-expert representation selection; do not combine it with a global non-exact --quant profile".into(),
+            ));
+        }
+    } else {
+        if request.plan_choice.is_some() {
+            return Err(ColicError::Usage(
+                "--plan-choice requires --optimize".into(),
+            ));
+        }
+        if request.calibration.is_some() {
+            return Err(ColicError::Usage(
+                "--calibration requires --optimize".into(),
+            ));
+        }
     }
     match &request.quant {
         QuantRequest::Exact => {}

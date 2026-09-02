@@ -203,9 +203,8 @@ pub fn pareto_plans(input: &OptimizerInput) -> Result<Vec<ParetoPlan>, String> {
 
     let keep = (0..raw.len())
         .filter(|&candidate| {
-            !(0..raw.len()).any(|other| {
-                other != candidate && dominates(raw[other].0, raw[candidate].0)
-            })
+            !(0..raw.len())
+                .any(|other| other != candidate && dominates(raw[other].0, raw[candidate].0))
         })
         .collect::<Vec<_>>();
 
@@ -463,11 +462,7 @@ fn balanced_index(plans: &[ParetoPlan]) -> usize {
     (0..plans.len())
         .min_by_key(|&index| {
             (
-                quality[index]
-                    + context[index]
-                    + latency[index]
-                    + resident[index]
-                    + traffic[index],
+                quality[index] + context[index] + latency[index] + resident[index] + traffic[index],
                 plans[index].id.clone(),
             )
         })
@@ -478,7 +473,10 @@ fn ranks(plans: &[ParetoPlan], value: impl Fn(&ParetoPlan) -> u64, reverse: bool
     let mut order = (0..plans.len()).collect::<Vec<_>>();
     order.sort_by_key(|&index| {
         let value = value(&plans[index]);
-        (if reverse { u64::MAX - value } else { value }, plans[index].id.clone())
+        (
+            if reverse { u64::MAX - value } else { value },
+            plans[index].id.clone(),
+        )
     });
     let mut ranks = vec![0; plans.len()];
     for (rank, index) in order.into_iter().enumerate() {
@@ -501,7 +499,8 @@ fn state_sort_key(state: &State) -> (u16, u64, u64, u64, u64, u64, Vec<usize>) {
 
 fn state_trim_key(state: &State) -> (u64, u64, u64, u64, u64, u16, Vec<usize>) {
     (
-        state.quality_loss_ppm
+        state
+            .quality_loss_ppm
             .saturating_add(state.latency_cost)
             .saturating_add(state.resident_bytes / 4096)
             .saturating_add(state.storage_traffic_bytes / 4096),
@@ -626,8 +625,7 @@ mod tests {
         );
         let frontier = pareto_plans(&spec).unwrap();
         let mixed = frontier.iter().find(|plan| {
-            plan.decisions[0].chosen.id == "mxfp4"
-                && plan.decisions[1].chosen.id == "bf16"
+            plan.decisions[0].chosen.id == "mxfp4" && plan.decisions[1].chosen.id == "bf16"
         });
         let mixed = mixed.expect("mixed plan must survive the Pareto frontier");
         assert!(mixed.metrics.resident_bytes <= 80);
@@ -635,9 +633,11 @@ mod tests {
         // Global BF16 is infeasible at 120 resident bytes. Global MXFP4 fits
         // memory but has quality loss 21ppm, so only the mixed plan satisfies
         // both the 80-byte memory and <=5ppm quality envelope.
-        assert!(!frontier.iter().any(|plan| {
-            plan.decisions.iter().all(|d| d.chosen.id == "bf16")
-        }));
+        assert!(
+            !frontier
+                .iter()
+                .any(|plan| { plan.decisions.iter().all(|d| d.chosen.id == "bf16") })
+        );
         assert!(frontier.iter().any(|plan| {
             plan.decisions.iter().all(|d| d.chosen.id == "mxfp4")
                 && plan.metrics.quality_loss_ppm == 21

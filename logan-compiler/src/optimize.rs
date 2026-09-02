@@ -41,9 +41,7 @@ impl CalibrationScores {
             .get("scores")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| {
-                ColicError::Usage(
-                    "optimizer calibration must contain a `scores` array".into(),
-                )
+                ColicError::Usage("optimizer calibration must contain a `scores` array".into())
             })?;
         let mut parsed = BTreeMap::new();
         for score in scores {
@@ -94,7 +92,11 @@ impl CompileOptimization {
                 "unknown optimizer plan `{selector}`; expected one of {}",
                 self.plans
                     .iter()
-                    .flat_map(|plan| plan.labels.iter().cloned().chain(std::iter::once(plan.id.clone())))
+                    .flat_map(|plan| plan
+                        .labels
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(plan.id.clone())))
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
@@ -152,11 +154,17 @@ fn compile_optimizer_input(
     for tensor in model
         .global_tensors
         .values()
-        .chain(model.layer_static_tensors.values().flat_map(|tensors| tensors.values()))
+        .chain(
+            model
+                .layer_static_tensors
+                .values()
+                .flat_map(|tensors| tensors.values()),
+        )
         .chain(model.resident_tensors.values())
     {
         let stored = target::exact_tensor_stored_bytes(tensor)?;
-        base_resident_bytes = checked_add(base_resident_bytes, tensor.len, "resident tensor bytes")?;
+        base_resident_bytes =
+            checked_add(base_resident_bytes, tensor.len, "resident tensor bytes")?;
         base_package_bytes = checked_add(base_package_bytes, stored, "package tensor bytes")?;
         base_storage_traffic_bytes =
             checked_add(base_storage_traffic_bytes, stored, "tensor storage traffic")?;
@@ -199,8 +207,9 @@ fn compile_optimizer_input(
                 latency_cost: cost_units(per_token),
                 quality_loss_ppm: calibration.quality(&key, CANDIDATE_KEEP, 0),
                 dispatch_class: DISPATCH_KEEP,
-                rationale: "preserve the source expert representation and its verified runtime kernel"
-                    .into(),
+                rationale:
+                    "preserve the source expert representation and its verified runtime kernel"
+                        .into(),
             });
         } else if experts.iter().all(|expert| canonical_mxfp4(expert)) {
             let package_bytes = sum_experts(&experts, target::apple8_expert_stored_bytes)?;
@@ -224,8 +233,9 @@ fn compile_optimizer_input(
                 latency_cost: cost_units(per_token),
                 quality_loss_ppm: calibration.quality(&key, CANDIDATE_KEEP, 0),
                 dispatch_class: DISPATCH_MXFP4,
-                rationale: "losslessly repack canonical MXFP4 into the target-native Apple8 tile ABI"
-                    .into(),
+                rationale:
+                    "losslessly repack canonical MXFP4 into the target-native Apple8 tile ABI"
+                        .into(),
             });
         }
 
@@ -335,7 +345,7 @@ pub fn selected_layer_quantization(plan: &ParetoPlan) -> Result<BTreeMap<u32, bo
             other => {
                 return Err(ColicError::Usage(format!(
                     "optimizer selected unknown compile candidate `{other}` for layer {layer}"
-                )))
+                )));
             }
         };
         selected.insert(layer, mxfp4);
@@ -382,9 +392,10 @@ fn canonical_mxfp4(expert: &RoutedExpert) -> bool {
         .into_iter()
         .all(|matrix| {
             matrix.source.dtype == "I8"
-                && matrix.scale.as_ref().is_some_and(|scale| {
-                    matches!(scale.dtype.as_str(), "F8_E8M0" | "F8_E8M0FNU")
-                })
+                && matrix
+                    .scale
+                    .as_ref()
+                    .is_some_and(|scale| matches!(scale.dtype.as_str(), "F8_E8M0" | "F8_E8M0FNU"))
         })
 }
 
@@ -463,7 +474,10 @@ mod tests {
     fn quality_prior_is_not_uniform_and_protects_model_edges_more() {
         assert!(layer_quant_quality_prior(0, 40) > layer_quant_quality_prior(10, 40));
         assert!(layer_quant_quality_prior(39, 40) > layer_quant_quality_prior(20, 40));
-        assert_ne!(layer_quant_quality_prior(10, 40), layer_quant_quality_prior(11, 40));
+        assert_ne!(
+            layer_quant_quality_prior(10, 40),
+            layer_quant_quality_prior(11, 40)
+        );
     }
 
     #[test]
@@ -479,14 +493,8 @@ mod tests {
         )
         .unwrap();
         let scores = CalibrationScores::load(Some(&root)).unwrap();
-        assert_eq!(
-            scores.quality("layer:7:routed-experts", "mxfp4", 999),
-            123
-        );
-        assert_eq!(
-            scores.quality("layer:8:routed-experts", "mxfp4", 999),
-            999
-        );
+        assert_eq!(scores.quality("layer:7:routed-experts", "mxfp4", 999), 123);
+        assert_eq!(scores.quality("layer:8:routed-experts", "mxfp4", 999), 999);
         let _ = fs::remove_file(root);
     }
 }
