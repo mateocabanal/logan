@@ -1,0 +1,34 @@
+name: issue68 storage-aware machine profile gate
+
+on:
+  push:
+    branches: [feat/storage-aware-machine-profile]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/storage-aware-machine-profile
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply scoped module patch
+        run: python3 .github/issue68_patch.py
+      - name: Format new resource profile module
+        run: rustfmt --edition 2024 logan-compiler/src/target/resources.rs
+      - name: Test compiler
+        run: cargo test -p logan-compiler --all-targets -- --test-threads=1
+      - name: Test IR compatibility
+        run: cargo test -p logan-ir --all-targets
+      - name: Commit scoped result and remove one-shot machinery
+        run: |
+          rm .github/issue68_patch.py .github/workflows/issue68-gate.yml
+          git config user.name "logan-issue68"
+          git config user.email "actions@users.noreply.github.com"
+          git add logan-compiler/src/target/resources.rs logan-compiler/src/target/mod.rs .github/issue68_patch.py .github/workflows/issue68-gate.yml
+          git commit -m "feat: add memory and path-bound storage resource profiles (#68)"
+          git push origin HEAD:feat/storage-aware-machine-profile
