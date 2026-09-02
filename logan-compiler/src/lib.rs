@@ -3,6 +3,8 @@
 //! It deliberately has no link-time relationship with the C inference runtime.
 //! Hardware-specialized Pareto planning lives in `optimize`; emission remains
 //! delegated to the same verified target lowerers used by manual compilation.
+//! Pareto choices use stable IDs so interactive and scripted selection replay
+//! the same physical representation decisions.
 
 pub mod cli;
 pub mod codec;
