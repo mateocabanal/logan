@@ -320,8 +320,8 @@ fn hash_numerical_policy(h: &mut Sha256, model: &Model) {
     // Qwen3.8 sigmoid gating deliberately declines the historical SiLU
     // Metal GDN kernel, so QWEN_GDN_METAL=0/1 are numerically identical
     // for this model and should share one prefix-cache namespace.
-    let effective_gdn_metal =
-        env_bool("QWEN_GDN_METAL", true) && model.cfg.output_gate == crate::OutputGate::Silu;
+    let effective_gdn_metal = env_bool("QWEN_GDN_METAL", true)
+        && model.cfg.output_gate == crate::OutputGate::Silu;
     h.update(b"QWEN_GDN_METAL");
     h.update([0]);
     h.update([effective_gdn_metal as u8]);

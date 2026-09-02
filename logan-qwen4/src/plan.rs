@@ -14,12 +14,12 @@ pub mod prefix_runtime;
 pub mod runtime_stats;
 pub mod snapshot;
 pub use prefix_cache::{
-    CacheRestoreStats, CacheWriteStats, PrefixCacheKey, PrefixCacheStore, digest_hex,
-    live_prefix_state_digest,
+    digest_hex, live_prefix_state_digest, CacheRestoreStats, CacheWriteStats, PrefixCacheKey,
+    PrefixCacheStore,
 };
 pub use prefix_runtime::{
-    PrefixRestoreSummary, apply_max_performance_defaults, auto_prefix_cache_enabled,
-    persist_prefix_boundary, restore_longest_prefix, run_greedy_cached_coli,
+    apply_max_performance_defaults, auto_prefix_cache_enabled, persist_prefix_boundary,
+    restore_longest_prefix, run_greedy_cached_coli, PrefixRestoreSummary,
 };
 pub use runtime_stats::{RuntimeFeatures, RuntimeStats};
 pub use snapshot::QwenStateSnapshot;
@@ -123,22 +123,12 @@ mod tests {
         let plan = Plan {
             layers: vec![
                 vec![
-                    PlannedExpert {
-                        shard_id: 0,
-                        regions: [(0, 100), (0, 100), (0, 100)],
-                        dims: [(1, 1); 3],
-                    },
-                    PlannedExpert {
-                        shard_id: 1,
-                        regions: [(0, 50), (0, 50), (0, 50)],
-                        dims: [(1, 1); 3],
-                    },
+                    PlannedExpert { shard_id: 0, regions: [(0, 100), (0, 100), (0, 100)], dims: [(1, 1); 3] },
+                    PlannedExpert { shard_id: 1, regions: [(0, 50), (0, 50), (0, 50)], dims: [(1, 1); 3] },
                 ],
-                vec![PlannedExpert {
-                    shard_id: 2,
-                    regions: [(0, 400), (0, 400), (0, 400)],
-                    dims: [(1, 1); 3],
-                }],
+                vec![
+                    PlannedExpert { shard_id: 2, regions: [(0, 400), (0, 400), (0, 400)], dims: [(1, 1); 3] },
+                ],
             ],
             max_slot_bytes: 1200,
         };

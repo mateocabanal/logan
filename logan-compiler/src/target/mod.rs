@@ -107,7 +107,10 @@ fn from_machine(machine: &MachineProfile) -> Result<TargetProfile> {
     if machine.apple8_abi {
         return Ok(MACOS_ARM64_METAL_APPLE8_V1);
     }
-    if machine.operating_system == "linux" && machine.architecture == "x86_64" && machine.avx2 {
+    if machine.operating_system == "linux"
+        && machine.architecture == "x86_64"
+        && machine.avx2
+    {
         return Ok(LINUX_X86_64_AVX2_V1);
     }
     Err(ColicError::unsupported(

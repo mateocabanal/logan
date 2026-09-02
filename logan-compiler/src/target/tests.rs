@@ -130,11 +130,7 @@ fn profile_identity_is_registry_owned() {
         MACOS_ARM64_METAL_APPLE8_V1
     );
     assert!(
-        resolve(
-            &TargetRequest::Profile("portable-v1".into()),
-            &apple_machine()
-        )
-        .is_err()
+        resolve(&TargetRequest::Profile("portable-v1".into()), &apple_machine()).is_err()
     );
 }
 
