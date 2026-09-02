@@ -8,10 +8,16 @@
 
 pub mod context;
 pub mod graph;
+pub mod optimizer;
 pub mod plan;
 
 pub use context::{
     ContextConstraint, ContextConstraintKind, ContextPlan, ContextStateBytes, PlannerMemoryBudget,
 };
 pub use graph::{AttentionKind, Graph, Node, NodeId, Op, Value, ValueId, ValueType};
+pub use optimizer::{
+    BUILTIN_COST_MODEL_V1, CandidateGroup, ContextCandidate, OptimizerInput, ParetoPlan,
+    PlanDecision, PlanMetrics, RejectedCandidate, RepresentationCandidate, material_plans,
+    pareto_plans, select_plan,
+};
 pub use plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec};
