@@ -29,6 +29,10 @@ jobs:
           rm .github/issue68_patch.py .github/workflows/issue68-gate.yml
           git config user.name "logan-issue68"
           git config user.email "actions@users.noreply.github.com"
-          git add logan-compiler/src/target/resources.rs logan-compiler/src/target/mod.rs .github/issue68_patch.py .github/workflows/issue68-gate.yml
+          # The repository's broad target/ ignore pattern also matches this
+          # tracked source directory by name, so force-stage only the two
+          # intended source paths. No build artifacts are included.
+          git add -f logan-compiler/src/target/resources.rs logan-compiler/src/target/mod.rs
+          git add -u .github/issue68_patch.py .github/workflows/issue68-gate.yml
           git commit -m "feat: add memory and path-bound storage resource profiles (#68)"
           git push origin HEAD:feat/storage-aware-machine-profile
