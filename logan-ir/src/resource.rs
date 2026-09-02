@@ -30,6 +30,8 @@ impl StoragePoolId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPoolBudget {
     pub id: MemoryPoolId,
+    /// Fast-tier capacity available to the plan. This constrains bounded
+    /// working sets and resident caches, never total logical/model bytes.
     pub capacity_bytes: u64,
 }
 
