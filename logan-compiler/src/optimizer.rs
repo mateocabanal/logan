@@ -146,8 +146,8 @@ fn estimate_context_bytes(model: &SemanticModel, tokens: u64) -> Result<u64> {
         .checked_mul(u64::from(g.layers.max(1)))
         .and_then(|value| value.checked_mul(u64::from(kv_heads)))
         .and_then(|value| value.checked_mul(u64::from(head_dim)))
-        .and_then(|value| value.checked_mul(2)) // K + V
-        .and_then(|value| value.checked_mul(2)) // BF16 bytes
+        .and_then(|value| value.checked_mul(2))
+        .and_then(|value| value.checked_mul(2))
         .ok_or_else(|| ColicError::Usage("context-state estimate overflows u64".into()))
 }
 
@@ -334,9 +334,6 @@ pub(crate) fn build_plans(
         context_constraint: constraint,
         base_resident_bytes,
         memory_budget_bytes,
-        // Roughly the cost of breaking a fused/regular expert execution band.
-        // It is versioned with the rest of COST_MODEL_VERSION and deliberately
-        // non-zero so arbitrary per-band mixtures need a measurable benefit.
         heterogeneity_penalty: 250,
     };
     let plans = optimize(&input).map_err(|message| ColicError::Usage(format!("optimizer: {message}")))?;
@@ -395,11 +392,11 @@ pub(crate) fn select(
 mod tests {
     use super::*;
     use crate::{ir::{Matrix, ModelGeometry}, source::TensorRef};
+    use std::path::PathBuf;
 
     fn tensor(name: &str, len: u64, shape: Vec<u64>) -> TensorRef {
         TensorRef {
-            name: name.into(),
-            shard: "fixture".into(),
+            source: PathBuf::from(format!("fixture-{name}.bin")),
             offset: 0,
             len,
             dtype: "BF16".into(),
