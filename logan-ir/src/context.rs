@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// User intent for context planning.
+/// User intent for context planning, shared by compile and recompile.
 ///
 /// `Maximum` means the optimizer may trade context away for another useful
 /// Pareto point, but must never plan beyond `tokens`. `Required` makes
