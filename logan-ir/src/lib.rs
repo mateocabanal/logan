@@ -23,6 +23,6 @@ pub use optimizer::{
 };
 pub use plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec};
 pub use resource::{
-    AccessKind, AccessPlan, BackingKind, BackingPlan, DataMutability, MemoryPoolId, ResidencyPlan,
-    ResourcePlan, StoragePoolId,
+    AccessKind, AccessPlan, BackingKind, BackingPlan, DataMutability, MemoryPoolBudget,
+    MemoryPoolId, ResidencyPlan, ResourceBudget, ResourcePlan, StoragePoolBudget, StoragePoolId,
 };
