@@ -1,0 +1,32 @@
+name: issue93 tiered frontier trim gate
+
+on:
+  push:
+    branches: [feat/tiered-resource-ir-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/tiered-resource-ir-v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply scoped frontier patch
+        run: python3 .github/issue93_trim_fix.py
+      - name: Format tiered optimizer
+        run: rustfmt --edition 2024 logan-ir/src/tiered_optimizer.rs
+      - name: Test IR
+        run: cargo test -p logan-ir --all-targets
+      - name: Commit scoped result and remove one-shot machinery
+        run: |
+          rm .github/issue93_trim_fix.py .github/workflows/issue93-trim-gate.yml
+          git config user.name "logan-issue93"
+          git config user.email "actions@users.noreply.github.com"
+          git add logan-ir/src/tiered_optimizer.rs .github/issue93_trim_fix.py .github/workflows/issue93-trim-gate.yml
+          git commit -m "fix: include I/O in tiered frontier trimming (#93)"
+          git push origin HEAD:feat/tiered-resource-ir-v2
