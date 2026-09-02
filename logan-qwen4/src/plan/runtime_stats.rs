@@ -4,7 +4,7 @@
 //! Counters are cumulative for the model/process lifetime; callers can take two
 //! snapshots and use `delta_from` to obtain a per-turn view.
 
-use crate::{cache_cap, Model};
+use crate::{Model, cache_cap};
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeFeatures {
@@ -86,7 +86,9 @@ impl RuntimeStats {
             gdn_metal_ok: self.gdn_metal_ok.saturating_sub(before.gdn_metal_ok),
             expert_hits: self.expert_hits.saturating_sub(before.expert_hits),
             expert_misses: self.expert_misses.saturating_sub(before.expert_misses),
-            expert_evictions: self.expert_evictions.saturating_sub(before.expert_evictions),
+            expert_evictions: self
+                .expert_evictions
+                .saturating_sub(before.expert_evictions),
             expert_resident: self.expert_resident,
             expert_capacity: self.expert_capacity,
             metal_encode_ns: self.metal_encode_ns.saturating_sub(before.metal_encode_ns),
@@ -185,7 +187,7 @@ impl Model {
                 metal_overlap: self.metal_overlap,
                 bnns_bf16: env_bool("QWEN_BNNS_BF16", false),
                 gdn_metal: env_bool("QWEN_GDN_METAL", true)
-            && self.cfg.output_gate == crate::OutputGate::Silu,
+                    && self.cfg.output_gate == crate::OutputGate::Silu,
                 gdn_single_copy: env_bool("QWEN_GDN_SINGLE_COPY", true),
                 attn_metal: env_bool("QWEN_ATTN_METAL", true),
                 qsa_index_metal: env_bool("QWEN_QSA_INDEX_METAL", true),

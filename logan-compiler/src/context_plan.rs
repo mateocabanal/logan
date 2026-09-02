@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use logan_ir::{
     ContextCandidate, ContextConstraint, ContextConstraintKind, ContextPlan, ContextStateBytes,
-    PlannerMemoryBudget,
+    ParetoPlan, PlannerMemoryBudget,
 };
 use serde_json::Value;
 
@@ -60,7 +60,25 @@ impl ContextPlanning {
     }
 
     pub fn point_for_tokens(&self, tokens: u64) -> Option<&PlannedContextPoint> {
-        self.points.iter().find(|point| point.candidate.tokens == tokens)
+        self.points
+            .iter()
+            .find(|point| point.candidate.tokens == tokens)
+    }
+
+    pub fn enrich_plans(&self, plans: &mut [ParetoPlan]) -> Result<()> {
+        for plan in plans {
+            let point = self
+                .point_for_tokens(plan.metrics.context_tokens)
+                .ok_or_else(|| {
+                    ColicError::Usage(format!(
+                        "optimizer returned unplanned context point {}",
+                        plan.metrics.context_tokens
+                    ))
+                })?;
+            plan.context_plan = Some(point.plan.clone());
+            plan.memory_budget = Some(point.budget);
+        }
+        Ok(())
     }
 }
 
@@ -80,9 +98,17 @@ pub fn plan_geometry(
     machine: &MachineProfile,
     fixed_model_state: u64,
 ) -> Result<ContextPlanning> {
-    constraint
-        .valid_for_model(geometry.model_max_tokens)
-        .map_err(ColicError::Usage)?;
+    if constraint.tokens == 0 {
+        return Err(ColicError::Usage(
+            "context must be greater than zero".into(),
+        ));
+    }
+    if constraint.tokens > geometry.model_max_tokens {
+        return Err(ColicError::Usage(format!(
+            "requested context {} exceeds model ceiling {}",
+            constraint.tokens, geometry.model_max_tokens
+        )));
+    }
     let physical_memory = machine
         .ram_bytes
         .unwrap_or(crate::target::machine::DEFAULT_POOL_BUDGET);
@@ -137,17 +163,21 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
         path: path.to_owned(),
         source,
     })?;
-    let root: Value = serde_json::from_slice(&bytes).map_err(|error| ColicError::InvalidSource {
-        path: path.to_owned(),
-        detail: format!("invalid config.json: {error}"),
-    })?;
+    let root: Value =
+        serde_json::from_slice(&bytes).map_err(|error| ColicError::InvalidSource {
+            path: path.to_owned(),
+            detail: format!("invalid config.json: {error}"),
+        })?;
     let config = root.get("text_config").unwrap_or(&root);
     let get = |key: &str| config.get(key).and_then(Value::as_u64).unwrap_or(0);
 
     let layers = get("num_hidden_layers");
     let hidden_size = get("hidden_size");
     if layers == 0 || hidden_size == 0 {
-        return invalid(path, "context planning requires num_hidden_layers and hidden_size");
+        return invalid(
+            path,
+            "context planning requires num_hidden_layers and hidden_size",
+        );
     }
     let model_max_tokens = get("max_position_embeddings");
     let model_max_tokens = if model_max_tokens == 0 {
@@ -165,7 +195,10 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
             if types.len() as u64 != layers {
                 return invalid(
                     path,
-                    format!("layer_types has {} entries but num_hidden_layers is {layers}", types.len()),
+                    format!(
+                        "layer_types has {} entries but num_hidden_layers is {layers}",
+                        types.len()
+                    ),
                 );
             }
             let mut full = 0_u64;
@@ -186,10 +219,23 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
     };
 
     let heads = get("num_attention_heads");
-    let head_dim = get("head_dim").max(if heads == 0 { 0 } else { hidden_size / heads });
-    let kv_heads = get("num_key_value_heads").max(heads);
+    let explicit_head_dim = get("head_dim");
+    let head_dim = if explicit_head_dim == 0 {
+        if heads == 0 { 0 } else { hidden_size / heads }
+    } else {
+        explicit_head_dim
+    };
+    let explicit_kv_heads = get("num_key_value_heads");
+    let kv_heads = if explicit_kv_heads == 0 {
+        heads
+    } else {
+        explicit_kv_heads
+    };
     if full_attention_layers != 0 && (head_dim == 0 || kv_heads == 0) {
-        return invalid(path, "full-attention context planning requires KV-head geometry");
+        return invalid(
+            path,
+            "full-attention context planning requires KV-head geometry",
+        );
     }
 
     let linear_key_heads = get("linear_num_key_heads");
@@ -207,7 +253,10 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
         ]
         .contains(&0)
     {
-        return invalid(path, "linear-attention context planning requires complete GDN geometry");
+        return invalid(
+            path,
+            "linear-attention context planning requires complete GDN geometry",
+        );
     }
 
     let idx_n_heads = get("indexer_n_heads");
@@ -219,7 +268,10 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
     let qsa_kv_heads = get("indexer_kv_heads");
     let qsa_head_dim = get("indexer_head_dim");
     if qsa_layers != 0 && (qsa_kv_heads == 0 || qsa_head_dim == 0) {
-        return invalid(path, "QSA context planning requires indexer_kv_heads and indexer_head_dim");
+        return invalid(
+            path,
+            "QSA context planning requires indexer_kv_heads and indexer_head_dim",
+        );
     }
 
     let ple_enabled = config
@@ -242,7 +294,10 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
             || ngram_heads == 0
             || ple_embed_dim % ngram_heads != 0)
     {
-        return invalid(path, "PLE context planning requires valid embed/conv/ngram geometry");
+        return invalid(
+            path,
+            "PLE context planning requires valid embed/conv/ngram geometry",
+        );
     }
 
     Ok(ContextGeometry {
@@ -270,22 +325,28 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
 }
 
 fn state_bytes(geometry: &ContextGeometry, tokens: u64) -> Result<ContextStateBytes> {
-    let full_attention_kv = checked_product(&[
-        geometry.full_attention_layers,
-        2,
-        geometry.kv_heads,
-        tokens,
-        geometry.head_dim,
-        F32_BYTES,
-    ], "full-attention KV")?;
+    let full_attention_kv = checked_product(
+        &[
+            geometry.full_attention_layers,
+            2,
+            geometry.kv_heads,
+            tokens,
+            geometry.head_dim,
+            F32_BYTES,
+        ],
+        "full-attention KV",
+    )?;
 
-    let gdn_recurrent = checked_product(&[
-        geometry.gdn_layers,
-        geometry.linear_value_heads,
-        geometry.linear_key_head_dim,
-        geometry.linear_value_head_dim,
-        F32_BYTES,
-    ], "GDN recurrent state")?;
+    let gdn_recurrent = checked_product(
+        &[
+            geometry.gdn_layers,
+            geometry.linear_value_heads,
+            geometry.linear_key_head_dim,
+            geometry.linear_value_head_dim,
+            F32_BYTES,
+        ],
+        "GDN recurrent state",
+    )?;
     let cdim = geometry
         .linear_key_heads
         .checked_mul(geometry.linear_key_head_dim)
@@ -297,19 +358,25 @@ fn state_bytes(geometry: &ContextGeometry, tokens: u64) -> Result<ContextStateBy
                 .and_then(|v| value.checked_add(v))
         })
         .ok_or_else(|| ColicError::Usage("GDN channel geometry overflows u64".into()))?;
-    let gdn_conv = checked_product(&[
-        geometry.gdn_layers,
-        cdim,
-        geometry.linear_conv_kernel.saturating_sub(1),
-        F32_BYTES,
-    ], "GDN convolution state")?;
-    let qsa_index = checked_product(&[
-        geometry.qsa_layers,
-        tokens,
-        geometry.qsa_kv_heads,
-        geometry.qsa_head_dim,
-        F32_BYTES,
-    ], "QSA index state")?;
+    let gdn_conv = checked_product(
+        &[
+            geometry.gdn_layers,
+            cdim,
+            geometry.linear_conv_kernel.saturating_sub(1),
+            F32_BYTES,
+        ],
+        "GDN convolution state",
+    )?;
+    let qsa_index = checked_product(
+        &[
+            geometry.qsa_layers,
+            tokens,
+            geometry.qsa_kv_heads,
+            geometry.qsa_head_dim,
+            F32_BYTES,
+        ],
+        "QSA index state",
+    )?;
 
     let ple = if geometry.ple_enabled {
         let hcd = geometry.ple_embed_dim / geometry.ngram_heads;
@@ -320,7 +387,10 @@ fn state_bytes(geometry: &ContextGeometry, tokens: u64) -> Result<ContextStateBy
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| ColicError::Usage("PLE history geometry overflows u64".into()))?;
         checked_product(&[geometry.ngram_size.max(1), I64_BYTES], "PLE token ring")?
-            .checked_add(checked_product(&[hcd, history.max(1), F32_BYTES], "PLE conv state")?)
+            .checked_add(checked_product(
+                &[hcd, history.max(1), F32_BYTES],
+                "PLE conv state",
+            )?)
             .ok_or_else(|| ColicError::Usage("PLE state bytes overflow u64".into()))?
     } else {
         0
@@ -381,7 +451,12 @@ fn reserve_policy(physical_memory: u64) -> (u64, u64, u64, u64) {
     let runtime_reserve = 256 * MIB;
     let safety_reserve = (physical_memory / 16).clamp(512 * MIB, 2 * GIB);
     let execution_scratch = 256 * MIB;
-    (os_reserve, runtime_reserve, safety_reserve, execution_scratch)
+    (
+        os_reserve,
+        runtime_reserve,
+        safety_reserve,
+        execution_scratch,
+    )
 }
 
 fn checked_product(values: &[u64], what: &str) -> Result<u64> {
@@ -436,10 +511,7 @@ mod tests {
     #[test]
     fn hybrid_kv_only_counts_full_attention_layers() {
         let state = state_bytes(&hybrid(), 131_072).unwrap();
-        assert_eq!(
-            state.full_attention_kv,
-            12 * 2 * 8 * 131_072 * 256 * 4
-        );
+        assert_eq!(state.full_attention_kv, 12 * 2 * 8 * 131_072 * 256 * 4);
         assert!(state.gdn_recurrent > 0);
         assert!(state.gdn_conv > 0);
         assert!(state.qsa_index > 0);
@@ -491,6 +563,64 @@ mod tests {
             .map(|point| point.candidate.tokens)
             .collect::<Vec<_>>();
         assert_eq!(tokens, vec![131_072, 262_144]);
+    }
+
+    #[test]
+    fn config_parser_preserves_explicit_gqa_geometry() {
+        let root = std::env::temp_dir().join(format!(
+            "logan-context-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "hidden_size":1024,
+                "num_hidden_layers":4,
+                "max_position_embeddings":262144,
+                "layer_types":["linear_attention","linear_attention","full_attention","full_attention"],
+                "num_attention_heads":8,
+                "num_key_value_heads":2,
+                "head_dim":128,
+                "linear_num_key_heads":4,
+                "linear_key_head_dim":64,
+                "linear_num_value_heads":8,
+                "linear_value_head_dim":64,
+                "linear_conv_kernel_dim":4,
+                "indexer_n_heads":4,
+                "indexer_kv_heads":2,
+                "indexer_head_dim":64
+            }"#,
+        )
+        .unwrap();
+        let geometry = geometry_from_config(&path, 131_072).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(geometry.full_attention_layers, 2);
+        assert_eq!(geometry.gdn_layers, 2);
+        assert_eq!(geometry.kv_heads, 2);
+        assert_eq!(geometry.head_dim, 128);
+        assert_eq!(geometry.qsa_layers, 2);
+        let state = state_bytes(&geometry, 131_072).unwrap();
+        assert_eq!(state.full_attention_kv, 2 * 2 * 2 * 131_072 * 128 * 4);
+    }
+
+    #[test]
+    fn sixteen_gib_cannot_admit_128k_for_large_hybrid_geometry() {
+        let planning = plan_geometry(
+            hybrid(),
+            ContextConstraint::required(131_072),
+            &machine(16 * GIB),
+            2 * GIB,
+        )
+        .unwrap();
+        let point = planning.point_for_tokens(131_072).unwrap();
+        assert_eq!(point.budget.available_for_weights_and_cache(), None);
+        assert!(point.plan.state_bytes.full_attention_kv > 16 * GIB);
     }
 
     #[test]

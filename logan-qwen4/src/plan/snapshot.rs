@@ -54,10 +54,7 @@ impl QwenStateSnapshot {
 }
 
 fn f32_exact(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.to_bits() == y.to_bits())
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 fn nested_f32_exact(a: &[Vec<f32>], b: &[Vec<f32>]) -> bool {
@@ -134,9 +131,7 @@ impl Model {
             if let Some(gm) = self.gdn_metal[li].as_ref() {
                 unsafe {
                     gdn_s.push(std::slice::from_raw_parts(gm.state, state_len).to_vec());
-                    gdn_conv.push(
-                        std::slice::from_raw_parts(gm.conv_state, conv_len).to_vec(),
-                    );
+                    gdn_conv.push(std::slice::from_raw_parts(gm.conv_state, conv_len).to_vec());
                 }
             } else {
                 gdn_s.push(self.gdn_s[li].clone());
@@ -237,9 +232,7 @@ impl Model {
             if !self.cfg.gdn_layers[li] {
                 continue;
             }
-            if snapshot.gdn_s[li].len() != state_len
-                || snapshot.gdn_conv[li].len() != conv_len
-            {
+            if snapshot.gdn_s[li].len() != state_len || snapshot.gdn_conv[li].len() != conv_len {
                 return Err(format!("layer {li}: incompatible GDN snapshot geometry"));
             }
             if self.gdn_s[li].len() != state_len || self.gdn_conv[li].len() != conv_len {
@@ -249,11 +242,7 @@ impl Model {
             self.gdn_conv[li].copy_from_slice(&snapshot.gdn_conv[li]);
             if let Some(gm) = self.gdn_metal[li].as_ref() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        snapshot.gdn_s[li].as_ptr(),
-                        gm.state,
-                        state_len,
-                    );
+                    std::ptr::copy_nonoverlapping(snapshot.gdn_s[li].as_ptr(), gm.state, state_len);
                     std::ptr::copy_nonoverlapping(
                         snapshot.gdn_conv[li].as_ptr(),
                         gm.conv_state,
@@ -270,9 +259,7 @@ impl Model {
             if self.cfg.gdn_layers[li] {
                 continue;
             }
-            if snapshot.kv_k[li].len() != compact_len
-                || snapshot.kv_v[li].len() != compact_len
-            {
+            if snapshot.kv_k[li].len() != compact_len || snapshot.kv_v[li].len() != compact_len {
                 return Err(format!("layer {li}: incompatible KV snapshot geometry"));
             }
             let expected = h * self.cfg.max_t * hd;
@@ -342,9 +329,11 @@ mod tests {
             let base = h * max_t * width;
             let active = prefix * width;
             assert_eq!(&dst[base..base + active], &src[base..base + active]);
-            assert!(dst[base + active..base + max_t * width]
-                .iter()
-                .all(|&v| v == -1.0));
+            assert!(
+                dst[base + active..base + max_t * width]
+                    .iter()
+                    .all(|&v| v == -1.0)
+            );
         }
     }
 }

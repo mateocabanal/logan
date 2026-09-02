@@ -290,6 +290,7 @@ fn optimizer_quantization_plan(
     })?;
     let optimization = crate::optimize::compile_plans(
         model,
+        &request.source,
         target_profile,
         machine,
         context,
@@ -349,6 +350,7 @@ pub fn preview_optimization(request: &CompileRequest) -> Result<Vec<ParetoPlan>>
     })?;
     Ok(crate::optimize::compile_plans(
         &model,
+        &request.source,
         target_profile,
         &machine,
         context,

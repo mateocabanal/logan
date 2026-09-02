@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextConstraint, Placement, QuantSpec};
+use crate::{ContextConstraint, ContextPlan, Placement, PlannerMemoryBudget, QuantSpec};
 
 pub const BUILTIN_COST_MODEL_V1: &str = "logan-builtin-cost-v1";
 const MAX_FRONTIER_STATES: usize = 4096;
@@ -84,6 +84,10 @@ pub struct ParetoPlan {
     pub cost_model: String,
     pub metrics: PlanMetrics,
     pub decisions: Vec<PlanDecision>,
+    /// Compiler-populated architecture-specific context state for this point.
+    pub context_plan: Option<ContextPlan>,
+    /// Compiler-populated complete memory budget used to admit this point.
+    pub memory_budget: Option<PlannerMemoryBudget>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +419,8 @@ fn build_plan(input: &OptimizerInput, metrics: PlanMetrics, choices: &[usize]) -
         cost_model: input.cost_model.clone(),
         metrics,
         decisions,
+        context_plan: None,
+        memory_budget: None,
     }
 }
 
