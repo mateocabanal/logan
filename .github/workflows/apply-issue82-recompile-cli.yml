@@ -1,0 +1,32 @@
+name: apply-issue82-recompile-cli
+
+on:
+  push:
+    branches: [feat/issue-82-pareto-planner]
+    paths:
+      - '.github/workflows/apply-issue82-recompile-cli.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/issue-82-pareto-planner
+          fetch-depth: 0
+      - name: Apply exact recompile/CLI patch
+        run: python3 tools/apply_issue82_recompile_cli.py
+      - name: Format touched Rust files only
+        run: rustfmt --edition 2024 logan-compiler/src/recompile.rs logan-compiler/src/cli.rs logan-compiler/src/main.rs logan-compiler/src/optimize.rs
+      - name: Remove one-shot machinery
+        run: rm tools/apply_issue82_recompile_cli.py .github/workflows/apply-issue82-recompile-cli.yml
+      - name: Commit result
+        run: |
+          git config user.name logan-issue82
+          git config user.email actions@users.noreply.github.com
+          git add -A
+          git commit -m 'feat: optimize compile and recompile with Pareto plans'
+          git push origin HEAD:feat/issue-82-pareto-planner
