@@ -11,6 +11,7 @@ pub mod graph;
 pub mod optimizer;
 pub mod plan;
 pub mod resource;
+pub mod tiered_optimizer;
 
 pub use context::{
     ContextConstraint, ContextConstraintKind, ContextPlan, ContextStateBytes, PlannerMemoryBudget,
@@ -25,4 +26,10 @@ pub use plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec};
 pub use resource::{
     AccessKind, AccessPlan, BackingKind, BackingPlan, DataMutability, MemoryPoolBudget,
     MemoryPoolId, ResidencyPlan, ResourceBudget, ResourcePlan, StoragePoolBudget, StoragePoolId,
+};
+pub use tiered_optimizer::{
+    MemoryPoolUsage, StoragePoolUsage, TIERED_COST_MODEL_V1, TieredCandidateGroup,
+    TieredContextCandidate, TieredOptimizerInput, TieredParetoPlan, TieredPlanDecision,
+    TieredPlanMetrics, TieredRejectedCandidate, TieredRepresentationCandidate,
+    TieredResourceUsage, select_tiered_plan, tiered_material_plans, tiered_pareto_plans,
 };
