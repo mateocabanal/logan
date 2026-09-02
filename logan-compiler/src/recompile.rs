@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use logan_ir::ContextConstraint;
 use logan_format::{
     codecs::{self, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID, RANS_TABLE_ID, RansTable},
     package::{Package, RecordInfo},
@@ -217,6 +218,11 @@ pub struct RecompileRequest {
     /// Ordered routed-expert overrides. Later matching rules win.
     pub quant_rules: Vec<QuantRule>,
     pub codec: CodecMode,
+    /// Same context-planning contract as compile. Required by --optimize.
+    pub context: Option<ContextConstraint>,
+    /// Hardware-specialized optimizer entrypoint. The candidate search itself
+    /// is tracked in #82 and fails closed until it exists.
+    pub optimize: bool,
     pub allow_requantize: bool,
     /// Force target-layout reconstruction even when the package already uses
     /// the requested representation.
@@ -234,6 +240,8 @@ impl RecompileRequest {
             quant: QuantMode::Keep,
             quant_rules: Vec::new(),
             codec: CodecMode::Keep,
+            context: None,
+            optimize: false,
             allow_requantize: false,
             repack: false,
             verify: false,
@@ -339,6 +347,17 @@ struct Action {
 }
 
 pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
+    if request.optimize {
+        if request.context.is_none() {
+            return Err(ColicError::Usage(
+                "recompile --optimize requires exactly one of --max-context N or --require-context N".into(),
+            ));
+        }
+        return Err(ColicError::unsupported(
+            "COLI optimization",
+            "--optimize is wired for recompile, including native target selection and context intent, but mixed-representation Pareto search is not implemented yet (see #82); no package was modified",
+        ));
+    }
     if request.source == request.output && !request.force {
         return Err(ColicError::Usage(
             "recompiling in place requires --force; using a separate output path is safer".into(),
@@ -424,6 +443,12 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
 }
 
 fn resolve_target(package: &Package, requested: &str) -> Result<TargetProfile> {
+    if matches!(requested, "auto" | "native") {
+        return target::resolve(
+            &crate::pipeline::TargetRequest::Native,
+            &target::MachineProfile::probe(),
+        );
+    }
     let name = if requested == "source" {
         package.profile()
     } else {
@@ -1390,6 +1415,14 @@ fn write_provenance(
         "target_profile": target.name,
         "quant": request.quant.as_str(),
         "quant_rules": request.quant_rules.iter().map(|rule| rule.as_spec()).collect::<Vec<_>>(),
+        "context": request.context.map(|constraint| json!({
+            "kind": match constraint.kind {
+                logan_ir::ContextConstraintKind::Maximum => "maximum",
+                logan_ir::ContextConstraintKind::Required => "required",
+            },
+            "tokens": constraint.tokens,
+        })),
+        "optimize": request.optimize,
         "in_place": request.source == request.output,
         "codec": request.codec.as_str(),
         "allow_requantize": request.allow_requantize,

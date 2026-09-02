@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
 
 use logan_ir::{
+    ContextConstraint,
     graph::{Graph, Op, ValueType},
     plan::{MemoryPlan, Placement, PlanArtifact, QuantSpec},
 };
@@ -24,6 +25,12 @@ pub struct CompileRequest {
     pub quant: QuantRequest,
     pub codec: CodecRequest,
     pub optimization: OptimizationProfile,
+    /// Compile-time context intent. CLI callers must supply exactly one of
+    /// --max-context or --require-context.
+    pub context: Option<ContextConstraint>,
+    /// Enter hardware-specialized planning. Candidate search lands in #82;
+    /// until then this is rejected rather than silently behaving like a fixed quant.
+    pub optimize: bool,
     pub dry_run: bool,
     pub verify: bool,
     pub force: bool,
@@ -45,6 +52,8 @@ impl CompileRequest {
             quant: QuantRequest::Exact,
             codec: CodecRequest::None,
             optimization: OptimizationProfile::Default,
+            context: None,
+            optimize: false,
             dry_run: false,
             verify: false,
             force: false,
@@ -1014,6 +1023,12 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
 }
 
 fn validate_supported_options(request: &CompileRequest) -> Result<()> {
+    if request.optimize {
+        return Err(ColicError::unsupported(
+            Stage::TargetPlanning.as_str(),
+            "--optimize is wired to the shared context contract, but mixed-representation Pareto search is not implemented yet (see #82); refusing to pretend a fixed quant is optimized",
+        ));
+    }
     match &request.quant {
         QuantRequest::Exact => {}
         QuantRequest::Profile(profile) if profile == "mxfp4" => {}

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use logan_ir::ContextConstraint;
+
 use crate::{
     error::{ColicError, Result},
     pipeline::{
@@ -29,7 +31,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|PROFILE] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N)] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -129,6 +131,29 @@ where
             "--opt" => {
                 request.optimization = OptimizationProfile::parse(&value(&mut args, "--opt")?)?;
             }
+            "--optimize" => request.optimize = true,
+            "--max-context" => {
+                if request.context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                request.context = Some(ContextConstraint::maximum(parse_context_tokens(
+                    &value(&mut args, "--max-context")?,
+                    "--max-context",
+                )?));
+            }
+            "--require-context" => {
+                if request.context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                request.context = Some(ContextConstraint::required(parse_context_tokens(
+                    &value(&mut args, "--require-context")?,
+                    "--require-context",
+                )?));
+            }
             "--plan" => request.plan = Some(PathBuf::from(value(&mut args, "--plan")?)),
             "-o" | "--output" => {
                 request.output = Some(PathBuf::from(value(&mut args, "--output")?))
@@ -148,7 +173,22 @@ where
             "compile requires -o/--output unless --dry-run is set".into(),
         ));
     }
+    if request.context.is_none() {
+        return Err(ColicError::Usage(
+            "compile requires exactly one of --max-context N or --require-context N".into(),
+        ));
+    }
     Ok(Command::Compile(request))
+}
+
+fn parse_context_tokens(value: &str, flag: &str) -> Result<u64> {
+    let tokens = value
+        .parse::<u64>()
+        .map_err(|_| ColicError::Usage(format!("{flag} must be a positive integer")))?;
+    if tokens == 0 {
+        return Err(ColicError::Usage(format!("{flag} must be greater than zero")));
+    }
+    Ok(tokens)
 }
 
 fn parse_recompile<I>(args: I) -> Result<Command>
@@ -162,6 +202,9 @@ where
     );
     let mut output = None;
     let mut target = "source".to_owned();
+    let mut target_explicit = false;
+    let mut context = None;
+    let mut optimize = false;
     let mut quant = RecompileQuantMode::Keep;
     let mut quant_rules = Vec::new();
     let mut codec = RecompileCodecMode::Keep;
@@ -178,7 +221,33 @@ where
         };
         match flag.as_str() {
             "-o" | "--output" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
-            "--target" => target = value(&mut args, "--target")?,
+            "--target" => {
+                target = value(&mut args, "--target")?;
+                target_explicit = true;
+            }
+            "--optimize" => optimize = true,
+            "--max-context" => {
+                if context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                context = Some(ContextConstraint::maximum(parse_context_tokens(
+                    &value(&mut args, "--max-context")?,
+                    "--max-context",
+                )?));
+            }
+            "--require-context" => {
+                if context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                context = Some(ContextConstraint::required(parse_context_tokens(
+                    &value(&mut args, "--require-context")?,
+                    "--require-context",
+                )?));
+            }
             "--quant" => quant = RecompileQuantMode::parse(&value(&mut args, "--quant")?)?,
             "--quant-rule" => {
                 quant_rules.push(QuantRule::parse(&value(&mut args, "--quant-rule")?)?)
@@ -195,6 +264,20 @@ where
                 )));
             }
         }
+    }
+
+    if optimize && context.is_none() {
+        return Err(ColicError::Usage(
+            "recompile --optimize requires exactly one of --max-context N or --require-context N".into(),
+        ));
+    }
+    if !optimize && context.is_some() {
+        return Err(ColicError::Usage(
+            "recompile context options require --optimize so they cannot be silently ignored".into(),
+        ));
+    }
+    if optimize && !target_explicit {
+        target = "auto".to_owned();
     }
 
     if in_place && output.is_some() {
@@ -216,6 +299,8 @@ where
         quant,
         quant_rules,
         codec,
+        context,
+        optimize,
         allow_requantize,
         repack,
         verify,
@@ -232,7 +317,7 @@ mod tests {
         let command = parse(
             [
                 "compile", "fixture", "--target", "native", "--quant", "exact", "--codec", "none",
-                "--opt", "latency", "-o", "out.coli", "--verify",
+                "--opt", "latency", "--max-context", "65536", "-o", "out.coli", "--verify",
             ]
             .map(str::to_owned),
         )
@@ -244,6 +329,7 @@ mod tests {
         assert_eq!(request.quant, QuantRequest::Exact);
         assert_eq!(request.codec, CodecRequest::None);
         assert_eq!(request.optimization, OptimizationProfile::Latency);
+        assert_eq!(request.context, Some(ContextConstraint::maximum(65_536)));
         assert!(request.verify);
     }
 
@@ -307,6 +393,35 @@ mod tests {
         assert_eq!(request.quant_rules.len(), 2);
         assert!(request.allow_requantize);
         assert!(request.force);
+    }
+
+    #[test]
+    fn parses_optimized_recompile_with_same_context_contract() {
+        let command = parse([
+            "recompile", "model.coli", "--in-place", "--optimize",
+            "--require-context", "131072",
+        ].map(str::to_owned)).unwrap();
+        let Command::Recompile(request) = command else { panic!("expected recompile") };
+        assert!(request.optimize);
+        assert_eq!(request.target, "auto");
+        assert_eq!(request.context, Some(ContextConstraint::required(131_072)));
+    }
+
+    #[test]
+    fn compile_and_recompile_reject_ambiguous_context_constraints() {
+        assert!(parse([
+            "compile", "fixture", "--max-context", "32768",
+            "--require-context", "65536", "--dry-run",
+        ].map(str::to_owned)).is_err());
+        assert!(parse([
+            "recompile", "model.coli", "--in-place", "--optimize",
+            "--max-context", "32768", "--require-context", "65536",
+        ].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn optimized_recompile_requires_context() {
+        assert!(parse(["recompile", "model.coli", "--in-place", "--optimize"].map(str::to_owned)).is_err());
     }
 
     #[test]
