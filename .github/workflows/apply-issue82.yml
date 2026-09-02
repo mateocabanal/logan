@@ -18,12 +18,13 @@ jobs:
         run: |
           python3 tools/apply_issue82_compile.py
           python3 tools/fix_issue82_compile.py
+          python3 tools/fix_issue82_frontier.py
       - name: Format touched Rust
         run: rustfmt --edition 2024 logan-ir/src/optimizer.rs logan-ir/src/plan.rs logan-ir/src/lib.rs logan-compiler/src/optimizer.rs logan-compiler/src/pipeline.rs logan-compiler/src/cli.rs logan-compiler/src/lib.rs
       - name: Test focused crates
         run: cargo test -p logan-ir -p logan-compiler --all-targets
       - name: Remove one-shot machinery
-        run: rm tools/apply_issue82_compile.py tools/fix_issue82_compile.py .github/workflows/apply-issue82.yml
+        run: rm tools/apply_issue82_compile.py tools/fix_issue82_compile.py tools/fix_issue82_frontier.py .github/workflows/apply-issue82.yml
       - name: Commit result
         run: |
           git config user.name 'logan-issue82'
