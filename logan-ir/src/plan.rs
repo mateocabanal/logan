@@ -5,10 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::Graph;
+use crate::{graph::Graph, optimizer::ParetoPlan};
 
 /// Artifact format version. Bump on any breaking change to the schema.
-pub const PLAN_ARTIFACT_VERSION: u32 = 1;
+pub const PLAN_ARTIFACT_VERSION: u32 = 2;
 
 /// Where a weight lives at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,14 +32,16 @@ pub struct QuantSpec {
     pub scale: Option<String>,
 }
 
-/// Memory plan: the compiler's placement decisions, replayable by the
-/// runtime without re-running the planner.
+/// Memory plan: the compiler's placement/representation decisions, replayable
+/// by the runtime without re-running the optimizer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
     /// value name -> placement
     pub placement: Vec<(String, Placement)>,
     /// value name -> quant
     pub quant: Vec<(String, QuantSpec)>,
+    /// value name -> physical execution layout id (0 means canonical/none).
+    pub layout: Vec<(String, u16)>,
     /// Peak resident budget the plan was built for (bytes).
     pub ram_budget_bytes: u64,
 }
@@ -53,6 +55,9 @@ pub struct PlanArtifact {
     pub package_fingerprint: String,
     pub graph: Graph,
     pub memory: MemoryPlan,
+    /// The selected Pareto point, including per-group reasoning. `None` for
+    /// legacy/manual plans that did not run the optimizer.
+    pub optimizer: Option<ParetoPlan>,
 }
 
 impl PlanArtifact {
@@ -62,7 +67,13 @@ impl PlanArtifact {
             package_fingerprint,
             graph,
             memory,
+            optimizer: None,
         }
+    }
+
+    pub fn with_optimizer(mut self, optimizer: ParetoPlan) -> PlanArtifact {
+        self.optimizer = Some(optimizer);
+        self
     }
 
     /// Serialize to a compact binary form (bincode-style framing via serde).
@@ -140,6 +151,7 @@ mod tests {
                     scale: None,
                 },
             )],
+            layout: vec![("layers.0.mlp.gate.weight".into(), 0x0103)],
             ram_budget_bytes: 4 * 1024 * 1024 * 1024,
         };
         PlanArtifact::new("abc123".into(), g, memory)
@@ -170,14 +182,13 @@ mod tests {
     }
 
     #[test]
-    fn placement_and_quant_round_trip() {
+    fn placement_quant_and_layout_round_trip() {
         let plan = sample_plan();
         let bytes = plan.to_bytes().unwrap();
         let back = PlanArtifact::from_bytes(&bytes).unwrap();
         assert_eq!(back.memory.placement.len(), 2);
-        assert_eq!(
-            back.memory.quant[0].1.kind,
-            "mxfp4-tile8x32"
-        );
+        assert_eq!(back.memory.quant[0].1.kind, "mxfp4-tile8x32");
+        assert_eq!(back.memory.layout[0].1, 0x0103);
+        assert!(back.optimizer.is_none());
     }
 }
