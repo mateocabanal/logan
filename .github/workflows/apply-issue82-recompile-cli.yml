@@ -17,6 +17,17 @@ jobs:
         with:
           ref: feat/issue-82-pareto-planner
           fetch-depth: 0
+      - name: Fix ambiguous one-shot guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tools/apply_issue82_recompile_cli.py')
+          s = p.read_text()
+          old = "rep('    let quant = effective_quant(request, record);\\n', '', 1)"
+          new = "needle = '    let quant = effective_quant(request, record);\\n'\nidx = s.rfind(needle)\nassert idx >= 0\ns = s[:idx] + s[idx + len(needle):]"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Apply exact recompile/CLI patch
         run: python3 tools/apply_issue82_recompile_cli.py
       - name: Format touched Rust files only
