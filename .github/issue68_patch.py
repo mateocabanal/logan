@@ -1,5 +1,9 @@
 from pathlib import Path
 
+# One-shot, assertion-guarded source patch. The workflow force-stages only
+# logan-compiler/src/target/* because the repository's generic target/ ignore
+# pattern otherwise hides this legitimate source directory from git add.
+
 # Wire the new target resource module without rewriting the large target file.
 p = Path('logan-compiler/src/target/mod.rs')
 s = p.read_text()
