@@ -1938,6 +1938,51 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_bias_never_overrides_manual_quant_rule_pins() {
+        let mut request =
+            RecompileRequest::new(PathBuf::from("old.coli"), PathBuf::from("new.coli"));
+        request.quant = QuantMode::Keep;
+        request.quant_rules = vec![
+            QuantRule::parse("layer:4-7=mxfp4").unwrap(),
+            QuantRule::parse("expert:3=keep").unwrap(),
+        ];
+        let record = RecordInfo {
+            id: 1,
+            kind: 2,
+            codec: 0,
+            math_format: 0,
+            scale_format: 0,
+            layout: 0,
+            flags: 0,
+            shard_id: 0,
+            name: None,
+            layer: 6,
+            expert: 3,
+            offset: 0,
+            stored: 0,
+            decoded: 0,
+            stored_crc: 0,
+            logical_crc: 0,
+        };
+        assert_eq!(
+            optimizer_mode_for_record(&request, &record, QuantMode::Mxfp4),
+            QuantMode::Keep
+        );
+
+        let mut unpinned = record.clone();
+        unpinned.layer = 8;
+        unpinned.expert = 9;
+        assert_eq!(
+            optimizer_mode_for_record(&request, &unpinned, QuantMode::Mxfp4),
+            QuantMode::Mxfp4
+        );
+        assert_eq!(
+            optimizer_mode_for_record(&request, &unpinned, QuantMode::Keep),
+            QuantMode::Keep
+        );
+    }
+
+    #[test]
     fn quant_rule_parser_rejects_reversed_and_unknown_selectors() {
         assert!(QuantRule::parse("layer:9-3=mxfp4").is_err());
         assert!(QuantRule::parse("dense=mxfp4").is_err());

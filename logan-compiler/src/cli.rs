@@ -457,6 +457,53 @@ mod tests {
     }
 
     #[test]
+    fn optimized_requests_parse_plan_choice_and_calibration() {
+        let compile = parse(
+            [
+                "compile",
+                "fixture",
+                "--optimize",
+                "--max-context",
+                "65536",
+                "--plan-choice",
+                "balanced",
+                "--calibration",
+                "scores.json",
+                "--dry-run",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Compile(compile) = compile else {
+            panic!("expected compile")
+        };
+        assert_eq!(compile.plan_choice.as_deref(), Some("balanced"));
+        assert_eq!(compile.calibration, Some(PathBuf::from("scores.json")));
+
+        let recompile = parse(
+            [
+                "recompile",
+                "model.coli",
+                "--in-place",
+                "--optimize",
+                "--require-context",
+                "32768",
+                "--plan-choice",
+                "p-0123456789abcdef",
+                "--calibration",
+                "scores.json",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(recompile) = recompile else {
+            panic!("expected recompile")
+        };
+        assert_eq!(recompile.plan_choice.as_deref(), Some("p-0123456789abcdef"));
+        assert_eq!(recompile.calibration, Some(PathBuf::from("scores.json")));
+    }
+
+    #[test]
     fn compile_and_recompile_reject_ambiguous_context_constraints() {
         assert!(
             parse(

@@ -1532,13 +1532,13 @@ mod tests {
         let model = qwen_mxfp4_inventory_model();
         let exact = record_inventory(
             &model,
-            ExpertQuantization::Exact,
+            &ExpertQuantizationPlan::uniform(ExpertQuantization::Exact),
             target::LINUX_X86_64_AVX2_V1,
         )
         .unwrap();
         let mxfp4 = record_inventory(
             &model,
-            ExpertQuantization::Mxfp4,
+            &ExpertQuantizationPlan::uniform(ExpertQuantization::Mxfp4),
             target::LINUX_X86_64_AVX2_V1,
         )
         .unwrap();
@@ -1553,7 +1553,7 @@ mod tests {
         let model = qwen_mxfp4_inventory_model();
         let records = record_inventory(
             &model,
-            ExpertQuantization::Mxfp4,
+            &ExpertQuantizationPlan::uniform(ExpertQuantization::Mxfp4),
             target::MACOS_ARM64_METAL_APPLE8_V1,
         )
         .unwrap();
