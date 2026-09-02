@@ -1,0 +1,38 @@
+name: issue93 tiered optimizer gate
+
+on:
+  push:
+    branches: [feat/tiered-resource-ir-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/tiered-resource-ir-v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply scoped correctness patch
+        run: python3 .github/issue93_tiered_fix.py
+      - name: Format touched IR
+        run: |
+          rustfmt --edition 2024 logan-ir/src/resource.rs
+          rustfmt --edition 2024 logan-ir/src/tiered_optimizer.rs
+          rustfmt --edition 2024 logan-ir/src/plan.rs
+          rustfmt --edition 2024 logan-ir/src/lib.rs
+      - name: Test IR
+        run: cargo test -p logan-ir --all-targets
+      - name: Test compiler compatibility
+        run: cargo test -p logan-compiler --all-targets -- --test-threads=1
+      - name: Commit scoped result and remove one-shot machinery
+        run: |
+          rm .github/issue93_tiered_fix.py .github/workflows/issue93-tiered-gate.yml
+          git config user.name "logan-issue93"
+          git config user.email "actions@users.noreply.github.com"
+          git add logan-ir/src/resource.rs logan-ir/src/tiered_optimizer.rs logan-ir/src/plan.rs logan-ir/src/lib.rs .github/issue93_tiered_fix.py .github/workflows/issue93-tiered-gate.yml
+          git commit -m "feat: add tier-aware optimizer resource accounting (#93)"
+          git push origin HEAD:feat/tiered-resource-ir-v2
