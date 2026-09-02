@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Stable logical identifier for one memory-capacity domain used by a plan.
@@ -22,6 +24,68 @@ pub struct StoragePoolId(pub String);
 impl StoragePoolId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPoolBudget {
+    pub id: MemoryPoolId,
+    pub capacity_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoragePoolBudget {
+    pub id: StoragePoolId,
+    /// Planner-visible free/allocatable bytes, not total device capacity.
+    pub available_bytes: u64,
+    pub writable: bool,
+}
+
+/// Resource envelope used by the physical optimizer. Memory and storage pools
+/// are intentionally distinct capacity domains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceBudget {
+    pub memory_pools: Vec<MemoryPoolBudget>,
+    pub storage_pools: Vec<StoragePoolBudget>,
+}
+
+impl ResourceBudget {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.memory_pools.is_empty() {
+            return Err("resource budget requires at least one memory pool".into());
+        }
+        let mut memory_ids = BTreeSet::new();
+        for pool in &self.memory_pools {
+            if pool.id.0.trim().is_empty() {
+                return Err("memory pool id cannot be empty".into());
+            }
+            if pool.capacity_bytes == 0 {
+                return Err(format!("memory pool `{}` has zero capacity", pool.id.0));
+            }
+            if !memory_ids.insert(pool.id.clone()) {
+                return Err(format!("duplicate memory pool `{}`", pool.id.0));
+            }
+        }
+        let mut storage_ids = BTreeSet::new();
+        for pool in &self.storage_pools {
+            if pool.id.0.trim().is_empty() {
+                return Err("storage pool id cannot be empty".into());
+            }
+            if !storage_ids.insert(pool.id.clone()) {
+                return Err(format!("duplicate storage pool `{}`", pool.id.0));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn memory_capacity(&self, id: &MemoryPoolId) -> Option<u64> {
+        self.memory_pools
+            .iter()
+            .find_map(|pool| (&pool.id == id).then_some(pool.capacity_bytes))
+    }
+
+    pub fn storage_pool(&self, id: &StoragePoolId) -> Option<&StoragePoolBudget> {
+        self.storage_pools.iter().find(|pool| &pool.id == id)
     }
 }
 
@@ -62,12 +126,15 @@ pub struct BackingPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResidencyPlan {
     pub memory_pool: MemoryPoolId,
-    /// True hard memory requirement to make forward progress. This is the
-    /// capacity check; total logical/resource bytes are not.
+    /// Resource-local transient bytes required to make forward progress.
+    /// Across sequential resources the optimizer uses the maximum transient
+    /// requirement, not the sum.
     pub minimum_working_set_bytes: u64,
-    /// Compiler-selected hot/cache target for performance. This is bounded by
-    /// the pool budget but may be much smaller than the backed resource.
+    /// Compiler-selected hot/cache target for performance. Persistent targets
+    /// from different resources do sum within a physical pool.
     pub target_resident_bytes: u64,
+    /// Bytes that remain resident for the lifetime of the plan/session and
+    /// therefore add to the hard pool floor.
     pub pinned_bytes: u64,
     /// Lower values are cheaper eviction victims. Exact policy is runtime
     /// specific but the ordering is compiler-approved and persisted.
@@ -103,11 +170,11 @@ pub struct ResourcePlan {
 
 impl ResourcePlan {
     pub fn validate(&self) -> Result<(), String> {
+        if self.residency.pinned_bytes > self.residency.minimum_working_set_bytes {
+            return Err("pinned bytes exceed minimum working set".into());
+        }
         if self.residency.minimum_working_set_bytes > self.residency.target_resident_bytes {
             return Err("minimum working set exceeds target resident bytes".into());
-        }
-        if self.residency.pinned_bytes > self.residency.target_resident_bytes {
-            return Err("pinned bytes exceed target resident bytes".into());
         }
         if self.backing.alignment == 0 {
             return Err("backing alignment must be non-zero".into());
@@ -159,7 +226,7 @@ impl ResourcePlan {
                 memory_pool,
                 minimum_working_set_bytes,
                 target_resident_bytes,
-                pinned_bytes: minimum_working_set_bytes,
+                pinned_bytes: 0,
                 eviction_priority: 100,
             },
             access: AccessPlan {
@@ -194,7 +261,7 @@ impl ResourcePlan {
                 memory_pool,
                 minimum_working_set_bytes,
                 target_resident_bytes,
-                pinned_bytes: minimum_working_set_bytes,
+                pinned_bytes: 0,
                 eviction_priority: 80,
             },
             access: AccessPlan {
@@ -202,6 +269,32 @@ impl ResourcePlan {
                 prefetch_depth: 1,
                 expected_read_bytes_per_step: read_bytes_per_step,
                 expected_write_bytes_per_step: write_bytes_per_step,
+            },
+        }
+    }
+
+    pub fn resident_only(bytes: u64, memory_pool: MemoryPoolId) -> Self {
+        Self {
+            mutability: DataMutability::Mutable,
+            backing: BackingPlan {
+                kind: BackingKind::ResidentOnly,
+                storage_pool: None,
+                bytes,
+                alignment: 1,
+                page_or_block_bytes: 1,
+            },
+            residency: ResidencyPlan {
+                memory_pool,
+                minimum_working_set_bytes: bytes,
+                target_resident_bytes: bytes,
+                pinned_bytes: bytes,
+                eviction_priority: u16::MAX,
+            },
+            access: AccessPlan {
+                kind: AccessKind::DirectShared,
+                prefetch_depth: 0,
+                expected_read_bytes_per_step: 0,
+                expected_write_bytes_per_step: 0,
             },
         }
     }
@@ -243,6 +336,7 @@ mod tests {
         assert_eq!(plan.backing.bytes, 21 * 1024);
         assert_eq!(plan.residency.target_resident_bytes, 12 * 1024);
         assert!(plan.backing.bytes > plan.residency.target_resident_bytes);
+        assert_eq!(plan.residency.pinned_bytes, 0);
     }
 
     #[test]
@@ -257,6 +351,7 @@ mod tests {
         assert!(plan.validate().is_ok());
         assert_eq!(plan.mutable_backing_bytes(), 0);
         assert_eq!(plan.immutable_package_backing_bytes(), 100 * 1024);
+        assert_eq!(plan.residency.pinned_bytes, 0);
     }
 
     #[test]
@@ -289,5 +384,42 @@ mod tests {
         );
         plan.backing.storage_pool = None;
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn apple_devices_can_share_one_uma_capacity_identity() {
+        let budget = ResourceBudget {
+            memory_pools: vec![MemoryPoolBudget {
+                id: MemoryPoolId::new("uma0"),
+                capacity_bytes: 16 * 1024,
+            }],
+            storage_pools: vec![],
+        };
+        assert!(budget.validate().is_ok());
+        assert_eq!(budget.memory_capacity(&MemoryPoolId::new("uma0")), Some(16 * 1024));
+    }
+
+    #[test]
+    fn discrete_host_and_vram_pools_remain_separate() {
+        let budget = ResourceBudget {
+            memory_pools: vec![
+                MemoryPoolBudget {
+                    id: MemoryPoolId::new("host"),
+                    capacity_bytes: 64 * 1024,
+                },
+                MemoryPoolBudget {
+                    id: MemoryPoolId::new("gpu0-vram"),
+                    capacity_bytes: 8 * 1024,
+                },
+            ],
+            storage_pools: vec![StoragePoolBudget {
+                id: StoragePoolId::new("ssd0"),
+                available_bytes: 500 * 1024,
+                writable: true,
+            }],
+        };
+        assert!(budget.validate().is_ok());
+        assert_eq!(budget.memory_capacity(&MemoryPoolId::new("host")), Some(64 * 1024));
+        assert_eq!(budget.memory_capacity(&MemoryPoolId::new("gpu0-vram")), Some(8 * 1024));
     }
 }
