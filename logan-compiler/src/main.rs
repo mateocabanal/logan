@@ -208,6 +208,67 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn print_optimizer_plans(plans: &[logan_ir::ParetoPlan]) {
+    for (index, plan) in plans.iter().enumerate() {
+        eprintln!(
+            "  [{}] {} aliases={} quality={}ppm context={} latency={} resident={} package={} traffic={}",
+            index + 1,
+            plan.id,
+            if plan.labels.is_empty() {
+                "-".to_owned()
+            } else {
+                plan.labels.join(",")
+            },
+            plan.metrics.quality_loss_ppm,
+            plan.metrics.context_tokens,
+            plan.metrics.latency_cost,
+            human_bytes(plan.metrics.resident_bytes),
+            human_bytes(plan.metrics.package_bytes),
+            human_bytes(plan.metrics.storage_traffic_bytes),
+        );
+    }
+}
+
+fn choose_optimizer_plan(plans: &[logan_ir::ParetoPlan]) -> logan_compiler::Result<String> {
+    if plans.is_empty() {
+        return Err(logan_compiler::ColicError::Usage(
+            "optimizer produced no selectable plans".into(),
+        ));
+    }
+    print_optimizer_plans(plans);
+    if !io::stdin().is_terminal() {
+        return Err(logan_compiler::ColicError::Usage(
+            "optimized compile/recompile is non-interactive here; pass --plan-choice NAME|ID (for example --plan-choice balanced)".into(),
+        ));
+    }
+    eprint!("select optimizer plan [balanced]: ");
+    let _ = io::stderr().flush();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|source| logan_compiler::ColicError::Io {
+            path: "<stdin>".into(),
+            source,
+        })?;
+    let input = input.trim();
+    if input.is_empty() {
+        return logan_ir::select_plan(plans, "balanced")
+            .or_else(|| plans.first())
+            .map(|plan| plan.id.clone())
+            .ok_or_else(|| logan_compiler::ColicError::Usage("no optimizer plan".into()));
+    }
+    if let Ok(index) = input.parse::<usize>() {
+        if let Some(plan) = index.checked_sub(1).and_then(|index| plans.get(index)) {
+            return Ok(plan.id.clone());
+        }
+    }
+    logan_ir::select_plan(plans, input)
+        .map(|plan| plan.id.clone())
+        .ok_or_else(|| {
+            logan_compiler::ColicError::Usage(format!("unknown optimizer plan `{input}`"))
+        })
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("colic: {error}");
@@ -257,19 +318,22 @@ fn run() -> logan_compiler::Result<()> {
             eprintln!("logan: verification...");
             let mut progress = ConsoleProgress::new();
             progress.verification_started = Some(Instant::now());
-            let summary = logan_compiler::verify::verify_package_with_progress(
-                &package,
-                &mut |update| {
+            let summary =
+                logan_compiler::verify::verify_package_with_progress(&package, &mut |update| {
                     progress.verification(update);
-                },
-            )?;
+                })?;
             logan_compiler::verify_target::verify_target_layouts(&package)?;
             println!("package={}", package.display());
             println!("shards={}", summary.shards);
             println!("records={}", summary.records);
             Ok(())
         }
-        Command::Recompile(request) => {
+        Command::Recompile(mut request) => {
+            if request.optimize && request.plan_choice.is_none() {
+                eprintln!("logan: computing non-dominated recompile plans...");
+                let plans = logan_compiler::recompile::preview_optimization(&request)?;
+                request.plan_choice = Some(choose_optimizer_plan(&plans)?);
+            }
             eprintln!("logan: offline COLI recompilation...");
             let summary = logan_compiler::recompile::recompile(&request)?;
             println!("source_profile={}", summary.source_profile);
@@ -279,6 +343,9 @@ fn run() -> logan_compiler::Result<()> {
             println!("rewritten_experts={}", summary.rewritten_experts);
             println!("requantized_experts={}", summary.requantized_experts);
             println!("source_fingerprint={}", summary.source_fingerprint);
+            if let Some(plan) = summary.optimizer_plan {
+                println!("optimizer_plan={plan}");
+            }
             Ok(())
         }
         Command::Run {
@@ -317,16 +384,11 @@ fn run() -> logan_compiler::Result<()> {
                             detail: e,
                         }
                     })?;
-                    logan_qwen4::plan::run_greedy_cached_coli(
-                        &package,
-                        &cfg,
-                        &prompt_ids,
-                        max_new,
-                    )
-                    .map_err(|e| logan_compiler::ColicError::Unsupported {
-                        stage: "run",
-                        detail: e,
-                    })?
+                    logan_qwen4::plan::run_greedy_cached_coli(&package, &cfg, &prompt_ids, max_new)
+                        .map_err(|e| logan_compiler::ColicError::Unsupported {
+                            stage: "run",
+                            detail: e,
+                        })?
                 }
                 _ => {
                     // Default to the Qwen3 MoE engine for other qwen model
@@ -364,9 +426,18 @@ fn run() -> logan_compiler::Result<()> {
                 "projected_padding_bytes={}",
                 summary.plan.projected_padding_bytes
             );
+            if !summary.optimizer_plans.is_empty() {
+                eprintln!("logan: non-dominated optimizer plans:");
+                print_optimizer_plans(&summary.optimizer_plans);
+            }
             Ok(())
         }
-        Command::Compile(request) => {
+        Command::Compile(mut request) => {
+            if request.optimize && request.plan_choice.is_none() {
+                eprintln!("logan: computing non-dominated compile plans...");
+                let plans = pipeline::preview_optimization(&request)?;
+                request.plan_choice = Some(choose_optimizer_plan(&plans)?);
+            }
             let mut progress = ConsoleProgress::new();
             if logan_compiler::codec::compile::handles(&request) {
                 logan_compiler::codec::compile::compile(&request, &mut progress)

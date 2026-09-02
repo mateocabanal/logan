@@ -72,7 +72,7 @@ impl CalibrationScores {
         Ok(Self { scores: parsed })
     }
 
-    fn quality(&self, group: &str, candidate: &str, fallback: u64) -> u64 {
+    pub(crate) fn quality(&self, group: &str, candidate: &str, fallback: u64) -> u64 {
         self.scores
             .get(&(group.to_owned(), candidate.to_owned()))
             .copied()
@@ -399,7 +399,7 @@ fn canonical_mxfp4(expert: &RoutedExpert) -> bool {
         })
 }
 
-fn layer_quant_quality_prior(layer: u32, layers: u32) -> u64 {
+pub(crate) fn layer_quant_quality_prior(layer: u32, layers: u32) -> u64 {
     if layers <= 1 {
         return 4_000;
     }

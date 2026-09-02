@@ -13,10 +13,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use logan_ir::ContextConstraint;
 use logan_format::{
     codecs::{self, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID, RANS_TABLE_ID, RansTable},
     package::{Package, RecordInfo},
+};
+use logan_ir::{
+    BUILTIN_COST_MODEL_V1, CandidateGroup, ContextCandidate, ContextConstraint, OptimizerInput,
+    ParetoPlan, Placement, QuantSpec, RepresentationCandidate, material_plans, select_plan,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -220,9 +223,12 @@ pub struct RecompileRequest {
     pub codec: CodecMode,
     /// Same context-planning contract as compile. Required by --optimize.
     pub context: Option<ContextConstraint>,
-    /// Hardware-specialized optimizer entrypoint. The candidate search itself
-    /// is tracked in #82 and fails closed until it exists.
+    /// Hardware-specialized optimizer entrypoint.
     pub optimize: bool,
+    /// Stable Pareto plan id or UX alias.
+    pub plan_choice: Option<String>,
+    /// Optional precomputed calibration-score JSON.
+    pub calibration: Option<PathBuf>,
     pub allow_requantize: bool,
     /// Force target-layout reconstruction even when the package already uses
     /// the requested representation.
@@ -242,6 +248,8 @@ impl RecompileRequest {
             codec: CodecMode::Keep,
             context: None,
             optimize: false,
+            plan_choice: None,
+            calibration: None,
             allow_requantize: false,
             repack: false,
             verify: false,
@@ -268,6 +276,7 @@ pub struct RecompileSummary {
     pub rewritten_experts: usize,
     pub requantized_experts: usize,
     pub source_fingerprint: String,
+    pub optimizer_plan: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,15 +356,9 @@ struct Action {
 }
 
 pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
-    if request.optimize {
-        if request.context.is_none() {
-            return Err(ColicError::Usage(
-                "recompile --optimize requires exactly one of --max-context N or --require-context N".into(),
-            ));
-        }
-        return Err(ColicError::unsupported(
-            "COLI optimization",
-            "--optimize is wired for recompile, including native target selection and context intent, but mixed-representation Pareto search is not implemented yet (see #82); no package was modified",
+    if request.optimize && request.context.is_none() {
+        return Err(ColicError::Usage(
+            "recompile --optimize requires --max-context or --require-context".into(),
         ));
     }
     if request.source == request.output && !request.force {
@@ -372,13 +375,51 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
         ExpertTarget::CanonicalMxfp4
     };
 
+    let selected_optimizer = if request.optimize {
+        let plans = build_recompile_plans(&package, request, target, target_kind)?;
+        let selector = request.plan_choice.as_deref().ok_or_else(|| {
+            ColicError::Usage(
+                "optimized recompile requires --plan-choice NAME|ID in non-interactive code paths; run the CLI without --plan-choice for the interactive picker or use --dry-run-equivalent preview tooling"
+                    .into(),
+            )
+        })?;
+        Some(select_plan(&plans, selector).cloned().ok_or_else(|| {
+            ColicError::Usage(format!(
+                "unknown optimizer plan `{selector}`; expected one of {}",
+                plans
+                    .iter()
+                    .flat_map(|plan| plan
+                        .labels
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(plan.id.clone())))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?)
+    } else {
+        None
+    };
+    let optimizer_modes = selected_optimizer
+        .as_ref()
+        .map(|plan| optimizer_modes_from_plan(request, &package, plan))
+        .transpose()?;
+
     let mut actions = Vec::with_capacity(package.records().len());
     let mut copied_records = 0_usize;
     let mut rewritten_experts = 0_usize;
     let mut requantized_experts = 0_usize;
 
     for record in package.records() {
-        let action = plan_record(&package, record, request, target, target_kind)?;
+        let action = if let Some(mode) = optimizer_modes
+            .as_ref()
+            .and_then(|modes| modes.get(&record.id))
+            .copied()
+        {
+            plan_record_with_quant(&package, record, request, target, target_kind, mode)?
+        } else {
+            plan_record(&package, record, request, target, target_kind)?
+        };
         match action.kind {
             ActionKind::Copy => copied_records += 1,
             ActionKind::Rewrite { requantized, .. } => {
@@ -406,6 +447,7 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
         target,
         fingerprint,
         request,
+        selected_optimizer.as_ref(),
         &temporary,
     );
     if let Err(error) = write_result {
@@ -413,9 +455,6 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
         return Err(error);
     }
 
-    // Verify the complete sibling artifact before it becomes visible. In-place
-    // recompilation always verifies, even without --verify, so a malformed
-    // rewrite can never replace the source package.
     if request.verify || request.source == request.output {
         let verification = crate::verify::verify_package(&temporary)
             .and_then(|_| crate::verify_target::verify_target_layouts(&temporary));
@@ -439,7 +478,29 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
         rewritten_experts,
         requantized_experts,
         source_fingerprint: hex_fingerprint(package.fingerprint()),
+        optimizer_plan: selected_optimizer.map(|plan| plan.id),
     })
+}
+
+pub fn preview_optimization(request: &RecompileRequest) -> Result<Vec<ParetoPlan>> {
+    if !request.optimize {
+        return Err(ColicError::Usage(
+            "recompile optimization preview requires --optimize".into(),
+        ));
+    }
+    if request.context.is_none() {
+        return Err(ColicError::Usage(
+            "recompile --optimize requires --max-context or --require-context".into(),
+        ));
+    }
+    let package = Package::open(&request.source)?;
+    let target = resolve_target(&package, &request.target)?;
+    let target_kind = if target.name == target_registry::APPLE8_PROFILE_NAME {
+        ExpertTarget::Apple8Mxfp4
+    } else {
+        ExpertTarget::CanonicalMxfp4
+    };
+    build_recompile_plans(&package, request, target, target_kind)
 }
 
 fn resolve_target(package: &Package, requested: &str) -> Result<TargetProfile> {
@@ -468,12 +529,285 @@ fn resolve_target(package: &Package, requested: &str) -> Result<TargetProfile> {
     Ok(target)
 }
 
+fn build_recompile_plans(
+    package: &Package,
+    request: &RecompileRequest,
+    target: TargetProfile,
+    target_kind: ExpertTarget,
+) -> Result<Vec<ParetoPlan>> {
+    let context = request.context.ok_or_else(|| {
+        ColicError::Usage("recompile --optimize requires a context constraint".into())
+    })?;
+    let calibration = crate::optimize::CalibrationScores::load(request.calibration.as_deref())?;
+    let machine = target::MachineProfile::probe();
+    let memory_budget_bytes = machine
+        .ram_bytes
+        .unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
+
+    let mut base_resident_bytes = 0_u64;
+    let mut base_package_bytes = 0_u64;
+    let mut by_layer = std::collections::BTreeMap::<i32, Vec<&RecordInfo>>::new();
+    for record in package.records() {
+        if record.kind == 2 {
+            by_layer.entry(record.layer).or_default().push(record);
+        } else {
+            base_package_bytes = base_package_bytes
+                .checked_add(record.stored)
+                .ok_or_else(|| ColicError::Usage("recompile package bytes overflow".into()))?;
+            base_resident_bytes = base_resident_bytes
+                .checked_add(record.decoded)
+                .ok_or_else(|| ColicError::Usage("recompile resident bytes overflow".into()))?;
+        }
+    }
+    let layer_count = by_layer.len().max(1) as u64;
+    let slots_per_layer = 256_u64.div_ceil(layer_count).max(1);
+    let experts_per_token = package_experts_per_token(&request.source);
+    let model_layers = by_layer
+        .keys()
+        .filter_map(|layer| u32::try_from(*layer).ok())
+        .max()
+        .map_or(1, |layer| layer.saturating_add(1));
+
+    let mut groups = Vec::with_capacity(by_layer.len());
+    for (&layer, records) in &by_layer {
+        let group_key = format!("layer:{layer}:routed-experts");
+        let mut options = Vec::new();
+        let mut signatures = Vec::<(u64, u64, u64, u64, String, u16)>::new();
+        for bias in [QuantMode::Keep, QuantMode::Mxfp4] {
+            let mut package_bytes = 0_u64;
+            let mut max_decoded = 0_u64;
+            let mut traffic_bytes = 0_u64;
+            let mut fresh_quant = false;
+            let mut requantize = false;
+            let mut quantized = 0_usize;
+            let mut feasible = true;
+            for record in records {
+                let mode = optimizer_mode_for_record(request, record, bias);
+                let descs = expert_descs(package, record)?;
+                let kinds = [descs[0].kind()?, descs[1].kind()?, descs[2].kind()?];
+                if mode == QuantMode::Mxfp4 {
+                    quantized += 1;
+                    fresh_quant |= kinds.iter().any(|kind| *kind == MatrixKind::Bf16);
+                    requantize |= kinds.iter().any(|kind| *kind == MatrixKind::Int4G32);
+                }
+                let action = match plan_record_with_quant(
+                    package,
+                    record,
+                    request,
+                    target,
+                    target_kind,
+                    mode,
+                ) {
+                    Ok(action) => action,
+                    Err(_) => {
+                        feasible = false;
+                        break;
+                    }
+                };
+                package_bytes = package_bytes
+                    .checked_add(action.lowered.stored_bytes)
+                    .ok_or_else(|| ColicError::Usage("candidate package bytes overflow".into()))?;
+                traffic_bytes = traffic_bytes
+                    .checked_add(action.lowered.stored_bytes)
+                    .ok_or_else(|| ColicError::Usage("candidate traffic bytes overflow".into()))?;
+                max_decoded = max_decoded.max(action.lowered.decoded_bytes);
+            }
+            if !feasible {
+                continue;
+            }
+            let average = traffic_bytes.div_ceil(records.len() as u64);
+            let traffic = average
+                .checked_mul(experts_per_token)
+                .ok_or_else(|| ColicError::Usage("candidate token traffic overflows".into()))?;
+            let resident = max_decoded
+                .checked_mul(slots_per_layer)
+                .ok_or_else(|| ColicError::Usage("candidate cache bytes overflow".into()))?;
+            let fallback_quality = if requantize {
+                crate::optimize::layer_quant_quality_prior(
+                    u32::try_from(layer).unwrap_or(0),
+                    model_layers,
+                )
+                .saturating_mul(2)
+            } else if fresh_quant {
+                crate::optimize::layer_quant_quality_prior(
+                    u32::try_from(layer).unwrap_or(0),
+                    model_layers,
+                )
+            } else {
+                0
+            };
+            let candidate_id = bias.as_str();
+            let quality = calibration.quality(&group_key, candidate_id, fallback_quality);
+            let quant_kind = if quantized == 0 {
+                "source"
+            } else if quantized == records.len() {
+                if target_kind == ExpertTarget::Apple8Mxfp4 {
+                    "mxfp4-tile8x32"
+                } else {
+                    "mxfp4"
+                }
+            } else {
+                "mixed"
+            };
+            let layout = if target_kind == ExpertTarget::Apple8Mxfp4 {
+                target_registry::APPLE8_MXFP4_TILE_LAYOUT
+            } else {
+                0
+            };
+            let signature = (
+                package_bytes,
+                resident,
+                traffic,
+                quality,
+                quant_kind.to_owned(),
+                layout,
+            );
+            if signatures.contains(&signature) {
+                continue;
+            }
+            signatures.push(signature);
+            options.push(RepresentationCandidate {
+                id: candidate_id.into(),
+                quant: QuantSpec {
+                    kind: quant_kind.into(),
+                    scale: (quant_kind.starts_with("mxfp4"))
+                        .then(|| "e8m0/1x32".to_owned()),
+                },
+                layout,
+                placement: Placement::Streamed,
+                resident_bytes: resident,
+                package_bytes,
+                storage_traffic_bytes: traffic,
+                latency_cost: traffic.div_ceil(4096).max(1),
+                quality_loss_ppm: quality,
+                dispatch_class: if bias == QuantMode::Keep { 1 } else { 2 },
+                rationale: format!(
+                    "{}-biased layer plan after hard quant-rule pins: {quantized}/{} experts use MXFP4; fresh_quant={fresh_quant}; requantize={requantize}",
+                    bias.as_str(),
+                    records.len()
+                ),
+            });
+        }
+        if options.is_empty() {
+            return Err(ColicError::Unsupported {
+                stage: "COLI optimization",
+                detail: format!(
+                    "no feasible expert representation remains for `{group_key}` on `{}` after manual constraints",
+                    target.name
+                ),
+            });
+        }
+        groups.push(CandidateGroup {
+            key: group_key,
+            options,
+        });
+    }
+
+    let input = OptimizerInput {
+        cost_model: BUILTIN_COST_MODEL_V1.into(),
+        groups,
+        context_constraint: context,
+        context_candidates: vec![ContextCandidate {
+            tokens: context.tokens,
+            resident_bytes: 0,
+            latency_cost: 0,
+        }],
+        memory_budget_bytes,
+        base_resident_bytes,
+        base_package_bytes,
+        base_storage_traffic_bytes: 0,
+        base_latency_cost: 0,
+        base_quality_loss_ppm: 0,
+        heterogeneity_switch_penalty: 64,
+    };
+    material_plans(&input).map_err(|detail| ColicError::Unsupported {
+        stage: "COLI optimization",
+        detail,
+    })
+}
+
+fn optimizer_mode_for_record(
+    request: &RecompileRequest,
+    record: &RecordInfo,
+    bias: QuantMode,
+) -> QuantMode {
+    if request.quant == QuantMode::Mxfp4 {
+        return QuantMode::Mxfp4;
+    }
+    request
+        .quant_rules
+        .iter()
+        .filter(|rule| rule.matches(record))
+        .last()
+        .map_or(bias, |rule| rule.mode)
+}
+
+fn optimizer_modes_from_plan(
+    request: &RecompileRequest,
+    package: &Package,
+    plan: &ParetoPlan,
+) -> Result<std::collections::BTreeMap<u64, QuantMode>> {
+    let mut modes = std::collections::BTreeMap::new();
+    for decision in &plan.decisions {
+        let layer = decision
+            .group
+            .strip_prefix("layer:")
+            .and_then(|rest| rest.strip_suffix(":routed-experts"))
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or_else(|| {
+                ColicError::Usage(format!(
+                    "optimizer decision has invalid recompile group `{}`",
+                    decision.group
+                ))
+            })?;
+        let bias = QuantMode::parse(&decision.chosen.id)?;
+        for record in package
+            .records()
+            .iter()
+            .filter(|record| record.kind == 2 && record.layer == layer)
+        {
+            modes.insert(record.id, optimizer_mode_for_record(request, record, bias));
+        }
+    }
+    Ok(modes)
+}
+
+fn package_experts_per_token(root: &Path) -> u64 {
+    let Ok(text) = fs::read_to_string(root.join("config.json")) else {
+        return 1;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return 1;
+    };
+    [
+        "num_experts_per_tok",
+        "num_experts_per_token",
+        "experts_per_token",
+    ]
+    .into_iter()
+    .find_map(|key| config.get(key).and_then(serde_json::Value::as_u64))
+    .filter(|value| *value > 0)
+    .unwrap_or(1)
+}
+
 fn plan_record(
     package: &Package,
     record: &RecordInfo,
     request: &RecompileRequest,
     target_profile: TargetProfile,
     target_kind: ExpertTarget,
+) -> Result<Action> {
+    let quant = effective_quant(request, record);
+    plan_record_with_quant(package, record, request, target_profile, target_kind, quant)
+}
+
+fn plan_record_with_quant(
+    package: &Package,
+    record: &RecordInfo,
+    request: &RecompileRequest,
+    target_profile: TargetProfile,
+    target_kind: ExpertTarget,
+    quant: QuantMode,
 ) -> Result<Action> {
     if record.kind != 2 {
         if record.codec != 0 {
@@ -503,7 +837,6 @@ fn plan_record(
     let all_mxfp4 = kinds
         .iter()
         .all(|kind| matches!(kind, MatrixKind::CanonicalMxfp4 | MatrixKind::Apple8Mxfp4));
-    let quant = effective_quant(request, record);
     let source_quantized = kinds.iter().any(|kind| *kind == MatrixKind::Int4G32);
     let requantized = source_quantized && quant == QuantMode::Mxfp4;
     if requantized && !request.allow_requantize {
@@ -611,6 +944,7 @@ fn write_package(
     target: TargetProfile,
     fingerprint: [u8; 32],
     request: &RecompileRequest,
+    optimizer: Option<&ParetoPlan>,
     temporary: &Path,
 ) -> Result<()> {
     let mut metadata = Vec::with_capacity(actions.len());
@@ -670,7 +1004,7 @@ fn write_package(
         source,
     })?;
     copy_json_metadata(&request.source, temporary)?;
-    write_provenance(package, target, actions, request, temporary)?;
+    write_provenance(package, target, actions, request, optimizer, temporary)?;
     Ok(())
 }
 
@@ -1386,6 +1720,7 @@ fn write_provenance(
     target: TargetProfile,
     actions: &[Action],
     request: &RecompileRequest,
+    optimizer: Option<&ParetoPlan>,
     output: &Path,
 ) -> Result<()> {
     let parent_manifest = package.manifest_ref();
@@ -1423,6 +1758,7 @@ fn write_provenance(
             "tokens": constraint.tokens,
         })),
         "optimize": request.optimize,
+        "optimizer_plan": optimizer,
         "in_place": request.source == request.output,
         "codec": request.codec.as_str(),
         "allow_requantize": request.allow_requantize,
