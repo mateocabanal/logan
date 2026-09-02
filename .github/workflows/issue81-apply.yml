@@ -14,7 +14,9 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Apply integration patch
-        run: python3 tools/issue81_apply.py
+        run: |
+          python3 tools/issue81_apply.py
+          python3 tools/issue81_repair.py
       - name: Format touched Rust
         run: rustfmt --edition 2024 logan-ir/src/context.rs logan-ir/src/optimizer.rs logan-ir/src/plan.rs logan-compiler/src/context_plan.rs logan-compiler/src/lib.rs logan-compiler/src/optimize.rs logan-compiler/src/pipeline.rs logan-compiler/src/recompile.rs logan-compiler/src/main.rs logan-qwen4/src/coliload.rs logan-qwen4/src/lib.rs logan-qwen/src/lib.rs
       - name: Focused tests
@@ -22,7 +24,7 @@ jobs:
       - name: Keep lockfile unchanged
         run: git checkout origin/main -- Cargo.lock
       - name: Remove one-shot machinery
-        run: rm tools/issue81_apply.py .github/workflows/issue81-apply.yml
+        run: rm tools/issue81_apply.py tools/issue81_repair.py .github/workflows/issue81-apply.yml
       - name: Commit result
         run: |
           git config user.name "logan-issue81"
