@@ -1,4 +1,8 @@
 //! Versioned target compatibility profiles and lowering boundary.
+//!
+//! Target ABI compatibility is intentionally independent from the machine
+//! resource profile: RAM/storage topology may change the physical plan without
+//! changing which execution-layout/kernel ABI the runtime can execute.
 
 use std::{
     fs::File,
