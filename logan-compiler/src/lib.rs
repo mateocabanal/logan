@@ -9,6 +9,7 @@ pub mod format;
 pub mod generated;
 pub mod ir;
 pub mod model;
+pub mod optimizer;
 pub mod passes;
 pub mod pipeline;
 pub mod quant;
