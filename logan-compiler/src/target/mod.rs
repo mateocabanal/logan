@@ -1,4 +1,8 @@
 //! Versioned target compatibility profiles and lowering boundary.
+//!
+//! Target ABI compatibility is intentionally independent from the machine
+//! resource profile: RAM/storage topology may change the physical plan without
+//! changing which execution-layout/kernel ABI the runtime can execute.
 
 use std::{
     fs::File,
@@ -15,8 +19,13 @@ use crate::{
 };
 
 pub mod machine;
+pub mod resources;
 
 pub use machine::{MachineProfile, metal_available_for};
+pub use resources::{
+    CapabilitySupport, MachineMemoryPool, MachineResourceProfile, MemoryPoolKind,
+    StoragePoolObservation, StoragePoolProfile, observe_storage_path,
+};
 
 const TENSOR_HEADER_BYTES: usize = 128;
 
