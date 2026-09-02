@@ -104,7 +104,10 @@ fn expert_cache_slots() -> u64 {
     256
 }
 
-fn context_candidates(model: &SemanticModel, constraint: ContextConstraint) -> Vec<ContextCandidate> {
+fn context_candidates(
+    model: &SemanticModel,
+    constraint: ContextConstraint,
+) -> Vec<ContextCandidate> {
     let mut tokens = BTreeSet::new();
     match constraint.kind {
         logan_ir::ContextConstraintKind::Maximum => {
@@ -121,7 +124,10 @@ fn context_candidates(model: &SemanticModel, constraint: ContextConstraint) -> V
         .filter_map(|tokens| {
             estimate_context_bytes(model, tokens)
                 .ok()
-                .map(|state_bytes| ContextCandidate { tokens, state_bytes })
+                .map(|state_bytes| ContextCandidate {
+                    tokens,
+                    state_bytes,
+                })
         })
         .collect()
 }
@@ -155,7 +161,12 @@ fn dense_resident_bytes(model: &SemanticModel) -> Result<u64> {
     model
         .global_tensors
         .values()
-        .chain(model.layer_static_tensors.values().flat_map(|layer| layer.values()))
+        .chain(
+            model
+                .layer_static_tensors
+                .values()
+                .flat_map(|layer| layer.values()),
+        )
         .chain(model.resident_tensors.values())
         .try_fold(0_u64, |sum, tensor| {
             sum.checked_add(tensor.len)
@@ -200,7 +211,9 @@ fn machine_base_reserve(
         .and_then(|value| value.checked_add(safety_reserve))
         .and_then(|value| value.checked_add(RUNTIME_RESERVE))
         .and_then(|value| value.checked_add(EXECUTION_SCRATCH))
-        .ok_or_else(|| ColicError::Usage("optimizer base memory reservation overflows u64".into()))?;
+        .ok_or_else(|| {
+            ColicError::Usage("optimizer base memory reservation overflows u64".into())
+        })?;
     Ok((base, physical))
 }
 
@@ -257,7 +270,11 @@ fn option_for_band(
     let throughput_weight = match representation {
         ExpertRepresentation::Exact => 100_u64,
         ExpertRepresentation::Mxfp4 => {
-            if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 { 42 } else { 62 }
+            if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 {
+                42
+            } else {
+                62
+            }
         }
     };
     let latency_cost = package_bytes
@@ -327,7 +344,8 @@ pub(crate) fn build_plans(
         );
         groups.push(DecisionGroup { id, options });
     }
-    let (base_resident_bytes, memory_budget_bytes) = machine_base_reserve(model, target_profile, machine)?;
+    let (base_resident_bytes, memory_budget_bytes) =
+        machine_base_reserve(model, target_profile, machine)?;
     let input = OptimizeInput {
         groups,
         contexts: context_candidates(model, constraint),
@@ -336,7 +354,8 @@ pub(crate) fn build_plans(
         memory_budget_bytes,
         heterogeneity_penalty: 250,
     };
-    let plans = optimize(&input).map_err(|message| ColicError::Usage(format!("optimizer: {message}")))?;
+    let plans =
+        optimize(&input).map_err(|message| ColicError::Usage(format!("optimizer: {message}")))?;
     if plans.is_empty() {
         return Err(ColicError::unsupported(
             "target planning",
@@ -359,7 +378,11 @@ pub(crate) fn select(
             "unknown optimizer plan `{selector}`; available: {}",
             plans
                 .iter()
-                .map(|plan| format!("{} ({})", plan.label.as_deref().unwrap_or("unlabeled"), plan.id))
+                .map(|plan| format!(
+                    "{} ({})",
+                    plan.label.as_deref().unwrap_or("unlabeled"),
+                    plan.id
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -372,11 +395,14 @@ pub(crate) fn select(
             other => {
                 return Err(ColicError::Usage(format!(
                     "optimizer selected unknown expert representation `{other}`"
-                )))
+                )));
             }
         };
         for &(layer, expert) in members.get(&decision.group).ok_or_else(|| {
-            ColicError::Usage(format!("optimizer lost group membership for `{}`", decision.group))
+            ColicError::Usage(format!(
+                "optimizer lost group membership for `{}`",
+                decision.group
+            ))
         })? {
             by_expert.insert((layer, expert), representation);
         }
@@ -391,7 +417,10 @@ pub(crate) fn select(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ir::{Matrix, ModelGeometry}, source::TensorRef};
+    use crate::{
+        ir::{Matrix, ModelGeometry},
+        source::TensorRef,
+    };
     use std::path::PathBuf;
 
     fn tensor(name: &str, len: u64, shape: Vec<u64>) -> TensorRef {
@@ -408,7 +437,11 @@ mod tests {
         let rows = 32 * sensitive_scale;
         let cols = 32;
         let matrix = |role: &str| Matrix {
-            source: tensor(role, u64::from(rows) * u64::from(cols) * 2, vec![u64::from(rows), u64::from(cols)]),
+            source: tensor(
+                role,
+                u64::from(rows) * u64::from(cols) * 2,
+                vec![u64::from(rows), u64::from(cols)],
+            ),
             rows,
             columns: cols,
             scale: None,
@@ -419,7 +452,11 @@ mod tests {
             gate: matrix("gate"),
             up: matrix("up"),
             down: Matrix {
-                source: tensor("down", u64::from(cols) * u64::from(rows) * 2, vec![u64::from(cols), u64::from(rows)]),
+                source: tensor(
+                    "down",
+                    u64::from(cols) * u64::from(rows) * 2,
+                    vec![u64::from(cols), u64::from(rows)],
+                ),
                 rows: cols,
                 columns: rows,
                 scale: None,
@@ -493,8 +530,16 @@ mod tests {
         assert_eq!(a, b);
         assert!(!members.is_empty());
         assert!(a.iter().any(|plan| {
-            let exact = plan.decisions.iter().filter(|decision| decision.option_id == "exact").count();
-            let small = plan.decisions.iter().filter(|decision| decision.option_id == "mxfp4").count();
+            let exact = plan
+                .decisions
+                .iter()
+                .filter(|decision| decision.option_id == "exact")
+                .count();
+            let small = plan
+                .decisions
+                .iter()
+                .filter(|decision| decision.option_id == "mxfp4")
+                .count();
             exact > 0 && small > 0
         }));
     }

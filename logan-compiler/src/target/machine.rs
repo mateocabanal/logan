@@ -147,8 +147,12 @@ mod tests {
         // mirrors the runtime direct-path gate exactly
         assert!(!ok(true, Some("0")));
         assert!(!ok(false, None));
-        assert!(!MachineProfile::apple8_abi_for("macos", "x86_64", true, None));
-        assert!(!MachineProfile::apple8_abi_for("linux", "aarch64", true, None));
+        assert!(!MachineProfile::apple8_abi_for(
+            "macos", "x86_64", true, None
+        ));
+        assert!(!MachineProfile::apple8_abi_for(
+            "linux", "aarch64", true, None
+        ));
     }
 
     #[test]

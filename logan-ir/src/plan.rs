@@ -116,7 +116,10 @@ impl PlanArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{graph::{Op, ValueType}, optimizer::{PlanDecision, PlanMetrics}};
+    use crate::{
+        graph::{Op, ValueType},
+        optimizer::{PlanDecision, PlanMetrics},
+    };
     use std::collections::BTreeMap;
 
     fn sample_plan() -> PlanArtifact {

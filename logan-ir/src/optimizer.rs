@@ -217,15 +217,30 @@ fn representative_indices(plans: &[ParetoPlan]) -> Vec<(usize, &'static str)> {
     }
     let quality = (0..plans.len()).min_by_key(|&index| {
         let m = plans[index].metrics;
-        (m.quality_loss, m.latency_cost, std::cmp::Reverse(m.context_tokens), m.package_bytes)
+        (
+            m.quality_loss,
+            m.latency_cost,
+            std::cmp::Reverse(m.context_tokens),
+            m.package_bytes,
+        )
     });
     let latency = (0..plans.len()).min_by_key(|&index| {
         let m = plans[index].metrics;
-        (m.latency_cost, m.quality_loss, std::cmp::Reverse(m.context_tokens), m.package_bytes)
+        (
+            m.latency_cost,
+            m.quality_loss,
+            std::cmp::Reverse(m.context_tokens),
+            m.package_bytes,
+        )
     });
     let long_context = (0..plans.len()).min_by_key(|&index| {
         let m = plans[index].metrics;
-        (std::cmp::Reverse(m.context_tokens), m.quality_loss, m.latency_cost, m.package_bytes)
+        (
+            std::cmp::Reverse(m.context_tokens),
+            m.quality_loss,
+            m.latency_cost,
+            m.package_bytes,
+        )
     });
 
     let min_q = plans.iter().map(|p| p.metrics.quality_loss).min().unwrap();
@@ -234,16 +249,32 @@ fn representative_indices(plans: &[ParetoPlan]) -> Vec<(usize, &'static str)> {
     let max_l = plans.iter().map(|p| p.metrics.latency_cost).max().unwrap();
     let min_s = plans.iter().map(|p| p.metrics.package_bytes).min().unwrap();
     let max_s = plans.iter().map(|p| p.metrics.package_bytes).max().unwrap();
-    let min_c = plans.iter().map(|p| p.metrics.context_tokens).min().unwrap();
-    let max_c = plans.iter().map(|p| p.metrics.context_tokens).max().unwrap();
+    let min_c = plans
+        .iter()
+        .map(|p| p.metrics.context_tokens)
+        .min()
+        .unwrap();
+    let max_c = plans
+        .iter()
+        .map(|p| p.metrics.context_tokens)
+        .max()
+        .unwrap();
     let span = |min: u64, max: u64| max.saturating_sub(min).max(1);
     let balanced = (0..plans.len()).min_by_key(|&index| {
         let m = plans[index].metrics;
-        let q = (m.quality_loss.saturating_sub(min_q)).saturating_mul(1_000_000) / span(min_q, max_q);
-        let l = (m.latency_cost.saturating_sub(min_l)).saturating_mul(1_000_000) / span(min_l, max_l);
-        let s = (m.package_bytes.saturating_sub(min_s)).saturating_mul(1_000_000) / span(min_s, max_s);
-        let c = (max_c.saturating_sub(m.context_tokens)).saturating_mul(1_000_000) / span(min_c, max_c);
-        (q.saturating_add(l).saturating_add(s).saturating_add(c), m.quality_loss, m.latency_cost)
+        let q =
+            (m.quality_loss.saturating_sub(min_q)).saturating_mul(1_000_000) / span(min_q, max_q);
+        let l =
+            (m.latency_cost.saturating_sub(min_l)).saturating_mul(1_000_000) / span(min_l, max_l);
+        let s =
+            (m.package_bytes.saturating_sub(min_s)).saturating_mul(1_000_000) / span(min_s, max_s);
+        let c =
+            (max_c.saturating_sub(m.context_tokens)).saturating_mul(1_000_000) / span(min_c, max_c);
+        (
+            q.saturating_add(l).saturating_add(s).saturating_add(c),
+            m.quality_loss,
+            m.latency_cost,
+        )
     });
 
     let mut picked = Vec::new();
@@ -286,7 +317,10 @@ pub fn optimize(input: &OptimizeInput) -> Result<Vec<ParetoPlan>, String> {
         }
         states = prune_states(next);
         if states.is_empty() {
-            return Err(format!("optimizer overflow while planning group `{}`", group.id));
+            return Err(format!(
+                "optimizer overflow while planning group `{}`",
+                group.id
+            ));
         }
     }
 
@@ -342,10 +376,14 @@ pub fn optimize(input: &OptimizeInput) -> Result<Vec<ParetoPlan>, String> {
                 &right.id,
             ))
     });
-    frontier.dedup_by(|left, right| left.metrics == right.metrics && left.decisions == right.decisions);
+    frontier
+        .dedup_by(|left, right| left.metrics == right.metrics && left.decisions == right.decisions);
     let mut non_dominated = Vec::new();
     'candidate: for plan in frontier {
-        if non_dominated.iter().any(|other| dominates_plan(other, &plan)) {
+        if non_dominated
+            .iter()
+            .any(|other| dominates_plan(other, &plan))
+        {
             continue 'candidate;
         }
         non_dominated.retain(|other| !dominates_plan(&plan, other));
@@ -369,13 +407,10 @@ pub fn optimize(input: &OptimizeInput) -> Result<Vec<ParetoPlan>, String> {
     });
 
     let representatives = representative_indices(&non_dominated);
-    let mut result = Vec::with_capacity(representatives.len());
     for (index, label) in representatives {
-        let mut plan = non_dominated[index].clone();
-        plan.label = Some(label.to_string());
-        result.push(plan);
+        non_dominated[index].label = Some(label.to_string());
     }
-    Ok(result)
+    Ok(non_dominated)
 }
 
 pub fn select_plan<'a>(plans: &'a [ParetoPlan], selector: &str) -> Option<&'a ParetoPlan> {
@@ -388,7 +423,13 @@ pub fn select_plan<'a>(plans: &'a [ParetoPlan], selector: &str) -> Option<&'a Pa
 mod tests {
     use super::*;
 
-    fn option(id: &str, representation: &str, quality: u64, latency: u64, bytes: u64) -> PhysicalOption {
+    fn option(
+        id: &str,
+        representation: &str,
+        quality: u64,
+        latency: u64,
+        bytes: u64,
+    ) -> PhysicalOption {
         PhysicalOption {
             id: id.into(),
             representation: representation.into(),
@@ -420,7 +461,10 @@ mod tests {
                     ],
                 },
             ],
-            contexts: vec![ContextCandidate { tokens: 65_536, state_bytes: 0 }],
+            contexts: vec![ContextCandidate {
+                tokens: 65_536,
+                state_bytes: 0,
+            }],
             context_constraint: ContextConstraint::required(65_536),
             base_resident_bytes: 0,
             memory_budget_bytes: u64::MAX,
@@ -431,7 +475,9 @@ mod tests {
         let all_small = (51, 100, 100);
         assert!(plans.iter().any(|plan| {
             let m = plan.metrics;
-            m.quality_loss == 1 && m.latency_cost == 155 && m.package_bytes == 150
+            m.quality_loss == 1
+                && m.latency_cost == 155
+                && m.package_bytes == 150
                 && (m.quality_loss < all_small.0 || m.latency_cost < all_exact.1)
                 && m.package_bytes < all_exact.2
         }));
@@ -442,11 +488,20 @@ mod tests {
         let input = OptimizeInput {
             groups: vec![DecisionGroup {
                 id: "layer.0".into(),
-                options: vec![option("a", "bf16", 0, 10, 20), option("b", "mxfp4", 2, 5, 10)],
+                options: vec![
+                    option("a", "bf16", 0, 10, 20),
+                    option("b", "mxfp4", 2, 5, 10),
+                ],
             }],
             contexts: vec![
-                ContextCandidate { tokens: 32_768, state_bytes: 100 },
-                ContextCandidate { tokens: 65_536, state_bytes: 200 },
+                ContextCandidate {
+                    tokens: 32_768,
+                    state_bytes: 100,
+                },
+                ContextCandidate {
+                    tokens: 65_536,
+                    state_bytes: 200,
+                },
             ],
             context_constraint: ContextConstraint::maximum(65_536),
             base_resident_bytes: 100,
@@ -464,8 +519,14 @@ mod tests {
                 options: vec![option("a", "bf16", 0, 10, 20)],
             }],
             contexts: vec![
-                ContextCandidate { tokens: 32_768, state_bytes: 100 },
-                ContextCandidate { tokens: 65_536, state_bytes: 900 },
+                ContextCandidate {
+                    tokens: 32_768,
+                    state_bytes: 100,
+                },
+                ContextCandidate {
+                    tokens: 65_536,
+                    state_bytes: 900,
+                },
             ],
             context_constraint: ContextConstraint::required(65_536),
             base_resident_bytes: 200,

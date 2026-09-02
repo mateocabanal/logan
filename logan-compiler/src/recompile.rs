@@ -13,11 +13,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use logan_ir::ContextConstraint;
 use logan_format::{
     codecs::{self, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID, RANS_TABLE_ID, RansTable},
     package::{Package, RecordInfo},
 };
+use logan_ir::ContextConstraint;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
