@@ -1,0 +1,50 @@
+name: fix-issue82-tests
+on:
+  push:
+    branches: [feat/issue-82-pareto-planner]
+    paths: ['.github/workflows/fix-issue82-tests.yml']
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/issue-82-pareto-planner
+      - name: Update tests
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path('logan-compiler/src/pipeline.rs')
+          s=p.read_text()
+          s=s.replace('''            &model,\n            ExpertQuantization::Exact,\n            target::LINUX_X86_64_AVX2_V1,\n''','''            &model,\n            &ExpertQuantizationPlan::uniform(ExpertQuantization::Exact),\n            target::LINUX_X86_64_AVX2_V1,\n''',1)
+          s=s.replace('''            &model,\n            ExpertQuantization::Mxfp4,\n            target::LINUX_X86_64_AVX2_V1,\n''','''            &model,\n            &ExpertQuantizationPlan::uniform(ExpertQuantization::Mxfp4),\n            target::LINUX_X86_64_AVX2_V1,\n''',1)
+          s=s.replace('''            &model,\n            ExpertQuantization::Mxfp4,\n            target::MACOS_ARM64_METAL_APPLE8_V1,\n''','''            &model,\n            &ExpertQuantizationPlan::uniform(ExpertQuantization::Mxfp4),\n            target::MACOS_ARM64_METAL_APPLE8_V1,\n''',1)
+          p.write_text(s)
+
+          p=Path('logan-compiler/src/cli.rs')
+          s=p.read_text()
+          marker='''    #[test]\n    fn compile_and_recompile_reject_ambiguous_context_constraints() {'''
+          test='''    #[test]\n    fn optimized_requests_parse_plan_choice_and_calibration() {\n        let compile = parse(\n            [\n                "compile",\n                "fixture",\n                "--optimize",\n                "--max-context",\n                "65536",\n                "--plan-choice",\n                "balanced",\n                "--calibration",\n                "scores.json",\n                "--dry-run",\n            ]\n            .map(str::to_owned),\n        )\n        .unwrap();\n        let Command::Compile(compile) = compile else {\n            panic!("expected compile")\n        };\n        assert_eq!(compile.plan_choice.as_deref(), Some("balanced"));\n        assert_eq!(compile.calibration, Some(PathBuf::from("scores.json")));\n\n        let recompile = parse(\n            [\n                "recompile",\n                "model.coli",\n                "--in-place",\n                "--optimize",\n                "--require-context",\n                "32768",\n                "--plan-choice",\n                "p-0123456789abcdef",\n                "--calibration",\n                "scores.json",\n            ]\n            .map(str::to_owned),\n        )\n        .unwrap();\n        let Command::Recompile(recompile) = recompile else {\n            panic!("expected recompile")\n        };\n        assert_eq!(\n            recompile.plan_choice.as_deref(),\n            Some("p-0123456789abcdef")\n        );\n        assert_eq!(recompile.calibration, Some(PathBuf::from("scores.json")));\n    }\n\n'''
+          assert s.count(marker)==1
+          p.write_text(s.replace(marker,test+marker,1))
+
+          p=Path('logan-compiler/src/recompile.rs')
+          s=p.read_text()
+          marker='''    #[test]\n    fn quant_rule_parser_rejects_reversed_and_unknown_selectors() {'''
+          test='''    #[test]\n    fn optimizer_bias_never_overrides_manual_quant_rule_pins() {\n        let mut request =\n            RecompileRequest::new(PathBuf::from("old.coli"), PathBuf::from("new.coli"));\n        request.quant = QuantMode::Keep;\n        request.quant_rules = vec![\n            QuantRule::parse("layer:4-7=mxfp4").unwrap(),\n            QuantRule::parse("expert:3=keep").unwrap(),\n        ];\n        let record = RecordInfo {\n            id: 1,\n            kind: 2,\n            codec: 0,\n            math_format: 0,\n            scale_format: 0,\n            layout: 0,\n            flags: 0,\n            shard_id: 0,\n            name: None,\n            layer: 6,\n            expert: 3,\n            offset: 0,\n            stored: 0,\n            decoded: 0,\n            stored_crc: 0,\n            logical_crc: 0,\n        };\n        assert_eq!(\n            optimizer_mode_for_record(&request, &record, QuantMode::Mxfp4),\n            QuantMode::Keep\n        );\n\n        let mut unpinned = record.clone();\n        unpinned.layer = 8;\n        unpinned.expert = 9;\n        assert_eq!(\n            optimizer_mode_for_record(&request, &unpinned, QuantMode::Mxfp4),\n            QuantMode::Mxfp4\n        );\n        assert_eq!(\n            optimizer_mode_for_record(&request, &unpinned, QuantMode::Keep),\n            QuantMode::Keep\n        );\n    }\n\n'''
+          assert s.count(marker)==1
+          p.write_text(s.replace(marker,test+marker,1))
+          PY
+          rustfmt --edition 2024 logan-compiler/src/pipeline.rs logan-compiler/src/cli.rs logan-compiler/src/recompile.rs
+      - name: Remove one-shot workflow
+        run: rm .github/workflows/fix-issue82-tests.yml
+      - name: Commit
+        run: |
+          git config user.name logan-issue82
+          git config user.email actions@users.noreply.github.com
+          git add -A
+          git commit -m 'test: cover Pareto adapter constraints'
+          git push origin HEAD:feat/issue-82-pareto-planner
