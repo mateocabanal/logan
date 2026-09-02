@@ -1,19 +1,16 @@
 //! Qwen4Exp / Qwen3.8 Flash Next source frontend.
 //!
-//! The runtime already executes qwen4_exp COLI packages. This adapter closes
-//! the compiler-side gap for native BF16 checkpoints, including REAP-pruned
-//! checkpoints whose expert count differs from the upstream 512.
-//!
-//! Important source/layout properties:
-//! - real checkpoints may use `model.language_model.*`; the deterministic
-//!   fixture uses `model.*`;
-//! - experts may be per-expert gate_up/down tensors or fused per-layer tensors;
-//! - PLE is global in HF but layer-scoped in COLI (ple_layer_ids is 1-based);
-//! - a BF16 PLE n-gram table is converted to streamed E4M3 shard records by
-//!   the tensor lowerer. It is never materialized in RAM by the runtime.
+//! Native BF16 checkpoints are adapted to the existing Qwen4 runtime COLI
+//! names. Routed experts are left as BF16 semantic matrices so the normal
+//! BF16 -> MXFP4 -> Apple8 lowerer owns their quantization. The giant PLE
+//! n-gram embedding is the one Qwen4-specific transform: Apple8 packages
+//! store it as row-streamed E4M3 shards plus one BF16 per-tensor scale, the
+//! same representation consumed by the proven Qwen4 COLI runtime.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -25,9 +22,10 @@ use crate::{
     source::{self, SourceInventory, TensorRef},
 };
 
-pub(crate) const PLE_F8_FROM_BF16_S16: &str = "BF16_TO_F8_E4M3_S16";
-pub(crate) const PLE_SCALE_CONST_S16: &str = "CONST_BF16_PLE_SCALE_S16";
+pub(crate) const PLE_BF16_TO_F8_PREFIX: &str = "BF16_TO_F8_E4M3:";
+pub(crate) const PLE_CONST_BF16_PREFIX: &str = "CONST_BF16:";
 const PLE_SHARDS: u64 = 128;
+const E4M3_MAX_FINITE: f32 = 240.0;
 
 pub struct Qwen4ExpFrontend;
 
@@ -45,7 +43,10 @@ impl Qwen4ExpFrontend {
             detail: "Qwen4Exp source is missing config.json".into(),
         })?;
         if !is_qwen4_model_type(model_type(&config)) {
-            return invalid(&source.root, "config model_type is not qwen4_exp/qwen4_exp_text");
+            return invalid(
+                &source.root,
+                "config model_type is not qwen4_exp/qwen4_exp_text",
+            );
         }
         let tc = config.get("text_config").unwrap_or(&config);
         let layers = required_u32(&source.root, tc, "num_hidden_layers")?;
@@ -55,6 +56,7 @@ impl Qwen4ExpFrontend {
         let vocab = required_u32(&source.root, tc, "vocab_size")?;
         let layer_types = required_layer_types(&source.root, tc, layers)?;
         let base = text_base(source)?;
+        let ple_layer = ple_layer_index(&source.root, tc, layers)?;
 
         let geometry = ModelGeometry {
             hidden_size: hidden,
@@ -101,10 +103,7 @@ impl Qwen4ExpFrontend {
             source,
             &["lm_head.weight".to_owned(), format!("{base}.lm_head.weight")],
         )
-        .ok_or_else(|| ColicError::InvalidSource {
-            path: source.root.clone(),
-            detail: "missing lm_head.weight".into(),
-        })?;
+        .ok_or_else(|| missing(source, "lm_head.weight"))?;
         global_tensors.insert(
             "head.weight".into(),
             required_bf16(source, &head_name, &[vocab as u64, hidden as u64])?,
@@ -125,15 +124,17 @@ impl Qwen4ExpFrontend {
             }
         }
 
-        // Qwen4 runtime canonical names intentionally mirror the HF suffixes
-        // (`self_attn.*`, `linear_attn.*`, hyper connections and `mlp.*`).
+        // Qwen4 runtime names deliberately mirror the HF suffix below
+        // model[.language_model].layers.N. Skip only routed-expert payloads and
+        // the huge PLE table; the latter is re-emitted as independently
+        // pageable shards below.
         let mut layer_static_tensors: BTreeMap<u32, BTreeMap<String, TensorRef>> = BTreeMap::new();
         for layer in 0..layers {
             let lp = format!("{base}.layers.{layer}.");
             let mut map = BTreeMap::new();
             for (name, tensor) in &source.tensors {
                 let Some(rest) = name.strip_prefix(&lp) else { continue };
-                if rest.starts_with("mlp.experts.") || rest == "mlp.experts.gate_up_proj" || rest == "mlp.experts.down_proj" {
+                if rest.starts_with("mlp.experts.") || is_ngram_weight_suffix(rest) {
                     continue;
                 }
                 map.insert(rest.to_owned(), tensor.clone());
@@ -142,9 +143,6 @@ impl Qwen4ExpFrontend {
             layer_static_tensors.insert(layer, map);
         }
 
-        // PLE is globally named in HF, but is injected at a specific model
-        // layer. HF's ple_layer_ids is 1-based; COLI/runtime layers are 0-based.
-        let ple_layer = ple_layer_index(tc, layers)?;
         add_ple_tensors(
             source,
             &base,
@@ -153,8 +151,8 @@ impl Qwen4ExpFrontend {
             &mut consumed,
         )?;
 
-        // Keep unknown text tensors for forward compatibility, but deliberately
-        // omit vision tensors: logan-qwen4 is currently a text runtime.
+        // Preserve unknown text-side tensors for forward compatibility, but
+        // omit vision tensors because logan-qwen4 is currently text-only.
         let resident_tensors = source
             .tensors
             .iter()
@@ -167,10 +165,9 @@ impl Qwen4ExpFrontend {
             .collect();
 
         Ok(SemanticModel {
-            // Today this enum variant is the compiler's Qwen fine-grained-MoE
-            // family identity and is the gate that enables BF16->MXFP4 expert
-            // lowering. Runtime architecture dispatch still uses config.json's
-            // qwen4_exp model_type, so no Qwen3 execution path is involved.
+            // This is currently the compiler's fine-grained-Qwen-MoE family
+            // identity and enables the existing BF16->MXFP4 expert lowering.
+            // Runtime dispatch remains qwen4_exp via the copied config.json.
             architecture: Architecture::Qwen3_5MoeMoE,
             geometry,
             routed_experts,
@@ -266,14 +263,19 @@ fn build_experts(
                 consumed.insert(down_name);
                 out.insert(
                     (layer, expert),
-                    RoutedExpert { layer, expert, gate, up, down },
+                    RoutedExpert {
+                        layer,
+                        expert,
+                        gate,
+                        up,
+                        down,
+                    },
                 );
             }
             continue;
         }
 
-        // Also accept the older fused-per-layer layout. This makes conversion
-        // robust to checkpoint exporters without changing Apple8 lowering.
+        // Native Qwen4 commonly stores one fused expert bank per layer.
         let gu_name = first_existing_name(
             source,
             &[format!("{ep}.gate_up_proj"), format!("{ep}.gate_up_proj.weight")],
@@ -286,8 +288,18 @@ fn build_experts(
         .ok_or_else(|| missing(source, format!("layer {layer} fused down_proj")))?;
         let gu = source.tensors.get(&gu_name).unwrap();
         let down = source.tensors.get(&down_name).unwrap();
-        validate_bf16_shape(source, &gu_name, gu, &[ecount as u64, 2 * i as u64, h as u64])?;
-        validate_bf16_shape(source, &down_name, down, &[ecount as u64, h as u64, i as u64])?;
+        validate_bf16_shape(
+            source,
+            &gu_name,
+            gu,
+            &[ecount as u64, 2 * i as u64, h as u64],
+        )?;
+        validate_bf16_shape(
+            source,
+            &down_name,
+            down,
+            &[ecount as u64, h as u64, i as u64],
+        )?;
         for expert in 0..ecount {
             out.insert(
                 (layer, expert),
@@ -306,6 +318,12 @@ fn build_experts(
     Ok(out)
 }
 
+fn is_ngram_weight_suffix(rest: &str) -> bool {
+    rest == "ple.ple_embedding.ngram_embedding.weight"
+        || rest.starts_with("ple.ple_embedding.ngram_embedding.shard_")
+        || rest == "ple.ple_embedding.ngram_embedding.weight_scale"
+}
+
 fn add_ple_tensors(
     source: &SourceInventory,
     base: &str,
@@ -313,21 +331,29 @@ fn add_ple_tensors(
     layers: &mut BTreeMap<u32, BTreeMap<String, TensorRef>>,
     consumed: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let prefix = format!("{base}.ple.");
+    // Real Qwen3.8 checkpoints put PLE under layers.(ple_layer_ids[0]-1).ple;
+    // the historical tiny fixture used model.ple. Accept both layouts.
+    let layer_prefix = format!("{base}.layers.{ple_layer}.ple.");
+    let global_prefix = format!("{base}.ple.");
+    let prefix = if source.tensors.keys().any(|n| n.starts_with(&layer_prefix)) {
+        layer_prefix
+    } else if source.tensors.keys().any(|n| n.starts_with(&global_prefix)) {
+        global_prefix
+    } else {
+        return invalid(&source.root, "missing Qwen4 PLE tensors");
+    };
+
     let ple = layers.entry(ple_layer).or_default();
     let single_name = format!("{prefix}ple_embedding.ngram_embedding.weight");
     let source_shard_prefix = format!("{prefix}ple_embedding.ngram_embedding.shard_");
+    let source_scale_name = format!("{prefix}ple_embedding.ngram_embedding.weight_scale");
 
-    // First copy all small PLE tensors and metadata verbatim. The large ngram
-    // tensor is handled separately below.
     for (name, tensor) in &source.tensors {
         let Some(rest) = name.strip_prefix(&prefix) else { continue };
-        if name == &single_name || name.starts_with(&source_shard_prefix) {
-            continue;
-        }
-        // Native BF16 checkpoints normally have no ngram scale. If an exporter
-        // supplied one, preserve it unless we generate our own BF16->F8 scale.
-        if rest == "ple_embedding.ngram_embedding.weight_scale" {
+        if name == &single_name
+            || name.starts_with(&source_shard_prefix)
+            || name == &source_scale_name
+        {
             continue;
         }
         ple.insert(format!("ple.{rest}"), tensor.clone());
@@ -335,9 +361,20 @@ fn add_ple_tensors(
     }
 
     if let Some(table) = source.tensors.get(&single_name) {
-        add_single_bf16_ngram(source, table, ple)?;
-        consumed.insert(single_name.clone());
-        add_generated_ple_scale(table, ple);
+        if table.dtype == "BF16" {
+            let scale_bits = derive_ple_scale(source, std::slice::from_ref(table))?;
+            add_single_bf16_ngram(source, table, scale_bits, ple)?;
+            add_generated_ple_scale(table, scale_bits, ple);
+        } else {
+            return invalid(
+                &source.root,
+                format!("unsupported unsplit PLE dtype {}", table.dtype),
+            );
+        }
+        consumed.insert(single_name);
+        if source.tensors.contains_key(&source_scale_name) {
+            consumed.insert(source_scale_name);
+        }
         return Ok(());
     }
 
@@ -357,54 +394,95 @@ fn add_ple_tensors(
     if shards.is_empty() {
         return invalid(&source.root, "missing PLE ngram embedding weight/shards");
     }
-    for (ordinal, (_source_index, name, tensor)) in shards.into_iter().enumerate() {
-        let out = f8_view_of_bf16(source, &name, &tensor)?;
-        ple.insert(
-            format!("ple.ple_embedding.ngram_embedding.shard_{ordinal:03}"),
-            out,
-        );
-        consumed.insert(name);
+
+    let all_bf16 = shards.iter().all(|(_, _, tensor)| tensor.dtype == "BF16");
+    let all_f8 = shards
+        .iter()
+        .all(|(_, _, tensor)| matches!(tensor.dtype.as_str(), "F8_E4M3" | "F8_E4M3FN"));
+    if !all_bf16 && !all_f8 {
+        return invalid(&source.root, "PLE shards have mixed/unsupported dtypes");
     }
-    let first = ple
-        .values()
-        .find(|t| t.dtype == PLE_F8_FROM_BF16_S16)
-        .cloned()
-        .ok_or_else(|| missing(source, "BF16 PLE ngram shard"))?;
-    add_generated_ple_scale(&first, ple);
+
+    if all_bf16 {
+        let refs: Vec<TensorRef> = shards.iter().map(|(_, _, tensor)| tensor.clone()).collect();
+        let scale_bits = derive_ple_scale(source, &refs)?;
+        for (ordinal, (_index, name, tensor)) in shards.into_iter().enumerate() {
+            let out = f8_view_of_bf16(source, &name, &tensor, scale_bits)?;
+            ple.insert(
+                format!("ple.ple_embedding.ngram_embedding.shard_{ordinal:03}"),
+                out,
+            );
+            consumed.insert(name);
+        }
+        let first = ple
+            .values()
+            .find(|tensor| tensor.dtype.starts_with(PLE_BF16_TO_F8_PREFIX))
+            .cloned()
+            .ok_or_else(|| missing(source, "lowered PLE shard"))?;
+        add_generated_ple_scale(&first, scale_bits, ple);
+    } else {
+        // Already-FP8 sources are copied exactly. They must carry the global
+        // BF16 scale expected by the runtime.
+        let scale = source
+            .tensors
+            .get(&source_scale_name)
+            .ok_or_else(|| missing(source, "PLE FP8 weight_scale"))?;
+        if scale.dtype != "BF16" || scale.len != 2 {
+            return invalid(&source.root, "PLE FP8 weight_scale must be one BF16 value");
+        }
+        for (ordinal, (_index, name, tensor)) in shards.into_iter().enumerate() {
+            ple.insert(
+                format!("ple.ple_embedding.ngram_embedding.shard_{ordinal:03}"),
+                tensor,
+            );
+            consumed.insert(name);
+        }
+        ple.insert(
+            "ple.ple_embedding.ngram_embedding.weight_scale".into(),
+            scale.clone(),
+        );
+        consumed.insert(source_scale_name);
+    }
     Ok(())
 }
 
 fn add_single_bf16_ngram(
     source: &SourceInventory,
     table: &TensorRef,
+    scale_bits: u16,
     ple: &mut BTreeMap<String, TensorRef>,
 ) -> Result<()> {
-    if table.dtype != "BF16" || table.shape.len() != 2 {
-        return invalid(
-            &source.root,
-            format!("PLE ngram table must be rank-2 BF16, got {}/ {:?}", table.dtype, table.shape),
-        );
-    }
+    validate_ple_bf16(source, "ngram_embedding.weight", table)?;
     let rows = table.shape[0];
     let cols = table.shape[1];
     let rows_per_shard = rows.div_ceil(PLE_SHARDS).max(1);
-    let source_row_bytes = cols.checked_mul(2).ok_or_else(|| missing(source, "PLE row size overflow"))?;
+    let source_row_bytes = cols
+        .checked_mul(2)
+        .ok_or_else(|| missing(source, "PLE row size overflow"))?;
     for shard in 0..PLE_SHARDS {
         let first_row = shard * rows_per_shard;
-        if first_row >= rows { break; }
+        if first_row >= rows {
+            break;
+        }
         let shard_rows = (rows - first_row).min(rows_per_shard);
         let offset = table
             .offset
-            .checked_add(first_row.checked_mul(source_row_bytes).ok_or_else(|| missing(source, "PLE shard offset overflow"))?)
+            .checked_add(
+                first_row
+                    .checked_mul(source_row_bytes)
+                    .ok_or_else(|| missing(source, "PLE shard offset overflow"))?,
+            )
             .ok_or_else(|| missing(source, "PLE shard offset overflow"))?;
-        let len = shard_rows.checked_mul(cols).ok_or_else(|| missing(source, "PLE shard size overflow"))?;
+        let len = shard_rows
+            .checked_mul(cols)
+            .ok_or_else(|| missing(source, "PLE shard size overflow"))?;
         ple.insert(
             format!("ple.ple_embedding.ngram_embedding.shard_{shard:03}"),
             TensorRef {
                 source: table.source.clone(),
                 offset,
                 len,
-                dtype: PLE_F8_FROM_BF16_S16.into(),
+                dtype: ple_quant_dtype(scale_bits),
                 shape: vec![shard_rows, cols],
             },
         );
@@ -412,55 +490,144 @@ fn add_single_bf16_ngram(
     Ok(())
 }
 
-fn f8_view_of_bf16(source: &SourceInventory, name: &str, tensor: &TensorRef) -> Result<TensorRef> {
-    if tensor.dtype != "BF16" || tensor.shape.len() != 2 {
-        return invalid(
-            &source.root,
-            format!("PLE shard `{name}` must be rank-2 BF16, got {}/{:?}", tensor.dtype, tensor.shape),
-        );
-    }
+fn f8_view_of_bf16(
+    source: &SourceInventory,
+    name: &str,
+    tensor: &TensorRef,
+    scale_bits: u16,
+) -> Result<TensorRef> {
+    validate_ple_bf16(source, name, tensor)?;
     if tensor.len % 2 != 0 {
         return invalid(&source.root, format!("PLE shard `{name}` has odd BF16 byte length"));
     }
     let mut out = tensor.clone();
     out.len /= 2;
-    out.dtype = PLE_F8_FROM_BF16_S16.into();
+    out.dtype = ple_quant_dtype(scale_bits);
     Ok(out)
 }
 
-fn add_generated_ple_scale(source_tensor: &TensorRef, ple: &mut BTreeMap<String, TensorRef>) {
+fn validate_ple_bf16(source: &SourceInventory, name: &str, tensor: &TensorRef) -> Result<()> {
+    if tensor.dtype != "BF16" || tensor.shape.len() != 2 {
+        return invalid(
+            &source.root,
+            format!("PLE tensor `{name}` must be rank-2 BF16, got {}/{:?}", tensor.dtype, tensor.shape),
+        );
+    }
+    let expected = tensor.shape[0]
+        .checked_mul(tensor.shape[1])
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| missing(source, "PLE tensor byte size overflow"))?;
+    if tensor.len != expected {
+        return invalid(
+            &source.root,
+            format!("PLE tensor `{name}` len {} != expected {expected}", tensor.len),
+        );
+    }
+    Ok(())
+}
+
+fn derive_ple_scale(source: &SourceInventory, tensors: &[TensorRef]) -> Result<u16> {
+    let mut max_abs = 0.0_f32;
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    for tensor in tensors {
+        validate_ple_bf16(source, "ngram shard", tensor)?;
+        let mut file = File::open(&tensor.source).map_err(|error| ColicError::Io {
+            path: tensor.source.clone(),
+            source: error,
+        })?;
+        file.seek(SeekFrom::Start(tensor.offset))
+            .map_err(|error| ColicError::Io {
+                path: tensor.source.clone(),
+                source: error,
+            })?;
+        let mut remaining = tensor.len;
+        while remaining != 0 {
+            let mut count = remaining.min(buffer.len() as u64) as usize;
+            count &= !1;
+            if count == 0 {
+                return invalid(&source.root, "odd BF16 PLE byte count");
+            }
+            file.read_exact(&mut buffer[..count])
+                .map_err(|error| ColicError::Io {
+                    path: tensor.source.clone(),
+                    source: error,
+                })?;
+            for pair in buffer[..count].chunks_exact(2) {
+                let bits = u16::from_le_bytes([pair[0], pair[1]]);
+                let value = f32::from_bits((bits as u32) << 16);
+                if !value.is_finite() {
+                    return invalid(&source.root, "PLE contains non-finite BF16 value");
+                }
+                max_abs = max_abs.max(value.abs());
+            }
+            remaining -= count as u64;
+        }
+    }
+    let needed = if max_abs == 0.0 {
+        1.0
+    } else {
+        max_abs / E4M3_MAX_FINITE
+    };
+    let bits = bf16_ceil_positive(needed);
+    let scale = f32::from_bits((bits as u32) << 16);
+    if !(scale.is_finite() && scale > 0.0) {
+        return invalid(&source.root, "derived invalid PLE FP8 scale");
+    }
+    Ok(bits)
+}
+
+fn bf16_ceil_positive(value: f32) -> u16 {
+    debug_assert!(value.is_finite() && value > 0.0);
+    let bits = value.to_bits();
+    let mut upper = (bits >> 16) as u16;
+    let represented = f32::from_bits((upper as u32) << 16);
+    if represented < value {
+        upper = upper.saturating_add(1);
+    }
+    upper
+}
+
+fn ple_quant_dtype(scale_bits: u16) -> String {
+    format!("{PLE_BF16_TO_F8_PREFIX}{scale_bits:04x}")
+}
+
+fn add_generated_ple_scale(
+    source_tensor: &TensorRef,
+    scale_bits: u16,
+    ple: &mut BTreeMap<String, TensorRef>,
+) {
     ple.insert(
         "ple.ple_embedding.ngram_embedding.weight_scale".into(),
         TensorRef {
             source: source_tensor.source.clone(),
             offset: source_tensor.offset,
             len: 2,
-            dtype: PLE_SCALE_CONST_S16.into(),
+            dtype: format!("{PLE_CONST_BF16_PREFIX}{scale_bits:04x}"),
             shape: vec![1],
         },
     );
 }
 
-fn ple_layer_index(config: &Value, layers: u32) -> Result<u32> {
+fn ple_layer_index(root: &Path, config: &Value, layers: u32) -> Result<u32> {
     let id = config
         .get("ple_layer_ids")
         .and_then(Value::as_array)
         .and_then(|ids| ids.first())
         .and_then(Value::as_u64)
-        .unwrap_or(1);
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: root.to_owned(),
+            detail: "Qwen4 config is missing ple_layer_ids[0]".into(),
+        })?;
     let zero = id.checked_sub(1).ok_or_else(|| ColicError::InvalidSource {
-        path: Path::new("config.json").to_owned(),
+        path: root.to_owned(),
         detail: "ple_layer_ids must be 1-based and non-zero".into(),
     })?;
     let zero: u32 = zero.try_into().map_err(|_| ColicError::InvalidSource {
-        path: Path::new("config.json").to_owned(),
+        path: root.to_owned(),
         detail: "PLE layer index exceeds u32".into(),
     })?;
     if zero >= layers {
-        return Err(ColicError::InvalidSource {
-            path: Path::new("config.json").to_owned(),
-            detail: format!("PLE layer {zero} is outside {layers} layers"),
-        });
+        return invalid(root, format!("PLE layer {zero} is outside {layers} layers"));
     }
     Ok(zero)
 }
@@ -474,7 +641,10 @@ fn required_layer_types(root: &Path, config: &Value, layers: u32) -> Result<Vec<
             detail: "Qwen4 config is missing layer_types".into(),
         })?;
     if array.len() != layers as usize {
-        return invalid(root, format!("layer_types has {} entries, expected {layers}", array.len()));
+        return invalid(
+            root,
+            format!("layer_types has {} entries, expected {layers}", array.len()),
+        );
     }
     array
         .iter()
@@ -504,24 +674,38 @@ fn validate_bf16_shape(
             format!("tensor `{name}` has {}/{:?}, expected BF16/{shape:?}", tensor.dtype, tensor.shape),
         );
     }
-    let expected = shape.iter().try_fold(2_u64, |bytes, dim| bytes.checked_mul(*dim))
+    let expected = shape
+        .iter()
+        .try_fold(2_u64, |bytes, dim| bytes.checked_mul(*dim))
         .ok_or_else(|| missing(source, format!("tensor `{name}` byte size overflow")))?;
     if tensor.len != expected {
-        return invalid(&source.root, format!("tensor `{name}` len {} != {expected}", tensor.len));
+        return invalid(
+            &source.root,
+            format!("tensor `{name}` len {} != {expected}", tensor.len),
+        );
     }
     Ok(())
 }
 
 fn whole_matrix(source: &SourceInventory, name: &str, rows: u32, cols: u32) -> Result<Matrix> {
     let tensor = required_bf16(source, name, &[rows as u64, cols as u64])?;
-    Ok(Matrix { source: tensor, rows, columns: cols, scale: None })
+    Ok(Matrix {
+        source: tensor,
+        rows,
+        columns: cols,
+        scale: None,
+    })
 }
 
 fn slice_rows(tensor: &TensorRef, row_start: u32, rows: u32, cols: u32) -> Result<Matrix> {
     let row_bytes = u64::from(cols) * 2;
-    let offset = tensor.offset
+    let offset = tensor
+        .offset
         .checked_add(u64::from(row_start) * row_bytes)
-        .ok_or_else(|| ColicError::InvalidSource { path: tensor.source.clone(), detail: "expert row offset overflow".into() })?;
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: tensor.source.clone(),
+            detail: "expert row offset overflow".into(),
+        })?;
     Ok(Matrix {
         source: TensorRef {
             source: tensor.source.clone(),
@@ -545,13 +729,21 @@ fn slice_fused(
     rows: u32,
 ) -> Result<Matrix> {
     let row_bytes = u64::from(cols) * 2;
-    let expert_rows = u64::from(expert) * u64::from(rows_per_expert);
-    let offset_rows = expert_rows + u64::from(row_start);
-    let offset = tensor.offset
-        .checked_add(offset_rows.checked_mul(row_bytes).ok_or_else(|| ColicError::InvalidSource {
-            path: tensor.source.clone(), detail: "fused expert offset overflow".into()
-        })?)
-        .ok_or_else(|| ColicError::InvalidSource { path: tensor.source.clone(), detail: "fused expert offset overflow".into() })?;
+    let offset_rows = u64::from(expert) * u64::from(rows_per_expert) + u64::from(row_start);
+    let offset = tensor
+        .offset
+        .checked_add(
+            offset_rows
+                .checked_mul(row_bytes)
+                .ok_or_else(|| ColicError::InvalidSource {
+                    path: tensor.source.clone(),
+                    detail: "fused expert offset overflow".into(),
+                })?,
+        )
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: tensor.source.clone(),
+            detail: "fused expert offset overflow".into(),
+        })?;
     Ok(Matrix {
         source: TensorRef {
             source: tensor.source.clone(),
@@ -567,12 +759,15 @@ fn slice_fused(
 }
 
 fn first_existing_name(source: &SourceInventory, names: &[String]) -> Option<String> {
-    names.iter().find(|name| source.tensors.contains_key(*name)).cloned()
+    names
+        .iter()
+        .find(|name| source.tensors.contains_key(*name))
+        .cloned()
 }
 
 fn required_u32(root: &Path, config: &Value, field: &str) -> Result<u32> {
     optional_u32(config, field)
-        .filter(|v| *v > 0)
+        .filter(|value| *value > 0)
         .ok_or_else(|| ColicError::InvalidSource {
             path: root.to_owned(),
             detail: format!("config `{field}` must be a positive u32"),
@@ -584,9 +779,29 @@ fn optional_u32(config: &Value, field: &str) -> Option<u32> {
 }
 
 fn missing(source: &SourceInventory, detail: impl Into<String>) -> ColicError {
-    ColicError::InvalidSource { path: source.root.clone(), detail: format!("missing required {0}", detail.into()) }
+    ColicError::InvalidSource {
+        path: source.root.clone(),
+        detail: format!("missing required {}", detail.into()),
+    }
 }
 
 fn invalid<T>(path: &Path, detail: impl Into<String>) -> Result<T> {
-    Err(ColicError::InvalidSource { path: path.to_owned(), detail: detail.into() })
+    Err(ColicError::InvalidSource {
+        path: path.to_owned(),
+        detail: detail.into(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bf16_ceil_never_rounds_scale_down() {
+        for value in [1.0e-6_f32, 0.001, 0.0625, 1.0, 123.456] {
+            let bits = bf16_ceil_positive(value);
+            let represented = f32::from_bits((bits as u32) << 16);
+            assert!(represented >= value);
+        }
+    }
 }
