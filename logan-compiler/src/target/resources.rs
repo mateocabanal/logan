@@ -6,9 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use logan_ir::{
-    MemoryPoolBudget, MemoryPoolId, ResourceBudget, StoragePoolBudget, StoragePoolId,
-};
+use logan_ir::{MemoryPoolBudget, MemoryPoolId, ResourceBudget, StoragePoolBudget, StoragePoolId};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -79,8 +77,6 @@ pub struct StoragePoolProfile {
     pub filesystem_identity: String,
     pub mount_point: String,
     pub capacity_bytes: u64,
-    /// Proven by an actual create-new/delete probe in the selected directory.
-    pub writable: CapabilitySupport,
     /// Keep capabilities unknown until Logan has actually probed or has a
     /// platform contract for them. Do not guess from filesystem type/name.
     pub pageable_mapping: CapabilitySupport,
@@ -95,6 +91,10 @@ pub struct StoragePoolObservation {
     /// Volatile planner observation. This is checked again before allocation
     /// and must not be part of the stable execution ABI.
     pub available_bytes: u64,
+    /// Proven by an actual create-new/delete probe in the selected directory.
+    /// This can change with user/ACL state, so it is deliberately excluded
+    /// from the stable storage fingerprint.
+    pub writable: CapabilitySupport,
     /// Existing directory used for the probe. Persist requirements, not this
     /// machine-specific absolute path, in package execution plans.
     pub probe_directory: PathBuf,
@@ -150,7 +150,7 @@ impl MachineResourceProfile {
                 available_bytes: observation.available_bytes,
                 // Mutable backing is admitted only after writeability was
                 // proven, never from a metadata/permission-bit guess.
-                writable: observation.profile.writable.is_supported(),
+                writable: observation.writable.is_supported(),
             })
             .collect::<Vec<_>>();
         let budget = ResourceBudget {
@@ -169,12 +169,11 @@ impl MachineResourceProfile {
         profiles.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         for profile in profiles {
             canonical.push_str(&format!(
-                "storage={}:{}:{}:{}:{}:{}:{}:{}\n",
+                "storage={}:{}:{}:{}:{}:{}:{}\n",
                 profile.id.0,
                 profile.filesystem_identity,
                 profile.mount_point,
                 profile.capacity_bytes,
-                profile.writable.as_str(),
                 profile.pageable_mapping.as_str(),
                 profile.sparse_files.as_str(),
                 profile.direct_io.as_str(),
@@ -257,13 +256,13 @@ pub fn observe_storage_path(path: &Path) -> Result<StoragePoolObservation> {
             filesystem_identity: row.filesystem_identity,
             mount_point: row.mount_point,
             capacity_bytes: row.capacity_bytes,
-            writable,
             pageable_mapping: CapabilitySupport::Unknown,
             sparse_files: CapabilitySupport::Unknown,
             direct_io: CapabilitySupport::Unknown,
             preferred_alignment: None,
         },
         available_bytes: row.available_bytes,
+        writable,
         probe_directory: directory,
     })
 }
@@ -287,7 +286,10 @@ fn nearest_existing_directory(path: &Path) -> Result<PathBuf> {
         }
         if candidate.exists() {
             let parent = candidate.parent().ok_or_else(|| {
-                ColicError::Usage(format!("storage path `{}` has no parent directory", path.display()))
+                ColicError::Usage(format!(
+                    "storage path `{}` has no parent directory",
+                    path.display()
+                ))
             })?;
             return fs::canonicalize(parent).map_err(|source| ColicError::Io {
                 path: parent.to_owned(),
@@ -319,9 +321,8 @@ fn probe_df(directory: &Path) -> Result<DfRow> {
             directory.display()
         )));
     }
-    let stdout = String::from_utf8(output.stdout).map_err(|error| {
-        ColicError::Usage(format!("df -Pk returned non-UTF8 output: {error}"))
-    })?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| ColicError::Usage(format!("df -Pk returned non-UTF8 output: {error}")))?;
     parse_df_pk(&stdout).ok_or_else(|| {
         ColicError::Usage(format!(
             "could not parse df -Pk output for `{}`",
@@ -391,7 +392,10 @@ fn prove_directory_writable(directory: &Path) -> CapabilitySupport {
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-            ) => CapabilitySupport::Unsupported,
+            ) =>
+        {
+            CapabilitySupport::Unsupported
+        }
         Err(_) => CapabilitySupport::Unknown,
     }
 }
@@ -438,13 +442,13 @@ mod tests {
                 filesystem_identity: "/dev/test".into(),
                 mount_point: "/models".into(),
                 capacity_bytes: 1_000_000,
-                writable: CapabilitySupport::Supported,
                 pageable_mapping: CapabilitySupport::Unknown,
                 sparse_files: CapabilitySupport::Unknown,
                 direct_io: CapabilitySupport::Unknown,
                 preferred_alignment: None,
             },
             available_bytes,
+            writable: CapabilitySupport::Supported,
             probe_directory: PathBuf::from("/models"),
         }
     }
@@ -470,7 +474,10 @@ mod tests {
     fn ram_capacity_changes_machine_resource_fingerprint_not_execution_abi() {
         let low = apple_machine(Some(16 << 30));
         let high = apple_machine(Some(64 << 30));
-        assert_ne!(low.resource_profile().fingerprint, high.resource_profile().fingerprint);
+        assert_ne!(
+            low.resource_profile().fingerprint,
+            high.resource_profile().fingerprint
+        );
         assert!(low.apple8_abi && high.apple8_abi);
     }
 
@@ -484,7 +491,10 @@ mod tests {
         assert_eq!(parsed.mount_point, "/models");
 
         let spaced_mount = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s1 2000000 500000 1500000 25% /Volumes/Fast Models\n";
-        assert_eq!(parse_df_pk(spaced_mount).unwrap().mount_point, "/Volumes/Fast Models");
+        assert_eq!(
+            parse_df_pk(spaced_mount).unwrap().mount_point,
+            "/Volumes/Fast Models"
+        );
     }
 
     #[test]
@@ -496,6 +506,22 @@ mod tests {
             machine.fingerprint_with_storage(&[low]),
             machine.fingerprint_with_storage(&[high])
         );
+    }
+
+    #[test]
+    fn current_write_permission_is_not_part_of_stable_storage_fingerprint() {
+        let machine = apple_machine(Some(16 << 30)).resource_profile();
+        let writable = storage(100_000);
+        let mut readonly = writable.clone();
+        readonly.writable = CapabilitySupport::Unsupported;
+        assert_eq!(
+            machine.fingerprint_with_storage(&[writable]),
+            machine.fingerprint_with_storage(&[readonly.clone()])
+        );
+        let budget = machine
+            .resource_budget(&[readonly], &BTreeMap::new())
+            .unwrap();
+        assert!(!budget.storage_pools[0].writable);
     }
 
     #[test]
