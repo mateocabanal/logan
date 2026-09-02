@@ -1,0 +1,32 @@
+name: issue93 compatibility patch
+
+on:
+  push:
+    branches: [feat/tiered-resource-ir-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/tiered-resource-ir-v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply scoped patch
+        run: python3 .github/issue93_patch.py
+      - name: Test IR
+        run: cargo test -p logan-ir --all-targets
+      - name: Test compiler
+        run: cargo test -p logan-compiler --all-targets -- --test-threads=1
+      - name: Commit scoped result and remove one-shot machinery
+        run: |
+          rm .github/issue93_patch.py .github/workflows/issue93-patch.yml
+          git config user.name "logan-issue93"
+          git config user.email "actions@users.noreply.github.com"
+          git add logan-compiler/src/pipeline.rs .github/issue93_patch.py .github/workflows/issue93-patch.yml
+          git commit -m "chore: keep compiler compatible with resource plan v4"
+          git push origin HEAD:feat/tiered-resource-ir-v2
