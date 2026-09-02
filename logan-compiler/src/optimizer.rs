@@ -346,11 +346,13 @@ pub(crate) fn build_plans(
     }
     let (base_resident_bytes, memory_budget_bytes) =
         machine_base_reserve(model, target_profile, machine)?;
+    let base_package_bytes = dense_resident_bytes(model)?;
     let input = OptimizeInput {
         groups,
         contexts: context_candidates(model, constraint),
         context_constraint: constraint,
         base_resident_bytes,
+        base_package_bytes,
         memory_budget_bytes,
         heterogeneity_penalty: 250,
     };

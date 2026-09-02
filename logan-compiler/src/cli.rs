@@ -216,7 +216,9 @@ where
     let mut target_explicit = false;
     let mut context = None;
     let mut optimize = false;
+    let mut plan_choice = None;
     let mut quant = RecompileQuantMode::Keep;
+    let mut quant_explicit = false;
     let mut quant_rules = Vec::new();
     let mut codec = RecompileCodecMode::Keep;
     let mut allow_requantize = false;
@@ -237,6 +239,7 @@ where
                 target_explicit = true;
             }
             "--optimize" => optimize = true,
+            "--select-plan" => plan_choice = Some(value(&mut args, "--select-plan")?),
             "--max-context" => {
                 if context.is_some() {
                     return Err(ColicError::Usage(
@@ -259,7 +262,10 @@ where
                     "--require-context",
                 )?));
             }
-            "--quant" => quant = RecompileQuantMode::parse(&value(&mut args, "--quant")?)?,
+            "--quant" => {
+                quant = RecompileQuantMode::parse(&value(&mut args, "--quant")?)?;
+                quant_explicit = true;
+            }
             "--quant-rule" => {
                 quant_rules.push(QuantRule::parse(&value(&mut args, "--quant-rule")?)?)
             }
@@ -289,6 +295,11 @@ where
                 .into(),
         ));
     }
+    if plan_choice.is_some() && !optimize {
+        return Err(ColicError::Usage(
+            "recompile --select-plan requires --optimize".into(),
+        ));
+    }
     if optimize && !target_explicit {
         target = "auto".to_owned();
     }
@@ -310,10 +321,12 @@ where
         output,
         target,
         quant,
+        quant_explicit,
         quant_rules,
         codec,
         context,
         optimize,
+        plan_choice,
         allow_requantize,
         repack,
         verify,
@@ -477,6 +490,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn optimized_recompile_parses_named_plan_and_explicit_quant_constraint() {
+        let command = parse(
+            [
+                "recompile",
+                "model.coli",
+                "--in-place",
+                "--optimize",
+                "--require-context",
+                "65536",
+                "--select-plan",
+                "balanced",
+                "--quant",
+                "mxfp4",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(request) = command else {
+            panic!("expected recompile")
+        };
+        assert_eq!(request.plan_choice.as_deref(), Some("balanced"));
+        assert!(request.quant_explicit);
+        assert_eq!(request.quant, RecompileQuantMode::Mxfp4);
     }
 
     #[test]

@@ -964,7 +964,7 @@ fn requested_expert_constraint(request: &CompileRequest) -> Result<Option<Expert
     }
 }
 
-fn choose_optimizer_plan(
+pub(crate) fn choose_optimizer_plan(
     plans: &[logan_ir::ParetoPlan],
     requested: Option<&str>,
 ) -> Result<String> {

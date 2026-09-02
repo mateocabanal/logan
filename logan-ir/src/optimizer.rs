@@ -64,6 +64,7 @@ pub struct OptimizeInput {
     pub contexts: Vec<ContextCandidate>,
     pub context_constraint: ContextConstraint,
     pub base_resident_bytes: u64,
+    pub base_package_bytes: u64,
     pub memory_budget_bytes: u64,
     pub heterogeneity_penalty: u64,
 }
@@ -342,11 +343,15 @@ pub fn optimize(input: &OptimizeInput) -> Result<Vec<ParetoPlan>, String> {
             if resident_bytes > input.memory_budget_bytes {
                 continue;
             }
+            let Some(package_bytes) = input.base_package_bytes.checked_add(state.package_bytes)
+            else {
+                continue;
+            };
             let metrics = PlanMetrics {
                 quality_loss: state.quality_loss,
                 latency_cost: state.latency_cost,
                 resident_bytes,
-                package_bytes: state.package_bytes,
+                package_bytes,
                 context_tokens: context.tokens,
                 representation_switches: state.switches,
             };
@@ -467,6 +472,7 @@ mod tests {
             }],
             context_constraint: ContextConstraint::required(65_536),
             base_resident_bytes: 0,
+            base_package_bytes: 0,
             memory_budget_bytes: u64::MAX,
             heterogeneity_penalty: 5,
         };
@@ -505,6 +511,7 @@ mod tests {
             ],
             context_constraint: ContextConstraint::maximum(65_536),
             base_resident_bytes: 100,
+            base_package_bytes: 0,
             memory_budget_bytes: 1_000,
             heterogeneity_penalty: 7,
         };
@@ -530,6 +537,7 @@ mod tests {
             ],
             context_constraint: ContextConstraint::required(65_536),
             base_resident_bytes: 200,
+            base_package_bytes: 0,
             memory_budget_bytes: 1_000,
             heterogeneity_penalty: 0,
         };
