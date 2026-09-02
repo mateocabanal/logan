@@ -71,6 +71,7 @@ pub fn dry_run(request: &CompileRequest) -> Result<DryRunSummary> {
         source_tensors: inventory.tensors.len(),
         source_stored_bytes: inventory.source_stored_bytes,
         plan,
+        optimizer_plans: Vec::new(),
     })
 }
 
