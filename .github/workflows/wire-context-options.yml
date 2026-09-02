@@ -1,0 +1,34 @@
+name: wire-context-options
+
+on:
+  push:
+    branches: [feat/context-aware-compile-plan]
+    paths:
+      - 'tools/wire_context_options.py'
+      - '.github/workflows/wire-context-options.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/context-aware-compile-plan
+          fetch-depth: 0
+      - name: Apply exact patch
+        run: python3 tools/wire_context_options.py
+      - name: Remove one-shot machinery
+        run: |
+          rm tools/wire_context_options.py
+          rm .github/workflows/wire-context-options.yml
+      - name: Commit result
+        run: |
+          git config user.name 'logan-context-wiring'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'feat: wire context planning into compile and recompile'
+          git push origin HEAD:feat/context-aware-compile-plan
