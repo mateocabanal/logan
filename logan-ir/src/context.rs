@@ -56,6 +56,7 @@ impl ContextConstraint {
 pub struct ContextStateBytes {
     pub full_attention_kv: u64,
     pub gdn_recurrent: u64,
+    pub gdn_conv: u64,
     pub qsa_index: u64,
     pub ple: u64,
     pub mtp_speculative: u64,
@@ -67,6 +68,7 @@ impl ContextStateBytes {
         [
             self.full_attention_kv,
             self.gdn_recurrent,
+            self.gdn_conv,
             self.qsa_index,
             self.ple,
             self.mtp_speculative,
@@ -74,6 +76,10 @@ impl ContextStateBytes {
         ]
         .into_iter()
         .try_fold(0_u64, u64::checked_add)
+    }
+
+    pub fn total_bytes(self) -> u64 {
+        self.total().unwrap_or(u64::MAX)
     }
 }
 
@@ -98,8 +104,8 @@ impl ContextPlan {
 /// Capacity accounting that precedes weight residency/cache optimization.
 ///
 /// The optimizer may only spend `available_for_weights_and_cache()` on
-/// resident weights and optional caches. Fixed/context/scratch state and the
-/// host safety reserves are removed first.
+/// optional residency/cache after fixed/context/scratch state and host safety
+/// reserves are removed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannerMemoryBudget {
     pub physical_memory: u64,
@@ -164,12 +170,13 @@ mod tests {
         let state = ContextStateBytes {
             full_attention_kv: 4_000,
             gdn_recurrent: 300,
+            gdn_conv: 200,
             qsa_index: 500,
             ple: 100,
             mtp_speculative: 50,
             other: 25,
         };
-        assert_eq!(state.total(), Some(4_975));
+        assert_eq!(state.total(), Some(5_175));
         assert_eq!(
             ContextStateBytes {
                 full_attention_kv: u64::MAX,
@@ -192,13 +199,14 @@ mod tests {
             context_state: ContextStateBytes {
                 full_attention_kv: 3_000,
                 gdn_recurrent: 250,
+                gdn_conv: 250,
                 qsa_index: 250,
                 ..ContextStateBytes::default()
             },
             execution_scratch: 500,
         };
-        assert_eq!(budget.reserved_bytes(), Some(8_500));
-        assert_eq!(budget.available_for_weights_and_cache(), Some(7_500));
+        assert_eq!(budget.reserved_bytes(), Some(8_750));
+        assert_eq!(budget.available_for_weights_and_cache(), Some(7_250));
     }
 
     #[test]

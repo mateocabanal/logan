@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use logan_ir::{
-    BUILTIN_COST_MODEL_V1, CandidateGroup, ContextCandidate, ContextConstraint, OptimizerInput,
-    ParetoPlan, Placement, QuantSpec, RepresentationCandidate, material_plans, select_plan,
+    BUILTIN_COST_MODEL_V1, CandidateGroup, ContextConstraint, OptimizerInput, ParetoPlan,
+    Placement, QuantSpec, RepresentationCandidate, material_plans, select_plan,
 };
 
 use crate::{
@@ -115,6 +115,7 @@ impl CompileOptimization {
 
 pub fn compile_plans(
     model: &SemanticModel,
+    model_root: &Path,
     target_profile: TargetProfile,
     machine: &MachineProfile,
     context: ContextConstraint,
@@ -122,53 +123,64 @@ pub fn compile_plans(
     cache_slots: Option<u64>,
 ) -> Result<CompileOptimization> {
     let calibration = CalibrationScores::load(calibration_path)?;
-    let input = compile_optimizer_input(
+    let (input, context_planning) = compile_optimizer_input(
         model,
+        model_root,
         target_profile,
         machine,
         context,
         &calibration,
         cache_slots.unwrap_or(DEFAULT_EXPERT_CACHE_SLOTS).max(1),
     )?;
-    let plans = material_plans(&input).map_err(|detail| ColicError::Unsupported {
+    let mut plans = material_plans(&input).map_err(|detail| ColicError::Unsupported {
         stage: "target planning",
         detail,
     })?;
+    context_planning.enrich_plans(&mut plans)?;
     Ok(CompileOptimization { plans })
 }
 
 fn compile_optimizer_input(
     model: &SemanticModel,
+    model_root: &Path,
     target_profile: TargetProfile,
     machine: &MachineProfile,
     context: ContextConstraint,
     calibration: &CalibrationScores,
     cache_slots: u64,
-) -> Result<OptimizerInput> {
+) -> Result<(OptimizerInput, crate::context_plan::ContextPlanning)> {
     let memory_budget_bytes = machine
         .ram_bytes
         .unwrap_or(target::machine::DEFAULT_POOL_BUDGET);
     let mut base_resident_bytes = 0_u64;
     let mut base_package_bytes = 0_u64;
     let mut base_storage_traffic_bytes = 0_u64;
-    for tensor in model
-        .global_tensors
-        .values()
-        .chain(
-            model
-                .layer_static_tensors
-                .values()
-                .flat_map(|tensors| tensors.values()),
-        )
-        .chain(model.resident_tensors.values())
-    {
+    let mut account_tensor = |name: &str, tensor: &crate::source::TensorRef| -> Result<()> {
         let stored = target::exact_tensor_stored_bytes(tensor)?;
-        base_resident_bytes =
-            checked_add(base_resident_bytes, tensor.len, "resident tensor bytes")?;
+        if !is_streamed_ple_tensor(name) {
+            base_resident_bytes =
+                checked_add(base_resident_bytes, tensor.len, "resident tensor bytes")?;
+        }
         base_package_bytes = checked_add(base_package_bytes, stored, "package tensor bytes")?;
         base_storage_traffic_bytes =
             checked_add(base_storage_traffic_bytes, stored, "tensor storage traffic")?;
+        Ok(())
+    };
+    for (name, tensor) in &model.global_tensors {
+        account_tensor(name, tensor)?;
     }
+    for tensors in model.layer_static_tensors.values() {
+        for (name, tensor) in tensors {
+            account_tensor(name, tensor)?;
+        }
+    }
+    for (name, tensor) in &model.resident_tensors {
+        account_tensor(name, tensor)?;
+    }
+    drop(account_tensor);
+
+    let context_planning =
+        crate::context_plan::plan_from_package(model_root, context, machine, base_resident_bytes)?;
 
     let layer_count = u64::from(model.geometry.layers.max(1));
     let slots_per_layer = cache_slots.div_ceil(layer_count).max(1);
@@ -306,26 +318,26 @@ fn compile_optimizer_input(
         groups.push(CandidateGroup { key, options });
     }
 
-    Ok(OptimizerInput {
-        cost_model: BUILTIN_COST_MODEL_V1.into(),
-        groups,
-        context_constraint: context,
-        // #81 owns architecture-specific context-state expansion. #82 consumes
-        // the shared contract and treats the requested point as fixed until
-        // those additional admissible context points are available.
-        context_candidates: vec![ContextCandidate {
-            tokens: context.tokens,
-            resident_bytes: 0,
-            latency_cost: 0,
-        }],
-        memory_budget_bytes,
-        base_resident_bytes,
-        base_package_bytes,
-        base_storage_traffic_bytes,
-        base_latency_cost: 0,
-        base_quality_loss_ppm: 0,
-        heterogeneity_switch_penalty: HETEROGENEITY_SWITCH_PENALTY,
-    })
+    Ok((
+        OptimizerInput {
+            cost_model: BUILTIN_COST_MODEL_V1.into(),
+            groups,
+            context_constraint: context,
+            context_candidates: context_planning.optimizer_candidates(),
+            memory_budget_bytes,
+            base_resident_bytes,
+            base_package_bytes,
+            base_storage_traffic_bytes,
+            base_latency_cost: 0,
+            base_quality_loss_ppm: 0,
+            heterogeneity_switch_penalty: HETEROGENEITY_SWITCH_PENALTY,
+        },
+        context_planning,
+    ))
+}
+
+fn is_streamed_ple_tensor(name: &str) -> bool {
+    name.contains("ple.ple_embedding.ngram_embedding.shard_")
 }
 
 pub fn selected_layer_quantization(plan: &ParetoPlan) -> Result<BTreeMap<u32, bool>> {

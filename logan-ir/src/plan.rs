@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{graph::Graph, optimizer::ParetoPlan};
 
 /// Artifact format version. Bump on any breaking change to the schema.
-pub const PLAN_ARTIFACT_VERSION: u32 = 2;
+pub const PLAN_ARTIFACT_VERSION: u32 = 3;
 
 /// Where a weight lives at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

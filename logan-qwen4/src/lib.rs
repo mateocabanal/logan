@@ -3336,11 +3336,28 @@ impl Model {
             ple_offsets,
             ple_sizes,
             ple_mult,
-            gdn_conv: vec![
-                vec![0.0; (cdim_total(cfg)) * cfg.conv_kernel.saturating_sub(1)];
-                cfg.layers
-            ],
-            gdn_s: vec![vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]; cfg.layers],
+            gdn_conv: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        vec![0.0; (cdim_total(cfg)) * cfg.conv_kernel.saturating_sub(1)]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
+            gdn_s: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
             kv_k: cfg
                 .gdn_layers
                 .iter()

@@ -5,9 +5,9 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
-    cache_cap,
-    colisource::{bf16_to_f32, ColiSource},
-    lazy_zeroed_f32, Cfg, HcGlobal, Layer, Model, Wt,
+    Cfg, HcGlobal, Layer, Model, Wt, cache_cap,
+    colisource::{ColiSource, bf16_to_f32},
+    lazy_zeroed_f32,
 };
 
 /// C parity (coli_target_registry.h): the direct Apple8/MetalIO execution
@@ -461,11 +461,28 @@ impl Model {
             ple_offsets,
             ple_sizes,
             ple_mult,
-            gdn_conv: vec![
-                vec![0.0; (cdim_total(&cfg)) * cfg.conv_kernel.saturating_sub(1)];
-                cfg.layers
-            ],
-            gdn_s: vec![vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]; cfg.layers],
+            gdn_conv: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        vec![0.0; (cdim_total(&cfg)) * cfg.conv_kernel.saturating_sub(1)]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
+            gdn_s: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
             kv_k: cfg
                 .gdn_layers
                 .iter()

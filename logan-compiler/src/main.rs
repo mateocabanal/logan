@@ -211,7 +211,7 @@ fn human_bytes(bytes: u64) -> String {
 fn print_optimizer_plans(plans: &[logan_ir::ParetoPlan]) {
     for (index, plan) in plans.iter().enumerate() {
         eprintln!(
-            "  [{}] {} aliases={} quality={}ppm context={} latency={} resident={} package={} traffic={}",
+            "  [{}] {} aliases={} quant_loss={}ppm context={} latency={} resident={} package={} traffic={}",
             index + 1,
             plan.id,
             if plan.labels.is_empty() {
@@ -226,6 +226,28 @@ fn print_optimizer_plans(plans: &[logan_ir::ParetoPlan]) {
             human_bytes(plan.metrics.package_bytes),
             human_bytes(plan.metrics.storage_traffic_bytes),
         );
+        if let Some(budget) = plan.memory_budget {
+            let state = budget.context_state;
+            eprintln!(
+                "      memory physical={} os={} runtime={} safety={} fixed={} scratch={} | kv={} gdn_recur={} gdn_conv={} qsa={} ple={} mtp={} | cache_headroom={}",
+                human_bytes(budget.physical_memory),
+                human_bytes(budget.os_reserve),
+                human_bytes(budget.runtime_reserve),
+                human_bytes(budget.safety_reserve),
+                human_bytes(budget.fixed_model_state),
+                human_bytes(budget.execution_scratch),
+                human_bytes(state.full_attention_kv),
+                human_bytes(state.gdn_recurrent),
+                human_bytes(state.gdn_conv),
+                human_bytes(state.qsa_index),
+                human_bytes(state.ple),
+                human_bytes(state.mtp_speculative),
+                budget
+                    .available_for_weights_and_cache()
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "none".to_owned()),
+            );
+        }
     }
 }
 

@@ -18,8 +18,8 @@ use logan_format::{
     package::{Package, RecordInfo},
 };
 use logan_ir::{
-    BUILTIN_COST_MODEL_V1, CandidateGroup, ContextCandidate, ContextConstraint, OptimizerInput,
-    ParetoPlan, Placement, QuantSpec, RepresentationCandidate, material_plans, select_plan,
+    BUILTIN_COST_MODEL_V1, CandidateGroup, ContextConstraint, OptimizerInput, ParetoPlan,
+    Placement, QuantSpec, RepresentationCandidate, material_plans, select_plan,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -577,6 +577,12 @@ fn build_recompile_plans(
                 .ok_or_else(|| ColicError::Usage("recompile resident bytes overflow".into()))?;
         }
     }
+    let context_planning = crate::context_plan::plan_from_package(
+        &request.source,
+        context,
+        &machine,
+        base_resident_bytes,
+    )?;
     let layer_count = by_layer.len().max(1) as u64;
     let slots_per_layer = 256_u64.div_ceil(layer_count).max(1);
     let experts_per_token = package_experts_per_token(&request.source);
@@ -725,11 +731,7 @@ fn build_recompile_plans(
         cost_model: BUILTIN_COST_MODEL_V1.into(),
         groups,
         context_constraint: context,
-        context_candidates: vec![ContextCandidate {
-            tokens: context.tokens,
-            resident_bytes: 0,
-            latency_cost: 0,
-        }],
+        context_candidates: context_planning.optimizer_candidates(),
         memory_budget_bytes,
         base_resident_bytes,
         base_package_bytes,
@@ -738,10 +740,12 @@ fn build_recompile_plans(
         base_quality_loss_ppm: 0,
         heterogeneity_switch_penalty: 64,
     };
-    material_plans(&input).map_err(|detail| ColicError::Unsupported {
+    let mut plans = material_plans(&input).map_err(|detail| ColicError::Unsupported {
         stage: "COLI optimization",
         detail,
-    })
+    })?;
+    context_planning.enrich_plans(&mut plans)?;
+    Ok(plans)
 }
 
 fn optimizer_mode_for_record(

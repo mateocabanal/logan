@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextConstraint, Placement, QuantSpec};
+use crate::{ContextConstraint, ContextPlan, Placement, PlannerMemoryBudget, QuantSpec};
 
 pub const BUILTIN_COST_MODEL_V1: &str = "logan-builtin-cost-v1";
 const MAX_FRONTIER_STATES: usize = 4096;
@@ -84,6 +84,10 @@ pub struct ParetoPlan {
     pub cost_model: String,
     pub metrics: PlanMetrics,
     pub decisions: Vec<PlanDecision>,
+    /// Compiler-populated architecture-specific context state for this point.
+    pub context_plan: Option<ContextPlan>,
+    /// Compiler-populated complete memory budget used to admit this point.
+    pub memory_budget: Option<PlannerMemoryBudget>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +419,8 @@ fn build_plan(input: &OptimizerInput, metrics: PlanMetrics, choices: &[usize]) -
         cost_model: input.cost_model.clone(),
         metrics,
         decisions,
+        context_plan: None,
+        memory_budget: None,
     }
 }
 
@@ -461,8 +467,16 @@ fn balanced_index(plans: &[ParetoPlan]) -> usize {
     let traffic = ranks(plans, |plan| plan.metrics.storage_traffic_bytes, false);
     (0..plans.len())
         .min_by_key(|&index| {
+            let dimensions = [
+                quality[index],
+                context[index],
+                latency[index],
+                resident[index],
+                traffic[index],
+            ];
             (
-                quality[index] + context[index] + latency[index] + resident[index] + traffic[index],
+                *dimensions.iter().max().unwrap_or(&0),
+                dimensions.iter().sum::<usize>(),
                 plans[index].id.clone(),
             )
         })
@@ -479,8 +493,15 @@ fn ranks(plans: &[ParetoPlan], value: impl Fn(&ParetoPlan) -> u64, reverse: bool
         )
     });
     let mut ranks = vec![0; plans.len()];
-    for (rank, index) in order.into_iter().enumerate() {
-        ranks[index] = rank;
+    let mut previous = None;
+    let mut tied_rank = 0_usize;
+    for (position, index) in order.into_iter().enumerate() {
+        let current = value(&plans[index]);
+        if previous.is_some_and(|previous| previous != current) {
+            tied_rank = position;
+        }
+        previous = Some(current);
+        ranks[index] = tied_rank;
     }
     ranks
 }
@@ -659,6 +680,45 @@ mod tests {
         let plans = material_plans(&spec).unwrap();
         let balanced = select_plan(&plans, "balanced").unwrap();
         assert_eq!(select_plan(&plans, &balanced.id).unwrap().id, balanced.id);
+    }
+
+    #[test]
+    fn balanced_plan_surfaces_context_memory_compromise() {
+        let spec = OptimizerInput {
+            cost_model: BUILTIN_COST_MODEL_V1.into(),
+            groups: Vec::new(),
+            context_constraint: ContextConstraint::maximum(131_072),
+            context_candidates: vec![
+                ContextCandidate {
+                    tokens: 32_768,
+                    resident_bytes: 3,
+                    latency_cost: 0,
+                },
+                ContextCandidate {
+                    tokens: 65_536,
+                    resident_bytes: 6,
+                    latency_cost: 0,
+                },
+                ContextCandidate {
+                    tokens: 131_072,
+                    resident_bytes: 12,
+                    latency_cost: 0,
+                },
+            ],
+            memory_budget_bytes: 16,
+            base_resident_bytes: 0,
+            base_package_bytes: 0,
+            base_storage_traffic_bytes: 0,
+            base_latency_cost: 0,
+            base_quality_loss_ppm: 0,
+            heterogeneity_switch_penalty: 0,
+        };
+        let plans = material_plans(&spec).unwrap();
+        let balanced = select_plan(&plans, "balanced").unwrap();
+        let long = select_plan(&plans, "long-context").unwrap();
+        assert_eq!(balanced.metrics.context_tokens, 65_536);
+        assert_eq!(long.metrics.context_tokens, 131_072);
+        assert_ne!(balanced.id, long.id);
     }
 
     #[test]

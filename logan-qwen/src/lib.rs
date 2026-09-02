@@ -898,11 +898,28 @@ impl Model {
             final_norm: st.f32("model.norm.weight", &[cfg.hidden as u64])?,
             layers,
             experts,
-            gdn_conv: vec![
-                vec![0.0; (cdim_total(cfg)) * cfg.conv_kernel.saturating_sub(1)];
-                cfg.layers
-            ],
-            gdn_s: vec![vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]; cfg.layers],
+            gdn_conv: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        vec![0.0; (cdim_total(cfg)) * cfg.conv_kernel.saturating_sub(1)]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
+            gdn_s: cfg
+                .gdn_layers
+                .iter()
+                .map(|&is_gdn| {
+                    if is_gdn {
+                        vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
             kv_k: vec![0.0; cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim],
             kv_v: vec![0.0; cfg.layers * cfg.kv_heads * cfg.max_t * cfg.head_dim],
         })
@@ -915,7 +932,11 @@ fn cdim_total(cfg: &Cfg) -> usize {
 
 /// Standalone greedy runner for `logan run` on a Qwen3 MoE package dir
 /// (safetensors fixture or .coli package dir with config.json).
-pub fn run_greedy(package_dir: &std::path::Path, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
+pub fn run_greedy(
+    package_dir: &std::path::Path,
+    prompt: &[u32],
+    max_new: usize,
+) -> Result<Vec<u32>, String> {
     let cfg = load_cfg(&package_dir.join("config.json"))?;
     let st = StFile::open(&package_dir.join("model.safetensors"))?;
     let mut model = Model::load(&st, &cfg)?;
