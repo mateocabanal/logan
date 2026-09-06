@@ -563,6 +563,141 @@ kernel void kda_state(
   }
   oh[hq + i] = oi;
 }
+
+// Qwen3.5/3.6 Gated DeltaNet recurrence/norm. The dense projections around
+// this kernel are encoded with the existing fmt=7 GEMV pipeline, so MXFP4
+// input -> recurrence -> MXFP4 output can live in one command buffer.
+inline float qwen_gdn_conv_one_mx(
+    device const float *qkv,
+    device const float *weights,
+    device float *conv_state,
+    int ch,
+    int kk)
+{
+  float acc = 0.0f;
+  if (kk > 1) {
+    const long sb = (long)ch * (kk - 1);
+    const long wb = (long)ch * kk;
+    for (int j = 0; j < kk; ++j) {
+      const float v = (j == kk - 1) ? qkv[ch] : conv_state[sb + j];
+      acc += weights[wb + j] * v;
+    }
+    for (int j = 0; j < kk - 2; ++j)
+      conv_state[sb + j] = conv_state[sb + j + 1];
+    conv_state[sb + (kk - 2)] = qkv[ch];
+  } else {
+    acc = weights[ch] * qkv[ch];
+  }
+  return acc / (1.0f + exp(-acc));
+}
+
+kernel void qwen_gdn_conv_recur_norm_mx(
+    device const float *qkv       [[buffer(0)]],
+    device const float *conv_w    [[buffer(1)]],
+    device float *conv_state      [[buffer(2)]],
+    device const float *a         [[buffer(3)]],
+    device const float *b         [[buffer(4)]],
+    device const float *z         [[buffer(5)]],
+    device const float *A_log     [[buffer(6)]],
+    device const float *dt_bias   [[buffer(7)]],
+    device const float *norm_w    [[buffer(8)]],
+    device float *state           [[buffer(9)]],
+    device float *normed          [[buffer(10)]],
+    constant int &kheads          [[buffer(11)]],
+    constant int &kd              [[buffer(12)]],
+    constant int &vheads          [[buffer(13)]],
+    constant int &vd              [[buffer(14)]],
+    constant int &kk              [[buffer(15)]],
+    constant float &eps           [[buffer(16)]],
+    constant int &output_gate     [[buffer(17)]],
+    threadgroup float *scratch    [[threadgroup(0)]],
+    uint kh_u                     [[threadgroup_position_in_grid]],
+    uint t                        [[thread_index_in_threadgroup]])
+{
+  const int kh = (int)kh_u;
+  const int rep = vheads / kheads;
+  const int threads = rep * vd;
+  const int local_head = (int)t / vd;
+  const int d = (int)t - local_head * vd;
+  const int h = kh * rep + local_head;
+  const int kdim = kheads * kd;
+
+  threadgroup float *qv = scratch;
+  threadgroup float *kv = qv + kd;
+  threadgroup float *head_out = kv + kd;
+  threadgroup float *norm_inv = head_out + rep * vd;
+  threadgroup float *common = norm_inv + rep;
+  threadgroup float *decay = common + 3;
+  threadgroup float *beta = decay + rep;
+
+  for (int qi = (int)t; qi < 2 * kd; qi += threads) {
+    if (qi < kd) {
+      const int ch = kh * kd + qi;
+      qv[qi] = qwen_gdn_conv_one_mx(qkv, conv_w, conv_state, ch, kk);
+    } else {
+      const int i = qi - kd;
+      const int ch = kdim + kh * kd + i;
+      kv[i] = qwen_gdn_conv_one_mx(qkv, conv_w, conv_state, ch, kk);
+    }
+  }
+
+  const int vch = 2 * kdim + h * vd + d;
+  const float vv = qwen_gdn_conv_one_mx(qkv, conv_w, conv_state, vch, kk);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (t == 0) {
+    float qs = 0.0f, ks = 0.0f;
+    for (int i = 0; i < kd; ++i) {
+      const float q = qv[i], k = kv[i];
+      qs += q * q; ks += k * k;
+    }
+    common[0] = 1.0f / sqrt(qs + 1.0e-6f);
+    common[1] = 1.0f / sqrt(ks + 1.0e-6f);
+    common[2] = 1.0f / sqrt((float)kd);
+  }
+  if (d == 0) {
+    const float ga = -exp(A_log[h]) * log(1.0f + exp(a[h] + dt_bias[h]));
+    decay[local_head] = exp(ga);
+    beta[local_head] = 1.0f / (1.0f + exp(-b[h]));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float qinv = common[0], kinv = common[1], qscale = common[2];
+  const float decay_h = decay[local_head], beta_h = beta[local_head];
+  const long hs = (long)h * kd * vd;
+  float kv_mem = 0.0f;
+  for (int kk2 = 0; kk2 < kd; ++kk2) {
+    const float khh = kv[kk2] * kinv;
+    const long si = hs + (long)kk2 * vd + d;
+    const float sv = state[si] * decay_h;
+    state[si] = sv;
+    kv_mem += sv * khh;
+  }
+  const float delta = (vv - kv_mem) * beta_h;
+  float outv = 0.0f;
+  for (int kk2 = 0; kk2 < kd; ++kk2) {
+    const float khh = kv[kk2] * kinv;
+    const float qhh = (qv[kk2] * qinv) * qscale;
+    const long si = hs + (long)kk2 * vd + d;
+    const float next_s = state[si] + khh * delta;
+    state[si] = next_s;
+    outv += next_s * qhh;
+  }
+  head_out[local_head * vd + d] = outv;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (d == 0) {
+    float ms = 0.0f;
+    const int hb = local_head * vd;
+    for (int i = 0; i < vd; ++i) { const float ov = head_out[hb + i]; ms += ov * ov; }
+    norm_inv[local_head] = 1.0f / sqrt(ms / (float)vd + eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float zv = z[(long)h * vd + d];
+  const float sig = 1.0f / (1.0f + exp(-zv));
+  const float gate = output_gate == 1 ? sig : zv * sig;
+  normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * gate;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -600,7 +735,7 @@ static id<MTLBuffer> fwht_signs(int n) {
 }
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
 static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
-static id<MTLComputePipelineState> g_kda_conv_silu, g_kda_l2_norm, g_kda_state;
+static id<MTLComputePipelineState> g_kda_conv_silu, g_kda_l2_norm, g_kda_state, g_qwen_gdn_recur;
 static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
                                   // serial kernel — see coli_metal_init.
 static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
@@ -819,7 +954,8 @@ extern "C" int coli_metal_init(void) {
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
     g_kda_conv_silu=P("kda_conv_silu"); g_kda_l2_norm=P("kda_l2_norm"); g_kda_state=P("kda_state");
-    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    g_qwen_gdn_recur=P("qwen_gdn_conv_recur_norm_mx");
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state||!g_qwen_gdn_recur){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
     // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
     // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
@@ -1165,6 +1301,468 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
     memcpy(y, [by contents], (size_t)S*O*sizeof(float));
   }
   return 1;
+}
+
+extern "C" int coli_metal_matmul_multi(const float *x, int S,
+                                        ColiMetalMatmulDesc *descs, int count) {
+  if (!g_dev || !x || !descs || S <= 0 || count <= 0 || count > 16) return 0;
+  const int I = descs[0].I;
+  if (I <= 0) return 0;
+  uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+  @autoreleasepool {
+    id<MTLBuffer> bx = [g_dev newBufferWithBytes:x
+                                         length:(size_t)S * I * sizeof(float)
+                                        options:MTLResourceStorageModeShared];
+    if (!bx) return 0;
+
+    std::vector<id<MTLBuffer>> outs;
+    outs.reserve((size_t)count);
+    for (int di = 0; di < count; ++di) {
+      ColiMetalMatmulDesc &d = descs[di];
+      if (!d.y || !d.weights || !d.scales || d.I != I || d.O <= 0 ||
+          d.fmt < 0 || (d.fmt > 4 && d.fmt != 7 && d.fmt != 8)) return 0;
+
+      ColiMetalTensor *t = d.tensor;
+      if (t && (t->fmt != d.fmt || t->I != d.I || t->O != d.O)) return 0;
+      if (!t) {
+        uint64_t wa = 0, sa = 0;
+        id<MTLBuffer> wr = resolve(d.weights, &wa), sr = resolve(d.scales, &sa);
+        if (wr && sr) {
+          t = new ColiMetalTensor();
+          t->fmt = d.fmt; t->I = d.I; t->O = d.O;
+          t->wbytes = fmt_bytes(d.fmt, d.I, d.O);
+          t->w = wr; t->s = sr;
+          t->woff = (size_t)(wa - (uint64_t)[wr gpuAddress]);
+          t->soff = (size_t)(sa - (uint64_t)[sr gpuAddress]);
+          d.tensor = t;
+          g_tensor_count++; g_tensor_bytes += t->wbytes;
+        }
+      }
+      if (!t) {
+        t = new ColiMetalTensor();
+        t->fmt = d.fmt; t->I = d.I; t->O = d.O;
+        t->wbytes = fmt_bytes(d.fmt, d.I, d.O);
+        t->w = wrap(d.weights, t->wbytes);
+        t->s = wrap(d.scales, fmt_scale_bytes(d.fmt, d.I, d.O, d.gs));
+        if (!t->w || !t->s) { delete t; return 0; }
+        t->woff = 0; t->soff = 0;
+        d.tensor = t;
+        g_tensor_count++; g_tensor_bytes += t->wbytes;
+      }
+
+      id<MTLBuffer> by = [g_dev newBufferWithLength:(size_t)S * d.O * sizeof(float)
+                                            options:MTLResourceStorageModeShared];
+      if (!by) return 0;
+      outs.push_back(by);
+    }
+
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    if (!cb || !e) return 0;
+    for (int di = 0; di < count; ++di) {
+      ColiMetalMatmulDesc &d = descs[di];
+      ColiMetalTensor *t = d.tensor;
+      [e setComputePipelineState:g_gemv];
+      [e setBuffer:t->w offset:t->woff atIndex:0];
+      [e setBuffer:t->s offset:t->soff atIndex:1];
+      [e setBuffer:bx offset:0 atIndex:2];
+      [e setBuffer:outs[(size_t)di] offset:0 atIndex:3];
+      int NT = S * d.O;
+      [e setBytes:&S length:4 atIndex:4];
+      [e setBytes:&d.I length:4 atIndex:5];
+      [e setBytes:&d.O length:4 atIndex:6];
+      [e setBytes:&d.fmt length:4 atIndex:7];
+      [e setBytes:&NT length:4 atIndex:8];
+      [e setBytes:&d.gs length:4 atIndex:9];
+      [e dispatchThreadgroups:MTLSizeMake(((size_t)NT + 3) / 4, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    [e endEncoding];
+    if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.encode_ns += t1 - t0; t0 = t1; }
+    [cb commit];
+    if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.submit_ns += t1 - t0; t0 = t1; }
+    [cb waitUntilCompleted];
+    if (t0) g_metal_prof.wait_ns += mnow_ns() - t0;
+
+    for (int di = 0; di < count; ++di) {
+      ColiMetalMatmulDesc &d = descs[di];
+      memcpy(d.y, [outs[(size_t)di] contents], (size_t)S * d.O * sizeof(float));
+    }
+  }
+  return 1;
+}
+
+
+// ---- Qwen3.5/3.6 full MXFP4 Gated DeltaNet -------------------------------
+// Reuses the persistent ColiMetalTensor wrappers already owned by each dense
+// MXFP4 weight. Only the recurrent state/context scratch is allocated here.
+struct QwenGdnMxCtx {
+  uint64_t model_id = 0;
+  int layer = -1;
+  const float *host_a_log = nullptr, *host_dt_bias = nullptr;
+  const float *host_conv_w = nullptr, *host_norm_w = nullptr;
+  float *host_state = nullptr, *host_conv_state = nullptr;
+  int D = 0, kheads = 0, kd = 0, vheads = 0, vd = 0, kk = 0;
+  id<MTLBuffer> A_log = nil, dt_bias = nil, conv_w = nil, norm_w = nil;
+  id<MTLBuffer> state = nil, conv_state = nil;
+  id<MTLBuffer> xb = nil, outb = nil;
+  id<MTLBuffer> qkv = nil, z = nil, a = nil, b = nil, normed = nil;
+};
+static std::vector<QwenGdnMxCtx *> g_qwen_gdn_mx_ctxs;
+
+static size_t qwen_gdn_mx_round_page(size_t n) {
+  const size_t pg = 16384u;
+  if (!n || n > SIZE_MAX - (pg - 1)) return 0;
+  return (n + pg - 1) & ~(pg - 1);
+}
+
+static id<MTLBuffer> qwen_gdn_mx_wrap_state(void *p, size_t logical_bytes) {
+  if (!p || ((uintptr_t)p & 16383u)) return nil;
+  const size_t rounded = qwen_gdn_mx_round_page(logical_bytes);
+  if (!rounded) return nil;
+  return [g_dev newBufferWithBytesNoCopy:p length:rounded
+                                  options:MTLResourceStorageModeShared
+                              deallocator:nil];
+}
+
+static QwenGdnMxCtx *qwen_gdn_mx_ctx_locked(
+    uint64_t model_id, int layer,
+    const float *a_log, const float *dt_bias,
+    const float *conv_w, const float *norm_w,
+    float *state, float *conv_state,
+    int D, int kheads, int kd, int vheads, int vd, int kk) {
+  if (!g_dev || !g_queue || !g_qwen_gdn_recur || model_id == 0 || layer < 0 ||
+      !a_log || !dt_bias || !conv_w || !norm_w || !state || !conv_state ||
+      D <= 0 || kheads <= 0 || kd <= 0 || vheads <= 0 || vd <= 0 || kk <= 0 ||
+      vheads < kheads || (vheads % kheads) != 0)
+    return nullptr;
+
+  for (QwenGdnMxCtx *ctx : g_qwen_gdn_mx_ctxs) {
+    if (!ctx || ctx->model_id != model_id || ctx->layer != layer) continue;
+    if (ctx->D != D || ctx->kheads != kheads || ctx->kd != kd ||
+        ctx->vheads != vheads || ctx->vd != vd || ctx->kk != kk ||
+        ctx->host_a_log != a_log || ctx->host_dt_bias != dt_bias ||
+        ctx->host_conv_w != conv_w || ctx->host_norm_w != norm_w ||
+        ctx->host_state != state || ctx->host_conv_state != conv_state)
+      return nullptr;
+    return ctx;
+  }
+
+  const size_t kdim = (size_t)kheads * (size_t)kd;
+  const size_t vdim = (size_t)vheads * (size_t)vd;
+  if (kdim > (size_t)INT_MAX || vdim > (size_t)INT_MAX ||
+      kdim > (SIZE_MAX - vdim) / 2) return nullptr;
+  const size_t C = 2u * kdim + vdim;
+  const size_t rep = (size_t)vheads / (size_t)kheads;
+  const size_t recur_threads = rep * (size_t)vd;
+  const size_t scratch_floats = 2u * (size_t)kd + recur_threads + 3u * rep + 3u;
+  if (C > (size_t)INT_MAX || recur_threads == 0 ||
+      recur_threads > (size_t)g_qwen_gdn_recur.maxTotalThreadsPerThreadgroup ||
+      scratch_floats > SIZE_MAX / sizeof(float) ||
+      scratch_floats * sizeof(float) > (size_t)g_dev.maxThreadgroupMemoryLength)
+    return nullptr;
+  if ((size_t)vheads > SIZE_MAX / (size_t)kd ||
+      (size_t)vheads * (size_t)kd > SIZE_MAX / (size_t)vd) return nullptr;
+  const size_t state_floats = (size_t)vheads * (size_t)kd * (size_t)vd;
+  if (state_floats > SIZE_MAX / sizeof(float) ||
+      C > SIZE_MAX / (size_t)(kk > 1 ? kk - 1 : 1)) return nullptr;
+  const size_t state_bytes = state_floats * sizeof(float);
+  const size_t conv_floats = C * (size_t)(kk > 1 ? kk - 1 : 1);
+  if (conv_floats > SIZE_MAX / sizeof(float) ||
+      C > SIZE_MAX / (size_t)kk) return nullptr;
+  const size_t conv_state_bytes = conv_floats * sizeof(float);
+  const size_t conv_w_floats = C * (size_t)kk;
+
+  QwenGdnMxCtx *ctx = new (std::nothrow) QwenGdnMxCtx();
+  if (!ctx) return nullptr;
+  ctx->model_id = model_id; ctx->layer = layer;
+  ctx->host_a_log = a_log; ctx->host_dt_bias = dt_bias;
+  ctx->host_conv_w = conv_w; ctx->host_norm_w = norm_w;
+  ctx->host_state = state; ctx->host_conv_state = conv_state;
+  ctx->D = D; ctx->kheads = kheads; ctx->kd = kd;
+  ctx->vheads = vheads; ctx->vd = vd; ctx->kk = kk;
+  ctx->state = qwen_gdn_mx_wrap_state(state, state_bytes);
+  ctx->conv_state = qwen_gdn_mx_wrap_state(conv_state, conv_state_bytes);
+  ctx->A_log = [g_dev newBufferWithBytes:a_log length:(size_t)vheads*sizeof(float)
+                                  options:MTLResourceStorageModeShared];
+  ctx->dt_bias = [g_dev newBufferWithBytes:dt_bias length:(size_t)vheads*sizeof(float)
+                                    options:MTLResourceStorageModeShared];
+  ctx->conv_w = [g_dev newBufferWithBytes:conv_w length:conv_w_floats*sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+  ctx->norm_w = [g_dev newBufferWithBytes:norm_w length:(size_t)vd*sizeof(float)
+                                   options:MTLResourceStorageModeShared];
+  ctx->xb = [g_dev newBufferWithLength:(size_t)D*sizeof(float)
+                                options:MTLResourceStorageModeShared];
+  ctx->outb = [g_dev newBufferWithLength:(size_t)D*sizeof(float)
+                                  options:MTLResourceStorageModeShared];
+  ctx->qkv = [g_dev newBufferWithLength:C*sizeof(float)
+                                 options:MTLResourceStorageModePrivate];
+  ctx->z = [g_dev newBufferWithLength:vdim*sizeof(float)
+                               options:MTLResourceStorageModePrivate];
+  ctx->a = [g_dev newBufferWithLength:(size_t)vheads*sizeof(float)
+                               options:MTLResourceStorageModePrivate];
+  ctx->b = [g_dev newBufferWithLength:(size_t)vheads*sizeof(float)
+                               options:MTLResourceStorageModePrivate];
+  ctx->normed = [g_dev newBufferWithLength:vdim*sizeof(float)
+                                    options:MTLResourceStorageModePrivate];
+  if (!ctx->state || !ctx->conv_state || !ctx->A_log || !ctx->dt_bias ||
+      !ctx->conv_w || !ctx->norm_w || !ctx->xb || !ctx->outb || !ctx->qkv ||
+      !ctx->z || !ctx->a || !ctx->b || !ctx->normed) {
+    delete ctx; return nullptr;
+  }
+  g_qwen_gdn_mx_ctxs.push_back(ctx);
+  return ctx;
+}
+
+static ColiMetalTensor *qwen_gdn_mx_tensor(ColiMetalMatmulDesc &d) {
+  if (!d.weights || !d.scales || d.fmt != 7 || d.I <= 0 || d.O <= 0) return nullptr;
+  ColiMetalTensor *t = d.tensor;
+  if (t) {
+    if (t->fmt != d.fmt || t->I != d.I || t->O != d.O) return nullptr;
+    return t;
+  }
+  uint64_t wa = 0, sa = 0;
+  id<MTLBuffer> wr = resolve(d.weights, &wa), sr = resolve(d.scales, &sa);
+  t = new (std::nothrow) ColiMetalTensor();
+  if (!t) return nullptr;
+  t->fmt = d.fmt; t->I = d.I; t->O = d.O;
+  t->wbytes = fmt_bytes(d.fmt, d.I, d.O);
+  if (wr && sr) {
+    t->w = wr; t->s = sr;
+    t->woff = (size_t)(wa - (uint64_t)[wr gpuAddress]);
+    t->soff = (size_t)(sa - (uint64_t)[sr gpuAddress]);
+  } else {
+    t->w = wrap(d.weights, t->wbytes);
+    t->s = wrap(d.scales, fmt_scale_bytes(d.fmt, d.I, d.O, d.gs));
+    t->woff = 0; t->soff = 0;
+  }
+  if (!t->w || !t->s) { delete t; return nullptr; }
+  d.tensor = t;
+  g_tensor_count++; g_tensor_bytes += t->wbytes;
+  return t;
+}
+
+static void qwen_gdn_mx_encode_gemv(id<MTLComputeCommandEncoder> e,
+                                     ColiMetalTensor *t, id<MTLBuffer> x,
+                                     id<MTLBuffer> y, int I, int O) {
+  const int S = 1, NT = O, fmt = 7, gs = 0;
+  [e setComputePipelineState:g_gemv];
+  [e setBuffer:t->w offset:t->woff atIndex:0];
+  [e setBuffer:t->s offset:t->soff atIndex:1];
+  [e setBuffer:x offset:0 atIndex:2];
+  [e setBuffer:y offset:0 atIndex:3];
+  [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
+  [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
+  [e setBytes:&NT length:4 atIndex:8]; [e setBytes:&gs length:4 atIndex:9];
+  [e dispatchThreadgroups:MTLSizeMake(((size_t)O + 3u)/4u,1,1)
+            threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+}
+
+extern "C" int coli_metal_gdn_mxfp4(
+    uint64_t model_id, int layer, ColiMetalMatmulDesc *descs, int count,
+    const float *x, float *out,
+    const float *a_log, const float *dt_bias,
+    const float *conv_w, const float *norm_w,
+    float *state, float *conv_state,
+    int D, int kheads, int kd, int vheads, int vd, int kk,
+    int output_gate, float eps) {
+  if (!g_dev || !g_queue || !g_gemv || !g_qwen_gdn_recur || !descs || count != 5 ||
+      !x || !out || !(eps > 0.0f)) return 0;
+  const int64_t kdim64 = (int64_t)kheads * kd;
+  const int64_t vdim64 = (int64_t)vheads * vd;
+  const int64_t C64 = 2 * kdim64 + vdim64;
+  if (kdim64 <= 0 || vdim64 <= 0 || C64 <= 0 || C64 > INT_MAX || vdim64 > INT_MAX)
+    return 0;
+  const int C = (int)C64, vdim = (int)vdim64;
+  const int expected_I[5] = {D,D,D,D,vdim};
+  const int expected_O[5] = {C,vdim,vheads,vheads,D};
+  for (int i = 0; i < 5; ++i)
+    if (descs[i].fmt != 7 || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
+      return 0;
+
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    QwenGdnMxCtx *ctx = qwen_gdn_mx_ctx_locked(model_id, layer, a_log, dt_bias,
+                                                conv_w, norm_w, state, conv_state,
+                                                D, kheads, kd, vheads, vd, kk);
+    if (!ctx) return 0;
+    ColiMetalTensor *wt[5] = {};
+    for (int i = 0; i < 5; ++i) {
+      wt[i] = qwen_gdn_mx_tensor(descs[i]);
+      if (!wt[i]) return 0;
+    }
+    memcpy(ctx->xb.contents, x, (size_t)D*sizeof(float));
+    const int rep = vheads / kheads;
+    const NSUInteger recur_threads = (NSUInteger)rep * (NSUInteger)vd;
+    const NSUInteger scratch_floats = 2u*(NSUInteger)kd + recur_threads +
+                                      3u*(NSUInteger)rep + 3u;
+
+    uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> inp = [cb computeCommandEncoder];
+    if (!inp) return 0;
+    qwen_gdn_mx_encode_gemv(inp, wt[0], ctx->xb, ctx->qkv, D, C);
+    qwen_gdn_mx_encode_gemv(inp, wt[1], ctx->xb, ctx->z, D, vdim);
+    qwen_gdn_mx_encode_gemv(inp, wt[2], ctx->xb, ctx->a, D, vheads);
+    qwen_gdn_mx_encode_gemv(inp, wt[3], ctx->xb, ctx->b, D, vheads);
+    [inp endEncoding];
+
+    id<MTLComputeCommandEncoder> rec = [cb computeCommandEncoder];
+    if (!rec) return 0;
+    [rec setComputePipelineState:g_qwen_gdn_recur];
+    [rec setBuffer:ctx->qkv offset:0 atIndex:0];
+    [rec setBuffer:ctx->conv_w offset:0 atIndex:1];
+    [rec setBuffer:ctx->conv_state offset:0 atIndex:2];
+    [rec setBuffer:ctx->a offset:0 atIndex:3];
+    [rec setBuffer:ctx->b offset:0 atIndex:4];
+    [rec setBuffer:ctx->z offset:0 atIndex:5];
+    [rec setBuffer:ctx->A_log offset:0 atIndex:6];
+    [rec setBuffer:ctx->dt_bias offset:0 atIndex:7];
+    [rec setBuffer:ctx->norm_w offset:0 atIndex:8];
+    [rec setBuffer:ctx->state offset:0 atIndex:9];
+    [rec setBuffer:ctx->normed offset:0 atIndex:10];
+    [rec setBytes:&kheads length:4 atIndex:11]; [rec setBytes:&kd length:4 atIndex:12];
+    [rec setBytes:&vheads length:4 atIndex:13]; [rec setBytes:&vd length:4 atIndex:14];
+    [rec setBytes:&kk length:4 atIndex:15]; [rec setBytes:&eps length:4 atIndex:16];
+    [rec setBytes:&output_gate length:4 atIndex:17];
+    [rec setThreadgroupMemoryLength:scratch_floats*sizeof(float) atIndex:0];
+    [rec dispatchThreadgroups:MTLSizeMake((NSUInteger)kheads,1,1)
+              threadsPerThreadgroup:MTLSizeMake(recur_threads,1,1)];
+    [rec endEncoding];
+
+    id<MTLComputeCommandEncoder> op = [cb computeCommandEncoder];
+    if (!op) return 0;
+    qwen_gdn_mx_encode_gemv(op, wt[4], ctx->normed, ctx->outb, vdim, D);
+    [op endEncoding];
+    if (t0) { uint64_t t1=mnow_ns(); g_metal_prof.encode_ns += t1-t0; t0=t1; }
+    [cb commit];
+    if (t0) { uint64_t t1=mnow_ns(); g_metal_prof.submit_ns += t1-t0; t0=t1; }
+    [cb waitUntilCompleted];
+    if (t0) g_metal_prof.wait_ns += mnow_ns()-t0;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+      fprintf(stderr, "[metal-gdn-mxfp4] command failed after submission: %s\n",
+              cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+      return -1;
+    }
+    memcpy(out, ctx->outb.contents, (size_t)D*sizeof(float));
+  }
+  return 1;
+}
+
+extern "C" void coli_metal_gdn_mxfp4_drop_model(uint64_t model_id) {
+  if (!model_id) return;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  for (auto it = g_qwen_gdn_mx_ctxs.begin(); it != g_qwen_gdn_mx_ctxs.end();) {
+    QwenGdnMxCtx *ctx = *it;
+    if (ctx && ctx->model_id == model_id) {
+      delete ctx; it = g_qwen_gdn_mx_ctxs.erase(it);
+    } else ++it;
+  }
+}
+
+// ---- Qwen shared expert: full one-command-buffer MXFP4 decode ------------
+struct QwenSharedMxCtx {
+  uint64_t model_id = 0;
+  int layer = -1, D = 0, Iinter = 0;
+  id<MTLBuffer> xb = nil, gate = nil, up = nil, outb = nil;
+};
+static std::vector<QwenSharedMxCtx *> g_qwen_shared_mx_ctxs;
+
+static QwenSharedMxCtx *qwen_shared_mx_ctx_locked(uint64_t model_id, int layer,
+                                                   int D, int Iinter) {
+  if (!g_dev || !g_queue || model_id == 0 || layer < 0 || D <= 0 || Iinter <= 0)
+    return nullptr;
+  for (QwenSharedMxCtx *ctx : g_qwen_shared_mx_ctxs) {
+    if (!ctx || ctx->model_id != model_id || ctx->layer != layer) continue;
+    return (ctx->D == D && ctx->Iinter == Iinter) ? ctx : nullptr;
+  }
+  QwenSharedMxCtx *ctx = new (std::nothrow) QwenSharedMxCtx();
+  if (!ctx) return nullptr;
+  ctx->model_id = model_id; ctx->layer = layer; ctx->D = D; ctx->Iinter = Iinter;
+  ctx->xb = [g_dev newBufferWithLength:(size_t)D*sizeof(float)
+                                options:MTLResourceStorageModeShared];
+  ctx->gate = [g_dev newBufferWithLength:(size_t)Iinter*sizeof(float)
+                                  options:MTLResourceStorageModePrivate];
+  ctx->up = [g_dev newBufferWithLength:(size_t)Iinter*sizeof(float)
+                                options:MTLResourceStorageModePrivate];
+  ctx->outb = [g_dev newBufferWithLength:(size_t)D*sizeof(float)
+                                  options:MTLResourceStorageModeShared];
+  if (!ctx->xb || !ctx->gate || !ctx->up || !ctx->outb) {
+    delete ctx; return nullptr;
+  }
+  g_qwen_shared_mx_ctxs.push_back(ctx);
+  return ctx;
+}
+
+extern "C" int coli_metal_shared_mxfp4(
+    uint64_t model_id, int layer, ColiMetalMatmulDesc *descs, int count,
+    const float *x, float *out, int D, int Iinter) {
+  if (!g_dev || !g_queue || !g_gemv || !g_moe_silu || !descs || count != 3 ||
+      !x || !out || D <= 0 || Iinter <= 0) return 0;
+  const int expected_I[3] = {D, D, Iinter};
+  const int expected_O[3] = {Iinter, Iinter, D};
+  for (int i = 0; i < 3; ++i)
+    if (descs[i].fmt != 7 || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
+      return 0;
+
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    QwenSharedMxCtx *ctx = qwen_shared_mx_ctx_locked(model_id, layer, D, Iinter);
+    if (!ctx) return 0;
+    ColiMetalTensor *wt[3] = {};
+    for (int i = 0; i < 3; ++i) {
+      wt[i] = qwen_gdn_mx_tensor(descs[i]);
+      if (!wt[i]) return 0;
+    }
+    memcpy(ctx->xb.contents, x, (size_t)D*sizeof(float));
+    uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+
+    id<MTLComputeCommandEncoder> inp = [cb computeCommandEncoder];
+    if (!inp) return 0;
+    qwen_gdn_mx_encode_gemv(inp, wt[0], ctx->xb, ctx->gate, D, Iinter);
+    qwen_gdn_mx_encode_gemv(inp, wt[1], ctx->xb, ctx->up, D, Iinter);
+    [inp endEncoding];
+
+    id<MTLComputeCommandEncoder> act = [cb computeCommandEncoder];
+    if (!act) return 0;
+    [act setComputePipelineState:g_moe_silu];
+    [act setBuffer:ctx->gate offset:0 atIndex:0];
+    [act setBuffer:ctx->up offset:0 atIndex:1];
+    [act dispatchThreads:MTLSizeMake((NSUInteger)Iinter,1,1)
+          threadsPerThreadgroup:MTLSizeMake((NSUInteger)std::min(Iinter,256),1,1)];
+    [act endEncoding];
+
+    id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
+    if (!down) return 0;
+    qwen_gdn_mx_encode_gemv(down, wt[2], ctx->gate, ctx->outb, Iinter, D);
+    [down endEncoding];
+    if (t0) { uint64_t t1=mnow_ns(); g_metal_prof.encode_ns += t1-t0; t0=t1; }
+    [cb commit];
+    if (t0) { uint64_t t1=mnow_ns(); g_metal_prof.submit_ns += t1-t0; t0=t1; }
+    [cb waitUntilCompleted];
+    if (t0) g_metal_prof.wait_ns += mnow_ns()-t0;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+      fprintf(stderr, "[metal-shared-mxfp4] command failed after submission: %s\n",
+              cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+      return -1;
+    }
+    memcpy(out, ctx->outb.contents, (size_t)D*sizeof(float));
+  }
+  return 1;
+}
+
+extern "C" void coli_metal_shared_mxfp4_drop_model(uint64_t model_id) {
+  if (!model_id) return;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  for (auto it = g_qwen_shared_mx_ctxs.begin(); it != g_qwen_shared_mx_ctxs.end();) {
+    QwenSharedMxCtx *ctx = *it;
+    if (ctx && ctx->model_id == model_id) {
+      delete ctx; it = g_qwen_shared_mx_ctxs.erase(it);
+    } else ++it;
+  }
 }
 
 // ---- fused decode attention scratch (GLM-5.2 dims) ----

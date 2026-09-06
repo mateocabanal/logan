@@ -530,7 +530,14 @@ fn run_session_inner(
     prompt: &[u32],
     max_new: usize,
 ) -> Result<Vec<u32>, String> {
-    for (pos, &token) in prompt.iter().enumerate() {
+    if prompt.is_empty() || max_new == 0 {
+        return Ok(Vec::new());
+    }
+
+    // The final prompt token is itself the first decode quantum: its logits
+    // predict token prompt.len(). Prefilling it and then feeding it again at
+    // prompt.len() advances KV/GDN/PLE state twice and breaks causal parity.
+    for (pos, &token) in prompt[..prompt.len() - 1].iter().enumerate() {
         step_op(
             handle,
             session,
@@ -540,8 +547,9 @@ fn run_session_inner(
         )?;
     }
     let mut output = Vec::with_capacity(max_new);
-    let mut last = *prompt.last().unwrap_or(&0);
-    for pos in prompt.len()..prompt.len() + max_new {
+    let mut last = *prompt.last().unwrap();
+    for step in 0..max_new {
+        let pos = prompt.len() - 1 + step;
         let next = step_op(
             handle,
             session,
@@ -736,6 +744,63 @@ mod tests {
     // --- sim: tickets, bridge, resume through the REAL runtime --------------
 
     #[test]
+    fn scheduled_prompt_tail_is_consumed_exactly_once() {
+        let plan = Arc::new(tiny_plan());
+        let completed = Arc::new(CompletionLog {
+            state: Mutex::new(Completed::default()),
+            ready: Condvar::new(),
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (io, io_rx) = scripted_pair();
+        let accel = io.clone();
+        let executors = ExecutorSet::new(Box::new(io), Box::new(ClosedExecutor), Box::new(accel));
+        let (handle, runtime) = SchedulerRuntime::spawn(
+            Budget::default(),
+            RuntimeConfig { command_capacity: 16 },
+            executors,
+        ).unwrap();
+
+        let completed_worker = Arc::clone(&completed);
+        let seen_worker = Arc::clone(&seen);
+        let responder = thread::spawn(move || {
+            let mut generated = 42u32;
+            while let Ok(dispatch) = io_rx.recv() {
+                let action = decode_op(&dispatch.action.payload).unwrap();
+                seen_worker.lock().unwrap().push(action);
+                let outcome = match action {
+                    (OP_PREFILL, _, _) => SchedOutcome::Token(None),
+                    (OP_DECODE, _, _) => {
+                        let token = generated;
+                        generated += 1;
+                        SchedOutcome::Token(Some(token))
+                    }
+                    other => panic!("unexpected scripted action {other:?}"),
+                };
+                completed_worker.push(dispatch.ticket, Ok(outcome));
+                let _ = dispatch.completion.try_complete(dispatch.ticket, Outcome::Ok);
+            }
+        });
+
+        let session = match request(&handle, RuntimeRequest::CreateSession).unwrap() {
+            RuntimeReply::SessionCreated(session) => session,
+            other => panic!("unexpected session reply: {other:?}"),
+        };
+        let mut bridge = ResidencyBridge::new(&plan).unwrap();
+        let output = run_session_inner(&handle, session, &mut bridge, &completed, &[5, 7, 9], 2).unwrap();
+        assert_eq!(output, vec![42, 43]);
+        assert_eq!(*seen.lock().unwrap(), vec![
+            (OP_PREFILL, 5, 0),
+            (OP_PREFILL, 7, 1),
+            (OP_DECODE, 9, 2),
+            (OP_DECODE, 42, 3),
+        ]);
+
+        let _ = request(&handle, RuntimeRequest::Shutdown { mode: logan_core::sched::ShutdownMode::Drain });
+        runtime.join().unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
     fn cold_expert_round_trips_ticket_publish_resume() {
         let plan = Arc::new(tiny_plan());
         let completed = Arc::new(CompletionLog {
@@ -816,9 +881,18 @@ mod tests {
         let canonical = crate::run_greedy_with(crate::Model::load(&st, &cfg).unwrap(), cfg.clone(), &prompt, max_new);
         let mut sched = crate::Model::load(&st, &cfg).unwrap();
         sched.enable_sched_mode();
+        for (pos, &token) in prompt[..prompt.len() - 1].iter().enumerate() {
+            match sched.forward_scheduled(token as usize, pos) {
+                SchedForward::Logits(_) => {}
+                SchedForward::NeedExperts { .. } => {
+                    panic!("tiny fixture (preloaded experts) must never report cold experts")
+                }
+            }
+        }
         let mut out = Vec::new();
         let mut last = *prompt.last().unwrap();
-        for pos in prompt.len()..prompt.len() + max_new {
+        for step in 0..max_new {
+            let pos = prompt.len() - 1 + step;
             match sched.forward_scheduled(last as usize, pos) {
                 SchedForward::Logits(logits) => {
                     last = greedy_next(&logits).unwrap();
@@ -830,5 +904,36 @@ mod tests {
             }
         }
         assert_eq!(out, canonical, "scheduled wrapper diverged from canonical");
+    }
+
+    #[test]
+    fn layer_major_prefill_matches_token_major_tiny_fixture() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/qwen4_moe_tiny");
+        let cfg = crate::load_cfg(&dir.join("config.json")).unwrap();
+        let st = crate::StFile::open(&dir.join("model.safetensors")).unwrap();
+        let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+
+        let mut token_major = crate::Model::load(&st, &cfg).unwrap();
+        for (pos, &token) in prompt[..prompt.len() - 1].iter().enumerate() {
+            token_major.prefill_token(token as usize, pos);
+        }
+        let canonical_logits = token_major.forward_token(
+            *prompt.last().unwrap() as usize,
+            prompt.len() - 1,
+        );
+
+        let mut layer_major = crate::Model::load(&st, &cfg).unwrap();
+        let layer_logits = layer_major
+            .prefill_chunk(&prompt, 0, true)
+            .unwrap()
+            .expect("final prefill row produces logits");
+        assert_eq!(layer_logits, canonical_logits, "layer-major prefill changed final logits");
+
+        // The next causal step checks that hidden persistent state (KV/GDN/
+        // PLE where present) also landed at the identical prompt boundary.
+        let next = greedy_next(&canonical_logits).unwrap();
+        let a = token_major.forward_token(next as usize, prompt.len());
+        let b = layer_major.forward_token(next as usize, prompt.len());
+        assert_eq!(b, a, "layer-major prefill changed continuation state");
     }
 }

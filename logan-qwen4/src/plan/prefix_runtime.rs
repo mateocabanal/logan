@@ -30,6 +30,8 @@ fn set_if_unset(name: &str, value: &str) {
 /// runners/tests that need to establish policy before model construction.
 pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_GDN_SINGLE_COPY", "1");
+    set_if_unset("QWEN_GDN_MXFP4_FULL", "1");
+    set_if_unset("QWEN_SHARED_MXFP4_FULL", "1");
     set_if_unset("QWEN_QSA_INDEX_METAL", "1");
     set_if_unset("QWEN_APPLE8_DIRECT", "1");
     set_if_unset("QWEN_APPLE8_OVERLAP", "1");
@@ -37,8 +39,9 @@ pub fn apply_max_performance_defaults() {
     set_if_unset("QWEN_PREFIX_CACHE", "1");
     set_if_unset("QWEN_PREFIX_CACHE_WRITE", "1");
 
-    // Measured Apple Silicon winners: BNNS BF16 dense execution beats the
-    // current Metal GDN path, and the generic Metal BF16 attention path pays
+    // Measured Apple Silicon winners: the legacy BF16 full-GDN path remains
+    // slower than BNNS, while MXFP4 GDN has its own default-on full-GPU gate.
+    // The generic Metal BF16 attention path pays
     // synchronous weight-buffer staging/waits that are substantially slower
     // than BNNS at decode batch S=1. Explicit env values remain authoritative.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -216,9 +219,24 @@ pub fn persist_prefix_boundary(
 }
 
 fn prefill_suffix(model: &mut Model, prompt: &[u32], start: usize) -> Option<Vec<f32>> {
+    if start >= prompt.len() {
+        return None;
+    }
+    let chunk = std::env::var("QWEN_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 64);
+    let suffix = &prompt[start..];
     let mut logits = None;
-    for (i, &token) in prompt.iter().enumerate().skip(start) {
-        logits = Some(model.forward_token(token as usize, i));
+    for (chunk_idx, rows) in suffix.chunks(chunk).enumerate() {
+        let pos = start + chunk_idx * chunk;
+        let final_chunk = pos + rows.len() == prompt.len();
+        match model.prefill_chunk(rows, pos, final_chunk) {
+            Ok(Some(v)) => logits = Some(v),
+            Ok(None) => {}
+            Err(e) => panic!("layer-major prefill failed: {e}"),
+        }
     }
     logits
 }

@@ -26,6 +26,37 @@ mod imp {
         _private: [u8; 0],
     }
 
+    #[repr(C)]
+    struct ColiMetalMatmulDescRaw {
+        tensor: *mut ColiMetalTensor,
+        y: *mut f32,
+        weights: *const c_void,
+        scales: *const f32,
+        fmt: i32,
+        i: i32,
+        o: i32,
+        gs: i32,
+    }
+
+    pub struct MetalMatmulDesc<'a> {
+        pub tensor: *mut ColiMetalTensor,
+        pub y: &'a mut [f32],
+        pub weights: &'a [u8],
+        pub scales: &'a [u8],
+        pub fmt: i32,
+        pub i: usize,
+        pub o: usize,
+    }
+
+    pub struct MetalWeightDesc<'a> {
+        pub tensor: *mut ColiMetalTensor,
+        pub weights: &'a [u8],
+        pub scales: &'a [u8],
+        pub fmt: i32,
+        pub i: usize,
+        pub o: usize,
+    }
+
     unsafe extern "C" {
         pub fn coli_metal_init() -> i32;
         pub fn coli_metal_available() -> i32;
@@ -41,6 +72,46 @@ mod imp {
             o: i32,
             gs: i32,
         ) -> i32;
+        fn coli_metal_matmul_multi(
+            x: *const f32,
+            s: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+        ) -> i32;
+        fn coli_metal_gdn_mxfp4(
+            model_id: u64,
+            layer: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            x: *const f32,
+            out: *mut f32,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            conv_w: *const f32,
+            norm_w: *const f32,
+            state: *mut f32,
+            conv_state: *mut f32,
+            d: i32,
+            kheads: i32,
+            kd: i32,
+            vheads: i32,
+            vd: i32,
+            kk: i32,
+            output_gate: i32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_gdn_mxfp4_drop_model(model_id: u64);
+        fn coli_metal_shared_mxfp4(
+            model_id: u64,
+            layer: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            x: *const f32,
+            out: *mut f32,
+            d: i32,
+            iinter: i32,
+        ) -> i32;
+        fn coli_metal_shared_mxfp4_drop_model(model_id: u64);
         pub fn coli_metal_rmsnorm(x: *mut f32, w: *const f32, n: i32, nrows: i32, eps: f32) -> i32;
         pub fn coli_metal_add(y: *mut f32, a: *const f32, n: i32) -> i32;
         pub fn coli_metal_silu_mul(g: *mut f32, u: *const f32, n: i32) -> i32;
@@ -50,6 +121,14 @@ mod imp {
             w: *const u16,
             x: *const f32,
             y: *mut f32,
+            o: i32,
+            i: i32,
+        ) -> i32;
+        pub fn coli_bnns_bf16_matmul_batch(
+            w: *const u16,
+            x: *const f32,
+            y: *mut f32,
+            s: i32,
             o: i32,
             i: i32,
         ) -> i32;
@@ -87,7 +166,12 @@ mod imp {
         if !metal_available() {
             return false;
         }
-        if weights.len() < o * ((i + 1) / 2) || scales.len() < o * ((i + 31) / 32) {
+        let (weight_bytes, scale_bytes) = match fmt {
+            7 => (o * ((i + 1) / 2), o * ((i + 31) / 32)),
+            8 => (o * i, o.div_ceil(128) * i.div_ceil(128) * std::mem::size_of::<f32>()),
+            _ => return false,
+        };
+        if weights.len() < weight_bytes || scales.len() < scale_bytes {
             return false;
         }
         let rc = unsafe {
@@ -107,6 +191,181 @@ mod imp {
         rc == 1
     }
 
+    /// Several independent one-token quantized GEMVs that share the same
+    /// activation vector, encoded into one Metal command buffer and waited once.
+    /// Each descriptor retains its lazily-created opaque tensor handle.
+    pub fn metal_matmul_multi(x: &[f32], descs: &mut [MetalMatmulDesc<'_>]) -> bool {
+        if !metal_available() || descs.is_empty() || descs.len() > 16 {
+            return false;
+        }
+        let common_i = descs[0].i;
+        if common_i == 0 || common_i > i32::MAX as usize || x.len() < common_i {
+            return false;
+        }
+        let mut raw = Vec::with_capacity(descs.len());
+        for d in descs.iter_mut() {
+            if d.i != common_i
+                || d.o == 0
+                || d.o > i32::MAX as usize
+                || d.y.len() < d.o
+            {
+                return false;
+            }
+            let (weight_bytes, scale_bytes) = match d.fmt {
+                7 => (d.o * d.i.div_ceil(2), d.o * d.i.div_ceil(32)),
+                8 => (
+                    d.o * d.i,
+                    d.o.div_ceil(128) * d.i.div_ceil(128) * std::mem::size_of::<f32>(),
+                ),
+                _ => return false,
+            };
+            if d.weights.len() < weight_bytes || d.scales.len() < scale_bytes {
+                return false;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: d.tensor,
+                y: d.y.as_mut_ptr(),
+                weights: d.weights.as_ptr() as *const c_void,
+                scales: d.scales.as_ptr() as *const f32,
+                fmt: d.fmt,
+                i: d.i as i32,
+                o: d.o as i32,
+                gs: 0,
+            });
+        }
+        let ok = unsafe {
+            coli_metal_matmul_multi(x.as_ptr(), 1, raw.as_mut_ptr(), raw.len() as i32) == 1
+        };
+        for (d, r) in descs.iter_mut().zip(raw.iter()) {
+            d.tensor = r.tensor;
+        }
+        ok
+    }
+
+    /// Full one-command-buffer MXFP4 Qwen Gated DeltaNet decode. `descs`
+    /// must be [qkv, z, a, b, out], all fmt=7. Persistent tensor handles are
+    /// updated in place exactly like `metal_matmul_multi`. Returns >0 on
+    /// success, 0 on a pre-submit decline, and <0 on a post-submit GPU fault.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_mxfp4(
+        model_id: u64,
+        layer: usize,
+        descs: &mut [MetalWeightDesc<'_>],
+        x: &[f32],
+        out: &mut [f32],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        conv_w: &[f32],
+        norm_w: &[f32],
+        state: &mut [f32],
+        conv_state: &mut [f32],
+        d: usize,
+        kheads: usize,
+        kd: usize,
+        vheads: usize,
+        vd: usize,
+        kk: usize,
+        output_gate: i32,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available() || model_id == 0 || layer > i32::MAX as usize || descs.len() != 5
+            || d == 0 || d > i32::MAX as usize || kheads == 0 || kheads > i32::MAX as usize
+            || kd == 0 || kd > i32::MAX as usize || vheads == 0 || vheads > i32::MAX as usize
+            || vd == 0 || vd > i32::MAX as usize || kk == 0 || kk > i32::MAX as usize
+            || x.len() < d || out.len() < d || a_log.len() < vheads || dt_bias.len() < vheads
+            || norm_w.len() < vd || !(eps > 0.0)
+        {
+            return 0;
+        }
+        let kdim = match kheads.checked_mul(kd) { Some(v) => v, None => return 0 };
+        let vdim = match vheads.checked_mul(vd) { Some(v) => v, None => return 0 };
+        let cdim = match kdim.checked_mul(2).and_then(|v| v.checked_add(vdim)) { Some(v) => v, None => return 0 };
+        let conv_need = match cdim.checked_mul(kk) { Some(v) => v, None => return 0 };
+        let state_need = match vheads.checked_mul(kd).and_then(|v| v.checked_mul(vd)) { Some(v) => v, None => return 0 };
+        let conv_state_need = match cdim.checked_mul(kk.saturating_sub(1)) { Some(v) => v, None => return 0 };
+        if conv_w.len() < conv_need || state.len() < state_need || conv_state.len() < conv_state_need {
+            return 0;
+        }
+        let mut raw = Vec::with_capacity(5);
+        for dsc in descs.iter_mut() {
+            if dsc.fmt != 7 || dsc.i == 0 || dsc.o == 0 || dsc.i > i32::MAX as usize || dsc.o > i32::MAX as usize {
+                return 0;
+            }
+            let weight_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(2));
+            let scale_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(32));
+            if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes {
+                return 0;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: dsc.tensor, y: std::ptr::null_mut(),
+                weights: dsc.weights.as_ptr() as *const c_void,
+                scales: dsc.scales.as_ptr() as *const f32,
+                fmt: 7, i: dsc.i as i32, o: dsc.o as i32, gs: 0,
+            });
+        }
+        let rc = unsafe {
+            coli_metal_gdn_mxfp4(
+                model_id, layer as i32, raw.as_mut_ptr(), raw.len() as i32,
+                x.as_ptr(), out.as_mut_ptr(), a_log.as_ptr(), dt_bias.as_ptr(),
+                conv_w.as_ptr(), norm_w.as_ptr(), state.as_mut_ptr(), conv_state.as_mut_ptr(),
+                d as i32, kheads as i32, kd as i32, vheads as i32, vd as i32, kk as i32,
+                output_gate, eps,
+            )
+        };
+        for (dsc, r) in descs.iter_mut().zip(raw.iter()) { dsc.tensor = r.tensor; }
+        rc
+    }
+
+    pub fn gdn_mxfp4_drop_model(model_id: u64) {
+        if model_id != 0 { unsafe { coli_metal_gdn_mxfp4_drop_model(model_id) }; }
+    }
+
+    /// Full one-command-buffer MXFP4 shared MLP. `descs` are
+    /// [gate_proj, up_proj, down_proj]. The checkpoint's scalar shared gate is
+    /// computed separately by the caller because it may use BF16. Returns
+    /// Some(()) on success, None on pre-submit decline; post-submit faults are
+    /// reported as Err.
+    pub fn shared_mxfp4(
+        model_id: u64,
+        layer: usize,
+        descs: &mut [MetalWeightDesc<'_>],
+        x: &[f32],
+        out: &mut [f32],
+        d: usize,
+        iinter: usize,
+    ) -> Result<Option<()>, ()> {
+        if !metal_available() || model_id == 0 || layer > i32::MAX as usize || descs.len() != 3
+            || d == 0 || d > i32::MAX as usize || iinter == 0 || iinter > i32::MAX as usize
+            || x.len() < d || out.len() < d
+        {
+            return Ok(None);
+        }
+        let expected = [(d, iinter), (d, iinter), (iinter, d)];
+        let mut raw = Vec::with_capacity(3);
+        for (dsc, &(ei, eo)) in descs.iter_mut().zip(expected.iter()) {
+            if dsc.fmt != 7 || dsc.i != ei || dsc.o != eo { return Ok(None); }
+            let weight_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(2));
+            let scale_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(32));
+            if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes { return Ok(None); }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: dsc.tensor, y: std::ptr::null_mut(),
+                weights: dsc.weights.as_ptr() as *const c_void,
+                scales: dsc.scales.as_ptr() as *const f32,
+                fmt: 7, i: dsc.i as i32, o: dsc.o as i32, gs: 0,
+            });
+        }
+        let rc = unsafe { coli_metal_shared_mxfp4(
+            model_id, layer as i32, raw.as_mut_ptr(), raw.len() as i32,
+            x.as_ptr(), out.as_mut_ptr(), d as i32, iinter as i32,
+        ) };
+        for (dsc, r) in descs.iter_mut().zip(raw.iter()) { dsc.tensor = r.tensor; }
+        match rc { r if r > 0 => Ok(Some(())), 0 => Ok(None), _ => Err(()) }
+    }
+
+    pub fn shared_mxfp4_drop_model(model_id: u64) {
+        if model_id != 0 { unsafe { coli_metal_shared_mxfp4_drop_model(model_id) }; }
+    }
+
     /// CPU BF16 GEMV through Accelerate/BNNS. No weight copy is retained.
     pub fn bnns_bf16_matmul(w: &[u8], x: &[f32], y: &mut [f32], o: usize, i: usize) -> bool {
         if w.len() < o * i * 2 || x.len() < i || y.len() < o {
@@ -117,6 +376,38 @@ mod imp {
                 w.as_ptr() as *const u16,
                 x.as_ptr(),
                 y.as_mut_ptr(),
+                o as i32,
+                i as i32,
+            ) == 1
+        }
+    }
+
+    /// CPU BF16 batched dense projection through BNNS. `x`/`y` are row-major
+    /// `[rows, i]` and `[rows, o]`; the BF16 weight matrix remains caller-owned.
+    pub fn bnns_bf16_matmul_batch(
+        w: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        rows: usize,
+        o: usize,
+        i: usize,
+    ) -> bool {
+        if rows == 0
+            || rows > i32::MAX as usize
+            || o > i32::MAX as usize
+            || i > i32::MAX as usize
+            || w.len() < o.saturating_mul(i).saturating_mul(2)
+            || x.len() < rows.saturating_mul(i)
+            || y.len() < rows.saturating_mul(o)
+        {
+            return false;
+        }
+        unsafe {
+            coli_bnns_bf16_matmul_batch(
+                w.as_ptr() as *const u16,
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows as i32,
                 o as i32,
                 i as i32,
             ) == 1
@@ -178,6 +469,8 @@ mod imp {
             kind: i32,
         ) -> i64;
         pub fn metalio_wait(event_value: i64) -> i32;
+        pub fn metalio_batch_barrier() -> i64;
+        pub fn metalio_batch_wait(event_value: i64, slots: *const i32, count: i32) -> i32;
         pub fn metalio_slot_consumed(slot: i32);
         pub fn metalio_stats(out: *mut ColiMetalioStats);
     }
@@ -214,6 +507,25 @@ mod imp {
         unsafe { metalio_active() == 1 }
     }
 
+    /// Insert one queue-level completion point after all MetalIO loads issued
+    /// so far. On a concurrent MTLIO queue this is the safe way to wait for a
+    /// whole expert batch without assuming per-load event values complete in
+    /// order.
+    pub fn mio_batch_barrier() -> Option<i64> {
+        if !mio_active() {
+            return None;
+        }
+        let event = unsafe { metalio_batch_barrier() };
+        (event > 0).then_some(event)
+    }
+
+    pub fn mio_batch_wait(event_value: i64, slots: &[i32]) -> bool {
+        event_value > 0
+            && unsafe {
+                metalio_batch_wait(event_value, slots.as_ptr(), slots.len() as i32) == 0
+            }
+    }
+
     /// The crate keeps ONE MTLIOFileHandle per shard file for the process
     /// lifetime (the C table hard-caps at METALIO_MAX_FILES=64; re-adding per
     /// miss would exhaust it and every load after the 64th would fall back to
@@ -245,9 +557,10 @@ mod imp {
     /// contiguously (dst offsets 0..total) so a single `moe_topk`/`swiglu`
     /// submission can consume the expert. Returns (slot, event) on success.
     /// The caller owns the slot until it frees it (or drops it into a cache).
-    pub fn mio_load_expert(
+    fn mio_load_expert_kind(
         fid: i32,
-        regions: &[(u64, usize)], // (file_offset, bytes) per matrix
+        regions: &[(u64, usize)],
+        kind: i32,
     ) -> Option<(i32, i64)> {
         if !mio_init() || regions.is_empty() {
             return None;
@@ -257,33 +570,60 @@ mod imp {
         if slot < 0 {
             return None;
         }
-        let mut dst = 0usize;
-        let mut cr: Vec<ColiMetalioRegion> = regions
-            .iter()
-            .map(|(off, len)| {
-                let r = ColiMetalioRegion {
-                    file: fid,
-                    src_off: *off,
-                    bytes: *len,
-                    dst_off: dst as u64,
-                };
-                dst += len;
-                r
-            })
-            .collect();
+        let coalesce = std::env::var("QWEN_MIO_COALESCE_EXPERT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let contiguous = regions.windows(2).all(|w| {
+            w[0].0.checked_add(w[0].1 as u64) == Some(w[1].0)
+        });
+        let mut cr: Vec<ColiMetalioRegion> = if coalesce && contiguous {
+            vec![ColiMetalioRegion {
+                file: fid,
+                src_off: regions[0].0,
+                bytes: total,
+                dst_off: 0,
+            }]
+        } else {
+            let mut dst = 0usize;
+            regions
+                .iter()
+                .map(|(off, len)| {
+                    let r = ColiMetalioRegion {
+                        file: fid,
+                        src_off: *off,
+                        bytes: *len,
+                        dst_off: dst as u64,
+                    };
+                    dst += len;
+                    r
+                })
+                .collect()
+        };
         let ev = unsafe {
-            metalio_loadv(
-                slot,
-                cr.as_mut_ptr(),
-                cr.len() as i32,
-                1, // MIO_LOAD_ASYNC
-            )
+            metalio_loadv(slot, cr.as_mut_ptr(), cr.len() as i32, kind)
         };
         if ev < 0 {
             unsafe { metalio_slot_free(slot) };
             return None;
         }
         Some((slot, ev))
+    }
+
+    /// Demand/async expert load used by the canonical routed path.
+    pub fn mio_load_expert(
+        fid: i32,
+        regions: &[(u64, usize)],
+    ) -> Option<(i32, i64)> {
+        mio_load_expert_kind(fid, regions, 1) // MIO_LOAD_ASYNC
+    }
+
+    /// Speculative expert load. Same physical path, but tagged so MetalIO
+    /// telemetry can distinguish prediction work from demand work.
+    pub fn mio_prefetch_expert(
+        fid: i32,
+        regions: &[(u64, usize)],
+    ) -> Option<(i32, i64)> {
+        mio_load_expert_kind(fid, regions, 2) // MIO_LOAD_SPEC
     }
 
     /// MetalIO streaming counters (loads/bytes/waits/fails + prefetch).
@@ -342,6 +682,16 @@ mod imp {
             hidden: i32,
             intermediate: i32,
         ) -> i32;
+        pub fn coli_apple8_metalio_moe_rows(
+            experts: *const ColiApple8MetalioExpert,
+            row_offsets: *const i32,
+            expert_count: i32,
+            x: *const f32,
+            y: *mut f32,
+            total_rows: i32,
+            hidden: i32,
+            intermediate: i32,
+        ) -> i32;
         pub fn coli_apple8_metalio_moe_topk(
             experts: *const ColiApple8MetalioExpert,
             route_weights: *const f32,
@@ -361,6 +711,7 @@ mod imp {
             pending_out: *mut *mut c_void,
         ) -> i32;
         pub fn coli_apple8_metalio_moe_topk_finish(pending: *mut c_void, y: *mut f32) -> i32;
+        pub fn coli_apple8_metalio_moe_topk_discard(pending: *mut c_void);
         pub fn coli_apple8_metalio_profile_get(
             encode_ns: *mut u64,
             submit_ns: *mut u64,
@@ -379,7 +730,9 @@ mod imp {
             i: i32,
         ) -> i32;
         // GDN (coalesced Metal kernels, qwen_moe.c seam contract)
+        pub fn coli_apple8_metalio_gdn_drop_model(model_id: u64);
         pub fn coli_apple8_metalio_gdn_token(
+            model_id: u64,
             layer: i32,
             x: *const f32,
             out: *mut f32,
@@ -400,6 +753,7 @@ mod imp {
             vheads: i32,
             vd: i32,
             kk: i32,
+            output_gate: i32,
             eps: f32,
         ) -> i32;
     }
@@ -422,6 +776,89 @@ mod imp {
 
     pub fn direct_available() -> bool {
         unsafe { DIRECT_OK }
+    }
+
+    /// Batched rows through one slot-resident Apple8 expert. `x` and `y` are
+    /// row-major `[rows, hidden]`. The native kernel reuses the expert weights
+    /// across all rows in one command buffer.
+    pub fn swiglu_slot_batch(
+        expert: &ColiApple8MetalioExpert,
+        x: &[f32],
+        y: &mut [f32],
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> bool {
+        if !direct_available()
+            || rows == 0
+            || x.len() < rows.saturating_mul(hidden)
+            || y.len() < rows.saturating_mul(hidden)
+            || rows > i32::MAX as usize
+            || hidden > i32::MAX as usize
+            || intermediate > i32::MAX as usize
+        {
+            return false;
+        }
+        unsafe {
+            coli_apple8_metalio_swiglu_slot(
+                expert.slot,
+                expert.gate_offset,
+                expert.gate_bytes,
+                expert.up_offset,
+                expert.up_bytes,
+                expert.down_offset,
+                expert.down_bytes,
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows as i32,
+                hidden as i32,
+                intermediate as i32,
+            ) == 1
+        }
+    }
+
+    /// Prefill routed-MoE batch. `x` is grouped by expert according to
+    /// `row_offsets`; native code encodes all expert groups into one command
+    /// buffer and writes corresponding unweighted expert outputs to `y`.
+    pub fn moe_rows(
+        experts: &[ColiApple8MetalioExpert],
+        row_offsets: &[i32],
+        x: &[f32],
+        y: &mut [f32],
+        hidden: usize,
+        intermediate: usize,
+    ) -> bool {
+        if !direct_available()
+            || experts.is_empty()
+            || row_offsets.len() != experts.len() + 1
+            || row_offsets.first().copied() != Some(0)
+        {
+            return false;
+        }
+        let Some(total_rows) = row_offsets.last().copied() else {
+            return false;
+        };
+        if total_rows <= 0
+            || x.len() < total_rows as usize * hidden
+            || y.len() < total_rows as usize * hidden
+            || experts.len() > i32::MAX as usize
+            || hidden > i32::MAX as usize
+            || intermediate > i32::MAX as usize
+        {
+            return false;
+        }
+        unsafe {
+            coli_apple8_metalio_moe_rows(
+                experts.as_ptr(),
+                row_offsets.as_ptr(),
+                experts.len() as i32,
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                total_rows,
+                hidden as i32,
+                intermediate as i32,
+            ) == 1
+        }
     }
 
     /// Fused decode-only routed layer: for K experts submits ONE command
@@ -459,16 +896,34 @@ mod imp {
         }
     }
 
-    /// Split-phase begin: encode+commit the fused block, return a pending
-    /// handle, do NOT wait — the CPU can run the shared expert while the GPU
-    /// works (the C engine's QWEN_APPLE8_OVERLAP=1 default path).
+    /// Owning split-phase routed-MoE submission. The native pointer is never
+    /// exposed through the safe API: finishing consumes this value, while
+    /// dropping it retires the command without publishing output. This makes
+    /// double-finish impossible in safe Rust and keeps scratch/slot lifetimes
+    /// tied to actual native completion.
+    pub struct MoePending {
+        raw: Option<std::ptr::NonNull<c_void>>,
+        hidden: usize,
+    }
+
+    impl Drop for MoePending {
+        fn drop(&mut self) {
+            if let Some(raw) = self.raw.take() {
+                unsafe { coli_apple8_metalio_moe_topk_discard(raw.as_ptr()) };
+            }
+        }
+    }
+
+    /// Split-phase begin: encode+commit the fused block, return an owning
+    /// pending handle, do NOT wait — the CPU can run the shared expert while
+    /// the GPU works (the C engine's QWEN_APPLE8_OVERLAP=1 default path).
     pub fn moe_topk_begin(
         experts: &[ColiApple8MetalioExpert],
         weights: &[f32],
         x: &[f32],
         hidden: usize,
         intermediate: usize,
-    ) -> Option<*mut std::ffi::c_void> {
+    ) -> Option<MoePending> {
         if !direct_available()
             || experts.is_empty()
             || experts.len() > 64
@@ -477,7 +932,7 @@ mod imp {
         {
             return None;
         }
-        let mut pending: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut pending: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             coli_apple8_metalio_moe_topk_begin(
                 experts.as_ptr(),
@@ -489,21 +944,32 @@ mod imp {
                 &mut pending,
             )
         };
-        if rc == 1 && !pending.is_null() {
-            Some(pending)
+        let raw = std::ptr::NonNull::new(pending)?;
+        if rc == 1 {
+            Some(MoePending {
+                raw: Some(raw),
+                hidden,
+            })
         } else {
+            // A non-null pointer on a failed begin would be a native contract
+            // violation; retire it defensively rather than leaking resources.
+            unsafe { coli_apple8_metalio_moe_topk_discard(raw.as_ptr()) };
             None
         }
     }
 
-    /// Wait for the pending block, scatter-add into y, free the handle.
-    /// false = GPU fault: the caller must redo those experts on CPU (C
-    /// contract: end returning 0 means the caller redoes them).
-    pub fn moe_topk_finish(pending: *mut std::ffi::c_void, y: &mut [f32], hidden: usize) -> bool {
-        if pending.is_null() {
+    /// Wait for the pending block, copy exactly `hidden` floats into y, and
+    /// free the native handle. `pending` is consumed, so it cannot be finished
+    /// twice. A too-short output is rejected before native memcpy; Drop still
+    /// retires the submitted GPU work safely.
+    pub fn moe_topk_finish(mut pending: MoePending, y: &mut [f32]) -> bool {
+        if y.len() < pending.hidden {
             return false;
         }
-        unsafe { coli_apple8_metalio_moe_topk_finish(pending, y.as_mut_ptr()) == 1 }
+        let Some(raw) = pending.raw.take() else {
+            return false;
+        };
+        unsafe { coli_apple8_metalio_moe_topk_finish(raw.as_ptr(), y.as_mut_ptr()) == 1 }
     }
 
     /// Direct-path profile counters (encode/submit/wait/kernel ns +
@@ -516,16 +982,29 @@ mod imp {
         (e, s, w, k, fc, fe)
     }
 
+    /// Release native GDN wrappers for one model before its aligned Rust
+    /// backing allocations are dropped. The native side serializes this with
+    /// token execution and therefore cannot retain zero-copy buffers past the
+    /// model lifetime.
+    pub fn gdn_drop_model(model_id: u64) {
+        if model_id != 0 && direct_available() {
+            unsafe { coli_apple8_metalio_gdn_drop_model(model_id) };
+        }
+    }
+
     /// Decode-only Metal GDN token, byte-exact C seam contract:
     /// - the five BF16 weight matrices, the recurrent state, and the conv
     ///   state MUST live in 16 KiB page-aligned host memory (the .mm wraps
     ///   them zero-copy via newBufferWithBytesNoCopy);
+    /// - model_id is a process-unique owner identity; native layer reuse is
+    ///   permitted only within that exact model;
     /// - x/out are copied;
     /// - rc > 0: done; rc == 0: declined BEFORE commit (CPU fallback safe);
     ///   rc < 0: failed AFTER submit — recurrent state may have advanced, the
     ///   C engine treats that as fatal (do not fall through).
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_token(
+        model_id: u64,
         layer: usize,
         x: &[f32],
         out: &mut [f32],
@@ -546,13 +1025,15 @@ mod imp {
         vheads: usize,
         vd: usize,
         kk: usize,
+        output_gate: i32,
         eps: f32,
     ) -> i32 {
-        if !direct_available() || !metal_available() {
+        if !direct_available() {
             return 0;
         }
         unsafe {
             coli_apple8_metalio_gdn_token(
+                model_id,
                 layer as i32,
                 x.as_ptr(),
                 out.as_mut_ptr(),
@@ -573,6 +1054,7 @@ mod imp {
                 vheads as i32,
                 vd as i32,
                 kk as i32,
+                output_gate,
                 eps,
             )
         }
@@ -587,6 +1069,25 @@ mod imp {
     #[repr(C)]
     pub struct ColiMetalTensor {
         _private: [u8; 0],
+    }
+
+    pub struct MetalMatmulDesc<'a> {
+        pub tensor: *mut ColiMetalTensor,
+        pub y: &'a mut [f32],
+        pub weights: &'a [u8],
+        pub scales: &'a [u8],
+        pub fmt: i32,
+        pub i: usize,
+        pub o: usize,
+    }
+
+    pub struct MetalWeightDesc<'a> {
+        pub tensor: *mut ColiMetalTensor,
+        pub weights: &'a [u8],
+        pub scales: &'a [u8],
+        pub fmt: i32,
+        pub i: usize,
+        pub o: usize,
     }
 
     pub fn metal_init() -> bool {
@@ -605,6 +1106,9 @@ mod imp {
         _i: usize,
         _o: usize,
     ) -> bool {
+        false
+    }
+    pub fn metal_matmul_multi(_x: &[f32], _descs: &mut [MetalMatmulDesc<'_>]) -> bool {
         false
     }
     pub fn metal_rmsnorm(_x: &mut [f32], _w: &[f32], _n: usize, _nrows: usize, _eps: f32) -> bool {
@@ -633,10 +1137,19 @@ mod imp {
     pub fn mio_active() -> bool {
         false
     }
+    pub fn mio_batch_barrier() -> Option<i64> {
+        None
+    }
+    pub fn mio_batch_wait(_event_value: i64, _slots: &[i32]) -> bool {
+        false
+    }
     pub fn mio_file(_path: &str) -> Option<i32> {
         None
     }
     pub fn mio_load_expert(_fid: i32, _regions: &[(u64, usize)]) -> Option<(i32, i64)> {
+        None
+    }
+    pub fn mio_prefetch_expert(_fid: i32, _regions: &[(u64, usize)]) -> Option<(i32, i64)> {
         None
     }
     pub struct ColiMetalioStats {
@@ -685,11 +1198,41 @@ mod imp {
     pub fn bnns_bf16_matmul(_w: &[u8], _x: &[f32], _y: &mut [f32], _o: usize, _i: usize) -> bool {
         false
     }
+    pub fn bnns_bf16_matmul_batch(
+        _w: &[u8],
+        _x: &[f32],
+        _y: &mut [f32],
+        _rows: usize,
+        _o: usize,
+        _i: usize,
+    ) -> bool {
+        false
+    }
 
     pub fn direct_init() -> bool {
         false
     }
     pub fn direct_available() -> bool {
+        false
+    }
+    pub fn swiglu_slot_batch(
+        _expert: &ColiApple8MetalioExpert,
+        _x: &[f32],
+        _y: &mut [f32],
+        _rows: usize,
+        _hidden: usize,
+        _intermediate: usize,
+    ) -> bool {
+        false
+    }
+    pub fn moe_rows(
+        _experts: &[ColiApple8MetalioExpert],
+        _row_offsets: &[i32],
+        _x: &[f32],
+        _y: &mut [f32],
+        _hidden: usize,
+        _intermediate: usize,
+    ) -> bool {
         false
     }
     pub fn moe_topk(
@@ -702,27 +1245,44 @@ mod imp {
     ) -> bool {
         false
     }
+    pub struct MoePending {
+        _private: (),
+    }
     pub fn moe_topk_begin(
         _experts: &[ColiApple8MetalioExpert],
         _weights: &[f32],
         _x: &[f32],
         _hidden: usize,
         _inter: usize,
-    ) -> Option<*mut std::ffi::c_void> {
+    ) -> Option<MoePending> {
         None
     }
-    pub fn moe_topk_finish(
-        _pending: *mut std::ffi::c_void,
-        _y: &mut [f32],
-        _hidden: usize,
-    ) -> bool {
+    pub fn moe_topk_finish(_pending: MoePending, _y: &mut [f32]) -> bool {
         false
     }
     pub fn metal_profile() -> (u64, u64, u64, u64, u64, u64) {
         (0, 0, 0, 0, 0, 0)
     }
     #[allow(clippy::too_many_arguments)]
+    pub fn gdn_mxfp4(
+        _model_id: u64, _layer: usize, _descs: &mut [MetalWeightDesc<'_>],
+        _x: &[f32], _out: &mut [f32], _a_log: &[f32], _dt_bias: &[f32],
+        _conv_w: &[f32], _norm_w: &[f32], _state: &mut [f32], _conv_state: &mut [f32],
+        _d: usize, _kheads: usize, _kd: usize, _vheads: usize, _vd: usize, _kk: usize,
+        _output_gate: i32, _eps: f32,
+    ) -> i32 { 0 }
+    pub fn shared_mxfp4(
+        _model_id: u64, _layer: usize, _descs: &mut [MetalWeightDesc<'_>],
+        _x: &[f32], _out: &mut [f32], _d: usize, _iinter: usize,
+    ) -> Result<Option<()>, ()> { Ok(None) }
+    pub fn shared_mxfp4_drop_model(_model_id: u64) {}
+
+    pub fn gdn_mxfp4_drop_model(_model_id: u64) {}
+
+    pub fn gdn_drop_model(_model_id: u64) {}
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_token(
+        _model_id: u64,
         _layer: usize,
         _x: &[f32],
         _out: &mut [f32],
@@ -743,6 +1303,7 @@ mod imp {
         _vheads: usize,
         _vd: usize,
         _kk: usize,
+        _output_gate: i32,
         _eps: f32,
     ) -> i32 {
         0

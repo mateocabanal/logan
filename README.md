@@ -44,6 +44,8 @@ The C-oracle differential tests (rANS/Apple8 identity vs the C decoder)
 skip automatically when the C reference tree is absent — the C fork
 (`mateocabanal/colibri`) remains the parity oracle and is not vendored here.
 
+Repository-agent and chat-harness behavior is aligned with the applicable parts of OpenAI's current latest-model guidance. The applicability matrix, including why Astra-only API parameter restrictions do not apply to Logan's local Qwen sampler, is in `docs/OPENAI_LATEST_MODEL_GUIDANCE.md`.
+
 ## Run
 
 ```bash

@@ -17,7 +17,12 @@ use crate::Model;
 
 const MAGIC: &[u8; 8] = b"LOGANPFX";
 const FORMAT_VERSION: u32 = 1;
-const STATE_ABI_VERSION: u32 = 2;
+// Bump whenever causal-state math or layout changes in a way that makes an
+// older snapshot unsafe to restore. v3 invalidated states produced before the
+// PLE payload-offset/tap-order and E4M3FN corrections. v4 invalidates classic
+// Qwen3.5/3.6 states produced while MLX-sanitized RMSNorm weights were treated
+// as raw Hugging Face delta weights.
+const STATE_ABI_VERSION: u32 = 4;
 const HEADER_BYTES: usize = 256;
 const CHECKSUM_OFF: usize = 224;
 const CHECKSUM_BYTES: usize = 32;
@@ -307,7 +312,7 @@ fn env_bool(name: &str, default: bool) -> bool {
 }
 
 fn hash_numerical_policy(h: &mut Sha256, model: &Model) {
-    h.update(b"logan-qwen4-numerical-policy-v1\0");
+    h.update(b"logan-qwen4-numerical-policy-v2\0");
     h.update(std::env::consts::OS.as_bytes());
     h.update([0]);
     h.update(std::env::consts::ARCH.as_bytes());
@@ -316,15 +321,23 @@ fn hash_numerical_policy(h: &mut Sha256, model: &Model) {
     // `metal_direct` is resolved at model load and therefore more exact than
     // re-reading QWEN_APPLE8_DIRECT here.
     h.update([model.metal_direct as u8]);
-    // Hash the backend that can actually execute this checkpoint.
-    // Qwen3.8 sigmoid gating deliberately declines the historical SiLU
-    // Metal GDN kernel, so QWEN_GDN_METAL=0/1 are numerically identical
-    // for this model and should share one prefix-cache namespace.
-    let effective_gdn_metal = env_bool("QWEN_GDN_METAL", true)
-        && model.cfg.output_gate == crate::OutputGate::Silu;
+    // Hash the backend that can actually execute this checkpoint. The Metal
+    // GDN kernel now supports both SiLU and sigmoid output gates, so the old
+    // gate-based aliasing rule would let CPU- and GPU-produced sigmoid state
+    // share a cache namespace. `metal_direct` already captures whether this
+    // loaded package/backend can use the direct Apple path.
+    let effective_gdn_metal = model.metal_direct && env_bool("QWEN_GDN_METAL", true);
     h.update(b"QWEN_GDN_METAL");
     h.update([0]);
     h.update([effective_gdn_metal as u8]);
+    let effective_gdn_mxfp4_full = model.metal_direct && env_bool("QWEN_GDN_MXFP4_FULL", true);
+    h.update(b"QWEN_GDN_MXFP4_FULL");
+    h.update([0]);
+    h.update([effective_gdn_mxfp4_full as u8]);
+    let effective_shared_mxfp4_full = model.metal_direct && env_bool("QWEN_SHARED_MXFP4_FULL", true);
+    h.update(b"QWEN_SHARED_MXFP4_FULL");
+    h.update([0]);
+    h.update([effective_shared_mxfp4_full as u8]);
     for (name, default) in [
         ("QWEN_BNNS_BF16", false),
         ("QWEN_ATTN_METAL", true),

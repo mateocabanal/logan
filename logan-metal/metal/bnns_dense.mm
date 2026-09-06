@@ -11,18 +11,19 @@
  * Workspace is thread-local and grows monotonically, avoiding per-call
  * allocation/free in BNNSMatMul.
  */
-extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
-                                      const float *x,
-                                      float *y,
-                                      int O,
-                                      int I) {
-    if (!w || !x || !y || O <= 0 || I <= 0) return 0;
+extern "C" int coli_bnns_bf16_matmul_batch(const uint16_t *w,
+                                            const float *x,
+                                            float *y,
+                                            int S,
+                                            int O,
+                                            int I) {
+    if (!w || !x || !y || S <= 0 || O <= 0 || I <= 0) return 0;
 
     BNNSNDArrayDescriptor a = {};
     a.flags = BNNSNDArrayFlagBackpropSet;
     a.layout = BNNSDataLayoutRowMajorMatrix;
     a.size[0] = (size_t)I;
-    a.size[1] = 1;
+    a.size[1] = (size_t)S;
     a.stride[0] = 1;
     a.stride[1] = (size_t)I;
     a.data = (void *)x;
@@ -46,7 +47,7 @@ extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
     c.flags = BNNSNDArrayFlagBackpropSet;
     c.layout = BNNSDataLayoutRowMajorMatrix;
     c.size[0] = (size_t)O;
-    c.size[1] = 1;
+    c.size[1] = (size_t)S;
     c.stride[0] = 1;
     c.stride[1] = (size_t)O;
     c.data = (void *)y;
@@ -63,4 +64,12 @@ extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
     const int rc = BNNSMatMul(false, true, 1.0f, &a, &b, &c, ws, nullptr);
 #pragma clang diagnostic pop
     return rc == 0 ? 1 : 0;
+}
+
+extern "C" int coli_bnns_bf16_matmul(const uint16_t *w,
+                                      const float *x,
+                                      float *y,
+                                      int O,
+                                      int I) {
+    return coli_bnns_bf16_matmul_batch(w, x, y, 1, O, I);
 }

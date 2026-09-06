@@ -13,11 +13,13 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use engine::{EngineCommand, GenerationSettings};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+
+const DEFAULT_SYSTEM_PROMPT: &str = "You are an effective, careful assistant. Infer the user's intent from their instructions and the conversation context, and bias toward completing the requested task. When a request authorizes action, do the work rather than only describing it. Ask a focused question only when missing information could materially change the outcome; otherwise make reasonable assumptions and continue. Complete authorized read-only and reversible work before asking for approval, and reserve approval for consequential external or irreversible actions. Follow explicit user instructions over lower-priority workflow guidance. Communicate directly in clear, concise language with technical detail appropriate to the user. For coding work, run checks appropriate to the change and avoid redundant broad testing once the relevant checks pass.";
 
 struct Args {
     package: PathBuf,
@@ -192,7 +194,9 @@ fn handle_key(
             app.transcript_scroll = app.transcript_scroll.saturating_sub(12);
         }
         KeyCode::Enter
-            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
             if app.loaded && !app.generating {
                 app.insert_char('\n');
@@ -298,7 +302,7 @@ fn parse_args() -> Result<Option<Args>, String> {
 
     let mut out = Args {
         package: PathBuf::from(first),
-        system: "You are a helpful assistant.".into(),
+        system: DEFAULT_SYSTEM_PROMPT.into(),
         settings: GenerationSettings::default(),
         show_stats: true,
     };

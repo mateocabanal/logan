@@ -137,6 +137,15 @@ impl QwenMoeFrontend {
                 detail: "linear-attention QKV width overflows u64".into(),
             })?;
 
+        // MLX-community MXFP4 checkpoints use a different, already-packed
+        // text layout (`language_model.model.*`) with routed experts under
+        // `mlp.switch_mlp.{gate,up,down}_proj.{weight,scales}`. Preserve that
+        // quantization exactly and adapt it into the same semantic IR rather
+        // than dequantizing/requantizing through BF16.
+        if is_mlx_mxfp4_layout(source) {
+            return build_mlx_mxfp4(source, geometry);
+        }
+
         // ---- routed experts: slice the fused per-layer tensors ----
         let inter = geometry.moe_intermediate_size;
         let hidden = geometry.hidden_size;
@@ -499,6 +508,294 @@ impl QwenMoeFrontend {
             resident_tensors,
         })
     }
+}
+
+fn is_mlx_mxfp4_layout(source: &SourceInventory) -> bool {
+    source
+        .tensors
+        .contains_key("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight")
+}
+
+fn build_mlx_mxfp4(source: &SourceInventory, geometry: ModelGeometry) -> Result<SemanticModel> {
+    let mut consumed = BTreeSet::new();
+    let routed_experts = build_mlx_switch_experts(source, &geometry, &mut consumed)?;
+
+    let mut global_tensors = BTreeMap::new();
+    for (canonical, source_name) in [
+        ("embed.weight", "language_model.model.embed_tokens.weight"),
+        ("embed.scales", "language_model.model.embed_tokens.scales"),
+        ("head.weight", "language_model.lm_head.weight"),
+        ("head.scales", "language_model.lm_head.scales"),
+        ("norm.weight", "language_model.model.norm.weight"),
+    ] {
+        let tensor = tensor_by_name(source, source_name)?;
+        global_tensors.insert(
+            canonical.to_owned(),
+            mlx_tensor_view(source, source_name, tensor)?,
+        );
+        consumed.insert(source_name.to_owned());
+    }
+
+    let mut layer_static_tensors = BTreeMap::new();
+    for layer in 0..geometry.layers {
+        let prefix = format!("language_model.model.layers.{layer}.");
+        let mut tensors = BTreeMap::new();
+        for (name, tensor) in &source.tensors {
+            let Some(role) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if role.starts_with("mlp.switch_mlp.") {
+                continue;
+            }
+            tensors.insert(role.to_owned(), mlx_tensor_view(source, name, tensor)?);
+            consumed.insert(name.clone());
+        }
+        if tensors.is_empty() {
+            return invalid(
+                &source.root,
+                format!("MLX MXFP4 layer {layer} has no static tensors"),
+            );
+        }
+        layer_static_tensors.insert(layer, tensors);
+    }
+
+    // Keep any future text-side tensors that were not classified above, but
+    // deliberately ignore the vision tower: Logan's Qwen runtime is text-only.
+    let mut resident_tensors = BTreeMap::new();
+    for (name, tensor) in &source.tensors {
+        if consumed.contains(name)
+            || name.starts_with("vision_tower.")
+            || name.starts_with("model.visual.")
+            || name.starts_with("visual.")
+        {
+            continue;
+        }
+        if name.starts_with("language_model.") {
+            resident_tensors.insert(name.clone(), mlx_tensor_view(source, name, tensor)?);
+        }
+    }
+
+    Ok(SemanticModel {
+        architecture: Architecture::Qwen3_5MoeMoE,
+        geometry,
+        routed_experts,
+        global_tensors,
+        layer_static_tensors,
+        resident_tensors,
+    })
+}
+
+/// Reinterpret an MLX quantized tensor as the byte-level representation that
+/// COLI stores. Safetensors U32 payloads are little-endian packed words; no
+/// byte shuffle is needed on disk.
+fn mlx_tensor_view(source: &SourceInventory, name: &str, tensor: &TensorRef) -> Result<TensorRef> {
+    match tensor.dtype.as_str() {
+        "U32" => {
+            let base = name
+                .strip_suffix(".weight")
+                .ok_or_else(|| ColicError::InvalidSource {
+                    path: source.root.clone(),
+                    detail: format!("packed U32 tensor `{name}` is not a weight tensor"),
+                })?;
+            let scale_name = format!("{base}.scales");
+            let scale = tensor_by_name(source, &scale_name)?;
+            let dtype = match scale.dtype.as_str() {
+                // MLX MXFP4: eight 4-bit E2M1 values per U32 word.
+                "U8" => "I8",
+                // MLX affine 8-bit group quantization: four bytes per U32 word.
+                "BF16" => "U8",
+                other => {
+                    return invalid(
+                        &source.root,
+                        format!("packed tensor `{name}` has unsupported scale dtype `{other}`"),
+                    );
+                }
+            };
+            let mut shape = tensor.shape.clone();
+            let last = shape.last_mut().ok_or_else(|| ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("packed tensor `{name}` has scalar shape"),
+            })?;
+            *last = last
+                .checked_mul(4)
+                .ok_or_else(|| ColicError::InvalidSource {
+                    path: source.root.clone(),
+                    detail: format!("packed tensor `{name}` byte shape overflows u64"),
+                })?;
+            Ok(TensorRef {
+                source: tensor.source.clone(),
+                offset: tensor.offset,
+                len: tensor.len,
+                dtype: dtype.into(),
+                shape,
+            })
+        }
+        // MLX stores E8M0 scale codes as raw U8. Retagging them makes the
+        // physical quantization contract explicit in COLI metadata.
+        "U8" if name.ends_with(".scales") => Ok(TensorRef {
+            source: tensor.source.clone(),
+            offset: tensor.offset,
+            len: tensor.len,
+            dtype: "F8_E8M0".into(),
+            shape: tensor.shape.clone(),
+        }),
+        _ => Ok(tensor.clone()),
+    }
+}
+
+fn build_mlx_switch_experts(
+    source: &SourceInventory,
+    geometry: &ModelGeometry,
+    consumed: &mut BTreeSet<String>,
+) -> Result<BTreeMap<(u32, u32), RoutedExpert>> {
+    let mut routed = BTreeMap::new();
+    for layer in 0..geometry.layers {
+        let prefix = format!("language_model.model.layers.{layer}.mlp.switch_mlp");
+        let gate_w = format!("{prefix}.gate_proj.weight");
+        let gate_s = format!("{prefix}.gate_proj.scales");
+        let up_w = format!("{prefix}.up_proj.weight");
+        let up_s = format!("{prefix}.up_proj.scales");
+        let down_w = format!("{prefix}.down_proj.weight");
+        let down_s = format!("{prefix}.down_proj.scales");
+        for name in [&gate_w, &gate_s, &up_w, &up_s, &down_w, &down_s] {
+            consumed.insert(name.clone());
+        }
+        for expert in 0..geometry.routed_experts_per_layer {
+            routed.insert(
+                (layer, expert),
+                RoutedExpert {
+                    layer,
+                    expert,
+                    gate: slice_mlx_mxfp4_bank(
+                        source,
+                        &gate_w,
+                        &gate_s,
+                        expert,
+                        geometry.routed_experts_per_layer,
+                        geometry.moe_intermediate_size,
+                        geometry.hidden_size,
+                    )?,
+                    up: slice_mlx_mxfp4_bank(
+                        source,
+                        &up_w,
+                        &up_s,
+                        expert,
+                        geometry.routed_experts_per_layer,
+                        geometry.moe_intermediate_size,
+                        geometry.hidden_size,
+                    )?,
+                    down: slice_mlx_mxfp4_bank(
+                        source,
+                        &down_w,
+                        &down_s,
+                        expert,
+                        geometry.routed_experts_per_layer,
+                        geometry.hidden_size,
+                        geometry.moe_intermediate_size,
+                    )?,
+                },
+            );
+        }
+    }
+    Ok(routed)
+}
+
+fn slice_mlx_mxfp4_bank(
+    source: &SourceInventory,
+    weight_name: &str,
+    scale_name: &str,
+    expert: u32,
+    experts: u32,
+    rows: u32,
+    columns: u32,
+) -> Result<Matrix> {
+    if columns % 32 != 0 {
+        return invalid(
+            &source.root,
+            format!("MXFP4 matrix `{weight_name}` has columns={columns}, not divisible by 32"),
+        );
+    }
+    let weight = tensor_by_name(source, weight_name)?;
+    let scale = tensor_by_name(source, scale_name)?;
+    let packed_words = u64::from(columns) / 8;
+    let groups = u64::from(columns) / 32;
+    let expected_weight_shape = [u64::from(experts), u64::from(rows), packed_words];
+    let expected_scale_shape = [u64::from(experts), u64::from(rows), groups];
+    if weight.dtype != "U32" || weight.shape != expected_weight_shape {
+        return invalid(
+            &source.root,
+            format!(
+                "MXFP4 weight `{weight_name}` has {}/{:?}, expected U32/{expected_weight_shape:?}",
+                weight.dtype, weight.shape
+            ),
+        );
+    }
+    if scale.dtype != "U8" || scale.shape != expected_scale_shape {
+        return invalid(
+            &source.root,
+            format!(
+                "MXFP4 scales `{scale_name}` have {}/{:?}, expected U8/{expected_scale_shape:?}",
+                scale.dtype, scale.shape
+            ),
+        );
+    }
+
+    let weight_bytes = u64::from(rows)
+        .checked_mul(u64::from(columns) / 2)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MXFP4 weight slice `{weight_name}` overflows u64"),
+        })?;
+    let scale_bytes =
+        u64::from(rows)
+            .checked_mul(groups)
+            .ok_or_else(|| ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("MXFP4 scale slice `{scale_name}` overflows u64"),
+            })?;
+    let weight_offset = weight
+        .offset
+        .checked_add(u64::from(expert).checked_mul(weight_bytes).ok_or_else(|| {
+            ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("MXFP4 expert offset `{weight_name}` overflows u64"),
+            }
+        })?)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MXFP4 expert offset `{weight_name}` overflows u64"),
+        })?;
+    let scale_offset = scale
+        .offset
+        .checked_add(u64::from(expert).checked_mul(scale_bytes).ok_or_else(|| {
+            ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("MXFP4 expert offset `{scale_name}` overflows u64"),
+            }
+        })?)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MXFP4 expert offset `{scale_name}` overflows u64"),
+        })?;
+
+    Ok(Matrix {
+        source: TensorRef {
+            source: weight.source.clone(),
+            offset: weight_offset,
+            len: weight_bytes,
+            dtype: "I8".into(),
+            shape: vec![u64::from(rows), u64::from(columns) / 2],
+        },
+        rows,
+        columns,
+        scale: Some(TensorRef {
+            source: scale.source.clone(),
+            offset: scale_offset,
+            len: scale_bytes,
+            dtype: "F8_E8M0".into(),
+            shape: vec![u64::from(rows), groups],
+        }),
+    })
 }
 
 /// A tensor name that is one of the two fused per-layer expert payloads.

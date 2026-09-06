@@ -10,6 +10,8 @@ It is intentionally a runtime test surface, not a wrapper around the one-shot CL
 - the first system-message boundary is persisted as a semantic checkpoint;
 - validated Logan performance paths are enabled by default and remain opt-out through their existing `QWEN_*` environment variables;
 - generation is streamed into the TUI token-by-token;
+- the default system prompt follows the applicable OpenAI latest-model harness guidance: infer intent, act on authorized requests, ask only when missing information materially changes the result, communicate directly, and calibrate verification to the task;
+- `--system TEXT` or `/system TEXT` replaces that default when a model- or workflow-specific prompt is desired;
 - runtime counters are read directly from the model/Metal backend, not parsed from stderr.
 
 ## Build

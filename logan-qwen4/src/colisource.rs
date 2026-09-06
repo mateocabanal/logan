@@ -107,9 +107,12 @@ impl logan_core::expert::Slot for SlotExpert {
     }
 }
 
-/// Resident weight: BF16 bytes + shape. matmul decodes on the fly.
+/// Resident matrix in the physical representation carried by COLI.
 pub struct ColiWt {
-    pub bytes: Vec<u8>, // BF16 little-endian
+    pub bytes: Vec<u8>,
+    pub scales: Vec<u8>,
+    /// Logan Metal format: 5 = BF16 bytes, 7 = row-major MXFP4 + E8M0.
+    pub fmt: i32,
     pub o: usize,
     pub i: usize,
 }
@@ -148,19 +151,147 @@ impl ColiSource {
         Ok(payload)
     }
 
-    /// Dense matrix -> BF16 bytes, rows x cols.
+    /// Dense matrix in the package's physical representation. Qwen3.6 MXFP4
+    /// checkpoints keep their large matrices compressed all the way into the
+    /// runtime; only the tiny affine-Q8 router/gate matrices are expanded once
+    /// to BF16 at load so the established CPU routing path remains unchanged.
     pub fn wt(&self, name: &str, o: usize, i: usize) -> Result<ColiWt, String> {
         let rec = self.rec(name).ok_or_else(|| format!("missing dense matrix {name}"))?;
         let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
-        let want = o * i * 2; // BF16
+        match rec.math_format {
+            0x0003 => {
+                let want = o
+                    .checked_mul(i)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| format!("{name}: BF16 matrix size overflows"))?;
+                if payload.len() != want {
+                    return Err(format!(
+                        "{name}: BF16 payload {} bytes != expected {want} ({o}x{i})",
+                        payload.len()
+                    ));
+                }
+                Ok(ColiWt {
+                    bytes: payload,
+                    scales: Vec::new(),
+                    fmt: 5,
+                    o,
+                    i,
+                })
+            }
+            0x0020 => {
+                let want_w = o
+                    .checked_mul(i.div_ceil(2))
+                    .ok_or_else(|| format!("{name}: MXFP4 matrix size overflows"))?;
+                if payload.len() != want_w {
+                    return Err(format!(
+                        "{name}: MXFP4 payload {} bytes != expected {want_w} ({o}x{i})",
+                        payload.len()
+                    ));
+                }
+                let base = name
+                    .strip_suffix(".weight")
+                    .ok_or_else(|| format!("{name}: MXFP4 matrix is not a .weight record"))?;
+                let scale_name = format!("{base}.scales");
+                let scale_rec = self
+                    .rec(&scale_name)
+                    .ok_or_else(|| format!("missing MXFP4 scales {scale_name}"))?;
+                let scales = self
+                    .pkg
+                    .read_tensor_payload(scale_rec)
+                    .map_err(|e| e.to_string())?;
+                let want_s = o
+                    .checked_mul(i.div_ceil(32))
+                    .ok_or_else(|| format!("{name}: MXFP4 scale size overflows"))?;
+                if scales.len() != want_s {
+                    return Err(format!(
+                        "{scale_name}: payload {} bytes != expected {want_s} ({o}xceil({i}/32))",
+                        scales.len()
+                    ));
+                }
+                Ok(ColiWt {
+                    bytes: payload,
+                    scales,
+                    fmt: 7,
+                    o,
+                    i,
+                })
+            }
+            0x0005 => self.dequant_affine_q8(name, payload, o, i),
+            other => Err(format!(
+                "{name}: unsupported resident matrix math format 0x{other:04x}"
+            )),
+        }
+    }
+
+    fn dequant_affine_q8(
+        &self,
+        name: &str,
+        payload: Vec<u8>,
+        o: usize,
+        i: usize,
+    ) -> Result<ColiWt, String> {
+        let want = o
+            .checked_mul(i)
+            .ok_or_else(|| format!("{name}: Q8 matrix size overflows"))?;
         if payload.len() != want {
             return Err(format!(
-                "{name}: payload {} bytes != expected {want} ({o}x{i})",
+                "{name}: Q8 payload {} bytes != expected {want} ({o}x{i})",
                 payload.len()
             ));
         }
+        let base = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| format!("{name}: Q8 matrix is not a .weight record"))?;
+        let scale_name = format!("{base}.scales");
+        let bias_name = format!("{base}.biases");
+        let scales = self
+            .pkg
+            .read_tensor_payload(
+                self.rec(&scale_name)
+                    .ok_or_else(|| format!("missing affine-Q8 scales {scale_name}"))?,
+            )
+            .map_err(|e| e.to_string())?;
+        let biases = self
+            .pkg
+            .read_tensor_payload(
+                self.rec(&bias_name)
+                    .ok_or_else(|| format!("missing affine-Q8 biases {bias_name}"))?,
+            )
+            .map_err(|e| e.to_string())?;
+        if scales.len() != biases.len() || scales.len() % (o * 2) != 0 {
+            return Err(format!(
+                "{name}: invalid affine-Q8 scale/bias payloads {}/{} bytes for {o} rows",
+                scales.len(),
+                biases.len()
+            ));
+        }
+        let groups = scales.len() / (o * 2);
+        if groups == 0 || i % groups != 0 {
+            return Err(format!(
+                "{name}: cannot infer affine-Q8 group size from {groups} groups across {i} columns"
+            ));
+        }
+        let group_size = i / groups;
+        let bf16_at = |bytes: &[u8], index: usize| -> f32 {
+            let off = index * 2;
+            bf16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
+        };
+        let mut out = Vec::with_capacity(want * 2);
+        for row in 0..o {
+            for col in 0..i {
+                let group = row * groups + col / group_size;
+                // MLX affine quantization reconstructs q*scale + bias. The
+                // packed U32 source has already been exposed as raw U8 bytes
+                // by the Logan compiler, so no further bit unpacking is needed.
+                let value = payload[row * i + col] as f32 * bf16_at(&scales, group)
+                    + bf16_at(&biases, group);
+                out.extend_from_slice(&f32_to_bf16(value).to_le_bytes());
+            }
+        }
         Ok(ColiWt {
-            bytes: payload,
+            bytes: out,
+            scales: Vec::new(),
+            fmt: 5,
             o,
             i,
         })
@@ -231,6 +362,8 @@ impl ColiSource {
             };
             out.push(ColiWt {
                 bytes,
+                scales: Vec::new(),
+                fmt: 5,
                 o: rows as usize,
                 i: cols as usize,
             });
@@ -375,7 +508,7 @@ impl ColiSource {
         let within = (r % rps) as u64;
         // pread only this row (F8: hd_per bytes) — never the whole shard
         self.pkg
-            .read_payload_range(rec, within * hd_per as u64, hd_per)
+            .read_tensor_payload_range(rec, within * hd_per as u64, hd_per)
             .map_err(|e| e.to_string())
     }
 
@@ -398,8 +531,10 @@ impl ColiSource {
         let exp = ((b >> 3) & 0x0f) as i32;
         let mant = (b & 0x07) as f32;
         match exp {
-            0 => sign * mant * 0.001953125,   // subnormal: 2^-9
-            0x0f => sign * f32::INFINITY,     // NaN/Inf
+            0 => sign * mant * 0.001953125, // subnormal: 2^-9
+            // OCP E4M3FN has no infinity encoding. Exponent 15 remains
+            // finite through mantissa 6 (256..448); only mantissa 7 is NaN.
+            0x0f if mant == 7.0 => f32::NAN,
             e => sign * (1.0 + mant * 0.125) * 2f32.powi(e - 7),
         }
     }
@@ -419,4 +554,28 @@ pub fn bf16_bytes(f: f32) -> [u8; 2] {
 
 pub fn bf16_to_f32(u: u16) -> f32 {
     f32::from_bits((u as u32) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ColiSource;
+
+    #[test]
+    fn e4m3fn_exponent_15_is_finite_except_nan_code() {
+        assert_eq!(ColiSource::e4m3_decode(0x78), 256.0);
+        assert_eq!(ColiSource::e4m3_decode(0x79), 288.0);
+        assert_eq!(ColiSource::e4m3_decode(0x7e), 448.0);
+        assert_eq!(ColiSource::e4m3_decode(0xf8), -256.0);
+        assert_eq!(ColiSource::e4m3_decode(0xfe), -448.0);
+        assert!(ColiSource::e4m3_decode(0x7f).is_nan());
+        assert!(ColiSource::e4m3_decode(0xff).is_nan());
+    }
+
+    #[test]
+    fn e4m3fn_zero_subnormal_and_normal_boundaries() {
+        assert_eq!(ColiSource::e4m3_decode(0x00).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(ColiSource::e4m3_decode(0x80).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(ColiSource::e4m3_decode(0x01), 2.0_f32.powi(-9));
+        assert_eq!(ColiSource::e4m3_decode(0x08), 2.0_f32.powi(-6));
+    }
 }

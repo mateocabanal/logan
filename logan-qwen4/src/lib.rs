@@ -91,6 +91,13 @@ pub enum OutputGate {
 }
 
 impl OutputGate {
+    fn gdn_metal_code(self) -> i32 {
+        match self {
+            Self::Silu => 0,
+            Self::Sigmoid => 1,
+        }
+    }
+
     fn from_config(v: &serde_json::Value) -> Result<Self, String> {
         let name = v
             .get("output_gate_type")
@@ -320,14 +327,104 @@ pub enum SchedForward {
     NeedExperts { layer: usize, experts: Vec<u32> },
 }
 
+pub enum WtBytes {
+    /// Canonical BF16 row-major matrix.
+    Bf16(Vec<u8>),
+    /// OCP MXFP4 row-major packed E2M1 nibbles plus one E8M0 scale byte per
+    /// 32 input columns. The optional Metal tensor is created lazily on first
+    /// use and is owned by this weight representation.
+    Mxfp4 {
+        weights: Vec<u8>,
+        scales: Vec<u8>,
+        metal_tensor: std::sync::Mutex<usize>,
+    },
+}
+
+impl Clone for WtBytes {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Bf16(bytes) => Self::Bf16(bytes.clone()),
+            Self::Mxfp4 { weights, scales, .. } => Self::Mxfp4 {
+                weights: weights.clone(),
+                scales: scales.clone(),
+                // A native tensor handle is tied to the original byte buffers.
+                // Clones must create their own handle lazily.
+                metal_tensor: std::sync::Mutex::new(0),
+            },
+        }
+    }
+}
+
+impl Drop for WtBytes {
+    fn drop(&mut self) {
+        if let Self::Mxfp4 { metal_tensor, .. } = self {
+            let raw = std::mem::take(
+                metal_tensor
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            if raw != 0 {
+                unsafe {
+                    logan_metal::coli_metal_tensor_free(
+                        raw as *mut logan_metal::ColiMetalTensor,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Wt {
     f: Vec<f32>,
-    /// BF16 bytes when loaded from a .coli package (decoded per-row in
-    /// matmul to keep resident memory at package size).
-    bytes: Option<Vec<u8>>,
+    /// Physical bytes when loaded from a COLI package. The representation is
+    /// explicit so resident MXFP4 matrices never masquerade as BF16.
+    bytes: Option<WtBytes>,
     o: usize,
     i: usize,
+}
+
+impl Wt {
+    fn bf16_bytes(&self) -> Option<&[u8]> {
+        match self.bytes.as_ref()? {
+            WtBytes::Bf16(bytes) => Some(bytes),
+            WtBytes::Mxfp4 { .. } => None,
+        }
+    }
+
+    fn row_f32(&self, row: usize) -> Vec<f32> {
+        assert!(row < self.o);
+        if !self.f.is_empty() {
+            return self.f[row * self.i..(row + 1) * self.i].to_vec();
+        }
+        match self.bytes.as_ref().expect("resident weight has physical bytes") {
+            WtBytes::Bf16(bytes) => (0..self.i)
+                .map(|col| {
+                    let off = (row * self.i + col) * 2;
+                    let u = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                    f32::from_bits((u as u32) << 16)
+                })
+                .collect(),
+            WtBytes::Mxfp4 { weights, scales, .. } => {
+                let rb = self.i.div_ceil(2);
+                let ng = self.i.div_ceil(32);
+                let wr = &weights[row * rb..(row + 1) * rb];
+                let sr = &scales[row * ng..(row + 1) * ng];
+                const MX4: [f32; 16] = [
+                    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+                ];
+                (0..self.i)
+                    .map(|col| {
+                        let packed = wr[col / 2];
+                        let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+                        let scale = f32::from_bits((sr[col / 32] as u32) << 23);
+                        MX4[code as usize] * scale
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -564,10 +661,24 @@ pub struct Model {
     // 280->173 ms/tok; LRU upgrade if hit-rate plateaus low). Entries own
     // their Metal tensor handles — the C backend keys handles by weight
     // pointer, so stale handles would serve wrong weights.
+    /// Pre-resolved package geometry for every routed expert. Canonical decode
+    /// uses this just like the scheduled executor so a cache miss never has to
+    /// read/parse the Apple8 descriptor from the shard on the hot path.
+    expert_plan: Option<crate::plan::Plan>,
     /// LRU expert store (engine-neutral core; slot-owning values).
     expert_store: logan_core::expert::ExpertStore<crate::colisource::SlotExpert>,
     /// Per-token telemetry accumulator (LOGAN_PROFILE=1).
     spans: logan_core::telemetry::TokenSpans,
+    /// Previous routed top-k per layer + overlap counters. This is cheap
+    /// correctness-neutral instrumentation used to size layer-local expert
+    /// residency from observed temporal locality rather than guesswork.
+    route_prev: Vec<Vec<usize>>,
+    route_overlap_common: Vec<u64>,
+    route_overlap_total: Vec<u64>,
+    route_overlap_pairs: Vec<u64>,
+    /// Process-unique owner identity for native model-scoped resources. The
+    /// native GDN cache is keyed by this ID + layer, never by layer alone.
+    metal_model_id: u64,
     /// Metal direct path (fused Apple8 moe_topk + coalesced GDN kernels).
     /// Brought up lazily on the first decode token; failures leave it off and
     /// every caller falls back to the CPU reference (C contract).
@@ -596,6 +707,33 @@ pub struct Model {
     sched_blocked: Option<Vec<u32>>,
     /// Resume cursor for a blocked token forward (same-op resubmission).
     sched_pause: Option<TokenPause>,
+}
+
+// Profiling-only routed-MoE fallback diagnostics. Each benchmark process owns
+// one model in practice; counters are process-lifetime and printed only when
+// LOGAN_PROFILE is enabled. They make CPU fallback causes attributable instead
+// of folding every decline into the broad `fill` span.
+
+fn next_metal_model_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // Zero is reserved as "no owner" by the native API. Wraparound is not a
+    // practical runtime concern, but fail closed rather than aliasing it.
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(id, 0, "native Metal model id exhausted");
+    id
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        // Drop native zero-copy wrappers *before* Rust destroys gdn_metal's
+        // aligned backing allocations. The native call shares the GDN mutex
+        // with token execution and therefore also waits for any synchronous
+        // GDN submission to retire before releasing its wrappers.
+        logan_metal::shared_mxfp4_drop_model(self.metal_model_id);
+        logan_metal::gdn_mxfp4_drop_model(self.metal_model_id);
+        crate::ffi::gdn_drop_model(self.metal_model_id);
+    }
 }
 
 /// 16 KiB page-aligned allocation (Metal zero-copy wrap contract).
@@ -696,6 +834,10 @@ struct AttnProjection {
 }
 
 struct GdnMetalLayer {
+    /// True when the five dense projections are BF16 and live in the aligned
+    /// buffers below. MXFP4 layers use this object as a state-only holder;
+    /// their persistent quantized weight buffers are owned by WtBytes.
+    bf16_weights: bool,
     /// [cdim, hidden] BF16 in_proj_qkv (16 KiB-aligned, zero-copy wrapped)
     wqkv: *mut u8,
     /// [vdim, hidden] BF16 in_proj_z
@@ -833,78 +975,77 @@ fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize)
     }
 }
 
+fn matmul_mxfp4_bytes(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    scales: &[u8],
+    o: usize,
+    i: usize,
+) {
+    const MX4: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    let rb = i.div_ceil(2);
+    let ng = i.div_ceil(32);
+    debug_assert!(weights.len() >= o * rb);
+    debug_assert!(scales.len() >= o * ng);
+    for row in 0..o {
+        let wr = &weights[row * rb..(row + 1) * rb];
+        let sr = &scales[row * ng..(row + 1) * ng];
+        let mut acc = 0.0_f32;
+        for col in 0..i {
+            let packed = wr[col / 2];
+            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let scale = f32::from_bits((sr[col / 32] as u32) << 23);
+            acc += x[col] * MX4[code as usize] * scale;
+        }
+        y[row] = acc;
+    }
+}
+
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
+    if let Some(bytes) = &w.bytes {
+        match bytes {
+            WtBytes::Bf16(bytes) => matmul_bf16_bytes(y, x, bytes, o, i),
+            WtBytes::Mxfp4 {
+                weights,
+                scales,
+                metal_tensor,
+            } => {
+                let mut handle = metal_tensor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut tensor = *handle as *mut logan_metal::ColiMetalTensor;
+                if logan_metal::metal_matmul(
+                    &mut tensor,
+                    y,
+                    x,
+                    weights,
+                    scales,
+                    7,
+                    i,
+                    o,
+                ) {
+                    *handle = tensor as usize;
+                    return;
+                }
+                *handle = tensor as usize;
+                drop(handle);
+                matmul_mxfp4_bytes(y, x, weights, scales, o, i);
+            }
+        }
+        return;
+    }
     // ponytail: thread::scope per call costs ~50-100us of spawn; only
-    // parallelize matmuls big enough to amortize it (>= 16M MACs ≈ 2ms of
-    // work at ~8 GFLOPs scalar). A persistent pool (rayon) would lower this
-    // ceiling — add when the dense path is the measured bottleneck again.
+    // parallelize in-memory f32 matrices big enough to amortize it.
     let parallel = o * i >= 16_000_000
         && std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             > 1;
-    if let Some(bytes) = &w.bytes {
-        let bnns = std::env::var("QWEN_BNNS_BF16")
-            .map(|v| v != "0")
-            .unwrap_or(false);
-        if bnns && logan_metal::bnns_bf16_matmul(bytes, x, y, o, i) {
-            return;
-        }
-        // NEON BF16: 4 f32 lanes, bf16 weights widened by (u16<<16).
-        // fp-order differs from scalar (grouped fma) — the token-identity
-        // gate decides; QWEN_NEON_BF16=0 opts out.
-        let neon = std::env::var("QWEN_NEON_BF16")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        #[cfg(target_arch = "aarch64")]
-        let neon = neon && o * i >= 1 << 18;
-        #[cfg(not(target_arch = "aarch64"))]
-        let neon = false;
-        if neon {
-            matmul_bf16_neon(y, x, bytes, o, i);
-            return;
-        }
-        if parallel {
-            std::thread::scope(|s| {
-                let nthreads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let chunk = o.div_ceil(nthreads);
-                for (c, yslice) in y.chunks_mut(chunk).enumerate() {
-                    let rows = c * chunk;
-                    let (x, bytes) = (&*x, &*bytes);
-                    s.spawn(move || {
-                        for (oo, yv) in yslice.iter_mut().enumerate() {
-                            let oo = rows + oo;
-                            let mut acc = 0.0_f32;
-                            for ii in 0..i {
-                                let u = u16::from_le_bytes([
-                                    bytes[(oo * i + ii) * 2],
-                                    bytes[(oo * i + ii) * 2 + 1],
-                                ]);
-                                acc += x[ii] * f32::from_bits((u as u32) << 16);
-                            }
-                            *yv = acc;
-                        }
-                    });
-                }
-            });
-        } else {
-            for oo in 0..o {
-                let mut acc = 0.0_f32;
-                for ii in 0..i {
-                    let u = u16::from_le_bytes([
-                        bytes[(oo * i + ii) * 2],
-                        bytes[(oo * i + ii) * 2 + 1],
-                    ]);
-                    acc += x[ii] * f32::from_bits((u as u32) << 16);
-                }
-                y[oo] = acc;
-            }
-        }
-        return;
-    }
     if parallel {
         std::thread::scope(|s| {
             let nthreads = std::thread::available_parallelism()
@@ -937,6 +1078,117 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     }
 }
 
+/// Encode several resident MXFP4 GEMVs that consume the same activation in a
+/// single Metal command buffer. Returns false without changing numerical state
+/// when any weight is not MXFP4 or Metal declines, so callers can fall back to
+/// the established per-matrix path.
+fn matmul_mxfp4_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
+    if ys.is_empty() || ys.len() != ws.len() {
+        return false;
+    }
+    let mut parts = Vec::with_capacity(ws.len());
+    for &w in ws {
+        let Some(WtBytes::Mxfp4 {
+            weights,
+            scales,
+            metal_tensor,
+        }) = w.bytes.as_ref()
+        else {
+            return false;
+        };
+        parts.push((weights.as_slice(), scales.as_slice(), metal_tensor, w.i, w.o));
+    }
+
+    let mut guards = Vec::with_capacity(parts.len());
+    for (_, _, metal_tensor, _, _) in &parts {
+        guards.push(
+            metal_tensor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    let mut descs = Vec::with_capacity(parts.len());
+    for ((y, part), guard) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()) {
+        let (weights, scales, _, input, output) = *part;
+        descs.push(logan_metal::MetalMatmulDesc {
+            tensor: **guard as *mut logan_metal::ColiMetalTensor,
+            y: &mut **y,
+            weights,
+            scales,
+            fmt: 7,
+            i: input,
+            o: output,
+        });
+    }
+
+    let ok = logan_metal::metal_matmul_multi(x, &mut descs);
+    for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
+        **guard = desc.tensor as usize;
+    }
+    ok
+}
+
+/// Full one-command-buffer MXFP4 Gated DeltaNet decode. Uses the same
+/// persistent ColiMetalTensor handles as the ordinary MXFP4 GEMV path and the
+/// state-only GdnMetalLayer for page-aligned recurrent state.
+fn gdn_mxfp4_full_token(
+    model_id: u64,
+    li: usize,
+    layer: &Layer,
+    gm: &mut GdnMetalLayer,
+    cfg: &Cfg,
+    x: &[f32],
+    out: &mut [f32],
+) -> i32 {
+    if gm.bf16_weights {
+        return 0;
+    }
+    let ws = [
+        &layer.gdn_in_qkv,
+        &layer.gdn_in_z,
+        &layer.gdn_in_a,
+        &layer.gdn_in_b,
+        &layer.gdn_out,
+    ];
+    let mut parts = Vec::with_capacity(ws.len());
+    for &w in &ws {
+        let Some(WtBytes::Mxfp4 { weights, scales, metal_tensor }) = w.bytes.as_ref() else {
+            return 0;
+        };
+        parts.push((weights.as_slice(), scales.as_slice(), metal_tensor, w.i, w.o));
+    }
+    let mut guards = Vec::with_capacity(parts.len());
+    for (_, _, metal_tensor, _, _) in &parts {
+        guards.push(metal_tensor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    }
+    let mut descs = Vec::with_capacity(parts.len());
+    for (part, guard) in parts.iter().zip(guards.iter()) {
+        let (weights, scales, _, input, output) = *part;
+        descs.push(logan_metal::MetalWeightDesc {
+            tensor: **guard as *mut logan_metal::ColiMetalTensor,
+            weights, scales, fmt: 7, i: input, o: output,
+        });
+    }
+
+    let state_len = cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim;
+    let cdim = cfg.lin_k_heads * cfg.lin_k_dim * 2 + cfg.lin_v_heads * cfg.lin_v_dim;
+    let conv_len = cdim * cfg.conv_kernel.saturating_sub(1);
+    let state = unsafe { std::slice::from_raw_parts_mut(gm.state, state_len) };
+    let conv_state = unsafe { std::slice::from_raw_parts_mut(gm.conv_state, conv_len) };
+    let rc = logan_metal::gdn_mxfp4(
+        model_id, li, &mut descs, x, out,
+        &layer.gdn_a_log, &layer.gdn_dt_bias, &layer.gdn_conv1d, &layer.gdn_norm,
+        state, conv_state, cfg.hidden, cfg.lin_k_heads, cfg.lin_k_dim,
+        cfg.lin_v_heads, cfg.lin_v_dim, cfg.conv_kernel,
+        cfg.output_gate.gdn_metal_code(), cfg.eps,
+    );
+    for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
+        **guard = desc.tensor as usize;
+    }
+    rc
+}
+
 fn rmsnorm_row(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     let d = x.len();
     let mut ms = 0.0_f64;
@@ -946,6 +1198,23 @@ fn rmsnorm_row(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     let r = 1.0 / (ms as f32 / d as f32 + eps).sqrt();
     for i in 0..d {
         out[i] = x[i] * r * (1.0 + w[i]);
+    }
+}
+
+/// MLX's Qwen3.5/3.6 sanitizer folds the Transformers RMSNorm `(1 + weight)`
+/// into the stored checkpoint tensor. Those converted tensors therefore use
+/// ordinary multiplicative RMSNorm at runtime. Keep this separate from the
+/// Qwen4/raw-HF convention above so the two checkpoint families cannot be
+/// silently mixed.
+fn rmsnorm_row_shifted(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
+    let d = x.len();
+    let mut ms = 0.0_f64;
+    for i in 0..d {
+        ms += x[i] as f64 * x[i] as f64;
+    }
+    let r = 1.0 / (ms as f32 / d as f32 + eps).sqrt();
+    for i in 0..d {
+        out[i] = x[i] * r * w[i];
     }
 }
 
@@ -962,6 +1231,19 @@ fn rmsnorm_grouped(out: &mut [f32], x: &[f32], w: &[f32], hc: usize, d: usize, e
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// One depthwise causal Conv1d sample using PyTorch/standard cross-correlation
+/// tap order: weight[K-1] multiplies the newest/current sample and weight[0]
+/// multiplies the oldest sample in the receptive field.
+fn causal_conv1d_sample(current: f32, history: &[f32], weights: &[f32], dilation: usize) -> f32 {
+    let mut acc = 0.0_f32;
+    for (tap, &weight) in weights.iter().enumerate() {
+        let lag = (weights.len() - 1 - tap) * dilation;
+        let sample = if lag == 0 { current } else { history[lag - 1] };
+        acc += weight * sample;
+    }
+    acc
 }
 
 fn rmsnorm_gated_row(out: &mut [f32], x: &[f32], z: &[f32], w: &[f32], eps: f32, gate: OutputGate) {
@@ -1144,7 +1426,7 @@ impl Model {
         let cdim = kd * kheads * 2 + vd * vheads;
         let kk = cfg.conv_kernel;
         let move_bf16 = |w: &Wt| -> Option<AlignedBuf> {
-            let bytes = w.bytes.as_ref()?;
+            let bytes = w.bf16_bytes()?;
             let mut buf = AlignedBuf::zeroed(bytes.len())?;
             buf.as_mut_u8()[..bytes.len()].copy_from_slice(bytes);
             Some(buf)
@@ -1153,31 +1435,55 @@ impl Model {
         let conv_elems = cdim * kk.saturating_sub(1);
         let state = AlignedBuf::zeroed(state_elems * 4)?;
         let conv_state = AlignedBuf::zeroed(conv_elems * 4)?;
+        let state_ptr = state.ptr as *mut f32;
+        let conv_state_ptr = conv_state.ptr as *mut f32;
+
+        let all_bf16 = layer.gdn_in_qkv.bf16_bytes().is_some()
+            && layer.gdn_in_z.bf16_bytes().is_some()
+            && layer.gdn_in_a.bf16_bytes().is_some()
+            && layer.gdn_in_b.bf16_bytes().is_some()
+            && layer.gdn_out.bf16_bytes().is_some();
+
+        if !all_bf16 {
+            // MXFP4 path: only recurrent/conv state needs page-aligned,
+            // model-lifetime storage. Dense weights remain in their existing
+            // WtBytes and lazily create persistent ColiMetalTensor wrappers.
+            return Some(GdnMetalLayer {
+                bf16_weights: false,
+                wqkv: std::ptr::null_mut(),
+                wz: std::ptr::null_mut(),
+                wa: std::ptr::null_mut(),
+                wb: std::ptr::null_mut(),
+                wout: std::ptr::null_mut(),
+                state: state_ptr,
+                conv_state: conv_state_ptr,
+                _bufs: vec![state, conv_state],
+            });
+        }
+
         let wqkv = move_bf16(&layer.gdn_in_qkv)?;
         let wz = move_bf16(&layer.gdn_in_z)?;
         let wa = move_bf16(&layer.gdn_in_a)?;
         let wb = move_bf16(&layer.gdn_in_b)?;
         let wout = move_bf16(&layer.gdn_out)?;
         let metal = GdnMetalLayer {
+            bf16_weights: true,
             wqkv: wqkv.ptr,
             wz: wz.ptr,
             wa: wa.ptr,
             wb: wb.ptr,
             wout: wout.ptr,
-            state: state.ptr as *mut f32,
-            conv_state: conv_state.ptr as *mut f32,
+            state: state_ptr,
+            conv_state: conv_state_ptr,
             _bufs: vec![wqkv, wz, wa, wb, wout, state, conv_state],
         };
 
         // The aligned Metal allocation is now the authoritative BF16
         // storage. The old code retained both copies for the model lifetime,
         // which duplicates ~3.9 GiB on Flash-Next's 36 GDN layers.
-        //
-        // Default ON; disable for an exact same-binary memory/perf A/B.
         let single_copy = std::env::var("QWEN_GDN_SINGLE_COPY")
             .map(|v| v != "0")
             .unwrap_or(true);
-
         if single_copy {
             layer.gdn_in_qkv.bytes = None;
             layer.gdn_in_z.bytes = None;
@@ -1185,7 +1491,6 @@ impl Model {
             layer.gdn_in_b.bytes = None;
             layer.gdn_out.bytes = None;
         }
-
         Some(metal)
     }
 
@@ -1194,17 +1499,17 @@ impl Model {
             return None;
         }
         let move_bf16 = |w: &Wt| -> Option<AlignedBuf> {
-            let bytes = w.bytes.as_ref()?;
+            let bytes = w.bf16_bytes()?;
             let mut buf = AlignedBuf::zeroed(bytes.len())?;
             buf.as_mut_u8()[..bytes.len()].copy_from_slice(bytes);
             Some(buf)
         };
         let o = move_bf16(&layer.attn_o)?;
-        let q_bytes = layer.attn_q.bytes.as_ref()?;
-        let k_bytes = layer.attn_k.bytes.as_ref()?;
-        let v_bytes = layer.attn_v.bytes.as_ref()?;
+        let q_bytes = layer.attn_q.bf16_bytes()?;
+        let k_bytes = layer.attn_k.bf16_bytes()?;
+        let v_bytes = layer.attn_v.bf16_bytes()?;
         let idx_bytes = if layer.is_qsa {
-            layer.index_qk.bytes.as_deref()
+            layer.index_qk.bf16_bytes()
         } else {
             None
         };
@@ -1218,7 +1523,7 @@ impl Model {
         let mut qkv = AlignedBuf::zeroed(total)?;
         let dst = qkv.as_mut_u8();
         let mut off = 0usize;
-        for bytes in [q_bytes.as_slice(), k_bytes.as_slice(), v_bytes.as_slice()] {
+        for bytes in [q_bytes, k_bytes, v_bytes] {
             dst[off..off + bytes.len()].copy_from_slice(bytes);
             off += bytes.len();
         }
@@ -1232,6 +1537,272 @@ impl Model {
             o: o.ptr,
             _bufs: vec![qkv, o],
         })
+    }
+
+    fn gdn_chunk_batched(
+        &mut self,
+        layer: &mut Layer,
+        li: usize,
+        xs: &[Vec<f32>],
+        outs: &mut [Vec<f32>],
+    ) -> bool {
+        let rows = xs.len();
+        if rows <= 1 || outs.len() != rows || !layer.is_gdn {
+            return false;
+        }
+        let enabled = std::env::var("QWEN_PREFILL_GDN_BATCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if !enabled {
+            return false;
+        }
+
+        let c = self.cfg.clone();
+        let kd = c.lin_k_dim;
+        let kheads = c.lin_k_heads;
+        let vd = c.lin_v_dim;
+        let vheads = c.lin_v_heads;
+        let kdim = kd * kheads;
+        let vdim = vd * vheads;
+        let cdim = kdim * 2 + vdim;
+        let kk = c.conv_kernel;
+        let d = c.hidden;
+        if xs.iter().any(|x| x.len() != d) || outs.iter().any(|o| o.len() != d) {
+            return false;
+        }
+
+        // Establish the same aligned single-copy BF16 storage/state used by
+        // decode before any causal state is touched.
+        if self.gdn_metal[li].is_none() {
+            let built = Self::build_gdn_metal(layer, &self.cfg);
+            if let Some(gm) = built.as_ref() {
+                let state_len = vheads * kd * vd;
+                let conv_len = cdim * (kk - 1);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.gdn_s[li].as_ptr(), gm.state, state_len);
+                    std::ptr::copy_nonoverlapping(
+                        self.gdn_conv[li].as_ptr(),
+                        gm.conv_state,
+                        conv_len,
+                    );
+                }
+            }
+            self.gdn_metal[li] = built;
+        }
+        let Some(gm) = self.gdn_metal[li].as_ref() else {
+            return false;
+        };
+        if !gm.bf16_weights {
+            return false;
+        }
+        let (wqkv, wz, wa, wb, wout, state_ptr, conv_ptr) =
+            (gm.wqkv, gm.wz, gm.wa, gm.wb, gm.wout, gm.state, gm.conv_state);
+
+        let mut x_all = Vec::with_capacity(rows * d);
+        for x in xs {
+            x_all.extend_from_slice(x);
+        }
+        let mut qkv_all = vec![0.0_f32; rows * cdim];
+        let mut z_all = vec![0.0_f32; rows * vdim];
+        let mut a_all = vec![0.0_f32; rows * vheads];
+        let mut b_all = vec![0.0_f32; rows * vheads];
+
+        let in_t0 = std::time::Instant::now();
+        let input_ok = unsafe {
+            crate::ffi::bnns_bf16_matmul_batch(
+                std::slice::from_raw_parts(wqkv, cdim * d * 2),
+                &x_all,
+                &mut qkv_all,
+                rows,
+                cdim,
+                d,
+            ) && crate::ffi::bnns_bf16_matmul_batch(
+                std::slice::from_raw_parts(wz, vdim * d * 2),
+                &x_all,
+                &mut z_all,
+                rows,
+                vdim,
+                d,
+            ) && crate::ffi::bnns_bf16_matmul_batch(
+                std::slice::from_raw_parts(wa, vheads * d * 2),
+                &x_all,
+                &mut a_all,
+                rows,
+                vheads,
+                d,
+            ) && crate::ffi::bnns_bf16_matmul_batch(
+                std::slice::from_raw_parts(wb, vheads * d * 2),
+                &x_all,
+                &mut b_all,
+                rows,
+                vheads,
+                d,
+            )
+        };
+        if !input_ok {
+            return false;
+        }
+        if logan_core::telemetry::enabled() {
+            self.spans.gdn_in_proj_ms += in_t0.elapsed().as_secs_f64() * 1e3;
+        }
+
+        let mut normed_all = vec![0.0_f32; rows * vdim];
+        let rep = vheads / kheads;
+        assert!(rep >= 1 && vheads % kheads == 0);
+        let state_len = vheads * kd * vd;
+        let conv_len = cdim * (kk - 1);
+        let conv_st = unsafe { std::slice::from_raw_parts_mut(conv_ptr, conv_len) };
+        let state = unsafe { std::slice::from_raw_parts_mut(state_ptr, state_len) };
+
+        for row in 0..rows {
+            let qkv = &qkv_all[row * cdim..(row + 1) * cdim];
+            let a = &a_all[row * vheads..(row + 1) * vheads];
+            let b = &b_all[row * vheads..(row + 1) * vheads];
+            let z = &z_all[row * vdim..(row + 1) * vdim];
+
+            let conv_t0 = std::time::Instant::now();
+            let mut y = vec![0.0_f32; cdim];
+            if kk > 1 {
+                for ch in 0..cdim {
+                    let mut acc = 0.0_f32;
+                    for j in 0..kk {
+                        let vv = if j == kk - 1 {
+                            qkv[ch]
+                        } else {
+                            conv_st[ch * (kk - 1) + j]
+                        };
+                        acc += layer.gdn_conv1d[ch * kk + j] * vv;
+                    }
+                    y[ch] = silu(acc);
+                }
+                for ch in 0..cdim {
+                    for s in 0..kk - 2 {
+                        conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
+                    }
+                    conv_st[ch * (kk - 1) + (kk - 2)] = qkv[ch];
+                }
+            } else {
+                for ch in 0..cdim {
+                    y[ch] = silu(layer.gdn_conv1d[ch] * qkv[ch]);
+                }
+            }
+            if logan_core::telemetry::enabled() {
+                self.spans.gdn_conv_ms += conv_t0.elapsed().as_secs_f64() * 1e3;
+            }
+
+            let prep_t0 = std::time::Instant::now();
+            let q_ = &y[..kdim];
+            let k_ = &y[kdim..kdim * 2];
+            let v_ = &y[kdim * 2..];
+            let mut qh = vec![0.0_f32; vheads * kd];
+            let mut kh = vec![0.0_f32; vheads * kd];
+            let mut vh = vec![0.0_f32; vheads * vd];
+            for h in 0..vheads {
+                let khd = h / rep;
+                for dd in 0..kd {
+                    qh[h * kd + dd] = q_[khd * kd + dd];
+                    kh[h * kd + dd] = k_[khd * kd + dd];
+                }
+                for dd in 0..vd {
+                    vh[h * vd + dd] = v_[h * vd + dd];
+                }
+                l2norm(&mut qh[h * kd..h * kd + kd]);
+                l2norm(&mut kh[h * kd..h * kd + kd]);
+                let sc = 1.0 / (kd as f32).sqrt();
+                for dd in 0..kd {
+                    qh[h * kd + dd] *= sc;
+                }
+            }
+            if logan_core::telemetry::enabled() {
+                self.spans.gdn_prepare_ms += prep_t0.elapsed().as_secs_f64() * 1e3;
+            }
+
+            let recur_t0 = std::time::Instant::now();
+            let mut kv_mem = vec![0.0_f32; vd];
+            for h in 0..vheads {
+                let ga = -layer.gdn_a_log[h].exp()
+                    * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
+                let gt = ga.exp();
+                let bt = 1.0 / (1.0 + (-b[h]).exp());
+                let sh = &mut state[h * kd * vd..(h + 1) * kd * vd];
+                let qhh = &qh[h * kd..(h + 1) * kd];
+                let khh = &kh[h * kd..(h + 1) * kd];
+                let vhh = &vh[h * vd..(h + 1) * vd];
+                kv_mem.fill(0.0);
+                for kk2 in 0..kd {
+                    for dd in 0..vd {
+                        let si = kk2 * vd + dd;
+                        let sv = sh[si] * gt;
+                        sh[si] = sv;
+                        kv_mem[dd] += sv * khh[kk2];
+                    }
+                }
+                for dd in 0..vd {
+                    let delta = (vhh[dd] - kv_mem[dd]) * bt;
+                    let mut acc = 0.0_f32;
+                    for kk2 in 0..kd {
+                        let si = kk2 * vd + dd;
+                        let next_s = sh[si] + khh[kk2] * delta;
+                        sh[si] = next_s;
+                        acc += next_s * qhh[kk2];
+                    }
+                    kv_mem[dd] = acc;
+                }
+                vh[h * vd..(h + 1) * vd].copy_from_slice(&kv_mem);
+            }
+            if logan_core::telemetry::enabled() {
+                self.spans.gdn_recur_ms += recur_t0.elapsed().as_secs_f64() * 1e3;
+            }
+
+            let gate_t0 = std::time::Instant::now();
+            let normed = &mut normed_all[row * vdim..(row + 1) * vdim];
+            for h in 0..vheads {
+                rmsnorm_gated_row(
+                    &mut normed[h * vd..h * vd + vd],
+                    &vh[h * vd..h * vd + vd],
+                    &z[h * vd..h * vd + vd],
+                    &layer.gdn_norm,
+                    c.eps,
+                    c.output_gate,
+                );
+            }
+            if logan_core::telemetry::enabled() {
+                self.spans.gdn_gate_ms += gate_t0.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+
+        let out_t0 = std::time::Instant::now();
+        let mut out_all = vec![0.0_f32; rows * d];
+        let out_ok = unsafe {
+            crate::ffi::bnns_bf16_matmul_batch(
+                std::slice::from_raw_parts(wout, d * vdim * 2),
+                &normed_all,
+                &mut out_all,
+                rows,
+                d,
+                vdim,
+            )
+        };
+        if out_ok {
+            for row in 0..rows {
+                outs[row].copy_from_slice(&out_all[row * d..(row + 1) * d]);
+            }
+        } else {
+            let wout_bytes = unsafe { std::slice::from_raw_parts(wout, d * vdim * 2) };
+            for row in 0..rows {
+                matmul_bf16_bytes(
+                    &mut outs[row],
+                    &normed_all[row * vdim..(row + 1) * vdim],
+                    wout_bytes,
+                    d,
+                    vdim,
+                );
+            }
+        }
+        if logan_core::telemetry::enabled() {
+            self.spans.gdn_out_proj_ms += out_t0.elapsed().as_secs_f64() * 1e3;
+        }
+        true
     }
 
     fn gdn_token(&mut self, layer: &mut Layer, li: usize, x: &[f32], out: &mut [f32]) {
@@ -1272,16 +1843,39 @@ impl Model {
         }
         // Metal direct path (C QWEN_GDN_METAL default ON): the coalesced
         // kernels consume the page-aligned re-home above; rc semantics per
-        // C contract (0=decline pre-submit, <0 = fatal post-submit).
-        // The current Metal kernel encodes the historical SiLU gate.
-        // Fail closed for sigmoid checkpoints instead of silently running the
-        // wrong model. Apple defaults already prefer the faster BNNS CPU GDN.
+        // C contract (0=decline pre-submit, <0 = fatal post-submit). The
+        // kernel receives the checkpoint's gated-RMSNorm activation explicitly
+        // (0=SiLU, 1=sigmoid), so Qwen3.8-Flash-Next no longer has to fall
+        // back to CPU merely because it uses the newer sigmoid gate.
         let gdn_enabled = std::env::var("QWEN_GDN_METAL")
             .map(|v| v != "0")
-            .unwrap_or(true)
-            && c.output_gate == OutputGate::Silu;
+            .unwrap_or(true);
+        let gdn_mxfp4_full = std::env::var("QWEN_GDN_MXFP4_FULL")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        // This gate is intentionally independent of legacy QWEN_GDN_METAL.
+        // The latter remains off by default on Apple Silicon because the old
+        // BF16 full-GDN path lost to BNNS; MXFP4 is qualified separately.
+        if gdn_mxfp4_full {
+            if let Some(gm) = self.gdn_metal[li].as_mut() {
+                if !gm.bf16_weights {
+                    let rc = gdn_mxfp4_full_token(
+                        self.metal_model_id, li, layer, gm, &c, x, out,
+                    );
+                    if rc > 0 {
+                        self.spans.gdn_metal_ok += 1;
+                        return;
+                    }
+                    if rc < 0 {
+                        eprintln!("qwen4-rs: full MXFP4 Metal GDN failed after submission (layer {li})");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
         if let Some(gm) = &self.gdn_metal[li] {
-            if gdn_enabled {
+            if gdn_enabled && gm.bf16_weights {
                 // SAFETY: exact-length views over the layer's aligned blocks
                 // (kept alive by gm._bufs for the model lifetime). The GPU
                 // mutates state/conv_state in place; the CPU fallback syncs
@@ -1289,6 +1883,7 @@ impl Model {
                 let (n_state, n_conv) = (vheads * kd * vd, cdim * (kk - 1));
                 let rc = unsafe {
                     crate::ffi::gdn_token(
+                        self.metal_model_id,
                         li,
                         x,
                         out,
@@ -1309,6 +1904,7 @@ impl Model {
                         vheads,
                         vd,
                         kk,
+                        c.output_gate.gdn_metal_code(),
                         c.eps,
                     )
                 };
@@ -1332,7 +1928,7 @@ impl Model {
         let mut z = vec![0.0; vdim];
         let gdn_in_t0 = profile_gdn_parts.then(std::time::Instant::now);
 
-        if let Some(gm) = self.gdn_metal[li].as_ref() {
+        if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
             // SAFETY: GdnMetalLayer owns every aligned allocation for the
             // entire model lifetime. These are the exact BF16 package bytes.
             unsafe {
@@ -1366,10 +1962,27 @@ impl Model {
                 );
             }
         } else {
-            matmul(&mut qkv, x, &layer.gdn_in_qkv);
-            matmul(&mut a, x, &layer.gdn_in_a);
-            matmul(&mut b, x, &layer.gdn_in_b);
-            matmul(&mut z, x, &layer.gdn_in_z);
+            let fused_input = std::env::var("QWEN_GDN_FUSED_INPUT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let fused_ok = if fused_input {
+                let mut ys: [&mut [f32]; 4] = [&mut qkv, &mut a, &mut b, &mut z];
+                let ws = [
+                    &layer.gdn_in_qkv,
+                    &layer.gdn_in_a,
+                    &layer.gdn_in_b,
+                    &layer.gdn_in_z,
+                ];
+                matmul_mxfp4_multi(&mut ys, x, &ws)
+            } else {
+                false
+            };
+            if !fused_ok {
+                matmul(&mut qkv, x, &layer.gdn_in_qkv);
+                matmul(&mut a, x, &layer.gdn_in_a);
+                matmul(&mut b, x, &layer.gdn_in_b);
+                matmul(&mut z, x, &layer.gdn_in_z);
+            }
         }
         if let Some(t0) = gdn_in_t0 {
             self.spans.gdn_in_proj_ms += t0.elapsed().as_secs_f64() * 1e3;
@@ -1514,7 +2127,7 @@ impl Model {
         }
 
         let gdn_out_t0 = profile_gdn_parts.then(std::time::Instant::now);
-        if let Some(gm) = self.gdn_metal[li].as_ref() {
+        if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
             // SAFETY: model-lifetime aligned BF16 storage.
             unsafe {
                 matmul_bf16_bytes(
@@ -1531,6 +2144,89 @@ impl Model {
         if let Some(t0) = gdn_out_t0 {
             self.spans.gdn_out_proj_ms += t0.elapsed().as_secs_f64() * 1e3;
         }
+    }
+
+    /// Prefill-only BF16 attention projection batch. The projections are pure
+    /// functions of each row, so batching them cannot expose future KV or QSA
+    /// index state; those causal updates remain in `attention_common` /
+    /// `qsa_select` and are executed chronologically afterward.
+    fn project_attention_chunk(
+        &mut self,
+        layer: &Layer,
+        xs: &[Vec<f32>],
+    ) -> Option<Vec<AttnProjection>> {
+        let rows = xs.len();
+        if rows <= 1 || layer.is_gdn {
+            return None;
+        }
+        let enabled = std::env::var("QWEN_PREFILL_ATTN_BATCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if !enabled {
+            return None;
+        }
+        let c = self.cfg.clone();
+        let h = c.heads;
+        let hd = c.head_dim;
+        let kv = c.kv_heads;
+        let rows_q = 2 * h * hd;
+        let rows_kv = kv * hd;
+        let q_bytes = layer.attn_q.bf16_bytes()?;
+        let k_bytes = layer.attn_k.bf16_bytes()?;
+        let v_bytes = layer.attn_v.bf16_bytes()?;
+        if xs.iter().any(|x| x.len() != c.hidden) {
+            return None;
+        }
+        let mut x_all = Vec::with_capacity(rows * c.hidden);
+        for x in xs {
+            x_all.extend_from_slice(x);
+        }
+        let mut q_all = vec![0.0_f32; rows * rows_q];
+        let mut k_all = vec![0.0_f32; rows * rows_kv];
+        let mut v_all = vec![0.0_f32; rows * rows_kv];
+        if !crate::ffi::bnns_bf16_matmul_batch(
+            q_bytes, &x_all, &mut q_all, rows, rows_q, c.hidden,
+        ) || !crate::ffi::bnns_bf16_matmul_batch(
+            k_bytes, &x_all, &mut k_all, rows, rows_kv, c.hidden,
+        ) || !crate::ffi::bnns_bf16_matmul_batch(
+            v_bytes, &x_all, &mut v_all, rows, rows_kv, c.hidden,
+        ) {
+            return None;
+        }
+
+        let index_rows = if layer.is_qsa {
+            (c.idx_n_heads + c.idx_kv_heads) * c.idx_head_dim
+        } else {
+            0
+        };
+        let mut index_all = if index_rows > 0 {
+            let bytes = layer.index_qk.bf16_bytes()?;
+            let mut out = vec![0.0_f32; rows * index_rows];
+            if !crate::ffi::bnns_bf16_matmul_batch(
+                bytes, &x_all, &mut out, rows, index_rows, c.hidden,
+            ) {
+                return None;
+            }
+            Some(out)
+        } else {
+            None
+        };
+
+        let mut projected = Vec::with_capacity(rows);
+        for row in 0..rows {
+            projected.push(AttnProjection {
+                qg: q_all[row * rows_q..(row + 1) * rows_q].to_vec(),
+                k: k_all[row * rows_kv..(row + 1) * rows_kv].to_vec(),
+                v: v_all[row * rows_kv..(row + 1) * rows_kv].to_vec(),
+                index_qk: index_all.as_mut().map(|all| {
+                    all[row * index_rows..(row + 1) * index_rows].to_vec()
+                }),
+                // This flag means the output projection is Metal-resident;
+                // batched BNNS input projections intentionally leave it false.
+                metal_ok: false,
+            });
+        }
+        Some(projected)
     }
 
     /// Input-side attention projection. QSA can append index_qk to the packed
@@ -1611,9 +2307,25 @@ impl Model {
         }
 
         if !metal_ok {
-            matmul(&mut qg, x, &layer.attn_q);
-            matmul(&mut k, x, &layer.attn_k);
-            matmul(&mut v, x, &layer.attn_v);
+            // Default-on for MXFP4 decode: Q/K/V share one activation and
+            // one Metal command buffer. The helper declines non-MXFP4 weights,
+            // preserving the canonical path. Measured ~17% lower attention
+            // span and a repeatable end-to-end win on the 16 GiB M2 workload.
+            let fused_input = std::env::var("QWEN_ATTN_FUSED_INPUT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let fused_ok = if fused_input {
+                let mut ys: [&mut [f32]; 3] = [&mut qg, &mut k, &mut v];
+                let ws = [&layer.attn_q, &layer.attn_k, &layer.attn_v];
+                matmul_mxfp4_multi(&mut ys, x, &ws)
+            } else {
+                false
+            };
+            if !fused_ok {
+                matmul(&mut qg, x, &layer.attn_q);
+                matmul(&mut k, x, &layer.attn_k);
+                matmul(&mut v, x, &layer.attn_v);
+            }
         }
 
         // If QKV ran on Metal but index fusion was unavailable, preserve the
@@ -1659,21 +2371,25 @@ impl Model {
         } = projected.unwrap_or_else(|| self.project_attention(layer, li, x, false));
         let qg_snap = qg.clone();
         for hh in 0..h {
-            rmsnorm_row(
-                &mut qg[hh * 2 * hd..hh * 2 * hd + hd],
-                &qg_snap[hh * 2 * hd..hh * 2 * hd + hd],
-                &layer.attn_qn,
-                c.eps,
-            );
+            let out = &mut qg[hh * 2 * hd..hh * 2 * hd + hd];
+            let input = &qg_snap[hh * 2 * hd..hh * 2 * hd + hd];
+            if c.hc_count == 0 {
+                // MLX Qwen3.5/3.6 converted checkpoints already have the
+                // Transformers `+1` folded into q_norm/k_norm weights.
+                rmsnorm_row_shifted(out, input, &layer.attn_qn, c.eps);
+            } else {
+                rmsnorm_row(out, input, &layer.attn_qn, c.eps);
+            }
         }
         let k_snap = k.clone();
         for g in 0..kv {
-            rmsnorm_row(
-                &mut k[g * hd..g * hd + hd],
-                &k_snap[g * hd..g * hd + hd],
-                &layer.attn_kn,
-                c.eps,
-            );
+            let out = &mut k[g * hd..g * hd + hd];
+            let input = &k_snap[g * hd..g * hd + hd];
+            if c.hc_count == 0 {
+                rmsnorm_row_shifted(out, input, &layer.attn_kn, c.eps);
+            } else {
+                rmsnorm_row(out, input, &layer.attn_kn, c.eps);
+            }
         }
         for hh in 0..h {
             rope_partial_with_angles(
@@ -1931,19 +2647,51 @@ impl Model {
         &mut self,
         li: i32,
         ei: i32,
+        speculative: bool,
     ) -> Option<std::rc::Rc<crate::colisource::SlotRef>> {
-        // LRU hit: promote + return a borrowed view (no slot ownership).
-        if let Some(v) = self.expert_store.get((li as u32, ei as u32)) {
+        // Demand hits promote/count; speculative probes deliberately do not
+        // perturb hit-rate telemetry or recency when the expert is resident.
+        if speculative {
+            if let Some(v) = self.expert_store.peek((li as u32, ei as u32)) {
+                return Some(std::rc::Rc::new(v.ref_view()));
+            }
+        } else if let Some(v) = self.expert_store.get((li as u32, ei as u32)) {
             return Some(std::rc::Rc::new(v.ref_view()));
         }
         let coli = self.coli.as_ref()?;
+        let planned = self
+            .expert_plan
+            .as_ref()
+            .and_then(|plan| plan.layers.get(li as usize))
+            .and_then(|layer| layer.get(ei as usize))
+            .cloned();
         let se: Option<crate::colisource::SlotExpert> = (|| {
-            let recs = coli.pkg_ref().expert_records(li, ei);
-            let rec = recs.first()?;
-            let shard = coli.pkg_ref().shard_path(rec.shard_id)?;
-            let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
+            let (shard_id, regions, dims) = if let Some(planned) = planned.as_ref() {
+                (
+                    planned.shard_id,
+                    [planned.regions[0], planned.regions[1], planned.regions[2]],
+                    [planned.dims[0], planned.dims[1], planned.dims[2]],
+                )
+            } else {
+                // Exact legacy lazy-descriptor path, retained for A/B and
+                // non-preplanned packages.
+                let recs = coli.pkg_ref().expert_records(li, ei);
+                let rec = recs.first()?;
+                let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
+                if regions.len() < 3 || dims.len() < 3 { return None; }
+                (
+                    rec.shard_id,
+                    [regions[0], regions[1], regions[2]],
+                    [dims[0], dims[1], dims[2]],
+                )
+            };
+            let shard = coli.pkg_ref().shard_path(shard_id)?;
             let fid = crate::ffi::mio_file(&shard)?;
-            let (slot, ev) = crate::ffi::mio_load_expert(fid, &regions)?;
+            let (slot, ev) = if speculative {
+                crate::ffi::mio_prefetch_expert(fid, &regions)?
+            } else {
+                crate::ffi::mio_load_expert(fid, &regions)?
+            };
             let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) } as *mut u8;
             if ptr.is_null() {
                 unsafe { crate::ffi::metalio_slot_free(slot) };
@@ -1978,6 +2726,22 @@ impl Model {
         Some(std::rc::Rc::new(v.ref_view()))
     }
 
+    /// Issue the previous token's route early while the temporal block runs.
+    /// With 8/layer residency this is normally a zero-I/O probe (the whole
+    /// previous route is retained); it remains useful as an opt-in policy for
+    /// smaller/global caches and records speculative MetalIO separately.
+    fn prefetch_previous_route(&mut self, li: usize) {
+        if self.sched_mode
+            || !std::env::var("QWEN_PREV_ROUTE_PREFETCH").map(|v| v != "0").unwrap_or(false)
+        {
+            return;
+        }
+        let previous = self.route_prev[li].clone();
+        for ei in previous {
+            let _ = self.cached_expert_issue(li as i32, ei as i32, true);
+        }
+    }
+
     /// Phase 2 (drain): wait for a previously-issued expert's MetalIO event.
     /// Uses `peek` (not `get`) so the drain does NOT count as a cache hit —
     /// hits measure genuine reuse only. Returns false on I/O failure
@@ -1999,13 +2763,55 @@ impl Model {
         true
     }
 
+    /// Prefill-only layer warmup: issue the union of routed experts for the
+    /// current layer/chunk, then retire them behind one MetalIO completion
+    /// point. This changes only load timing; the existing per-row fused MoE
+    /// kernel still consumes experts in each row's canonical top-k order.
+    fn preload_expert_set(&mut self, li: usize, experts: &[usize]) -> bool {
+        if self.coli.is_none() || experts.is_empty() || experts.len() > cache_cap() {
+            return false;
+        }
+        let mut refs: Vec<std::rc::Rc<crate::colisource::SlotRef>> =
+            Vec::with_capacity(experts.len());
+        for &ei in experts {
+            match self.cached_expert_issue(li as i32, ei as i32, false) {
+                Some(r) => refs.push(r),
+                None => return false,
+            }
+        }
+        let has_pending = experts.iter().any(|&ei| {
+            self.expert_store
+                .peek((li as u32, ei as u32))
+                .is_some_and(|v| v.pending.get() != 0)
+        });
+        if !has_pending {
+            return true;
+        }
+        if let Some(event) = crate::ffi::mio_batch_barrier() {
+            let slots: Vec<i32> = refs.iter().map(|r| r.slot).collect();
+            if !crate::ffi::mio_batch_wait(event, &slots) {
+                return false;
+            }
+            for &ei in experts {
+                if let Some(v) = self.expert_store.peek((li as u32, ei as u32)) {
+                    v.pending.set(0);
+                }
+            }
+            true
+        } else {
+            experts
+                .iter()
+                .all(|&ei| self.expert_wait(li as i32, ei as i32))
+        }
+    }
+
     /// Synchronous variant (CPU fallback paths): issue then drain.
     fn cached_expert_await(
         &mut self,
         li: i32,
         ei: i32,
     ) -> Option<std::rc::Rc<crate::colisource::SlotRef>> {
-        let r = self.cached_expert_issue(li, ei)?;
+        let r = self.cached_expert_issue(li, ei, false)?;
         if !self.expert_wait(li, ei) {
             return None;
         }
@@ -2060,19 +2866,19 @@ impl Model {
         let [gb, ub, db] = cb;
         let g = Wt {
             f: vec![],
-            bytes: Some(gb),
+            bytes: Some(WtBytes::Bf16(gb)),
             o: se.rows[0],
             i: se.cols[0],
         };
         let u = Wt {
             f: vec![],
-            bytes: Some(ub),
+            bytes: Some(WtBytes::Bf16(ub)),
             o: se.rows[1],
             i: se.cols[1],
         };
         let dw = Wt {
             f: vec![],
-            bytes: Some(db),
+            bytes: Some(WtBytes::Bf16(db)),
             o: se.rows[2],
             i: se.cols[2],
         };
@@ -2082,16 +2888,88 @@ impl Model {
         matmul(y, &h, &dw);
     }
 
-    fn shared_expert_value(&self, layer: &Layer, x: &[f32]) -> (Vec<f32>, f32) {
-        let c = &self.cfg;
-        let d = c.hidden;
+    fn shared_expert_value(&self, layer: &Layer, li: usize, x: &[f32]) -> (Vec<f32>, f32) {
+        // The checkpoint keeps the tiny scalar shared-expert gate separate
+        // from the three MXFP4 shared-MLP matrices. Preserve that scalar math
+        // independently, then fuse gate_proj + up_proj + SwiGLU + down_proj
+        // into one Metal command buffer when the large matrices are MXFP4.
         let mut sg = vec![0.0; 1];
         matmul(&mut sg, x, &layer.se_g);
         let gs = 1.0 / (1.0 + (-sg[0]).exp());
+
+        let full_mxfp4 = std::env::var("QWEN_SHARED_MXFP4_FULL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if full_mxfp4 {
+            let ws = [&layer.se_gate, &layer.se_up, &layer.se_down];
+            let mut parts = Vec::with_capacity(3);
+            let mut all_mx = true;
+            for &w in &ws {
+                if let Some(WtBytes::Mxfp4 { weights, scales, metal_tensor }) = w.bytes.as_ref() {
+                    parts.push((weights.as_slice(), scales.as_slice(), metal_tensor, w.i, w.o));
+                } else {
+                    all_mx = false;
+                    break;
+                }
+            }
+            if all_mx {
+                let mut guards = Vec::with_capacity(3);
+                for (_, _, metal_tensor, _, _) in &parts {
+                    guards.push(metal_tensor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+                }
+                let mut descs = Vec::with_capacity(3);
+                for (part, guard) in parts.iter().zip(guards.iter()) {
+                    let (weights, scales, _, input, output) = *part;
+                    descs.push(logan_metal::MetalWeightDesc {
+                        tensor: **guard as *mut logan_metal::ColiMetalTensor,
+                        weights, scales, fmt: 7, i: input, o: output,
+                    });
+                }
+                let mut sy = vec![0.0f32; self.cfg.hidden];
+                match logan_metal::shared_mxfp4(
+                    self.metal_model_id, li, &mut descs, x, &mut sy,
+                    self.cfg.hidden, self.cfg.shared_inter,
+                ) {
+                    Ok(Some(())) => {
+                        for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
+                            **guard = desc.tensor as usize;
+                        }
+                        return (sy, gs);
+                    }
+                    Ok(None) => {
+                        for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
+                            **guard = desc.tensor as usize;
+                        }
+                    }
+                    Err(()) => {
+                        eprintln!("qwen4-rs: full MXFP4 shared expert failed after submission (layer {li})");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        let c = &self.cfg;
+        let d = c.hidden;
         let mut gv = vec![0.0; c.shared_inter];
         let mut h = vec![0.0; c.shared_inter];
-        matmul(&mut gv, x, &layer.se_gate);
-        matmul(&mut h, x, &layer.se_up);
+        // Gate/up depend on the same activation; encode both MXFP4 GEMVs
+        // into one Metal command buffer instead of synchronizing twice.
+        // The helper declines non-MXFP4 weights. Default-on after paired and
+        // reversed-order real-model A/Bs showed a repeatable wall-time win.
+        let fused_input = std::env::var("QWEN_SHARED_FUSED_INPUT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let fused_ok = if fused_input {
+            let mut ys: [&mut [f32]; 2] = [&mut gv, &mut h];
+            let ws = [&layer.se_gate, &layer.se_up];
+            matmul_mxfp4_multi(&mut ys, x, &ws)
+        } else {
+            false
+        };
+        if !fused_ok {
+            matmul(&mut gv, x, &layer.se_gate);
+            matmul(&mut h, x, &layer.se_up);
+        }
         for i in 0..c.shared_inter {
             h[i] = silu(gv[i]) * h[i];
         }
@@ -2100,19 +2978,17 @@ impl Model {
         (sy, gs)
     }
 
-    fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
+    fn route_topk(&mut self, layer: &Layer, x: &[f32]) -> (Vec<usize>, Vec<f32>, f32) {
         let c = self.cfg.clone();
         let e = c.experts;
         let k = c.topk;
-        let d = c.hidden;
-
         let mut _route_t = logan_core::telemetry::Span::begin("route");
         let mut logits = vec![0.0; e];
         matmul(&mut logits, x, &layer.router);
         softmax_row(&mut logits);
 
         let mut idx: Vec<usize> = (0..e).collect();
-        let mut val = logits.clone();
+        let mut val = logits;
         for i in 0..k {
             let mut best = i;
             for j in i + 1..e {
@@ -2125,6 +3001,40 @@ impl Model {
         }
         let wsum: f32 = val[..k].iter().sum();
         self.spans.route_ms += _route_t.end();
+        (idx, val, wsum)
+    }
+
+    fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
+        let (idx, val, wsum) = self.route_topk(layer, x);
+        self.moe_token_routed(layer, li, x, out, &idx, &val, wsum);
+    }
+
+    fn moe_token_routed(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        out: &mut [f32],
+        idx: &[usize],
+        val: &[f32],
+        wsum: f32,
+    ) {
+        let c = self.cfg.clone();
+        let k = c.topk;
+        let d = c.hidden;
+
+        let current_route = &idx[..k.min(idx.len())];
+        if std::env::var("QWEN_ROUTE_OVERLAP").map(|v| v != "0").unwrap_or(false) {
+            let previous = &self.route_prev[li];
+            if previous.len() == current_route.len() && !previous.is_empty() {
+                let common = current_route.iter().filter(|&&e| previous.contains(&e)).count() as u64;
+                self.route_overlap_common[li] += common;
+                self.route_overlap_total[li] += current_route.len() as u64;
+                self.route_overlap_pairs[li] += 1;
+            }
+        }
+        self.route_prev[li].clear();
+        self.route_prev[li].extend_from_slice(current_route);
 
         // Scheduler-driven mode (issue #53): the model never issues expert
         // loads. If any routed expert of this layer is not resident in the
@@ -2156,14 +3066,30 @@ impl Model {
         // the CPU shared expert while the GPU works, then wait.
         let direct =
             self.metal_direct && crate::ffi::direct_available() && k <= 64 && self.coli.is_some();
-        let mut pending: Option<*mut std::ffi::c_void> = None;
+        let mut pending: Option<crate::ffi::MoePending> = None;
         let mut direct_done = false;
+        let mut fallback_reason: &'static str = if direct { "unknown" } else { "direct-disabled" };
         let mut shared_ready: Option<(Vec<f32>, f32)> = None;
         let shared_io_overlap = std::env::var("QWEN_SHARED_IO_OVERLAP")
             .map(|v| v != "0")
             .unwrap_or(true);
         let mut _io_t = logan_core::telemetry::Span::begin("io");
         if direct {
+            // With a per-layer cache exactly equal to top-k, sequential miss
+            // insertion can otherwise evict an expert that is already resident
+            // and appears later in THIS SAME route. Protect the whole resident
+            // route first; `promote_if_present` is telemetry-neutral, so the
+            // subsequent `get` calls still count each genuine reuse exactly once.
+            let pin_route_hits = std::env::var("QWEN_ROUTE_PIN_HITS")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if pin_route_hits {
+                for i in 0..k {
+                    self.expert_store
+                        .promote_if_present((li as u32, idx[i] as u32));
+                }
+            }
+
             // Async issue: enqueue ALL K expert loads first (no waits), so
             // MTLIO pipelines them back-to-back instead of serializing each
             // load+wait (the C engine's exact-demand async issue). The
@@ -2171,27 +3097,62 @@ impl Model {
             let mut refs: Vec<std::rc::Rc<crate::colisource::SlotRef>> = Vec::with_capacity(k);
             let mut all_ok = true;
             for i in 0..k {
-                match self.cached_expert_issue(li as i32, idx[i] as i32) {
+                match self.cached_expert_issue(li as i32, idx[i] as i32, false) {
                     Some(ce) => refs.push(ce),
                     None => {
                         all_ok = false;
+                        fallback_reason = "expert-issue";
                         break;
                     }
                 }
             }
+            // Queue one completion point immediately after all cold loads.
+            // The IO queue is concurrent, so waiting on the numerically last
+            // per-expert event is not sufficient; enqueueBarrier() is. We can
+            // then overlap the shared expert with the whole outstanding batch
+            // and perform one blocking wait before the fused MoE submit.
+            let batch_wait_enabled = std::env::var("QWEN_MIO_BATCH_WAIT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let has_pending = all_ok
+                && (0..k).any(|i| {
+                    self.expert_store
+                        .peek((li as u32, idx[i] as u32))
+                        .is_some_and(|v| v.pending.get() != 0)
+                });
+            let batch_event = if batch_wait_enabled && has_pending {
+                crate::ffi::mio_batch_barrier()
+            } else {
+                None
+            };
+
             // The shared expert depends only on x, not on routed-expert bytes.
             // Run it while MetalIO owns outstanding NVMe->UMA transfers instead of
             // spending the same CPU work after all I/O has already drained.
             if all_ok && shared_io_overlap {
                 let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-                shared_ready = Some(self.shared_expert_value(layer, x));
+                shared_ready = Some(self.shared_expert_value(layer, li, x));
                 self.spans.shared_ms += _shared_t.end();
             }
             if all_ok {
-                for i in 0..k {
-                    if !self.expert_wait(li as i32, idx[i] as i32) {
+                if let Some(event) = batch_event {
+                    let slots: Vec<i32> = refs.iter().map(|r| r.slot).collect();
+                    if crate::ffi::mio_batch_wait(event, &slots) {
+                        for i in 0..k {
+                            if let Some(v) = self.expert_store.peek((li as u32, idx[i] as u32)) {
+                                v.pending.set(0);
+                            }
+                        }
+                    } else {
                         all_ok = false;
-                        break;
+                        fallback_reason = "batch-wait";
+                    }
+                } else {
+                    for i in 0..k {
+                        if !self.expert_wait(li as i32, idx[i] as i32) {
+                            all_ok = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -2217,6 +3178,7 @@ impl Model {
             if pending.is_none() && self.metal_overlap && all_ok {
                 // begin() declined mid-run: fall through to the CPU loop
                 // (weights unchanged; nothing was submitted).
+                fallback_reason = "moe-begin";
             }
         }
 
@@ -2226,7 +3188,7 @@ impl Model {
                 v
             } else {
                 let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-                let v = self.shared_expert_value(layer, x);
+                let v = self.shared_expert_value(layer, li, x);
                 self.spans.shared_ms += _shared_t.end();
                 v
             };
@@ -2243,13 +3205,13 @@ impl Model {
                 v
             } else {
                 let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-                let v = self.shared_expert_value(layer, x);
+                let v = self.shared_expert_value(layer, li, x);
                 self.spans.shared_ms += _shared_t.end();
                 v
             };
             let p = pending.unwrap();
             let mut _gpu_wait = logan_core::telemetry::Span::begin("gpu-wait");
-            let gpu_ok = crate::ffi::moe_topk_finish(p, &mut acc, d);
+            let gpu_ok = crate::ffi::moe_topk_finish(p, &mut acc);
             self.spans.gpu_ms += _gpu_wait.end();
             if !gpu_ok {
                 // GPU fault AFTER submit: C contract = redo those experts on
@@ -2275,6 +3237,9 @@ impl Model {
             return;
         }
 
+        if std::env::var("QWEN_MOE_FALLBACK_DIAG").map(|v| v != "0").unwrap_or(false) {
+            eprintln!("[moe-fallback] layer={li} reason={fallback_reason}");
+        }
         let mut _fill_t = logan_core::telemetry::Span::begin("fill");
         for i in 0..k {
             let w = val[i] / wsum;
@@ -2308,19 +3273,19 @@ impl Model {
                         [
                             Wt {
                                 f: vec![],
-                                bytes: Some(m[0].bytes.clone()),
+                                bytes: Some(WtBytes::Bf16(m[0].bytes.clone())),
                                 o: m[0].o,
                                 i: m[0].i,
                             },
                             Wt {
                                 f: vec![],
-                                bytes: Some(m[1].bytes.clone()),
+                                bytes: Some(WtBytes::Bf16(m[1].bytes.clone())),
                                 o: m[1].o,
                                 i: m[1].i,
                             },
                             Wt {
                                 f: vec![],
-                                bytes: Some(m[2].bytes.clone()),
+                                bytes: Some(WtBytes::Bf16(m[2].bytes.clone())),
                                 o: m[2].o,
                                 i: m[2].i,
                             },
@@ -2349,7 +3314,7 @@ impl Model {
             v
         } else {
             let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-            let v = self.shared_expert_value(layer, x);
+            let v = self.shared_expert_value(layer, li, x);
             self.spans.shared_ms += _shared_t.end();
             v
         };
@@ -2465,16 +3430,8 @@ impl Model {
         let st = pad + 1;
         for i in 0..hcd {
             let w = &self.ple_conv1d[i * kk..(i + 1) * kk];
-            let mut acc = 0.0_f32;
-            for j in 0..kk {
-                let lag = j * dil;
-                let xj = if lag == 0 {
-                    conv_in[i]
-                } else {
-                    self.ple_conv_state[i * st + (lag - 1)]
-                };
-                acc += w[j] * xj;
-            }
+            let state = &self.ple_conv_state[i * st..(i + 1) * st];
+            let acc = causal_conv1d_sample(conv_in[i], state, w, dil);
             for s in (1..st).rev() {
                 self.ple_conv_state[i * st + s] = self.ple_conv_state[i * st + s - 1];
             }
@@ -2483,36 +3440,39 @@ impl Model {
         }
     }
 
-    pub fn forward_token(&mut self, token: usize, pos: usize) -> Vec<f32> {
-        let c = self.cfg.clone();
-        let d = c.hidden;
-        let hc = c.hc_count;
-        let hcd = hc * d;
-        let rope = rope_angles(pos, &c);
-
-        // embed row repeated hc times (BF16 bytes in .coli mode, f32 in
-        // safetensors mode)
-        let mut stream = vec![0.0; hcd];
-        let row: Vec<f32> = if let Some(eb) = &self.embed.bytes {
-            (0..d)
-                .map(|j| {
-                    let u =
-                        u16::from_le_bytes([eb[(token * d + j) * 2], eb[(token * d + j) * 2 + 1]]);
-                    f32::from_bits((u as u32) << 16)
-                })
-                .collect()
-        } else {
-            self.embed.f[token * d..(token + 1) * d].to_vec()
-        };
+    fn init_token_stream(&self, token: usize) -> Vec<f32> {
+        let d = self.cfg.hidden;
+        let hc = self.cfg.hc_count;
+        let row = self.embed.row_f32(token);
+        if hc == 0 {
+            return row;
+        }
+        let mut stream = vec![0.0; hc * d];
         for g in 0..hc {
             stream[g * d..(g + 1) * d].copy_from_slice(&row);
         }
+        stream
+    }
 
-        // PLE ring push
-        for i in 0..c.ngram_size - 1 {
+    fn push_ple_ring(&mut self, token: usize) {
+        if self.cfg.ngram_size == 0 {
+            return;
+        }
+        for i in 0..self.cfg.ngram_size - 1 {
             self.ple_ring[i] = self.ple_ring[i + 1];
         }
-        self.ple_ring[c.ngram_size - 1] = token as i64;
+        self.ple_ring[self.cfg.ngram_size - 1] = token as i64;
+    }
+
+    fn forward_token_inner(&mut self, token: usize, pos: usize, want_logits: bool) -> Vec<f32> {
+        let c = self.cfg.clone();
+        let rope = rope_angles(pos, &c);
+        let mut stream = self.init_token_stream(token);
+
+        // Token-major execution may advance the PLE ring immediately because
+        // only PLE consumes it. Layer-major prefill advances it immediately
+        // before each chronological row reaches the PLE layer instead.
+        self.push_ple_ring(token);
 
         for l in 0..c.layers {
             if !self.forward_layer(l, token, pos, &rope, &mut stream) {
@@ -2522,7 +3482,357 @@ impl Model {
                 return Vec::new();
             }
         }
-        self.forward_tail(&stream)
+        if want_logits {
+            self.forward_tail(&stream)
+        } else {
+            // Intermediate prefill rows need only causal state (KV, GDN,
+            // PLE/indexer state, etc.) committed by the layer loop. The global
+            // HC tail and vocabulary projection are pure functions of this
+            // row's final stream and are not inputs to any later prompt row.
+            Vec::new()
+        }
+    }
+
+    pub fn forward_token(&mut self, token: usize, pos: usize) -> Vec<f32> {
+        self.forward_token_inner(token, pos, true)
+    }
+
+    /// Advance one prompt token without computing disposable final-row logits.
+    /// This is numerically identical for all persistent causal state to
+    /// `forward_token`; only the non-stateful global HC tail + LM head are
+    /// omitted. Use `forward_token` for the final prompt token.
+    pub fn prefill_token(&mut self, token: usize, pos: usize) {
+        let _ = self.forward_token_inner(token, pos, false);
+    }
+
+    /// Bounded layer-major prompt prefill. This deliberately reuses the exact
+    /// existing per-row layer implementation: only the traversal order changes
+    /// from token-major to layer-major within the chunk. Each causal layer is
+    /// still evaluated in increasing token position, so KV, GDN recurrent /
+    /// convolution state and QSA state advance in the same order as canonical
+    /// token-major execution.
+    ///
+    /// PLE is the only consumer of `ple_ring`; therefore its token history is
+    /// advanced immediately before each row reaches the PLE layer rather than
+    /// at chunk admission. The global HC tail + vocabulary projection run only
+    /// for the final requested row.
+    pub fn prefill_chunk(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want_logits_last: bool,
+    ) -> Result<Option<Vec<f32>>, String> {
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        if self.sched_mode {
+            return Err("layer-major prefill is not yet supported in scheduler mode".into());
+        }
+        let c = self.cfg.clone();
+        if c.hc_count == 0 {
+            // Correctness-first Qwen3.x prefill. Preserve canonical token-major
+            // state evolution until the MXFP4 dense projections have their own
+            // qualified layer-major batch path; routed expert caching/MetalIO
+            // still use the shared engine on every row.
+            let mut logits = None;
+            for (row, &token) in tokens.iter().enumerate() {
+                let pos = start_pos + row;
+                if want_logits_last && row + 1 == tokens.len() {
+                    logits = Some(self.forward_token(token as usize, pos));
+                } else {
+                    self.prefill_token(token as usize, pos);
+                }
+            }
+            return Ok(logits);
+        }
+        let mut streams: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&token| self.init_token_stream(token as usize))
+            .collect();
+        let ropes: Vec<Vec<(f32, f32)>> = (0..tokens.len())
+            .map(|row| rope_angles(start_pos + row, &c))
+            .collect();
+
+        for l in 0..c.layers {
+            // Keep one layer borrowed for the entire chunk. Each row advances
+            // this layer's causal state in increasing position, then pauses at
+            // the routed-MoE seam so the chunk can acquire its expert union.
+            let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
+            let mut moe_inputs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+            let mut injectors: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+
+            let d = c.hidden;
+            let hc = c.hc_count;
+            let mut mixed_rows: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+            let mut temporal_injectors: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+
+            // First HC is row-independent. Stop all rows at the temporal seam
+            // so GDN can batch its dense projections while retaining ordered
+            // convolution/recurrent state updates inside gdn_chunk_batched().
+            for row in 0..tokens.len() {
+                let token = tokens[row] as usize;
+                let stream = &mut streams[row];
+                if c.ple_layer == l as i64 {
+                    self.push_ple_ring(token);
+                    self.ple_forward(stream);
+                }
+                let mut mixed = vec![0.0; d];
+                let mut inj = vec![0.0; hc];
+                let mut _hc_t = logan_core::telemetry::Span::begin("hc");
+                self.hc_mix(
+                    &layer.hc_norm,
+                    &layer.hc_mix_down,
+                    &layer.hc_mix_up,
+                    Some(&layer.hc_inject),
+                    stream,
+                    &mut mixed,
+                    Some(&mut inj),
+                );
+                self.spans.hc_ms += _hc_t.end();
+                mixed_rows.push(mixed);
+                temporal_injectors.push(inj);
+            }
+
+            let mut temporal_rows = vec![vec![0.0_f32; d]; tokens.len()];
+            if layer.is_gdn {
+                let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
+                if !self.gdn_chunk_batched(&mut layer, l, &mixed_rows, &mut temporal_rows) {
+                    for row in 0..tokens.len() {
+                        self.gdn_token(
+                            &mut layer,
+                            l,
+                            &mixed_rows[row],
+                            &mut temporal_rows[row],
+                        );
+                    }
+                }
+                self.spans.gdn_ms += _gdn_t.end();
+            } else {
+                let mut projected = self
+                    .project_attention_chunk(&layer, &mixed_rows)
+                    .map(std::collections::VecDeque::from);
+                for row in 0..tokens.len() {
+                    let pos = start_pos + row;
+                    let mut _attn_t = logan_core::telemetry::Span::begin("attn");
+                    if let Some(projection) = projected.as_mut().and_then(|q| q.pop_front()) {
+                        if layer.is_qsa {
+                            let sel = self.qsa_select(
+                                &layer,
+                                l,
+                                &mixed_rows[row],
+                                pos,
+                                &ropes[row],
+                                projection.index_qk.as_deref(),
+                            );
+                            self.attention_common(
+                                &layer,
+                                l,
+                                &mixed_rows[row],
+                                pos,
+                                &ropes[row],
+                                Some(&sel),
+                                Some(projection),
+                                &mut temporal_rows[row],
+                            );
+                        } else {
+                            self.attention_common(
+                                &layer,
+                                l,
+                                &mixed_rows[row],
+                                pos,
+                                &ropes[row],
+                                None,
+                                Some(projection),
+                                &mut temporal_rows[row],
+                            );
+                        }
+                    } else if layer.is_qsa {
+                        self.sparse_attn_token(
+                            &layer,
+                            l,
+                            &mixed_rows[row],
+                            pos,
+                            &ropes[row],
+                            &mut temporal_rows[row],
+                        );
+                    } else {
+                        self.attention_token(
+                            &layer,
+                            l,
+                            &mixed_rows[row],
+                            pos,
+                            &ropes[row],
+                            &mut temporal_rows[row],
+                        );
+                    }
+                    self.spans.attn_ms += _attn_t.end();
+                }
+            }
+
+            for row in 0..tokens.len() {
+                let stream = &mut streams[row];
+                let mut inj = std::mem::take(&mut temporal_injectors[row]);
+                for g in 0..hc {
+                    for dd in 0..d {
+                        stream[g * d + dd] += inj[g] * temporal_rows[row][dd];
+                    }
+                }
+                let mut m2 = vec![0.0; d];
+                self.hc_mix(
+                    &layer.hc_mlp_norm,
+                    &layer.hc_mlp_mix_down,
+                    &layer.hc_mlp_mix_up,
+                    Some(&layer.hc_mlp_inject),
+                    stream,
+                    &mut m2,
+                    Some(&mut inj),
+                );
+                moe_inputs.push(m2);
+                injectors.push(inj);
+            }
+
+            // Route every row exactly once. Batched prefill groups route
+            // occurrences by expert for GPU execution, then scatters the raw
+            // expert outputs back to per-row/per-rank slots so floating-point
+            // reduction still follows each token's canonical top-k order.
+            let mut routes = Vec::with_capacity(tokens.len());
+            let mut seen = vec![false; c.experts];
+            let mut unique = Vec::new();
+            for x in &moe_inputs {
+                let route = self.route_topk(&layer, x);
+                for &ei in route.0.iter().take(c.topk) {
+                    if !seen[ei] {
+                        seen[ei] = true;
+                        unique.push(ei);
+                    }
+                }
+                routes.push(route);
+            }
+
+            let batch_enabled = std::env::var("QWEN_PREFILL_MOE_BATCH")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let mut batch_done = false;
+            if batch_enabled
+                && self.metal_direct
+                && crate::ffi::direct_available()
+                && self.coli.is_some()
+                && unique.len() <= cache_cap()
+            {
+                let mut _io_t = logan_core::telemetry::Span::begin("io");
+                let resident = self.preload_expert_set(l, &unique);
+                self.spans.io_ms += _io_t.end();
+                if resident {
+                    let mut refs: Vec<std::rc::Rc<crate::colisource::SlotRef>> =
+                        Vec::with_capacity(unique.len());
+                    let mut descriptors = Vec::with_capacity(unique.len());
+                    let mut row_offsets = Vec::with_capacity(unique.len() + 1);
+                    let mut grouped_x = Vec::with_capacity(tokens.len() * c.topk * c.hidden);
+                    let mut scatter: Vec<(usize, usize)> =
+                        Vec::with_capacity(tokens.len() * c.topk);
+                    row_offsets.push(0_i32);
+
+                    let mut bind_ok = true;
+                    for &ei in &unique {
+                        let Some(r) = self.cached_expert_issue(l as i32, ei as i32, false) else {
+                            bind_ok = false;
+                            break;
+                        };
+                        descriptors.push(Self::slot_descriptor(&r));
+                        refs.push(r);
+                        for row in 0..tokens.len() {
+                            let (idx, _, _) = &routes[row];
+                            for rank in 0..c.topk {
+                                if idx[rank] == ei {
+                                    grouped_x.extend_from_slice(&moe_inputs[row]);
+                                    scatter.push((row, rank));
+                                }
+                            }
+                        }
+                        row_offsets.push(scatter.len() as i32);
+                    }
+
+                    if bind_ok && scatter.len() == tokens.len() * c.topk {
+                        let mut grouped_y = vec![0.0_f32; scatter.len() * c.hidden];
+                        let mut _gpu_t = logan_core::telemetry::Span::begin("gpu");
+                        let gpu_ok = crate::ffi::moe_rows(
+                            &descriptors,
+                            &row_offsets,
+                            &grouped_x,
+                            &mut grouped_y,
+                            c.hidden,
+                            c.moe_inter,
+                        );
+                        self.spans.gpu_ms += _gpu_t.end();
+                        if gpu_ok {
+                            let mut contrib =
+                                vec![0.0_f32; tokens.len() * c.topk * c.hidden];
+                            for (grouped_row, &(row, rank)) in scatter.iter().enumerate() {
+                                let src = &grouped_y
+                                    [grouped_row * c.hidden..(grouped_row + 1) * c.hidden];
+                                let off = (row * c.topk + rank) * c.hidden;
+                                contrib[off..off + c.hidden].copy_from_slice(src);
+                            }
+                            for row in 0..tokens.len() {
+                                let (idx, val, wsum) = &routes[row];
+                                debug_assert!(idx.len() >= c.topk);
+                                let mut moe = vec![0.0_f32; c.hidden];
+                                for rank in 0..c.topk {
+                                    let w = val[rank] / *wsum;
+                                    let off = (row * c.topk + rank) * c.hidden;
+                                    for dd in 0..c.hidden {
+                                        moe[dd] += contrib[off + dd] * w;
+                                    }
+                                }
+                                let mut _shared_t =
+                                    logan_core::telemetry::Span::begin("shared");
+                                let (sy, gs) = self.shared_expert_value(&layer, l, &moe_inputs[row]);
+                                self.spans.shared_ms += _shared_t.end();
+                                for dd in 0..c.hidden {
+                                    moe[dd] += sy[dd] * gs;
+                                }
+                                for g in 0..c.hc_count {
+                                    for dd in 0..c.hidden {
+                                        streams[row][g * c.hidden + dd] +=
+                                            injectors[row][g] * moe[dd];
+                                    }
+                                }
+                            }
+                            batch_done = true;
+                        }
+                    }
+                    drop(refs);
+                }
+            }
+
+            if !batch_done {
+                for row in 0..tokens.len() {
+                    let mut moe = vec![0.0; c.hidden];
+                    let (idx, val, wsum) = &routes[row];
+                    self.moe_token_routed(
+                        &layer,
+                        l,
+                        &moe_inputs[row],
+                        &mut moe,
+                        idx,
+                        val,
+                        *wsum,
+                    );
+                    for g in 0..c.hc_count {
+                        for dd in 0..c.hidden {
+                            streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                        }
+                    }
+                }
+            }
+            self.layers[l] = layer;
+        }
+
+        if want_logits_last {
+            Ok(streams.last().map(|stream| self.forward_tail(stream)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// One transformer layer of the token stream — the exact canonical per-layer
@@ -2547,6 +3857,52 @@ impl Model {
         // dominate any Metal win). Split-borrow: methods take &Layer, so
         // pull the layer out, run both sub-phases, put it back.
         let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
+
+        // Qwen3.x classic residual block. The same temporal/MoE kernels and
+        // expert residency machinery are shared with the hyper-connection
+        // engine; only the residual plumbing and two RMSNorm sites differ.
+        if hc == 0 {
+            self.prefetch_previous_route(l);
+            let mut mixed = vec![0.0; d];
+            rmsnorm_row_shifted(&mut mixed, stream, &layer.in_ln, c.eps);
+            let mut attn = vec![0.0; d];
+            if layer.is_gdn {
+                let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
+                self.gdn_token(&mut layer, l, &mixed, &mut attn);
+                self.spans.gdn_ms += _gdn_t.end();
+            } else {
+                let mut _attn_t = logan_core::telemetry::Span::begin("attn");
+                self.attention_token(&layer, l, &mixed, pos, rope, &mut attn);
+                self.spans.attn_ms += _attn_t.end();
+            }
+            for dd in 0..d {
+                stream[dd] += attn[dd];
+            }
+
+            let mut m2 = vec![0.0; d];
+            rmsnorm_row_shifted(&mut m2, stream, &layer.hc_mlp_norm, c.eps);
+            let mut moe = vec![0.0; d];
+            self.moe_token(&layer, l, &m2, &mut moe);
+            if let Some(experts) = self.sched_blocked.take() {
+                self.layers[l] = layer;
+                self.sched_pause = Some(TokenPause {
+                    layer: l,
+                    experts,
+                    x: m2,
+                    inj: Vec::new(),
+                    stream: stream.to_vec(),
+                    token,
+                    pos,
+                });
+                return false;
+            }
+            for dd in 0..d {
+                stream[dd] += moe[dd];
+            }
+            self.layers[l] = layer;
+            return true;
+        }
+
         let mut mixed = vec![0.0; d];
         let mut attn = vec![0.0; d];
         if c.ple_layer == l as i64 {
@@ -2625,7 +3981,17 @@ impl Model {
     fn forward_tail(&mut self, stream: &[f32]) -> Vec<f32> {
         let c = self.cfg.clone();
         let d = c.hidden;
-        let hcd = c.hc_count * d;
+        if c.hc_count == 0 {
+            let mut _head_t = logan_core::telemetry::Span::begin("head");
+            let mut normed = vec![0.0; d];
+            // MLX Qwen3.5/3.6 sanitize() folds the raw HF `(1 + weight)`
+            // RMSNorm convention into model.norm.weight before quantization.
+            rmsnorm_row_shifted(&mut normed, stream, &self.final_norm, c.eps);
+            let mut logits = vec![0.0; c.vocab];
+            matmul(&mut logits, &normed, &self.lm_head);
+            self.spans.head_ms += _head_t.end();
+            return logits;
+        }
         // final global hc_mix (no inject)
         let mut out = vec![0.0; d];
         let mut _hc3_t = logan_core::telemetry::Span::begin("hc");
@@ -2713,9 +4079,15 @@ impl Model {
                 experts,
             };
         }
-        for g in 0..hc {
+        if hc == 0 {
             for dd in 0..d {
-                stream[g * d + dd] += pause.inj[g] * moe[dd];
+                stream[dd] += moe[dd];
+            }
+        } else {
+            for g in 0..hc {
+                for dd in 0..d {
+                    stream[g * d + dd] += pause.inj[g] * moe[dd];
+                }
             }
         }
         self.layers[pause.layer] = layer;
@@ -2829,6 +4201,22 @@ impl Model {
             self.expert_store.hits,
             self.expert_store.misses,
         );
+        if std::env::var("QWEN_ROUTE_OVERLAP").map(|v| v != "0").unwrap_or(false) {
+            let common: u64 = self.route_overlap_common.iter().sum();
+            let total: u64 = self.route_overlap_total.iter().sum();
+            let pairs: u64 = self.route_overlap_pairs.iter().sum();
+            eprintln!(
+                "logan route-overlap: common={common} total={total} pairs={pairs} rate={:.3}",
+                if total == 0 { 0.0 } else { common as f64 / total as f64 }
+            );
+            let detail = self.route_overlap_common.iter().zip(&self.route_overlap_total)
+                .zip(&self.route_overlap_pairs)
+                .enumerate()
+                .map(|(li, ((&c, &t), &p))| format!("{li}:{:.3}/{p}", if t == 0 { 0.0 } else { c as f64 / t as f64 }))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("logan route-overlap layers: {detail}");
+        }
     }
 }
 
@@ -2836,16 +4224,83 @@ impl Model {
 // load
 // ---------------------------------------------------------------------------
 
-/// Expert-cache capacity: QWEN4_CACHE env (default 256). Mirrors the C
-/// engine's CACHE arg — the measured plateau is ~1230 misses at any cap
-/// >= 256 (cold first-touch floor), so raising it past 256 only helps if
-/// the working set per token exceeds the cap.
-pub fn cache_cap() -> usize {
-    std::env::var("QWEN4_CACHE")
+/// Expert-cache capacity. An explicit `QWEN4_CACHE` always wins.
+///
+/// On 16 GiB Apple Silicon, a 256-slot expert cache measurably pressures UMA
+/// residency: the GDN command-buffer scheduling wait rises sharply even though
+/// the GDN GPU work itself is unchanged. Keep more headroom for dense/GDN GPU
+/// resources on that tier; larger or unknown machines retain the established
+/// 256-slot default until they have their own measured residency curve.
+fn make_expert_store(
+    layers: usize,
+) -> logan_core::expert::ExpertStore<crate::colisource::SlotExpert> {
+    // Explicit override: 0 restores the legacy global LRU for A/Bs.
+    if let Some(per_layer) = std::env::var("QWEN4_CACHE_PER_LAYER")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256)
-        .max(1)
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return if per_layer == 0 {
+            logan_core::expert::ExpertStore::new(cache_cap())
+        } else {
+            logan_core::expert::ExpertStore::new_layered(layers, per_layer)
+        };
+    }
+
+    // Measured on the 16 GiB M2 Qwen3.6-35B-A3B workload: 8/layer cuts
+    // routed-expert misses ~30% versus the 128-entry global LRU and beats
+    // 10/layer end-to-end because the latter adds UMA/residency pressure.
+    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && detect_physical_ram_bytes().is_some_and(|bytes| bytes <= 16 * 1024 * 1024 * 1024)
+    {
+        return logan_core::expert::ExpertStore::new_layered(layers, 8);
+    }
+    logan_core::expert::ExpertStore::new(cache_cap())
+}
+
+pub fn cache_cap() -> usize {
+    if let Some(cap) = std::env::var("QWEN4_CACHE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return cap.max(1);
+    }
+    default_cache_cap_for_ram(detect_physical_ram_bytes())
+}
+
+fn default_cache_cap_for_ram(ram_bytes: Option<u64>) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && ram_bytes.is_some_and(|bytes| bytes <= 16 * GIB)
+    {
+        128
+    } else {
+        256
+    }
+}
+
+fn detect_physical_ram_bytes() -> Option<u64> {
+    if let Some(gib) = std::env::var("RAM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return gib.checked_mul(1024 * 1024 * 1024);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        return text.trim().parse::<u64>().ok();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
@@ -3396,8 +4851,14 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
-            expert_store: logan_core::expert::ExpertStore::new(cache_cap()),
+            expert_plan: None,
+            expert_store: make_expert_store(cfg.layers),
             spans: logan_core::telemetry::TokenSpans::default(),
+            route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            route_overlap_common: vec![0; cfg.layers],
+            route_overlap_total: vec![0; cfg.layers],
+            route_overlap_pairs: vec![0; cfg.layers],
+            metal_model_id: next_metal_model_id(),
             // safetensors mode: no package profile, so the Apple8 direct path
             // never applies (C parity: direct requires the Apple8 target
             // profile). Keep the env gate for symmetry; the path is inert
@@ -3474,4 +4935,44 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
         model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        causal_conv1d_sample, default_cache_cap_for_ram, rmsnorm_row, rmsnorm_row_shifted,
+    };
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn expert_cache_leaves_uma_headroom_on_16g_apple_silicon() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(default_cache_cap_for_ram(Some(16 * GIB)), 128);
+        assert_eq!(default_cache_cap_for_ram(Some(32 * GIB)), 256);
+        assert_eq!(default_cache_cap_for_ram(None), 256);
+    }
+
+    #[test]
+    fn ple_causal_conv_uses_standard_tap_order() {
+        // history[0] is t-1, history[1] is t-2. For kernel [1,10,100],
+        // standard causal Conv1d computes 1*x[t-2] + 10*x[t-1] + 100*x[t].
+        let history = [4.0_f32, 3.0, 2.0];
+        let weights = [1.0_f32, 10.0, 100.0];
+        assert_eq!(causal_conv1d_sample(5.0, &history, &weights, 1), 543.0);
+    }
+
+    #[test]
+    fn mlx_qwen35_shifted_norm_matches_raw_hf_delta_norm() {
+        // MLX sanitize() folds the Transformers `1 + weight` into the saved
+        // Qwen3.5/3.6 norm tensor. Applying another +1 at runtime is the bug
+        // that caused the real MXFP4 checkpoint to generate garbage.
+        let x = [3.0_f32, -4.0, 1.5, -0.25];
+        let raw_hf_delta = [0.25_f32, -0.5, 0.125, 0.75];
+        let mlx_stored = [1.25_f32, 0.5, 1.125, 1.75];
+        let mut raw_out = [0.0_f32; 4];
+        let mut mlx_out = [0.0_f32; 4];
+        rmsnorm_row(&mut raw_out, &x, &raw_hf_delta, 1e-6);
+        rmsnorm_row_shifted(&mut mlx_out, &x, &mlx_stored, 1e-6);
+        assert_eq!(raw_out, mlx_out);
+    }
 }

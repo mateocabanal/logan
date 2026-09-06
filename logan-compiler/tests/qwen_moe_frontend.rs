@@ -47,6 +47,34 @@ fn add_tensor(
     *next_offset += len + 32;
 }
 
+fn add_typed_tensor(
+    tensors: &mut BTreeMap<String, TensorRef>,
+    source: &PathBuf,
+    next_offset: &mut u64,
+    name: impl Into<String>,
+    dtype: &str,
+    shape: &[u64],
+) {
+    let element_bytes = match dtype {
+        "U8" | "I8" | "F8_E8M0" => 1,
+        "BF16" => 2,
+        "U32" => 4,
+        other => panic!("unsupported fixture dtype {other}"),
+    };
+    let len = shape.iter().copied().product::<u64>() * element_bytes;
+    tensors.insert(
+        name.into(),
+        TensorRef {
+            source: source.clone(),
+            offset: *next_offset,
+            len,
+            dtype: dtype.into(),
+            shape: shape.to_vec(),
+        },
+    );
+    *next_offset += len + 32;
+}
+
 fn fixture() -> Fixture {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -274,6 +302,178 @@ fn fixture() -> Fixture {
     };
 
     Fixture { root, inventory }
+}
+
+fn mlx_fixture() -> Fixture {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "colic-qwen-mlx-frontend-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("config.json"),
+        r#"{
+          "model_type": "qwen3_5_moe",
+          "quantization_config": {"mode":"mxfp4","group_size":32,"bits":4},
+          "text_config": {
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "hidden_size": 32,
+            "num_experts": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "vocab_size": 64,
+            "num_experts_per_tok": 1,
+            "num_attention_heads": 1,
+            "head_dim": 32,
+            "num_key_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 32,
+            "linear_num_value_heads": 1,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let weights = root.join("weights.bin");
+    fs::write(&weights, []).unwrap();
+    let mut tensors = BTreeMap::new();
+    let mut offset = 4096;
+
+    for (name, dtype, shape) in [
+        (
+            "language_model.model.embed_tokens.weight",
+            "U32",
+            vec![64, 4],
+        ),
+        (
+            "language_model.model.embed_tokens.scales",
+            "U8",
+            vec![64, 1],
+        ),
+        ("language_model.lm_head.weight", "U32", vec![64, 4]),
+        ("language_model.lm_head.scales", "U8", vec![64, 1]),
+        ("language_model.model.norm.weight", "BF16", vec![32]),
+        (
+            "language_model.model.layers.0.input_layernorm.weight",
+            "BF16",
+            vec![32],
+        ),
+        (
+            "language_model.model.layers.0.post_attention_layernorm.weight",
+            "BF16",
+            vec![32],
+        ),
+        (
+            "language_model.model.layers.0.mlp.gate.weight",
+            "U32",
+            vec![2, 8],
+        ),
+        (
+            "language_model.model.layers.0.mlp.gate.scales",
+            "BF16",
+            vec![2, 1],
+        ),
+        (
+            "language_model.model.layers.0.mlp.gate.biases",
+            "BF16",
+            vec![2, 1],
+        ),
+        (
+            "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "U32",
+            vec![32, 4],
+        ),
+        (
+            "language_model.model.layers.0.mlp.shared_expert.gate_proj.scales",
+            "U8",
+            vec![32, 1],
+        ),
+        ("vision_tower.patch_embed.proj.weight", "BF16", vec![2, 2]),
+    ] {
+        add_typed_tensor(&mut tensors, &weights, &mut offset, name, dtype, &shape);
+    }
+    for role in ["gate_proj", "up_proj", "down_proj"] {
+        add_typed_tensor(
+            &mut tensors,
+            &weights,
+            &mut offset,
+            format!("language_model.model.layers.0.mlp.switch_mlp.{role}.weight"),
+            "U32",
+            &[2, 32, 4],
+        );
+        add_typed_tensor(
+            &mut tensors,
+            &weights,
+            &mut offset,
+            format!("language_model.model.layers.0.mlp.switch_mlp.{role}.scales"),
+            "U8",
+            &[2, 32, 1],
+        );
+    }
+
+    let inventory = SourceInventory {
+        root: root.clone(),
+        files: vec![root.join("config.json"), weights],
+        source_stored_bytes: tensors.values().map(|tensor| tensor.len).sum(),
+        dtype_counts: BTreeMap::new(),
+        source_fingerprint: "11".repeat(32),
+        config_fingerprint: None,
+        architecture_hint: Some("Qwen3_5MoeForConditionalGeneration".into()),
+        tensors,
+    };
+    Fixture { root, inventory }
+}
+
+#[test]
+fn adapts_mlx_mxfp4_switch_banks_without_requantizing() {
+    let fixture = mlx_fixture();
+    let model = QwenMoeFrontend::build(&fixture.inventory).unwrap();
+    assert_eq!(model.architecture, Architecture::Qwen3_5MoeMoE);
+
+    let gate_bank = fixture
+        .inventory
+        .tensors
+        .get("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight")
+        .unwrap();
+    let gate_scales = fixture
+        .inventory
+        .tensors
+        .get("language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales")
+        .unwrap();
+    let expert = model.routed_experts.get(&(0, 1)).unwrap();
+    assert_eq!(expert.gate.source.dtype, "I8");
+    assert_eq!(expert.gate.source.shape, vec![32, 16]);
+    assert_eq!(expert.gate.source.len, 512);
+    assert_eq!(expert.gate.source.offset, gate_bank.offset + 512);
+    let scale = expert.gate.scale.as_ref().unwrap();
+    assert_eq!(scale.dtype, "F8_E8M0");
+    assert_eq!(scale.shape, vec![32, 1]);
+    assert_eq!(scale.offset, gate_scales.offset + 32);
+
+    assert_eq!(model.global_tensors["embed.weight"].dtype, "I8");
+    assert_eq!(model.global_tensors["embed.weight"].shape, vec![64, 16]);
+    assert_eq!(model.global_tensors["embed.scales"].dtype, "F8_E8M0");
+
+    let layer = &model.layer_static_tensors[&0];
+    assert_eq!(layer["mlp.gate.weight"].dtype, "U8");
+    assert_eq!(layer["mlp.gate.weight"].shape, vec![2, 32]);
+    assert_eq!(layer["mlp.gate.scales"].dtype, "BF16");
+    assert_eq!(layer["mlp.shared_expert.gate_proj.weight"].dtype, "I8");
+    assert_eq!(layer["mlp.shared_expert.gate_proj.scales"].dtype, "F8_E8M0");
+
+    assert!(model.resident_tensors.is_empty());
+    assert!(
+        !model.layer_static_tensors[&0]
+            .keys()
+            .any(|name| name.starts_with("mlp.switch_mlp."))
+    );
 }
 
 #[test]

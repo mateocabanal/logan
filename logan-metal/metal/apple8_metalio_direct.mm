@@ -667,6 +667,7 @@ kernel void qwen_gdn_conv_recur_norm(
     constant int &vd              [[buffer(14)]],
     constant int &kk              [[buffer(15)]],
     constant float &eps           [[buffer(16)]],
+    constant int &output_gate     [[buffer(17)]],
     threadgroup float *scratch    [[threadgroup(0)]],
     uint kh_u                     [[threadgroup_position_in_grid]],
     uint t                        [[thread_index_in_threadgroup]])
@@ -763,8 +764,9 @@ kernel void qwen_gdn_conv_recur_norm(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float zv = z[(long)h * vd + d];
-    const float silu_z = zv / (1.0f + exp(-zv));
-    normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * silu_z;
+    const float sigmoid_z = 1.0f / (1.0f + exp(-zv));
+    const float gate_z = output_gate == 1 ? sigmoid_z : zv * sigmoid_z;
+    normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * gate_z;
 }
 
 /* Same deterministic coalesced projection as the input side. */
@@ -800,6 +802,11 @@ static id<MTLComputePipelineState> g_gdn_recur_pipeline = nil;
 static id<MTLComputePipelineState> g_gdn_output_pipeline = nil;
 
 struct QwenGdnMetalLayer {
+    uint64_t model_id = 0;
+    int layer = -1;
+    const void *host_wqkv = nullptr, *host_wz = nullptr, *host_wa = nullptr,
+               *host_wb = nullptr, *host_wout = nullptr;
+    float *host_state = nullptr, *host_conv_state = nullptr;
     id<MTLBuffer> wqkv = nil, wz = nil, wa = nil, wb = nil, wout = nil;
     id<MTLBuffer> A_log = nil, dt_bias = nil, conv_w = nil, norm_w = nil;
     id<MTLBuffer> state = nil, conv_state = nil;
@@ -866,7 +873,7 @@ static int qwen_gdn_mul3_size(size_t a, size_t b, size_t c, size_t *out) {
 }
 
 static QwenGdnMetalLayer *qwen_gdn_layer_locked(
-    int layer,
+    uint64_t model_id, int layer,
     const uint16_t *wqkv, const uint16_t *wz,
     const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
     const float *A_log, const float *dt_bias,
@@ -874,7 +881,7 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
     float *state, float *conv_state,
     int D, int kheads, int kd, int vheads, int vd, int kk)
 {
-    if (layer < 0 || D <= 0 || kheads <= 0 || kd <= 0 || vheads <= 0 || vd <= 0 ||
+    if (model_id == 0 || layer < 0 || D <= 0 || kheads <= 0 || kd <= 0 || vheads <= 0 || vd <= 0 ||
         kk <= 0 || vheads < kheads || vheads % kheads ||
         !wqkv || !wz || !wa || !wb || !wout || !A_log || !dt_bias ||
         !conv_w || !norm_w || !state || (kk > 1 && !conv_state))
@@ -892,9 +899,22 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
         scratch_floats * sizeof(float) > (size_t)g_device.maxThreadgroupMemoryLength)
         return nullptr;
 
-    if ((size_t)layer >= g_gdn_layers.size())
-        g_gdn_layers.resize((size_t)layer + 1, nullptr);
-    if (g_gdn_layers[(size_t)layer]) return g_gdn_layers[(size_t)layer];
+    // GDN resources belong to one concrete model/session allocation set.
+    // Layer number alone is not an identity: a later model can have the same
+    // layer index with different weights/state, and the old zero-copy wrappers
+    // would otherwise retain dangling host pointers. Reuse only the exact
+    // model+layer context and fail closed if that model tries to present a
+    // different allocation/geometry for the same layer.
+    for (QwenGdnMetalLayer *ctx : g_gdn_layers) {
+        if (!ctx || ctx->model_id != model_id || ctx->layer != layer) continue;
+        if (ctx->D != D || ctx->kheads != kheads || ctx->kd != kd ||
+            ctx->vheads != vheads || ctx->vd != vd || ctx->kk != kk ||
+            ctx->host_wqkv != wqkv || ctx->host_wz != wz || ctx->host_wa != wa ||
+            ctx->host_wb != wb || ctx->host_wout != wout ||
+            ctx->host_state != state || ctx->host_conv_state != conv_state)
+            return nullptr;
+        return ctx;
+    }
 
     const size_t kdim = (size_t)kheads * (size_t)kd;
     const size_t vdim = (size_t)vheads * (size_t)vd;
@@ -917,6 +937,11 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
 
     QwenGdnMetalLayer *ctx = new (std::nothrow) QwenGdnMetalLayer();
     if (!ctx) return nullptr;
+    ctx->model_id = model_id;
+    ctx->layer = layer;
+    ctx->host_wqkv = wqkv; ctx->host_wz = wz; ctx->host_wa = wa;
+    ctx->host_wb = wb; ctx->host_wout = wout;
+    ctx->host_state = state; ctx->host_conv_state = conv_state;
     ctx->D = D; ctx->kheads = kheads; ctx->kd = kd;
     ctx->vheads = vheads; ctx->vd = vd; ctx->kk = kk;
     ctx->wqkv = qwen_gdn_wrap_nocopy_locked(wqkv, wqkv_b);
@@ -960,23 +985,41 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
         delete ctx;
         return nullptr;
     }
-    g_gdn_layers[(size_t)layer] = ctx;
+    g_gdn_layers.push_back(ctx);
     return ctx;
 }
 
+// Release every cached GDN wrapper for one model while its Rust-owned backing
+// allocations are still alive. The token entry point holds the same mutex and
+// waits synchronously for its command buffer, so acquiring this lock also
+// establishes that no GDN command for this model is still using those buffers.
+extern "C" void coli_apple8_metalio_gdn_drop_model(uint64_t model_id) {
+    if (model_id == 0) return;
+    std::lock_guard<std::mutex> guard(g_lock);
+    for (auto it = g_gdn_layers.begin(); it != g_gdn_layers.end();) {
+        QwenGdnMetalLayer *ctx = *it;
+        if (ctx && ctx->model_id == model_id) {
+            delete ctx;
+            it = g_gdn_layers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 extern "C" int coli_apple8_metalio_gdn_token(
-    int layer, const float *x, float *out,
+    uint64_t model_id, int layer, const float *x, float *out,
     const uint16_t *wqkv, const uint16_t *wz,
     const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
     const float *A_log, const float *dt_bias,
     const float *conv_w, const float *norm_w,
     float *state, float *conv_state,
-    int D, int kheads, int kd, int vheads, int vd, int kk, float eps)
+    int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps)
 {
     if (!x || !out || !(eps > 0.0f)) return 0;
     std::lock_guard<std::mutex> guard(g_lock);
     QwenGdnMetalLayer *ctx = qwen_gdn_layer_locked(
-        layer, wqkv, wz, wa, wb, wout, A_log, dt_bias, conv_w, norm_w,
+        model_id, layer, wqkv, wz, wa, wb, wout, A_log, dt_bias, conv_w, norm_w,
         state, conv_state, D, kheads, kd, vheads, vd, kk);
     if (!ctx || !g_queue || !g_device) return 0;
 
@@ -1035,6 +1078,7 @@ extern "C" int coli_apple8_metalio_gdn_token(
     [rec setBytes:&vd length:sizeof(vd) atIndex:14];
     [rec setBytes:&kk length:sizeof(kk) atIndex:15];
     [rec setBytes:&eps length:sizeof(eps) atIndex:16];
+    [rec setBytes:&output_gate length:sizeof(output_gate) atIndex:17];
     [rec setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
     [rec dispatchThreadgroups:MTLSizeMake((NSUInteger)kheads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(recur_threads, 1, 1)];
@@ -1388,6 +1432,123 @@ extern "C" int coli_apple8_metalio_swiglu_slot(int slot,
     return 1;
 }
 
+/* Prefill routed-MoE batch: rows are grouped by expert on the host. Each
+ * expert therefore sees S>=1 activation rows, but every unique expert in the
+ * layer/chunk is encoded into the SAME command buffer. The existing Apple8
+ * gate/up and down kernels already support S>1, so this changes scheduling and
+ * weight reuse without introducing new shader arithmetic. Output rows preserve
+ * the grouped input order; the caller scatters them back to (token,route-rank)
+ * slots and performs canonical ordered reduction. */
+extern "C" int coli_apple8_metalio_moe_rows(
+    const ColiApple8MetalioExpert *experts,
+    const int *row_offsets,
+    int expert_count,
+    const float *x,
+    float *y,
+    int total_rows,
+    int hidden,
+    int intermediate) {
+    if (!experts || !row_offsets || !x || !y || expert_count <= 0 ||
+        total_rows <= 0 || hidden <= 0 || intermediate <= 0 ||
+        row_offsets[0] != 0 || row_offsets[expert_count] != total_rows)
+        return 0;
+    for (int e = 0; e < expert_count; ++e) {
+        if (row_offsets[e] < 0 || row_offsets[e + 1] <= row_offsets[e] ||
+            row_offsets[e + 1] > total_rows)
+            return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (!g_gu_pipeline || !g_down_pipeline || !g_queue || !g_device) return 0;
+
+    const size_t R = (size_t)total_rows, H = (size_t)hidden, M = (size_t)intermediate;
+    if (R > SIZE_MAX / H || R * H > SIZE_MAX / sizeof(float) ||
+        R > SIZE_MAX / M || R * M > SIZE_MAX / sizeof(float))
+        return 0;
+    const size_t x_bytes = R * H * sizeof(float);
+    const size_t mid_bytes = R * M * sizeof(float);
+    const size_t y_bytes = x_bytes;
+
+    std::vector<id<MTLBuffer>> weight_buffers((size_t)expert_count);
+    for (int e = 0; e < expert_count; ++e) {
+        size_t slot_bytes = 0;
+        weight_buffers[(size_t)e] = slot_buffer_locked(experts[e].slot, &slot_bytes);
+        if (!weight_buffers[(size_t)e] ||
+            !matrix_fits(slot_bytes, experts[e].gate_offset, experts[e].gate_bytes,
+                         intermediate, hidden) ||
+            !matrix_fits(slot_bytes, experts[e].up_offset, experts[e].up_bytes,
+                         intermediate, hidden) ||
+            !matrix_fits(slot_bytes, experts[e].down_offset, experts[e].down_bytes,
+                         hidden, intermediate))
+            return 0;
+    }
+
+    id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:x_bytes
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid = [g_device newBufferWithLength:mid_bytes
+                                              options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> yb = [g_device newBufferWithLength:y_bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!xb || !mid || !yb) return 0;
+
+    uint64_t encode_begin = direct_now_ns();
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+
+    id<MTLComputeCommandEncoder> gu = [cb computeCommandEncoder];
+    if (!gu) return 0;
+    [gu setComputePipelineState:g_gu_pipeline];
+    for (int e = 0; e < expert_count; ++e) {
+        const int S = row_offsets[e + 1] - row_offsets[e];
+        const NSUInteger row0 = (NSUInteger)row_offsets[e];
+        [gu setBuffer:weight_buffers[(size_t)e] offset:experts[e].gate_offset atIndex:0];
+        [gu setBuffer:weight_buffers[(size_t)e] offset:experts[e].up_offset atIndex:1];
+        [gu setBuffer:xb offset:row0 * (NSUInteger)H * sizeof(float) atIndex:2];
+        [gu setBuffer:mid offset:row0 * (NSUInteger)M * sizeof(float) atIndex:3];
+        [gu setBytes:&S length:sizeof(S) atIndex:4];
+        [gu setBytes:&hidden length:sizeof(hidden) atIndex:5];
+        [gu setBytes:&intermediate length:sizeof(intermediate) atIndex:6];
+        [gu dispatchThreadgroups:MTLSizeMake((NSUInteger)S * (NSUInteger)intermediate, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [gu endEncoding];
+
+    id<MTLComputeCommandEncoder> down = [cb computeCommandEncoder];
+    if (!down) return 0;
+    [down setComputePipelineState:g_down_pipeline];
+    for (int e = 0; e < expert_count; ++e) {
+        const int S = row_offsets[e + 1] - row_offsets[e];
+        const NSUInteger row0 = (NSUInteger)row_offsets[e];
+        [down setBuffer:weight_buffers[(size_t)e] offset:experts[e].down_offset atIndex:0];
+        [down setBuffer:mid offset:row0 * (NSUInteger)M * sizeof(float) atIndex:1];
+        [down setBuffer:yb offset:row0 * (NSUInteger)H * sizeof(float) atIndex:2];
+        [down setBytes:&S length:sizeof(S) atIndex:3];
+        [down setBytes:&hidden length:sizeof(hidden) atIndex:4];
+        [down setBytes:&intermediate length:sizeof(intermediate) atIndex:5];
+        [down dispatchThreadgroups:MTLSizeMake((NSUInteger)S * (NSUInteger)hidden, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    [down endEncoding];
+
+    uint64_t encode_ns = direct_now_ns() - encode_begin;
+    uint64_t submit_begin = direct_now_ns();
+    [cb commit];
+    uint64_t submit_ns = direct_now_ns() - submit_begin;
+    uint64_t wait_begin = direct_now_ns();
+    [cb waitUntilCompleted];
+    uint64_t wait_ns = direct_now_ns() - wait_begin;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        fprintf(stderr, "[apple8-metalio] batched routed MoE failed: %s\n",
+                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+        return 0;
+    }
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, expert_count);
+    memcpy(y, yb.contents, y_bytes);
+    for (int e = 0; e < expert_count; ++e)
+        metalio_slot_consumed(experts[e].slot);
+    return 1;
+}
+
 /* Split-phase fused routed MoE. begin() performs the exact same validation,
  * encoding and submission as the synchronous entry point, but deliberately
  * leaves the command buffer in flight. finish() is the first host-side
@@ -1564,14 +1725,13 @@ extern "C" int coli_apple8_metalio_moe_topk_begin(
     return 1;
 }
 
-extern "C" int coli_apple8_metalio_moe_topk_finish(void *opaque, float *y) {
-    if (!opaque || !y) return 0;
-    Apple8MoePending *pending = static_cast<Apple8MoePending *>(opaque);
+static int apple8_moe_pending_retire(Apple8MoePending *pending, float *y) {
+    if (!pending) return 0;
     uint64_t wait_begin = direct_now_ns();
     [pending->cb waitUntilCompleted];
     uint64_t wait_ns = direct_now_ns() - wait_begin;
     const int ok = pending->cb.status == MTLCommandBufferStatusCompleted;
-    if (ok) memcpy(y, pending->yb.contents, pending->y_bytes);
+    if (ok && y) memcpy(y, pending->yb.contents, pending->y_bytes);
 
     {
         std::lock_guard<std::mutex> guard(g_lock);
@@ -1589,6 +1749,19 @@ extern "C" int coli_apple8_metalio_moe_topk_finish(void *opaque, float *y) {
     }
     delete pending;
     return ok;
+}
+
+extern "C" int coli_apple8_metalio_moe_topk_finish(void *opaque, float *y) {
+    if (!opaque || !y) return 0;
+    return apple8_moe_pending_retire(static_cast<Apple8MoePending *>(opaque), y);
+}
+
+// Retirement without publishing the output. This is the Drop path for the
+// Rust RAII handle: it still waits for native completion, consumes the slot
+// generations, and releases the shared scratch lease before freeing pending.
+extern "C" void coli_apple8_metalio_moe_topk_discard(void *opaque) {
+    if (!opaque) return;
+    (void)apple8_moe_pending_retire(static_cast<Apple8MoePending *>(opaque), nullptr);
 }
 
 extern "C" int coli_apple8_metalio_moe_topk(const ColiApple8MetalioExpert *experts,

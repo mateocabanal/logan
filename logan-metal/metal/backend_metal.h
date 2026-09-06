@@ -65,6 +65,52 @@ int coli_metal_matmul(ColiMetalTensor **tensor,
                       const void *weights, const float *scales,
                       int fmt, int S, int I, int O, int gs);
 
+typedef struct ColiMetalMatmulDesc {
+  ColiMetalTensor *tensor;
+  float *y;
+  const void *weights;
+  const float *scales;
+  int fmt;
+  int I;
+  int O;
+  int gs;
+} ColiMetalMatmulDesc;
+
+/*
+ * Encode several independent GEMVs that share the same x[S,I] activation in
+ * one command buffer, then wait once and copy each result back. The function
+ * updates descs[n].tensor exactly like coli_metal_matmul does, so callers can
+ * retain the lazily-created weight/scales wrappers across tokens.
+ * Returns 1 on success, 0 before submit if any descriptor is invalid/unusable.
+ */
+int coli_metal_matmul_multi(const float *x, int S,
+                            ColiMetalMatmulDesc *descs, int count);
+
+/* Qwen3.5/3.6 decode-only full MXFP4 Gated DeltaNet. `descs` are exactly
+ * [qkv,z,a,b,out], all fmt=7; their persistent ColiMetalTensor handles are
+ * reused/updated in place. The five GEMVs plus causal conv/recurrent update,
+ * gated RMSNorm, and output projection execute in ONE command buffer. State
+ * and conv_state must be 16 KiB-aligned model-lifetime allocations.
+ * Returns 1 on success, 0 on pre-submit decline, -1 on post-submit failure. */
+int coli_metal_gdn_mxfp4(uint64_t model_id, int layer,
+                         ColiMetalMatmulDesc *descs, int count,
+                         const float *x, float *out,
+                         const float *a_log, const float *dt_bias,
+                         const float *conv_w, const float *norm_w,
+                         float *state, float *conv_state,
+                         int D, int kheads, int kd, int vheads, int vd, int kk,
+                         int output_gate, float eps);
+void coli_metal_gdn_mxfp4_drop_model(uint64_t model_id);
+
+/* Qwen shared expert MXFP4 MLP: descs=[gate_proj, up_proj, down_proj].
+ * gate/up, SwiGLU and down projection execute in one command buffer. The
+ * checkpoint's separate scalar shared-expert gate is intentionally computed
+ * by the caller (it may be BF16); no duplicate dense weights are created. */
+int coli_metal_shared_mxfp4(uint64_t model_id, int layer,
+                            ColiMetalMatmulDesc *descs, int count,
+                            const float *x, float *out, int D, int Iinter);
+void coli_metal_shared_mxfp4_drop_model(uint64_t model_id);
+
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 int    coli_metal_ptr_registered(const void *p);

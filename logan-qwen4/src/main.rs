@@ -14,7 +14,18 @@ fn apply_apple_runtime_defaults() {
     if std::env::var_os("QWEN_BNNS_BF16").is_none() {
         std::env::set_var("QWEN_BNNS_BF16", "1");
     }
+    if std::env::var_os("QWEN_GDN_MXFP4_FULL").is_none() {
+        std::env::set_var("QWEN_GDN_MXFP4_FULL", "1");
+    }
+    if std::env::var_os("QWEN_SHARED_MXFP4_FULL").is_none() {
+        std::env::set_var("QWEN_SHARED_MXFP4_FULL", "1");
+    }
     if std::env::var_os("QWEN_GDN_METAL").is_none() {
+        // The current generic BF16 Metal GDN path synchronously submits and
+        // waits once per GDN layer and is substantially slower than BNNS at
+        // decode batch S=1 on this M2. A future qualified FP8 dense island is
+        // selected by package capability through its own policy; do not force
+        // this generic path on merely because Metal is available.
         std::env::set_var("QWEN_GDN_METAL", "0");
     }
 }

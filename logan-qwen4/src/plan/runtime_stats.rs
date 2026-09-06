@@ -4,7 +4,7 @@
 //! Counters are cumulative for the model/process lifetime; callers can take two
 //! snapshots and use `delta_from` to obtain a per-turn view.
 
-use crate::{cache_cap, Model};
+use crate::Model;
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeFeatures {
@@ -159,7 +159,7 @@ impl Model {
             expert_misses: self.expert_store.misses,
             expert_evictions: self.expert_store.evictions,
             expert_resident: self.expert_store.len(),
-            expert_capacity: cache_cap(),
+            expert_capacity: self.expert_store.capacity(),
             metal_encode_ns: encode,
             metal_submit_ns: submit,
             metal_wait_ns: wait,
@@ -184,8 +184,7 @@ impl Model {
                 metal_direct: self.metal_direct,
                 metal_overlap: self.metal_overlap,
                 bnns_bf16: env_bool("QWEN_BNNS_BF16", false),
-                gdn_metal: env_bool("QWEN_GDN_METAL", true)
-            && self.cfg.output_gate == crate::OutputGate::Silu,
+                gdn_metal: self.metal_direct && env_bool("QWEN_GDN_METAL", true),
                 gdn_single_copy: env_bool("QWEN_GDN_SINGLE_COPY", true),
                 attn_metal: env_bool("QWEN_ATTN_METAL", true),
                 qsa_index_metal: env_bool("QWEN_QSA_INDEX_METAL", true),

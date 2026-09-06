@@ -15,8 +15,9 @@
 //!   accept accelerator work;
 //! * every resident resource generation referenced by an action is pinned
 //!   through a #47 residency lease at submission and released exactly once
-//!   by completion processing (or by `cancel_ticket` when the core revokes
-//!   the ticket). While pinned, the generation cannot be evicted or reused;
+//!   by native completion processing. Logical cancellation never releases a
+//!   lease early: the backend may still be reading that generation until its
+//!   command buffer/event actually completes;
 //! * stale and duplicate completions are harmless no-ops.
 //!
 //! Native command buffers/streams/events and native resource handles are
@@ -194,18 +195,19 @@ impl Accel {
             .map_err(AccelError::Core)
     }
 
-    /// Release the retained generations of one ticket whose session was
-    /// cancelled, finished, or failed by the core. The backend's eventual
-    /// report for that ticket then hits neither this bookkeeping nor the
-    /// core. Idempotent: returns whether a record existed.
-    pub fn cancel_ticket(&mut self, residency: &mut ResidencyManager, ticket: Ticket) -> bool {
-        let Some(leases) = self.inflight.remove(&ticket) else {
-            return false;
-        };
-        for lease in leases {
-            let _ = residency.release(lease);
-        }
-        true
+    /// Mark one core-revoked accelerator ticket as logically cancelled.
+    ///
+    /// Crucially, cancellation does **not** release residency leases here:
+    /// best-effort native cancellation can race a command buffer that is
+    /// already executing, so those generations must remain pinned until the
+    /// backend reports the ticket's actual native completion. `complete` is
+    /// the sole path that retires the retained leases.
+    ///
+    /// Idempotent: returns whether the ticket is still awaiting native
+    /// completion. The residency argument is retained for API compatibility;
+    /// it is deliberately not mutated on logical cancellation.
+    pub fn cancel_ticket(&mut self, _residency: &mut ResidencyManager, ticket: Ticket) -> bool {
+        self.inflight.contains_key(&ticket)
     }
 
     /// Number of tickets with retained leases awaiting completion.
@@ -446,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_while_in_flight_releases_retention_and_late_reports_are_noops() {
+    fn cancellation_while_in_flight_retains_leases_until_native_completion() {
         let mut registry = DeviceRegistry::new();
         let target = gpu_target(&mut registry, 0);
         let mut residency = ResidencyManager::new();
@@ -470,12 +472,17 @@ mod tests {
         mock.submit(&dispatch);
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 40);
 
-        // The core revokes the session; the driver releases the retention.
+        // The core revokes the session logically, but native GPU work may
+        // still be reading the expert. Cancellation therefore keeps the
+        // generation pinned until the backend reports actual completion.
         assert_eq!(core.cancel(doomed).unwrap(), vec![Effect::Cancel { ticket }]);
         assert!(accel.cancel_ticket(&mut residency, ticket));
-        assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
+        assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 40);
+        assert_eq!(accel.inflight_len(), 1);
 
-        // The backend's late report changes nothing and errors nothing.
+        // Native completion is the point where the retained generation may
+        // finally be released. The core ticket is already revoked, so its
+        // late logical completion remains a harmless no-op.
         assert!(accel
             .complete(
                 &mut core,
@@ -484,6 +491,7 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+        assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
         assert_eq!(core.session_state(doomed), Some(SessionState::Cancelling));
         assert!(!accel.cancel_ticket(&mut residency, ticket));
 

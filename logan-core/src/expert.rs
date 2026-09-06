@@ -33,6 +33,11 @@ pub struct ExpertStore<V: Slot> {
     head: Option<usize>, // most-recently-used
     tail: Option<usize>, // least-recently-used
     cap: usize,
+    /// Optional per-layer capacity. When set, insertion evicts the least
+    /// recently used expert from the SAME layer, preventing a later layer
+    /// in the token walk from destroying earlier layers' next-token locality.
+    layer_cap: Option<usize>,
+    layer_counts: HashMap<u32, usize>,
     /// Telemetry counters (regime-independent A/B metrics).
     pub hits: u64,
     pub misses: u64,
@@ -47,11 +52,37 @@ impl<V: Slot> ExpertStore<V> {
             head: None,
             tail: None,
             cap: cap.max(1),
+            layer_cap: None,
+            layer_counts: HashMap::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
         }
     }
+
+    /// Layer-partitioned LRU. Each layer owns `per_layer_cap` entries; the
+    /// global intrusive list still provides O(1) promotion, while eviction
+    /// walks backward only until it finds that layer's LRU entry. Capacities
+    /// used by Logan are a few hundred entries, so this bounded walk is tiny
+    /// compared with an expert I/O miss and avoids a second intrusive index.
+    pub fn new_layered(layers: usize, per_layer_cap: usize) -> ExpertStore<V> {
+        let layers = layers.max(1);
+        let per_layer_cap = per_layer_cap.max(1);
+        ExpertStore {
+            map: HashMap::new(),
+            slab: Vec::new(),
+            head: None,
+            tail: None,
+            cap: layers.saturating_mul(per_layer_cap),
+            layer_cap: Some(per_layer_cap),
+            layer_counts: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize { self.cap }
 
     /// Get a cached expert, promoting it to MRU. None on miss.
     pub fn get(&mut self, key: (u32, u32)) -> Option<&V> {
@@ -67,6 +98,17 @@ impl<V: Slot> ExpertStore<V> {
     pub fn peek(&self, key: (u32, u32)) -> Option<&V> {
         let &idx = self.map.get(&key)?;
         Some(&self.slab[idx].as_ref().unwrap().value)
+    }
+
+    /// Promote a resident expert to MRU without counting a cache hit. This is
+    /// used by route-level pinning: all experts already needed by the current
+    /// top-k route are protected from being evicted by earlier misses in the
+    /// same issue batch. Returns false when the key is not resident.
+    pub fn promote_if_present(&mut self, key: (u32, u32)) -> bool {
+        let Some(&idx) = self.map.get(&key) else { return false; };
+        self.unlink(idx);
+        self.push_front(idx);
+        true
     }
 
     /// Insert (or replace) an expert, evicting LRU when over capacity.
@@ -86,25 +128,60 @@ impl<V: Slot> ExpertStore<V> {
             return (None, v);
         }
         self.misses += 1;
-        let mut evicted = None;
-        if self.map.len() >= self.cap {
-            if let Some(t) = self.tail {
-                let key_t = self.slab[t].as_ref().unwrap().key;
-                self.unlink(t);
-                self.map.remove(&key_t);
-                let node = self.slab[t].take().unwrap();
-                evicted = Some(node.value);
-                self.evictions += 1;
+
+        let mut victim = None;
+        if let Some(layer_cap) = self.layer_cap {
+            if self.layer_counts.get(&key.0).copied().unwrap_or(0) >= layer_cap {
+                let mut cur = self.tail;
+                while let Some(idx) = cur {
+                    let node = self.slab[idx].as_ref().unwrap();
+                    if node.key.0 == key.0 {
+                        victim = Some(idx);
+                        break;
+                    }
+                    cur = node.prev;
+                }
             }
+        } else if self.map.len() >= self.cap {
+            victim = self.tail;
         }
-        let idx = self.slab.len();
-        self.slab.push(Some(Node {
-            key,
-            value,
-            prev: None,
-            next: None,
-        }));
+
+        // Defensive global bound. With layer partitioning this should only be
+        // needed for malformed/out-of-range layer IDs, but never exceed cap.
+        if victim.is_none() && self.map.len() >= self.cap {
+            victim = self.tail;
+        }
+
+        let mut evicted = None;
+        let reuse_idx = if let Some(t) = victim {
+            let key_t = self.slab[t].as_ref().unwrap().key;
+            self.unlink(t);
+            self.map.remove(&key_t);
+            let node = self.slab[t].take().unwrap();
+            evicted = Some(node.value);
+            self.evictions += 1;
+            if self.layer_cap.is_some() {
+                if let Some(n) = self.layer_counts.get_mut(&key_t.0) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            Some(t)
+        } else {
+            None
+        };
+
+        let idx = if let Some(idx) = reuse_idx {
+            self.slab[idx] = Some(Node { key, value, prev: None, next: None });
+            idx
+        } else {
+            let idx = self.slab.len();
+            self.slab.push(Some(Node { key, value, prev: None, next: None }));
+            idx
+        };
         self.map.insert(key, idx);
+        if self.layer_cap.is_some() {
+            *self.layer_counts.entry(key.0).or_insert(0) += 1;
+        }
         self.push_front(idx);
         let v = &self.slab[idx].as_ref().unwrap().value;
         (evicted, v)
@@ -225,6 +302,18 @@ mod tests {
     }
 
     #[test]
+    fn promote_if_present_is_telemetry_neutral_and_protects_lru() {
+        let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
+        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        assert!(s.promote_if_present((0, 0)));
+        assert_eq!(s.hits, 0);
+        assert!(!s.promote_if_present((0, 9)));
+        let (evicted, _) = s.insert((0, 2), FakeSlot { key: (0, 2), released: false });
+        assert_eq!(evicted.unwrap().key, (0, 1));
+    }
+
+    #[test]
     fn insert_does_not_bump_hits() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
         s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
@@ -233,6 +322,34 @@ mod tests {
         assert_eq!(s.hits, 0);
         assert!(s.get((0, 1)).is_some()); // genuine reuse -> 1 hit
         assert_eq!(s.hits, 1);
+    }
+
+    #[test]
+    fn layered_lru_evicts_within_layer() {
+        let mut s: ExpertStore<FakeSlot> = ExpertStore::new_layered(2, 2);
+        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert((1, 0), FakeSlot { key: (1, 0), released: false });
+        s.insert((1, 1), FakeSlot { key: (1, 1), released: false });
+        // Layer 1 was touched later globally, but a new layer-0 expert must
+        // evict layer 0's own LRU, never an entry from layer 1.
+        let (evicted, _) = s.insert((0, 2), FakeSlot { key: (0, 2), released: false });
+        assert_eq!(evicted.unwrap().key, (0, 0));
+        assert!(s.peek((1, 0)).is_some());
+        assert!(s.peek((1, 1)).is_some());
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.capacity(), 4);
+    }
+
+    #[test]
+    fn layered_lru_respects_recency_inside_layer() {
+        let mut s: ExpertStore<FakeSlot> = ExpertStore::new_layered(2, 2);
+        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        assert!(s.get((0, 0)).is_some());
+        let (evicted, _) = s.insert((0, 2), FakeSlot { key: (0, 2), released: false });
+        assert_eq!(evicted.unwrap().key, (0, 1));
+        assert!(s.peek((0, 0)).is_some());
     }
 
     #[test]

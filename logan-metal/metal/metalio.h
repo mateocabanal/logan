@@ -72,9 +72,19 @@ int64_t metalio_loadv(int slot, const ColiMetalioRegion *regions, int count,
 /* One-region wrapper (weights-only loads); kind = MIO_LOAD_DEMAND. */
 int64_t metalio_load(int slot, int file, uint64_t offset, size_t bytes);
 
-/* CPU wait until the load signalling `event_value` (and everything before it
- * on the IO queue) has completed. Returns 0 when done. */
+/* CPU wait for the exact MTLIOCommandBuffer identified by `event_value`.
+ * The IO queue is concurrent: completion of a later/higher event does not
+ * imply this load has completed. Returns 0 only after this exact load is
+ * complete, or -1 on failure. */
 int metalio_wait(int64_t event_value);
+
+/* Collapse a group of already-committed loads into one completion point.
+ * enqueueBarrier() orders the returned signal after every in-flight IO
+ * command buffer committed before this call. */
+int64_t metalio_batch_barrier(void);
+/* Wait for a queue barrier, then verify each selected slot's exact preceding
+ * load completed successfully. One blocking wait, fail-closed status check. */
+int metalio_batch_wait(int64_t event_value, const int *slots, int count);
 
 /* --- prefetch accounting ------------------------------------------------- */
 /* Mark a slot's latest load as consumed by compute (prefetch_used), or as
@@ -91,7 +101,7 @@ typedef struct {
     uint64_t prefetch_loads;        /* loads marked as prefetch */
     uint64_t prefetch_used;         /* prefetched slots consumed by compute */
     uint64_t prefetch_wasted;       /* prefetched slots evicted unused */
-    uint64_t outstanding;           /* loads enqueued, not yet waited */
+    uint64_t outstanding;           /* loads enqueued, not yet natively completed */
     uint64_t peak_outstanding;
     uint64_t latency_samples;
     double  total_latency_s;        /* avg latency = total/samples */

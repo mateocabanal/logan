@@ -5,9 +5,9 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
-    Cfg, HcGlobal, Layer, Model, Wt, cache_cap,
+    Cfg, HcGlobal, Layer, Model, Wt, WtBytes, make_expert_store,
     colisource::{ColiSource, bf16_to_f32},
-    lazy_zeroed_f32,
+    lazy_zeroed_f32, next_metal_model_id,
 };
 
 /// C parity (coli_target_registry.h): the direct Apple8/MetalIO execution
@@ -19,9 +19,18 @@ const APPLE8_PROFILE: &str = "macos-arm64-metal-apple8-v1";
 
 fn load_wt(src: &ColiSource, name: &str, o: usize, i: usize) -> Result<Wt, String> {
     let m = src.wt(name, o, i)?;
+    let bytes = match m.fmt {
+        5 => WtBytes::Bf16(m.bytes),
+        7 => WtBytes::Mxfp4 {
+            weights: m.bytes,
+            scales: m.scales,
+            metal_tensor: std::sync::Mutex::new(0),
+        },
+        other => return Err(format!("{name}: unsupported COLI resident format {other}")),
+    };
     Ok(Wt {
         f: vec![],
-        bytes: Some(m.bytes),
+        bytes: Some(bytes),
         o: m.o,
         i: m.i,
     })
@@ -236,52 +245,87 @@ impl Model {
                 } else {
                     vec![]
                 },
-                hc_norm: vec_f32(
-                    src,
-                    &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
-                    hcd,
-                )?,
-                hc_mix_down: load_wt(
-                    src,
-                    &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
-                    cfg.hc_lowrank,
-                    hcd,
-                )?,
-                hc_mix_up: load_wt(
-                    src,
-                    &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
-                    hcd,
-                    cfg.hc_lowrank,
-                )?,
-                hc_inject: load_wt(
-                    src,
-                    &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
-                    cfg.hc_count,
-                    hcd,
-                )?,
-                hc_mlp_norm: vec_f32(
-                    src,
-                    &format!("{lp}.mlp_hyper_connection.hc_norm.weight"),
-                    hcd,
-                )?,
-                hc_mlp_mix_down: load_wt(
-                    src,
-                    &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
-                    cfg.hc_lowrank,
-                    hcd,
-                )?,
-                hc_mlp_mix_up: load_wt(
-                    src,
-                    &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
-                    hcd,
-                    cfg.hc_lowrank,
-                )?,
-                hc_mlp_inject: load_wt(
-                    src,
-                    &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
-                    cfg.hc_count,
-                    hcd,
-                )?,
+                hc_norm: if cfg.hc_count > 0 {
+                    vec_f32(
+                        src,
+                        &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
+                        hcd,
+                    )?
+                } else {
+                    vec![]
+                },
+                hc_mix_down: if cfg.hc_count > 0 {
+                    load_wt(
+                        src,
+                        &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
+                        cfg.hc_lowrank,
+                        hcd,
+                    )?
+                } else {
+                    empty()
+                },
+                hc_mix_up: if cfg.hc_count > 0 {
+                    load_wt(
+                        src,
+                        &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
+                        hcd,
+                        cfg.hc_lowrank,
+                    )?
+                } else {
+                    empty()
+                },
+                hc_inject: if cfg.hc_count > 0 {
+                    load_wt(
+                        src,
+                        &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
+                        cfg.hc_count,
+                        hcd,
+                    )?
+                } else {
+                    empty()
+                },
+                // In classic Qwen residual mode this field is repurposed for
+                // the post-attention RMSNorm. Hyper-connection checkpoints
+                // keep their established MLP-side HC norm here.
+                hc_mlp_norm: if cfg.hc_count > 0 {
+                    vec_f32(
+                        src,
+                        &format!("{lp}.mlp_hyper_connection.hc_norm.weight"),
+                        hcd,
+                    )?
+                } else {
+                    vec_f32(src, &format!("{lp}.post_attention_layernorm.weight"), cfg.hidden)?
+                },
+                hc_mlp_mix_down: if cfg.hc_count > 0 {
+                    load_wt(
+                        src,
+                        &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
+                        cfg.hc_lowrank,
+                        hcd,
+                    )?
+                } else {
+                    empty()
+                },
+                hc_mlp_mix_up: if cfg.hc_count > 0 {
+                    load_wt(
+                        src,
+                        &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
+                        hcd,
+                        cfg.hc_lowrank,
+                    )?
+                } else {
+                    empty()
+                },
+                hc_mlp_inject: if cfg.hc_count > 0 {
+                    load_wt(
+                        src,
+                        &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
+                        cfg.hc_count,
+                        hcd,
+                    )?
+                } else {
+                    empty()
+                },
                 router: load_wt(
                     src,
                     &format!("{lp}.mlp.gate.weight"),
@@ -409,6 +453,18 @@ impl Model {
             vec_f32(src, "norm.weight", cfg.hidden)?
         };
 
+        // Resolve routed-expert physical geometry once at model load. This
+        // moves the small Apple8 descriptor reads out of token decode and
+        // gives canonical and scheduler paths the same package plan.
+        let expert_preplan = std::env::var("QWEN_EXPERT_PREPLAN")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let expert_plan = if direct_ok && expert_preplan {
+            Some(crate::plan::Plan::resolve(src.pkg_ref(), cfg.layers, cfg.experts)?)
+        } else {
+            None
+        };
+
         // C-style one-line status (QWEN-APPLE8 / metalio parity with the C
         // engine's startup banner): makes silent-fallback visible.
         if direct_ok {
@@ -431,20 +487,28 @@ impl Model {
             final_norm,
             layers,
             experts: Vec::new(), // fetched on demand via coli
-            hc_global: HcGlobal {
-                norm: vec_f32(src, "hyper_connection_mixer.hc_norm.weight", hcd)?,
-                mix_down: load_wt(
-                    src,
-                    "hyper_connection_mixer.input_mix_weight_down.weight",
-                    cfg.hc_lowrank,
-                    hcd,
-                )?,
-                mix_up: load_wt(
-                    src,
-                    "hyper_connection_mixer.input_mix_weight_up.weight",
-                    hcd,
-                    cfg.hc_lowrank,
-                )?,
+            hc_global: if cfg.hc_count > 0 {
+                HcGlobal {
+                    norm: vec_f32(src, "hyper_connection_mixer.hc_norm.weight", hcd)?,
+                    mix_down: load_wt(
+                        src,
+                        "hyper_connection_mixer.input_mix_weight_down.weight",
+                        cfg.hc_lowrank,
+                        hcd,
+                    )?,
+                    mix_up: load_wt(
+                        src,
+                        "hyper_connection_mixer.input_mix_weight_up.weight",
+                        hcd,
+                        cfg.hc_lowrank,
+                    )?,
+                }
+            } else {
+                HcGlobal {
+                    norm: vec![],
+                    mix_down: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+                    mix_up: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+                }
             },
             ple_ngram: Wt {
                 f: vec![],
@@ -521,8 +585,14 @@ impl Model {
                 0.0;
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
-            expert_store: logan_core::expert::ExpertStore::new(cache_cap()),
+            expert_plan,
+            expert_store: make_expert_store(cfg.layers),
             spans: logan_core::telemetry::TokenSpans::default(),
+            route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            route_overlap_common: vec![0; cfg.layers],
+            route_overlap_total: vec![0; cfg.layers],
+            route_overlap_pairs: vec![0; cfg.layers],
+            metal_model_id: next_metal_model_id(),
             metal_direct: direct_ok
                 && std::env::var("QWEN_APPLE8_DIRECT")
                     .map(|v| v != "0")

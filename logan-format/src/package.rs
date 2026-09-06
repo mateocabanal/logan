@@ -7,15 +7,17 @@
 use std::{
     collections::HashMap,
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use crate::{
-    verify::{
-        i32_at, invalid, read_file_range, region, string_at, u16_at, u32_at, u64_at, usage,
-        validate_string_id, variable_region, FormatError, Result, LAYOUT_NONE,
-    },
     MANIFEST_HEADER_BYTES, MANIFEST_MAGIC,
+    verify::{
+        FormatError, LAYOUT_NONE, Result, i32_at, invalid, region, string_at, u16_at, u32_at,
+        u64_at, usage, validate_string_id, variable_region,
+    },
 };
 
 /// One entry of the manifest record table (96 bytes on disk).
@@ -43,7 +45,6 @@ pub struct RecordInfo {
 /// No record bytes are read until a payload is requested.
 #[derive(Debug, Clone)]
 pub struct Package {
-    root: PathBuf,
     manifest: Vec<u8>,
     alignment: u64,
     profile: String,
@@ -53,6 +54,14 @@ pub struct Package {
     by_id: HashMap<u64, usize>,
     by_name: HashMap<String, usize>,
     by_expert: HashMap<(i32, i32), Vec<usize>>,
+    // Keep shard descriptors open for the package lifetime. Hot expert-region
+    // lookup used to reopen the same shard twice per cache miss, making
+    // pathname/open syscalls a double-digit percentage of decode samples.
+    shard_paths: Vec<PathBuf>,
+    shard_files: Vec<Arc<Mutex<fs::File>>>,
+    // Expert envelope geometry is immutable. Parse it once per record and
+    // reuse the tiny (offset,size,dims) description on subsequent routes.
+    expert_regions: Arc<Mutex<HashMap<u64, (Vec<(u64, usize)>, Vec<(usize, usize)>)>>>,
 }
 
 impl Package {
@@ -101,17 +110,21 @@ impl Package {
         if string_desc_bytes > string_table.len() {
             return invalid("string table is shorter than its descriptor array");
         }
-        let profile = string_at(&manifest, &string_table, strings, u32_at(&manifest, 148)?)?
-            .to_owned();
-        let compiler = string_at(&manifest, &string_table, strings, u32_at(&manifest, 152)?)?
-            .to_owned();
+        let profile =
+            string_at(&manifest, &string_table, strings, u32_at(&manifest, 148)?)?.to_owned();
+        let compiler =
+            string_at(&manifest, &string_table, strings, u32_at(&manifest, 152)?)?.to_owned();
         let fingerprint: [u8; 32] = manifest[112..144].try_into().unwrap();
         if (flags & 1 != 0) != fingerprint.iter().any(|byte| *byte != 0) {
             return invalid("manifest source fingerprint validity flag disagrees with bytes");
         }
 
         // Shard table: contiguous IDs; files exist with the manifest sizes.
+        // Open each shard once here and retain the descriptor for all later
+        // payload-range reads. This also lets metadata() reuse the same fd.
         let mut shard_sizes = Vec::with_capacity(shards as usize);
+        let mut shard_paths = Vec::with_capacity(shards as usize);
+        let mut shard_files = Vec::with_capacity(shards as usize);
         for shard_id in 0..shards {
             let desc = shard_table.start + shard_id as usize * 64;
             if u32_at(&manifest, desc)? != shard_id {
@@ -125,7 +138,12 @@ impl Package {
             )?;
             let file_bytes = u64_at(&manifest, desc + 16)?;
             let path = root.join(format!("data-{shard_id:05}.coli"));
-            if fs::metadata(&path)
+            let file = fs::File::open(&path).map_err(|source| FormatError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file
+                .metadata()
                 .map_err(|source| FormatError::Io {
                     path: path.clone(),
                     source,
@@ -136,6 +154,8 @@ impl Package {
                 return invalid("shard file size does not match manifest");
             }
             shard_sizes.push(file_bytes);
+            shard_paths.push(path);
+            shard_files.push(Arc::new(Mutex::new(file)));
         }
 
         // Record table: unique IDs, unique names, in-bounds shard/range refs.
@@ -212,7 +232,6 @@ impl Package {
             records.push(info);
         }
         Ok(Package {
-            root: root.to_owned(),
             manifest: manifest.clone(),
             alignment,
             profile,
@@ -222,6 +241,9 @@ impl Package {
             by_id,
             by_name,
             by_expert,
+            shard_paths,
+            shard_files,
+            expert_regions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -261,29 +283,42 @@ impl Package {
 
     /// Absolute path of a shard file.
     pub fn shard_path(&self, shard_id: u32) -> Option<String> {
-        Some(self.root.join(format!("data-{shard_id:05}.coli")).to_string_lossy().into_owned())
+        self.shard_paths
+            .get(shard_id as usize)
+            .map(|path| path.to_string_lossy().into_owned())
     }
 
     /// (file_offset, bytes) of each matrix payload in an expert record, plus
     /// the 3 (rows, cols) pairs. The record must be a raw (wc=0) Apple8
     /// expert so MetalIO can stream the resident tiles straight into a
     /// buffer. Returns None for anything else (caller falls back to pread).
-    pub fn expert_matrix_regions(&self, rec: &RecordInfo) -> Option<(Vec<(u64, usize)>, Vec<(usize, usize)>)> {
-        // Header-only read: the C engine's expert_info equivalent. The
-        // 2.6 MB weight payload is NOT touched here — the runtime streams
-        // it via MetalIO from these byte offsets. Reading the whole record
-        // (read_record + CRC) was the ~35 ms/load synchronous stall.
-        let head = self.read_payload_range(rec, 0, 32).ok()?;
-        if &head[..8] != b"COLIEXPT" {
+    pub fn expert_matrix_regions(
+        &self,
+        rec: &RecordInfo,
+    ) -> Option<(Vec<(u64, usize)>, Vec<(usize, usize)>)> {
+        if let Ok(cache) = self.expert_regions.lock() {
+            if let Some(cached) = cache.get(&rec.id) {
+                return Some(cached.clone());
+            }
+        }
+
+        // Apple8 expert descriptors are currently 88 bytes. Read enough for
+        // the common case in ONE positioned shard read; if a future package
+        // extends the descriptor, retry once using its declared size.
+        const BASE_DESC: usize = 88;
+        let mut raw = self.read_payload_range(rec, 0, 64 + 3 * BASE_DESC).ok()?;
+        if raw.get(..8)? != b"COLIEXPT" {
             return None;
         }
-        let desc_size = u32::from_le_bytes(head[28..32].try_into().ok()?) as usize;
-        if desc_size < 88 {
-            return None; // descriptor must hold the offsets we read below
+        let desc_size = u32::from_le_bytes(raw.get(28..32)?.try_into().ok()?) as usize;
+        if desc_size < BASE_DESC {
+            return None;
         }
-        let raw = self
-            .read_payload_range(rec, 0, 64 + 3 * desc_size)
-            .ok()?;
+        let need = 64usize.checked_add(3usize.checked_mul(desc_size)?)?;
+        if need > raw.len() {
+            raw = self.read_payload_range(rec, 0, need).ok()?;
+        }
+
         let mut regions = Vec::with_capacity(3);
         let mut dims = Vec::with_capacity(3);
         for i in 0..3 {
@@ -294,14 +329,44 @@ impl Package {
             let cols = u64::from_le_bytes(raw.get(d + 24..d + 32)?.try_into().ok()?);
             let w_off = u64::from_le_bytes(raw.get(d + 48..d + 56)?.try_into().ok()?);
             let w_stored = u64::from_le_bytes(raw.get(d + 56..d + 64)?.try_into().ok()?);
-            // raw Apple8 tiles only (math 0x20, wc 0)
             if math != 0x20 || wc != 0 {
                 return None;
             }
             regions.push((rec.offset + w_off, w_stored as usize));
             dims.push((rows as usize, cols as usize));
         }
-        Some((regions, dims))
+        let parsed = (regions, dims);
+        if let Ok(mut cache) = self.expert_regions.lock() {
+            cache.insert(rec.id, parsed.clone());
+        }
+        Some(parsed)
+    }
+
+    fn read_shard_range(&self, shard_id: u32, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let index = shard_id as usize;
+        let path = self
+            .shard_paths
+            .get(index)
+            .ok_or_else(|| usage("record references a missing shard"))?;
+        let file = self
+            .shard_files
+            .get(index)
+            .ok_or_else(|| usage("record references a missing shard file"))?;
+        let mut file = file
+            .lock()
+            .map_err(|_| usage("shard file lock is poisoned"))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| FormatError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes)
+            .map_err(|source| FormatError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(bytes)
     }
 
     /// Streams a byte range from inside a record's payload WITHOUT loading
@@ -314,15 +379,16 @@ impl Package {
         within_off: u64,
         len: usize,
     ) -> Result<Vec<u8>> {
-        let path = self.root.join(format!("data-{:05}.coli", record.shard_id));
-        let bytes = read_file_range(&path, record.offset + within_off, len as u64)?;
-        Ok(bytes)
+        self.read_shard_range(record.shard_id, record.offset + within_off, len)
     }
 
     /// Reads a record's raw stored bytes and verifies the stored CRC32C.
     pub fn read_record(&self, record: &RecordInfo) -> Result<Vec<u8>> {
-        let path = self.root.join(format!("data-{:05}.coli", record.shard_id));
-        let bytes = read_file_range(&path, record.offset, record.stored)?;
+        let bytes = self.read_shard_range(
+            record.shard_id,
+            record.offset,
+            usize::try_from(record.stored).map_err(|_| usage("record size exceeds usize"))?,
+        )?;
         if crate::crc32c(&bytes) != record.stored_crc {
             return invalid("record stored CRC32C does not match");
         }
@@ -364,16 +430,26 @@ impl Package {
             let w_decoded = u64_at(&bytes, d + 64)?;
             let s_off = u64_at(&bytes, d + 72)?;
             let s_stored = u64_at(&bytes, d + 80)?;
-            let w_start = usize::try_from(w_off).map_err(|_| usage("matrix offset exceeds usize"))?;
+            let w_start =
+                usize::try_from(w_off).map_err(|_| usage("matrix offset exceeds usize"))?;
             let w_end = w_start
-                .checked_add(usize::try_from(w_stored).map_err(|_| usage("matrix size exceeds usize"))?)
+                .checked_add(
+                    usize::try_from(w_stored).map_err(|_| usage("matrix size exceeds usize"))?,
+                )
                 .ok_or_else(|| usage("matrix span overflows"))?;
-            let s_start = usize::try_from(s_off).map_err(|_| usage("scale offset exceeds usize"))?;
+            let s_start =
+                usize::try_from(s_off).map_err(|_| usage("scale offset exceeds usize"))?;
             let s_end = s_start
-                .checked_add(usize::try_from(s_stored).map_err(|_| usage("scale size exceeds usize"))?)
+                .checked_add(
+                    usize::try_from(s_stored).map_err(|_| usage("scale size exceeds usize"))?,
+                )
                 .ok_or_else(|| usage("scale span overflows"))?;
-            let weights = bytes.get(w_start..w_end).ok_or_else(|| usage("matrix data outside record"))?;
-            let scales = bytes.get(s_start..s_end).ok_or_else(|| usage("scale data outside record"))?;
+            let weights = bytes
+                .get(w_start..w_end)
+                .ok_or_else(|| usage("matrix data outside record"))?;
+            let scales = bytes
+                .get(s_start..s_end)
+                .ok_or_else(|| usage("scale data outside record"))?;
             // Descriptor layout (C coli_format.h / int4_record.rs):
             // role@0 math@4 scale@6 wc@8; verified on real packages.
             let decoded = match (math, scale) {
@@ -402,13 +478,59 @@ impl Package {
                 _ => {
                     return Err(usage(format!(
                         "expert matrix {i} (role {role}) uses unsupported math 0x{math:04x} scale 0x{scale:04x}"
-                    )))
+                    )));
                 }
             };
             let _ = (w_decoded, s_stored);
             matrices.push(decoded);
         }
         Ok(matrices)
+    }
+
+    /// Reads a bounded byte range from the logical payload of a codec-none
+    /// tensor record. `within_off` is relative to tensor data, not the
+    /// COLITENS envelope. This is the streaming counterpart of
+    /// `read_tensor_payload` and is used by PLE row reads.
+    pub fn read_tensor_payload_range(
+        &self,
+        record: &RecordInfo,
+        within_off: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        if record.kind != 1 {
+            return invalid("record is not a tensor record");
+        }
+        if record.codec != 0 {
+            return invalid("tensor record uses an unsupported codec (rANS decode lands with RW-014)");
+        }
+        let header = self.read_payload_range(record, 0, 128)?;
+        if &header[..8] != b"COLITENS" || u32_at(&header, 12)? != 128 || u16_at(&header, 16)? > 8 {
+            return invalid("tensor envelope header is invalid");
+        }
+        let data_offset = u64_at(&header, 96)?;
+        let data_stored = u64_at(&header, 104)?;
+        let data_decoded = u64_at(&header, 112)?;
+        if data_offset < 128
+            || data_offset % 16 != 0
+            || data_stored != data_decoded
+            || data_stored != record.decoded
+            || data_offset
+                .checked_add(data_stored)
+                .is_none_or(|end| end > record.stored)
+        {
+            return invalid("tensor envelope lengths are invalid");
+        }
+        let len = u64::try_from(len).map_err(|_| usage("tensor range length exceeds u64"))?;
+        let end = within_off
+            .checked_add(len)
+            .ok_or_else(|| usage("tensor payload range overflows"))?;
+        if end > data_stored {
+            return invalid("tensor payload range is outside tensor data");
+        }
+        let record_relative = data_offset
+            .checked_add(within_off)
+            .ok_or_else(|| usage("tensor payload offset overflows"))?;
+        self.read_payload_range(record, record_relative, len as usize)
     }
 
     /// Reads a tensor record (kind 1) and returns its payload bytes with the
@@ -420,7 +542,9 @@ impl Package {
             return invalid("record is not a tensor record");
         }
         if record.codec != 0 {
-            return invalid("tensor record uses an unsupported codec (rANS decode lands with RW-014)");
+            return invalid(
+                "tensor record uses an unsupported codec (rANS decode lands with RW-014)",
+            );
         }
         let bytes = self.read_record(record)?;
         if &bytes[..8] != b"COLITENS" || u32_at(&bytes, 12)? != 128 || u16_at(&bytes, 16)? > 8 {

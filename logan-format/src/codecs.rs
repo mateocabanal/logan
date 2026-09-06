@@ -347,7 +347,12 @@ pub fn apple8_mxfp4_decode(tiles: &[u8], rows: u64, columns: u64) -> Result<Vec<
                     let sign = if nibble & 0x08 != 0 { -1.0 } else { 1.0 };
                     let out_row = (rt * APPLE8_TILE_ROWS) as usize + r;
                     let out_col = (ct * APPLE8_TILE_COLUMNS) as usize + c;
-                    out[out_row * columns as usize + out_col] = sign * mag * scale;
+                    // Edge tiles are padded to 8x32 in the package. Decode
+                    // only the logical matrix extent; padded rows/columns are
+                    // storage, not output elements.
+                    if out_row < rows as usize && out_col < columns as usize {
+                        out[out_row * columns as usize + out_col] = sign * mag * scale;
+                    }
                 }
             }
         }
@@ -479,7 +484,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn apple8_mxfp4_decode_roundtrip() {
         // 1 tile (8x32): nibble codes 0..7 with sign on odd, scale 1.0
         // (code 127) -> mag values, sign flips on odd columns.
@@ -502,7 +506,24 @@ mod tests {
             let sign = if c % 2 == 1 { -1.0 } else { 1.0 };
             assert_eq!(out[c], sign * mag);
         }
-        assert!(apple8_mxfp4_decode(&tiles, 9, 32).is_err()); // wrong geometry
+    }
+
+    #[test]
+    fn apple8_mxfp4_decode_ignores_padded_tile_tails() {
+        // 9x33 occupies four physical 8x32 tiles. Fill every physical nibble
+        // with +0.5 and every row scale with 1.0; the decoder must return the
+        // 297 logical elements without indexing padded rows/columns.
+        let mut tiles = vec![0x11_u8; apple8_tile_bytes(9, 33).unwrap() as usize];
+        for tile in tiles.chunks_exact_mut(APPLE8_TILE_BYTES as usize) {
+            tile[APPLE8_WEIGHT_BYTES as usize..].fill(127);
+        }
+        let out = apple8_mxfp4_decode(&tiles, 9, 33).unwrap();
+        assert_eq!(out.len(), 9 * 33);
+        assert!(out.iter().all(|&v| v == 0.5));
+
+        let mut one = vec![0x11_u8; apple8_tile_bytes(1, 1).unwrap() as usize];
+        one[APPLE8_WEIGHT_BYTES as usize..].fill(127);
+        assert_eq!(apple8_mxfp4_decode(&one, 1, 1).unwrap(), vec![0.5]);
     }
 
     #[test]
