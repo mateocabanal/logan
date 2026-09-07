@@ -7,6 +7,7 @@
 //! - PLE ngram: per-shard record, rows read on demand (51 GB never resident)
 
 use std::path::Path;
+use std::{collections::HashMap, sync::Arc};
 
 use logan_format::codecs::{
     apple8_mxfp4_decode, RansTable, INT4_MATH_FORMAT, INT4_SCALE_FORMAT, RANS_CODEC_ID,
@@ -18,6 +19,29 @@ const HF_PREFIX: &str = "model.language_model.";
 #[derive(Clone)]
 pub struct ColiSource {
     pkg: Package,
+    // Immutable manifest indices only: never payloads or embedding rows.
+    ple_shards: Arc<HashMap<i32, Vec<usize>>>,
+}
+
+fn index_ple_shards(records: &[RecordInfo]) -> Result<HashMap<i32, Vec<usize>>, String> {
+    let mut grouped: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
+    for (index, rec) in records.iter().enumerate() {
+        if rec.kind != 1 { continue; }
+        let Some(name) = rec.name.as_deref() else { continue; };
+        let name = name.strip_prefix(HF_PREFIX).unwrap_or(name);
+        let Some(rest) = name.strip_prefix("layers.") else { continue; };
+        let Some((layer, shard)) = rest.split_once(".ple.ple_embedding.ngram_embedding.shard_") else { continue; };
+        let layer: i32 = layer.parse().map_err(|_| format!("invalid PLE layer in {name}"))?;
+        let shard: usize = shard.parse().map_err(|_| format!("invalid PLE shard in {name}"))?;
+        grouped.entry(layer).or_default().push((shard, index));
+    }
+    grouped.into_iter().map(|(layer, mut shards)| {
+        shards.sort_unstable();
+        if shards.iter().enumerate().any(|(expected, &(actual, _))| expected != actual) {
+            return Err(format!("PLE layer {layer}: shard indices must be unique and contiguous from zero"));
+        }
+        Ok((layer, shards.into_iter().map(|(_, index)| index).collect()))
+    }).collect()
 }
 
 /// Raw GPU-ready expert matrix (Apple8 MXFP4 tiles + E8M0 scales).
@@ -119,8 +143,11 @@ pub struct ColiWt {
 
 impl ColiSource {
     pub fn open(dir: &Path) -> Result<ColiSource, String> {
+        let pkg = Package::open(dir).map_err(|e| e.to_string())?;
+        let ple_shards = Arc::new(index_ple_shards(pkg.records())?);
         Ok(ColiSource {
-            pkg: Package::open(dir).map_err(|e| e.to_string())?,
+            pkg,
+            ple_shards,
         })
     }
 
@@ -483,28 +510,21 @@ impl ColiSource {
     /// loading the 400 MB shard. The tiny fixture's BF16 single-tensor form
     /// is handled by the safetensors loader (not this path).
     pub fn ple_ngram_row_f8(&self, layer: i32, r: u64, hd_per: usize) -> Result<Vec<u8>, String> {
-        let prefix = format!("layers.{layer}.ple.ple_embedding.ngram_embedding.shard_");
-        let recs: Vec<&RecordInfo> = self
-            .pkg
-            .records()
-            .iter()
-            .filter(|rec| {
-                rec.kind == 1
-                    && rec
-                        .name
-                        .as_deref()
-                        .map(|n| n.starts_with(&prefix))
-                        .unwrap_or(false)
-            })
-            .collect();
-        if recs.is_empty() {
-            return Err(format!("no ngram shards for layer {layer}"));
+        if hd_per == 0 {
+            return Err("ngram row width must be nonzero".into());
         }
-        let rps = recs[0].decoded as u64 / hd_per as u64; // rows per shard (F8: 1 byte/row-elem)
-        let shard_idx = (r / rps) as usize;
-        let rec = recs
+        let recs = self.ple_shards.get(&layer)
+            .ok_or_else(|| format!("no ngram shards for layer {layer}"))?;
+        let first = &self.pkg.records()[recs[0]];
+        if first.decoded == 0 || first.decoded % hd_per as u64 != 0 {
+            return Err(format!("invalid ngram shard row geometry for layer {layer}"));
+        }
+        let rps = first.decoded / hd_per as u64;
+        let shard_idx = usize::try_from(r / rps).map_err(|_| "ngram shard index overflow")?;
+        let &record_index = recs
             .get(shard_idx)
             .ok_or_else(|| format!("ngram row {r} out of range ({} shards)", recs.len()))?;
+        let rec = &self.pkg.records()[record_index];
         let within = (r % rps) as u64;
         // pread only this row (F8: hd_per bytes) — never the whole shard
         self.pkg
@@ -560,6 +580,63 @@ pub fn bf16_to_f32(u: u16) -> f32 {
 mod tests {
     use super::ColiSource;
 
+    fn shard(name: &str) -> logan_format::package::RecordInfo {
+        logan_format::package::RecordInfo {
+            id: 0, kind: 1, codec: 0, math_format: 0x10, scale_format: 0,
+            layout: 0, flags: 0, shard_id: 0, name: Some(name.into()),
+            layer: 1, expert: -1, offset: 0, stored: 16, decoded: 16,
+            stored_crc: 0, logical_crc: 0,
+        }
+    }
+
+    #[test]
+    fn ple_index_uses_numeric_shards_and_shares_no_payloads() {
+        let records: Vec<_> = (0..12).rev().map(|i| shard(&format!(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{i}"
+        ))).collect();
+        let index = super::index_ple_shards(&records).unwrap();
+        assert_eq!(index[&1], (0..12).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ple_index_rejects_gaps_and_duplicate_ordinals() {
+        let a = shard("layers.1.ple.ple_embedding.ngram_embedding.shard_0");
+        let b = shard("layers.1.ple.ple_embedding.ngram_embedding.shard_2");
+        assert!(super::index_ple_shards(&[a.clone(), b]).is_err());
+        assert!(super::index_ple_shards(&[a.clone(), a]).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires LOGAN_PLE_TEST_PACKAGE pointing to a local COLI model"]
+    fn real_ple_shard_boundaries_match_direct_range_reads() {
+        let path = std::env::var("LOGAN_PLE_TEST_PACKAGE").expect("set LOGAN_PLE_TEST_PACKAGE");
+        let path = std::path::Path::new(&path);
+        let cfg = crate::load_cfg(&path.join("config.json")).unwrap();
+        assert!(cfg.ngram_heads > 0);
+        let width = cfg.ple_embed_dim / cfg.ngram_heads;
+        let src = ColiSource::open(path).unwrap();
+        let layer = src.ple_layer().unwrap();
+        let shards = &src.ple_shards[&layer];
+        let rows_per_shard = src.pkg.records()[shards[0]].decoded / width as u64;
+        let mut checks = 0;
+        for (ordinal, &index) in shards.iter().enumerate() {
+            let rec = &src.pkg.records()[index];
+            assert_eq!(rec.decoded % width as u64, 0);
+            let rows = rec.decoded / width as u64;
+            assert!(rows > 0 && rows <= rows_per_shard);
+            if ordinal + 1 < shards.len() { assert_eq!(rows, rows_per_shard); }
+            for within in [0, rows - 1] {
+                let expected = src.pkg.read_tensor_payload_range(rec, within * width as u64, width).unwrap();
+                let got = src.ple_ngram_row_f8(layer, ordinal as u64 * rows_per_shard + within, width).unwrap();
+                assert_eq!(got, expected, "shard={ordinal} row={within}");
+                checks += 1;
+            }
+        }
+        assert!(src.ple_ngram_row_f8(layer, 0, 0).is_err());
+        assert!(src.ple_ngram_row_f8(layer, shards.len() as u64 * rows_per_shard, width).is_err());
+        println!("PLE gate: {checks} boundary rows, width={width}, metadata_indices={}, no whole-shard reads", shards.len());
+    }
+
     #[test]
     fn e4m3fn_exponent_15_is_finite_except_nan_code() {
         assert_eq!(ColiSource::e4m3_decode(0x78), 256.0);
@@ -579,3 +656,4 @@ mod tests {
         assert_eq!(ColiSource::e4m3_decode(0x08), 2.0_f32.powi(-6));
     }
 }
+

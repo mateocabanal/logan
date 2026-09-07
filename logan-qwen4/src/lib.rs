@@ -2314,13 +2314,23 @@ impl Model {
             let fused_input = std::env::var("QWEN_ATTN_FUSED_INPUT")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-            let fused_ok = if fused_input {
+            // Qwen4's QSA index projection consumes the same activation.
+            // Qualify this four-projection variant separately from Qwen3.6.
+            let fused_index = index_rows > 0 && std::env::var("QWEN_QSA_FUSED_INPUT")
+                .map(|v| v != "0").unwrap_or(false);
+            let mut fused_ok = false;
+            if fused_input && fused_index {
+                let mut qk = vec![0.0; index_rows];
+                let mut ys: [&mut [f32]; 4] = [&mut qg, &mut k, &mut v, &mut qk];
+                let ws = [&layer.attn_q, &layer.attn_k, &layer.attn_v, &layer.index_qk];
+                fused_ok = matmul_mxfp4_multi(&mut ys, x, &ws);
+                if fused_ok { index_qk = Some(qk); }
+            }
+            if fused_input && !fused_ok {
                 let mut ys: [&mut [f32]; 3] = [&mut qg, &mut k, &mut v];
                 let ws = [&layer.attn_q, &layer.attn_k, &layer.attn_v];
-                matmul_mxfp4_multi(&mut ys, x, &ws)
-            } else {
-                false
-            };
+                fused_ok = matmul_mxfp4_multi(&mut ys, x, &ws);
+            }
             if !fused_ok {
                 matmul(&mut qg, x, &layer.attn_q);
                 matmul(&mut k, x, &layer.attn_k);
@@ -3380,6 +3390,10 @@ impl Model {
         // ponytail: sized from config — the tiny fixture's 256 hides this;
         // the real model's ple_embed_dim is 20480.
         let mut emb = vec![0.0_f32; c.ple_embed_dim.max(256)];
+        // One immutable scalar is shared by every head. Keep row payloads
+        // range-read from NVMe; do not cache the embedding table here.
+        let ngram_scale = self.coli.as_ref()
+            .map(|coli| coli.ple_ngram_scale(c.ple_layer as i32).unwrap_or(1.0));
         for h in 0..heads {
             let r = rows[h] as usize;
             // .coli mode: fetch the ngram row on demand (F8 E4M3 shards, one
@@ -3389,7 +3403,7 @@ impl Model {
                 let row_bytes = coli
                     .ple_ngram_row_f8(c.ple_layer as i32, r as u64, hd_per)
                     .unwrap_or_else(|e| panic!("ple ngram row {r} fetch failed: {e}"));
-                let scale = coli.ple_ngram_scale(c.ple_layer as i32).unwrap_or(1.0);
+                let scale = ngram_scale.unwrap();
                 for d in 0..hd_per {
                     emb[h * hd_per + d] = colisource::ColiSource::e4m3_decode(row_bytes[d]) * scale;
                 }
@@ -3401,8 +3415,16 @@ impl Model {
 
         let mut key = vec![0.0; hcd];
         let mut value = vec![0.0; d];
-        matmul(&mut key, &emb, &self.ple_key_proj);
-        matmul(&mut value, &emb, &self.ple_value_proj);
+        let fused = std::env::var("QWEN_PLE_FUSED_INPUT")
+            .map(|v| v != "0").unwrap_or(false)
+            && matmul_mxfp4_multi(
+                &mut [&mut key, &mut value], &emb,
+                &[&self.ple_key_proj, &self.ple_value_proj],
+            );
+        if !fused {
+            matmul(&mut key, &emb, &self.ple_key_proj);
+            matmul(&mut value, &emb, &self.ple_value_proj);
+        }
         let key_snap = key.clone();
         rmsnorm_grouped(&mut key, &key_snap, &self.ple_norm_key, hc, d, c.eps);
         let mut qn = vec![0.0; hcd];
@@ -3858,11 +3880,14 @@ impl Model {
         // pull the layer out, run both sub-phases, put it back.
         let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
 
+        // Both residual layouts can overlap the previous route with temporal
+        // work; the helper retains its opt-in and scheduler exclusion gates.
+        self.prefetch_previous_route(l);
+
         // Qwen3.x classic residual block. The same temporal/MoE kernels and
         // expert residency machinery are shared with the hyper-connection
         // engine; only the residual plumbing and two RMSNorm sites differ.
         if hc == 0 {
-            self.prefetch_previous_route(l);
             let mut mixed = vec![0.0; d];
             rmsnorm_row_shifted(&mut mixed, stream, &layer.in_ln, c.eps);
             let mut attn = vec![0.0; d];
@@ -4945,6 +4970,40 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn qsa_four_mxfp4_projections_match_scalar_and_mixed_format_declines() {
+        use super::{Wt, WtBytes, matmul_mxfp4_multi, matmul_mxfp4_bytes};
+        crate::ffi::metal_init();
+        let x: Vec<f32> = (0..64).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let weights: Vec<Wt> = [(64, 0x22), (32, 0x44), (32, 0xaa), (16, 0xcc)]
+            .into_iter().map(|(o, code)| Wt {
+                f: vec![], o, i: 64,
+                bytes: Some(WtBytes::Mxfp4 {
+                    weights: vec![code; o * 32], scales: vec![127; o * 2],
+                    metal_tensor: std::sync::Mutex::new(0),
+                }),
+            }).collect();
+        let mut actual: Vec<Vec<f32>> = weights.iter().map(|w| vec![0.0; w.o]).collect();
+        let refs: Vec<&Wt> = weights.iter().collect();
+        assert!(matmul_mxfp4_multi(
+            &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(), &x, &refs,
+        ));
+        for (w, got) in weights.iter().zip(&actual) {
+            let WtBytes::Mxfp4 { weights, scales, .. } = w.bytes.as_ref().unwrap() else { unreachable!() };
+            let mut expected = vec![0.0; w.o];
+            matmul_mxfp4_bytes(&mut expected, &x, weights, scales, w.o, w.i);
+            assert_eq!(*got, expected);
+        }
+        let bf16 = Wt { f: vec![], bytes: Some(WtBytes::Bf16(vec![0; 16 * 64 * 2])), o: 16, i: 64 };
+        let before = actual.clone();
+        assert!(!matmul_mxfp4_multi(
+            &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(), &x,
+            &[&weights[0], &weights[1], &weights[2], &bf16],
+        ));
+        assert_eq!(actual, before);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn expert_cache_leaves_uma_headroom_on_16g_apple_silicon() {
         const GIB: u64 = 1024 * 1024 * 1024;
         assert_eq!(default_cache_cap_for_ram(Some(16 * GIB)), 128);
@@ -4976,3 +5035,4 @@ mod tests {
         assert_eq!(raw_out, mlx_out);
     }
 }
+
