@@ -5,9 +5,9 @@
 //! on demand through `Model::coli` (never resident as a whole).
 
 use crate::{
-    Cfg, HcGlobal, Layer, Model, Wt, WtBytes, make_expert_store,
-    colisource::{ColiSource, bf16_to_f32},
-    lazy_zeroed_f32, next_metal_model_id,
+    colisource::{bf16_to_f32, ColiSource},
+    lazy_zeroed_f32, make_expert_store, next_metal_model_id, Cfg, HcGlobal, Layer, Model, Wt,
+    WtBytes,
 };
 
 /// C parity (coli_target_registry.h): the direct Apple8/MetalIO execution
@@ -20,7 +20,10 @@ const APPLE8_PROFILE: &str = "macos-arm64-metal-apple8-v1";
 fn load_wt(src: &ColiSource, name: &str, o: usize, i: usize) -> Result<Wt, String> {
     let m = src.wt(name, o, i)?;
     let bytes = match m.fmt {
-        5 => WtBytes::Bf16(m.bytes),
+        5 => WtBytes::Bf16 {
+            weights: m.bytes,
+            metal_tensor: std::sync::Mutex::new(0),
+        },
         7 => WtBytes::Mxfp4 {
             weights: m.bytes,
             scales: m.scales,
@@ -294,7 +297,11 @@ impl Model {
                         hcd,
                     )?
                 } else {
-                    vec_f32(src, &format!("{lp}.post_attention_layernorm.weight"), cfg.hidden)?
+                    vec_f32(
+                        src,
+                        &format!("{lp}.post_attention_layernorm.weight"),
+                        cfg.hidden,
+                    )?
                 },
                 hc_mlp_mix_down: if cfg.hc_count > 0 {
                     load_wt(
@@ -460,7 +467,11 @@ impl Model {
             .map(|v| v != "0")
             .unwrap_or(true);
         let expert_plan = if direct_ok && expert_preplan {
-            Some(crate::plan::Plan::resolve(src.pkg_ref(), cfg.layers, cfg.experts)?)
+            Some(crate::plan::Plan::resolve(
+                src.pkg_ref(),
+                cfg.layers,
+                cfg.experts,
+            )?)
         } else {
             None
         };
@@ -479,11 +490,13 @@ impl Model {
         } else {
             eprintln!("[qwen4-rs] direct path unavailable; using canonical fallback");
         }
-        Ok(Model {
+        let mut model = Model {
             cfg: cfg.clone(),
             coli: Some(src.clone()),
             embed: load_wt(src, "embed.weight", cfg.vocab, cfg.hidden)?,
             lm_head: load_wt(src, "head.weight", cfg.vocab, cfg.hidden)?,
+            lm_head_aligned: None,
+            lm_head_metal_tensor: 0,
             final_norm,
             layers,
             experts: Vec::new(), // fetched on demand via coli
@@ -506,8 +519,18 @@ impl Model {
             } else {
                 HcGlobal {
                     norm: vec![],
-                    mix_down: Wt { f: vec![], bytes: None, o: 0, i: 0 },
-                    mix_up: Wt { f: vec![], bytes: None, o: 0, i: 0 },
+                    mix_down: Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    },
+                    mix_up: Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    },
                 }
             },
             ple_ngram: Wt {
@@ -583,10 +606,11 @@ impl Model {
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
             ple_conv_state: vec![
                 0.0;
-                hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
+                hcd * (cfg.ple_conv_kernel.saturating_sub(1) * cfg.ngram_size + 1)
+                    .max(1)
             ],
             expert_plan,
-            expert_store: make_expert_store(cfg.layers),
+            expert_store: make_expert_store(cfg.layers, cfg.topk),
             spans: logan_core::telemetry::TokenSpans::default(),
             route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
             route_overlap_common: vec![0; cfg.layers],
@@ -601,11 +625,26 @@ impl Model {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             gdn_metal: (0..cfg.layers).map(|_| None).collect(),
+            gdn_ane: (0..cfg.layers)
+                .map(|_| crate::gdn_ane::GdnAneState::default())
+                .collect(),
             attn_metal: (0..cfg.layers).map(|_| None).collect(),
             sched_mode: false,
             sched_blocked: None,
             sched_pause: None,
-        })
+        };
+        if model.rehome_lm_head_bf16() {
+            eprintln!("qwen4-rs: BF16 LM head re-homed to 16 KiB-aligned single-copy storage");
+        }
+        // Qualification-only seam: convert GDN BF16 dense projections to
+        // canonical MXFP4 before either Metal GDN state or ANE programs are
+        // built. QWEN_GDN_RUNTIME_MXFP4 is opt-in until full-model quality is
+        // measured; successful qualification should move this transform into
+        // the offline compiler/package.
+        model.quantize_gdn_runtime_q8();
+        model.quantize_gdn_runtime_mxfp4();
+        model.warm_selected_gdn_ane();
+        Ok(model)
     }
 }
 

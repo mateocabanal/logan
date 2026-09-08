@@ -14,8 +14,8 @@ pub mod prefix_runtime;
 pub mod runtime_stats;
 pub mod snapshot;
 pub use prefix_cache::{
-    digest_hex, live_prefix_state_digest, CacheRestoreStats, CacheWriteStats, PrefixCacheKey,
-    PrefixCacheStore,
+    digest_hex, live_prefix_state_digest, prefix_state_payload_bytes, CacheRestoreStats,
+    CacheWriteStats, PrefixCacheKey, PrefixCacheStore,
 };
 pub use prefix_runtime::{
     apply_max_performance_defaults, auto_prefix_cache_enabled, persist_prefix_boundary,
@@ -123,12 +123,22 @@ mod tests {
         let plan = Plan {
             layers: vec![
                 vec![
-                    PlannedExpert { shard_id: 0, regions: [(0, 100), (0, 100), (0, 100)], dims: [(1, 1); 3] },
-                    PlannedExpert { shard_id: 1, regions: [(0, 50), (0, 50), (0, 50)], dims: [(1, 1); 3] },
+                    PlannedExpert {
+                        shard_id: 0,
+                        regions: [(0, 100), (0, 100), (0, 100)],
+                        dims: [(1, 1); 3],
+                    },
+                    PlannedExpert {
+                        shard_id: 1,
+                        regions: [(0, 50), (0, 50), (0, 50)],
+                        dims: [(1, 1); 3],
+                    },
                 ],
-                vec![
-                    PlannedExpert { shard_id: 2, regions: [(0, 400), (0, 400), (0, 400)], dims: [(1, 1); 3] },
-                ],
+                vec![PlannedExpert {
+                    shard_id: 2,
+                    regions: [(0, 400), (0, 400), (0, 400)],
+                    dims: [(1, 1); 3],
+                }],
             ],
             max_slot_bytes: 1200,
         };

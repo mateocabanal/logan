@@ -144,12 +144,42 @@ fn main() {
         println!("cargo:rerun-if-changed=metal/bnns_dense.mm");
     }
 
+    // shared_surface.mm — persistent zero-copy IOSurface -> MTLBuffer import.
+    let shared_src = metal_dir.join("shared_surface.mm");
+    if shared_src.exists() {
+        let shared_obj = std::path::Path::new(&out).join("shared_surface.o");
+        let status = std::process::Command::new("clang++")
+            .args([
+                "-x",
+                "objective-c++",
+                "-std=gnu++17",
+                "-fobjc-arc",
+                "-O3",
+                "-fobjc-exceptions",
+                "-c",
+                shared_src.to_str().unwrap(),
+                "-o",
+                shared_obj.to_str().unwrap(),
+            ])
+            .status()
+            .expect("clang++ must be available on macOS");
+        assert!(status.success(), "shared_surface.mm failed to compile");
+        let ar = std::process::Command::new("ar")
+            .args(["rcs", lib.to_str().unwrap(), shared_obj.to_str().unwrap()])
+            .status()
+            .expect("ar failed for shared_surface.o");
+        assert!(ar.success(), "ar failed for shared_surface.o");
+        println!("cargo:rerun-if-changed=metal/shared_surface.mm");
+    }
+
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=backend_metal");
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=Accelerate");
+    println!("cargo:rustc-link-lib=framework=IOSurface");
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rerun-if-changed=metal/backend_metal.mm");
     println!("cargo:rerun-if-changed=metal/backend_metal.h");
 }

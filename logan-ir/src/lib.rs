@@ -7,6 +7,7 @@
 //! Design: docs/design_neutral_backend.md (slice 1).
 
 pub mod context;
+pub mod execution;
 pub mod graph;
 pub mod optimizer;
 pub mod plan;
@@ -15,6 +16,9 @@ pub mod tiered_optimizer;
 
 pub use context::{
     ContextConstraint, ContextConstraintKind, ContextPlan, ContextStateBytes, PlannerMemoryBudget,
+};
+pub use execution::{
+    ExecutionBackend, ExecutionEdge, ExecutionIsland, ExecutionPlan, IslandId, TransferKind,
 };
 pub use graph::{AttentionKind, Graph, Node, NodeId, Op, Value, ValueId, ValueType};
 pub use optimizer::{

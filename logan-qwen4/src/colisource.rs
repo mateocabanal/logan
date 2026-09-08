@@ -124,8 +124,10 @@ impl ColiSource {
         })
     }
 
-    /// The underlying package (for MetalIO region math).
-    pub fn pkg_ref(&self) -> &logan_format::package::Package {
+    /// The underlying package for crate-internal MetalIO/plan region math.
+    /// Keep this crate-private so external runtime code cannot bypass the
+    /// bounded PLE n-gram row API and accidentally materialize streamed shards.
+    pub(crate) fn pkg_ref(&self) -> &logan_format::package::Package {
         &self.pkg
     }
 
@@ -137,10 +139,27 @@ impl ColiSource {
             .or_else(|| self.pkg.record_by_name(name))
     }
 
+    fn reject_streamed_ple_full_read(name: &str) -> Result<(), String> {
+        if name.contains("ple.ple_embedding.ngram_embedding.shard_")
+            || name.ends_with("ple_embedding.ngram_embedding.weight")
+        {
+            return Err(format!(
+                "{name}: PLE n-gram weights are streamed-only; use ple_ngram_row_f8 so the table remains on NVMe"
+            ));
+        }
+        Ok(())
+    }
+
     /// Dense vector tensor -> BF16 bytes.
     pub fn vec(&self, name: &str, want: usize) -> Result<Vec<u8>, String> {
-        let rec = self.rec(name).ok_or_else(|| format!("missing dense tensor {name}"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        Self::reject_streamed_ple_full_read(name)?;
+        let rec = self
+            .rec(name)
+            .ok_or_else(|| format!("missing dense tensor {name}"))?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         if payload.len() != want * 2 {
             return Err(format!(
                 "{name}: payload {} bytes != expected {}",
@@ -156,8 +175,14 @@ impl ColiSource {
     /// runtime; only the tiny affine-Q8 router/gate matrices are expanded once
     /// to BF16 at load so the established CPU routing path remains unchanged.
     pub fn wt(&self, name: &str, o: usize, i: usize) -> Result<ColiWt, String> {
-        let rec = self.rec(name).ok_or_else(|| format!("missing dense matrix {name}"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        Self::reject_streamed_ple_full_read(name)?;
+        let rec = self
+            .rec(name)
+            .ok_or_else(|| format!("missing dense matrix {name}"))?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         match rec.math_format {
             0x0003 => {
                 let want = o
@@ -457,15 +482,26 @@ impl ColiSource {
     /// config-derived prime math diverges on the real model (row 173M vs
     /// computed 160M capacity), so .coli mode reads these instead.
     pub fn ple_metadata(&self, layer: i32) -> Result<(Vec<i64>, Vec<i64>, Vec<u64>), String> {
-        let sizes = self.i64_tensor(&format!("layers.{layer}.ple.ple_embedding.ngram_heads_vocab_sizes"))?;
-        let offsets = self.i64_tensor(&format!("layers.{layer}.ple.ple_embedding.ngram_heads_offsets"))?;
-        let mult = self.i64_tensor(&format!("layers.{layer}.ple.ple_embedding.layer_multipliers"))?;
+        let sizes = self.i64_tensor(&format!(
+            "layers.{layer}.ple.ple_embedding.ngram_heads_vocab_sizes"
+        ))?;
+        let offsets = self.i64_tensor(&format!(
+            "layers.{layer}.ple.ple_embedding.ngram_heads_offsets"
+        ))?;
+        let mult = self.i64_tensor(&format!(
+            "layers.{layer}.ple.ple_embedding.layer_multipliers"
+        ))?;
         Ok((sizes, offsets, mult.into_iter().map(|m| m as u64).collect()))
     }
 
     fn i64_tensor(&self, name: &str) -> Result<Vec<i64>, String> {
-        let rec = self.rec(name).ok_or_else(|| format!("missing PLE metadata {name}"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        let rec = self
+            .rec(name)
+            .ok_or_else(|| format!("missing PLE metadata {name}"))?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         // i64 records (8 bytes/elem: 16 heads x 8 = 128 bytes for
         // vocab_sizes/offsets; 3 x 8 = 24 for multipliers).
         if payload.len() % 8 != 0 {
@@ -515,9 +551,14 @@ impl ColiSource {
     /// Global BF16 scale for the F8 ngram table.
     pub fn ple_ngram_scale(&self, layer: i32) -> Result<f32, String> {
         let rec = self
-            .rec(&format!("layers.{layer}.ple.ple_embedding.ngram_embedding.weight_scale"))
+            .rec(&format!(
+                "layers.{layer}.ple.ple_embedding.ngram_embedding.weight_scale"
+            ))
             .ok_or_else(|| format!("missing ngram weight_scale"))?;
-        let payload = self.pkg.read_tensor_payload(rec).map_err(|e| e.to_string())?;
+        let payload = self
+            .pkg
+            .read_tensor_payload(rec)
+            .map_err(|e| e.to_string())?;
         if payload.len() != 2 {
             return Err(format!("weight_scale payload {} != 2", payload.len()));
         }
@@ -538,7 +579,6 @@ impl ColiSource {
             e => sign * (1.0 + mant * 0.125) * 2f32.powi(e - 7),
         }
     }
-
 }
 
 /// f32 -> BF16 (top 16 bits, round-to-nearest-even), as 2 LE bytes.
@@ -561,6 +601,21 @@ mod tests {
     use super::ColiSource;
 
     #[test]
+    fn streamed_ple_ngram_cannot_use_resident_read_paths() {
+        for name in [
+            "layers.1.ple.ple_embedding.ngram_embedding.shard_0",
+            "model.ple.ple_embedding.ngram_embedding.weight",
+        ] {
+            let err = ColiSource::reject_streamed_ple_full_read(name).unwrap_err();
+            assert!(err.contains("streamed-only"));
+        }
+        assert!(ColiSource::reject_streamed_ple_full_read(
+            "layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn e4m3fn_exponent_15_is_finite_except_nan_code() {
         assert_eq!(ColiSource::e4m3_decode(0x78), 256.0);
         assert_eq!(ColiSource::e4m3_decode(0x79), 288.0);
@@ -574,7 +629,10 @@ mod tests {
     #[test]
     fn e4m3fn_zero_subnormal_and_normal_boundaries() {
         assert_eq!(ColiSource::e4m3_decode(0x00).to_bits(), 0.0_f32.to_bits());
-        assert_eq!(ColiSource::e4m3_decode(0x80).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(
+            ColiSource::e4m3_decode(0x80).to_bits(),
+            (-0.0_f32).to_bits()
+        );
         assert_eq!(ColiSource::e4m3_decode(0x01), 2.0_f32.powi(-9));
         assert_eq!(ColiSource::e4m3_decode(0x08), 2.0_f32.powi(-6));
     }

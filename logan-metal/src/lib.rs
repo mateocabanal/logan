@@ -26,6 +26,22 @@ mod imp {
         _private: [u8; 0],
     }
 
+    /// Persistent zero-copy Metal view of an externally owned IOSurface.
+    pub struct MetalSharedSurface {
+        handle: *mut c_void,
+        logical_bytes: usize,
+        allocation_bytes: usize,
+        _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    /// Persistent Metal continuation for an ANE-produced GDN qkv IOSurface.
+    /// Lanes 0..kernel-2 contain causal history while the final spatial lane
+    /// contains the current qkv projection. One dispatch computes Conv1D+SiLU.
+    pub struct MetalGdnConvSilu {
+        handle: *mut c_void,
+        _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
     #[repr(C)]
     struct ColiMetalMatmulDescRaw {
         tensor: *mut ColiMetalTensor,
@@ -58,6 +74,25 @@ mod imp {
     }
 
     unsafe extern "C" {
+        fn logan_metal_shared_surface_wrap(
+            raw_surface: *mut c_void,
+            logical_bytes: usize,
+        ) -> *mut c_void;
+        fn logan_metal_shared_surface_free(handle: *mut c_void);
+        fn logan_metal_shared_surface_contents(handle: *mut c_void) -> *mut c_void;
+        fn logan_metal_shared_surface_length(handle: *mut c_void) -> usize;
+        fn logan_metal_shared_surface_allocation_length(handle: *mut c_void) -> usize;
+        fn logan_metal_gdn_conv_silu_create(
+            input_handle: *mut c_void,
+            output_handle: *mut c_void,
+            weights: *const f32,
+            channels: usize,
+            spatial: usize,
+            kernel: usize,
+        ) -> *mut c_void;
+        fn logan_metal_gdn_conv_silu_run(handle: *mut c_void) -> i32;
+        fn logan_metal_gdn_conv_silu_free(handle: *mut c_void);
+
         pub fn coli_metal_init() -> i32;
         pub fn coli_metal_available() -> i32;
         pub fn coli_metal_matmul(
@@ -134,6 +169,115 @@ mod imp {
         ) -> i32;
     }
 
+    impl MetalSharedSurface {
+        /// Import an IOSurface into Metal without copying its backing bytes.
+        ///
+        /// # Safety
+        /// `raw_surface` must be a valid `IOSurfaceRef` for this call. The
+        /// native wrapper retains it after a successful import.
+        pub unsafe fn from_iosurface(
+            raw_surface: *mut c_void,
+            logical_bytes: usize,
+        ) -> Option<Self> {
+            if raw_surface.is_null() || logical_bytes == 0 {
+                return None;
+            }
+            let handle = unsafe { logan_metal_shared_surface_wrap(raw_surface, logical_bytes) };
+            if handle.is_null() {
+                return None;
+            }
+            let native_logical = unsafe { logan_metal_shared_surface_length(handle) };
+            let allocation_bytes = unsafe { logan_metal_shared_surface_allocation_length(handle) };
+            if native_logical != logical_bytes || allocation_bytes < logical_bytes {
+                unsafe { logan_metal_shared_surface_free(handle) };
+                return None;
+            }
+            Some(Self {
+                handle,
+                logical_bytes,
+                allocation_bytes,
+                _not_send_sync: std::marker::PhantomData,
+            })
+        }
+
+        pub fn len(&self) -> usize {
+            self.logical_bytes
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.logical_bytes == 0
+        }
+
+        pub fn allocation_len(&self) -> usize {
+            self.allocation_bytes
+        }
+
+        /// CPU-visible address returned by `MTLBuffer.contents`.
+        ///
+        /// # Safety
+        /// The pointer aliases memory potentially used by Metal and ANE.
+        /// Callers must establish device completion and Rust aliasing safety.
+        pub unsafe fn contents_ptr(&self) -> *mut u8 {
+            unsafe { logan_metal_shared_surface_contents(self.handle).cast() }
+        }
+    }
+
+    impl Drop for MetalSharedSurface {
+        fn drop(&mut self) {
+            unsafe { logan_metal_shared_surface_free(self.handle) }
+        }
+    }
+
+    impl MetalGdnConvSilu {
+        pub fn new(
+            input: &MetalSharedSurface,
+            output: &MetalSharedSurface,
+            weights: &[f32],
+            channels: usize,
+            spatial: usize,
+            kernel: usize,
+        ) -> Option<Self> {
+            if channels == 0
+                || spatial == 0
+                || kernel == 0
+                || kernel > spatial
+                || weights.len() != channels.checked_mul(kernel)?
+                || input.len() < channels.checked_mul(spatial)?.checked_mul(4)?
+                || output.len() < channels.checked_mul(4)?
+            {
+                return None;
+            }
+            let handle = unsafe {
+                logan_metal_gdn_conv_silu_create(
+                    input.handle,
+                    output.handle,
+                    weights.as_ptr(),
+                    channels,
+                    spatial,
+                    kernel,
+                )
+            };
+            if handle.is_null() {
+                None
+            } else {
+                Some(Self {
+                    handle,
+                    _not_send_sync: std::marker::PhantomData,
+                })
+            }
+        }
+
+        pub fn run(&mut self) -> bool {
+            unsafe { logan_metal_gdn_conv_silu_run(self.handle) == 1 }
+        }
+    }
+
+    impl Drop for MetalGdnConvSilu {
+        fn drop(&mut self) {
+            unsafe { logan_metal_gdn_conv_silu_free(self.handle) }
+        }
+    }
+
     /// Lazily-initialized Metal availability. Returns true once init() succeeded.
     static INIT: std::sync::Once = std::sync::Once::new();
     static mut AVAILABLE: bool = false;
@@ -150,8 +294,8 @@ mod imp {
         unsafe { AVAILABLE && coli_metal_available() == 1 }
     }
 
-    /// y[O] = x[I] @ W^T for one token. `fmt` 7 = MXFP4 (Apple8 tiles),
-    /// weights = O*((I+1)/2) nibble bytes, scales = O*ceil(I/32) raw E8M0 bytes.
+    /// y[O] = x[I] @ W^T for one token. Supported dense formats include
+    /// raw BF16 (`fmt=5`), MXFP4 (`fmt=7`), and FP8 (`fmt=8`).
     /// Returns true if Metal ran the matmul.
     pub fn metal_matmul(
         tensor: &mut *mut ColiMetalTensor,
@@ -167,25 +311,39 @@ mod imp {
             return false;
         }
         let (weight_bytes, scale_bytes) = match fmt {
+            5 => (o * i * std::mem::size_of::<u16>(), 0),
             7 => (o * ((i + 1) / 2), o * ((i + 31) / 32)),
-            8 => (o * i, o.div_ceil(128) * i.div_ceil(128) * std::mem::size_of::<f32>()),
+            8 => (
+                o * i,
+                o.div_ceil(128) * i.div_ceil(128) * std::mem::size_of::<f32>(),
+            ),
+            11 => (o * i, o * i.div_ceil(32) * std::mem::size_of::<f32>()),
+            12 => (o * i, o * i.div_ceil(16) * std::mem::size_of::<f32>()),
+            13 => (o * i, o * i.div_ceil(8) * std::mem::size_of::<f32>()),
+            14 => (o * i + o * i.div_ceil(32) * 3, o * i.div_ceil(32) * std::mem::size_of::<f32>()),
             _ => return false,
         };
         if weights.len() < weight_bytes || scales.len() < scale_bytes {
             return false;
         }
+        static BF16_DUMMY_SCALE: [f32; 1] = [1.0];
+        let scale_ptr = if fmt == 5 {
+            BF16_DUMMY_SCALE.as_ptr()
+        } else {
+            scales.as_ptr() as *const f32
+        };
         let rc = unsafe {
             coli_metal_matmul(
                 tensor,
                 y.as_mut_ptr(),
                 x.as_ptr(),
                 weights.as_ptr() as *const c_void,
-                scales.as_ptr() as *const f32,
+                scale_ptr,
                 fmt,
                 1,
                 i as i32,
                 o as i32,
-                0,
+                match fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => 0 },
             )
         };
         rc == 1
@@ -204,33 +362,40 @@ mod imp {
         }
         let mut raw = Vec::with_capacity(descs.len());
         for d in descs.iter_mut() {
-            if d.i != common_i
-                || d.o == 0
-                || d.o > i32::MAX as usize
-                || d.y.len() < d.o
-            {
+            if d.i != common_i || d.o == 0 || d.o > i32::MAX as usize || d.y.len() < d.o {
                 return false;
             }
             let (weight_bytes, scale_bytes) = match d.fmt {
+                5 => (d.o * d.i * std::mem::size_of::<u16>(), 0),
                 7 => (d.o * d.i.div_ceil(2), d.o * d.i.div_ceil(32)),
                 8 => (
                     d.o * d.i,
                     d.o.div_ceil(128) * d.i.div_ceil(128) * std::mem::size_of::<f32>(),
                 ),
+                11 => (d.o * d.i, d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>()),
+                12 => (d.o * d.i, d.o * d.i.div_ceil(16) * std::mem::size_of::<f32>()),
+                13 => (d.o * d.i, d.o * d.i.div_ceil(8) * std::mem::size_of::<f32>()),
+                14 => (d.o * d.i + d.o * d.i.div_ceil(32) * 3, d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>()),
                 _ => return false,
             };
             if d.weights.len() < weight_bytes || d.scales.len() < scale_bytes {
                 return false;
             }
+            static BF16_DUMMY_SCALE: [f32; 1] = [1.0];
+            let scale_ptr = if d.fmt == 5 {
+                BF16_DUMMY_SCALE.as_ptr()
+            } else {
+                d.scales.as_ptr() as *const f32
+            };
             raw.push(ColiMetalMatmulDescRaw {
                 tensor: d.tensor,
                 y: d.y.as_mut_ptr(),
                 weights: d.weights.as_ptr() as *const c_void,
-                scales: d.scales.as_ptr() as *const f32,
+                scales: scale_ptr,
                 fmt: d.fmt,
                 i: d.i as i32,
                 o: d.o as i32,
-                gs: 0,
+                gs: match d.fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => 0 },
             });
         }
         let ok = unsafe {
@@ -268,56 +433,140 @@ mod imp {
         output_gate: i32,
         eps: f32,
     ) -> i32 {
-        if !metal_available() || model_id == 0 || layer > i32::MAX as usize || descs.len() != 5
-            || d == 0 || d > i32::MAX as usize || kheads == 0 || kheads > i32::MAX as usize
-            || kd == 0 || kd > i32::MAX as usize || vheads == 0 || vheads > i32::MAX as usize
-            || vd == 0 || vd > i32::MAX as usize || kk == 0 || kk > i32::MAX as usize
-            || x.len() < d || out.len() < d || a_log.len() < vheads || dt_bias.len() < vheads
-            || norm_w.len() < vd || !(eps > 0.0)
+        if !metal_available()
+            || model_id == 0
+            || layer > i32::MAX as usize
+            || descs.len() != 5
+            || d == 0
+            || d > i32::MAX as usize
+            || kheads == 0
+            || kheads > i32::MAX as usize
+            || kd == 0
+            || kd > i32::MAX as usize
+            || vheads == 0
+            || vheads > i32::MAX as usize
+            || vd == 0
+            || vd > i32::MAX as usize
+            || kk == 0
+            || kk > i32::MAX as usize
+            || x.len() < d
+            || out.len() < d
+            || a_log.len() < vheads
+            || dt_bias.len() < vheads
+            || norm_w.len() < vd
+            || !(eps > 0.0)
         {
             return 0;
         }
-        let kdim = match kheads.checked_mul(kd) { Some(v) => v, None => return 0 };
-        let vdim = match vheads.checked_mul(vd) { Some(v) => v, None => return 0 };
-        let cdim = match kdim.checked_mul(2).and_then(|v| v.checked_add(vdim)) { Some(v) => v, None => return 0 };
-        let conv_need = match cdim.checked_mul(kk) { Some(v) => v, None => return 0 };
-        let state_need = match vheads.checked_mul(kd).and_then(|v| v.checked_mul(vd)) { Some(v) => v, None => return 0 };
-        let conv_state_need = match cdim.checked_mul(kk.saturating_sub(1)) { Some(v) => v, None => return 0 };
-        if conv_w.len() < conv_need || state.len() < state_need || conv_state.len() < conv_state_need {
+        let kdim = match kheads.checked_mul(kd) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let vdim = match vheads.checked_mul(vd) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let cdim = match kdim.checked_mul(2).and_then(|v| v.checked_add(vdim)) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let conv_need = match cdim.checked_mul(kk) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let state_need = match vheads.checked_mul(kd).and_then(|v| v.checked_mul(vd)) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let conv_state_need = match cdim.checked_mul(kk.saturating_sub(1)) {
+            Some(v) => v,
+            None => return 0,
+        };
+        if conv_w.len() < conv_need
+            || state.len() < state_need
+            || conv_state.len() < conv_state_need
+        {
             return 0;
         }
         let mut raw = Vec::with_capacity(5);
         for dsc in descs.iter_mut() {
-            if dsc.fmt != 7 || dsc.i == 0 || dsc.o == 0 || dsc.i > i32::MAX as usize || dsc.o > i32::MAX as usize {
+            if (dsc.fmt != 5 && dsc.fmt != 7 && dsc.fmt != 9 && dsc.fmt != 10 && dsc.fmt != 11 && dsc.fmt != 12 && dsc.fmt != 13 && dsc.fmt != 14)
+                || dsc.i == 0
+                || dsc.o == 0
+                || dsc.i > i32::MAX as usize
+                || dsc.o > i32::MAX as usize
+            {
                 return 0;
             }
-            let weight_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(2));
-            let scale_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(32));
+            let (weight_bytes, scale_bytes) = if dsc.fmt == 5 {
+                (dsc.o.saturating_mul(dsc.i).saturating_mul(std::mem::size_of::<u16>()), 0)
+            } else if (11..=14).contains(&dsc.fmt) {
+                let block = match dsc.fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => unreachable!() };
+                let base = dsc.o.saturating_mul(dsc.i);
+                let weights = if dsc.fmt == 14 {
+                    base.saturating_add(dsc.o.saturating_mul(dsc.i.div_ceil(32)).saturating_mul(3))
+                } else { base };
+                (
+                    weights,
+                    dsc.o.saturating_mul(dsc.i.div_ceil(block)).saturating_mul(std::mem::size_of::<f32>()),
+                )
+            } else {
+                let planes = if dsc.fmt == 10 { 3 } else if dsc.fmt == 9 { 2 } else { 1 };
+                (
+                    planes * dsc.o.saturating_mul(dsc.i.div_ceil(2)),
+                    planes * dsc.o.saturating_mul(dsc.i.div_ceil(32)),
+                )
+            };
             if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes {
                 return 0;
             }
+            static BF16_DUMMY_SCALE_GDN: [f32; 1] = [1.0];
+            let scale_ptr = if dsc.fmt == 5 { BF16_DUMMY_SCALE_GDN.as_ptr() } else { dsc.scales.as_ptr() as *const f32 };
             raw.push(ColiMetalMatmulDescRaw {
-                tensor: dsc.tensor, y: std::ptr::null_mut(),
+                tensor: dsc.tensor,
+                y: std::ptr::null_mut(),
                 weights: dsc.weights.as_ptr() as *const c_void,
-                scales: dsc.scales.as_ptr() as *const f32,
-                fmt: 7, i: dsc.i as i32, o: dsc.o as i32, gs: 0,
+                scales: scale_ptr,
+                fmt: dsc.fmt,
+                i: dsc.i as i32,
+                o: dsc.o as i32,
+                gs: match dsc.fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => 0 },
             });
         }
         let rc = unsafe {
             coli_metal_gdn_mxfp4(
-                model_id, layer as i32, raw.as_mut_ptr(), raw.len() as i32,
-                x.as_ptr(), out.as_mut_ptr(), a_log.as_ptr(), dt_bias.as_ptr(),
-                conv_w.as_ptr(), norm_w.as_ptr(), state.as_mut_ptr(), conv_state.as_mut_ptr(),
-                d as i32, kheads as i32, kd as i32, vheads as i32, vd as i32, kk as i32,
-                output_gate, eps,
+                model_id,
+                layer as i32,
+                raw.as_mut_ptr(),
+                raw.len() as i32,
+                x.as_ptr(),
+                out.as_mut_ptr(),
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                conv_w.as_ptr(),
+                norm_w.as_ptr(),
+                state.as_mut_ptr(),
+                conv_state.as_mut_ptr(),
+                d as i32,
+                kheads as i32,
+                kd as i32,
+                vheads as i32,
+                vd as i32,
+                kk as i32,
+                output_gate,
+                eps,
             )
         };
-        for (dsc, r) in descs.iter_mut().zip(raw.iter()) { dsc.tensor = r.tensor; }
+        for (dsc, r) in descs.iter_mut().zip(raw.iter()) {
+            dsc.tensor = r.tensor;
+        }
         rc
     }
 
     pub fn gdn_mxfp4_drop_model(model_id: u64) {
-        if model_id != 0 { unsafe { coli_metal_gdn_mxfp4_drop_model(model_id) }; }
+        if model_id != 0 {
+            unsafe { coli_metal_gdn_mxfp4_drop_model(model_id) };
+        }
     }
 
     /// Full one-command-buffer MXFP4 shared MLP. `descs` are
@@ -334,36 +583,67 @@ mod imp {
         d: usize,
         iinter: usize,
     ) -> Result<Option<()>, ()> {
-        if !metal_available() || model_id == 0 || layer > i32::MAX as usize || descs.len() != 3
-            || d == 0 || d > i32::MAX as usize || iinter == 0 || iinter > i32::MAX as usize
-            || x.len() < d || out.len() < d
+        if !metal_available()
+            || model_id == 0
+            || layer > i32::MAX as usize
+            || descs.len() != 3
+            || d == 0
+            || d > i32::MAX as usize
+            || iinter == 0
+            || iinter > i32::MAX as usize
+            || x.len() < d
+            || out.len() < d
         {
             return Ok(None);
         }
         let expected = [(d, iinter), (d, iinter), (iinter, d)];
         let mut raw = Vec::with_capacity(3);
         for (dsc, &(ei, eo)) in descs.iter_mut().zip(expected.iter()) {
-            if dsc.fmt != 7 || dsc.i != ei || dsc.o != eo { return Ok(None); }
+            if dsc.fmt != 7 || dsc.i != ei || dsc.o != eo {
+                return Ok(None);
+            }
             let weight_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(2));
             let scale_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(32));
-            if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes { return Ok(None); }
+            if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes {
+                return Ok(None);
+            }
             raw.push(ColiMetalMatmulDescRaw {
-                tensor: dsc.tensor, y: std::ptr::null_mut(),
+                tensor: dsc.tensor,
+                y: std::ptr::null_mut(),
                 weights: dsc.weights.as_ptr() as *const c_void,
                 scales: dsc.scales.as_ptr() as *const f32,
-                fmt: 7, i: dsc.i as i32, o: dsc.o as i32, gs: 0,
+                fmt: 7,
+                i: dsc.i as i32,
+                o: dsc.o as i32,
+                gs: 0,
             });
         }
-        let rc = unsafe { coli_metal_shared_mxfp4(
-            model_id, layer as i32, raw.as_mut_ptr(), raw.len() as i32,
-            x.as_ptr(), out.as_mut_ptr(), d as i32, iinter as i32,
-        ) };
-        for (dsc, r) in descs.iter_mut().zip(raw.iter()) { dsc.tensor = r.tensor; }
-        match rc { r if r > 0 => Ok(Some(())), 0 => Ok(None), _ => Err(()) }
+        let rc = unsafe {
+            coli_metal_shared_mxfp4(
+                model_id,
+                layer as i32,
+                raw.as_mut_ptr(),
+                raw.len() as i32,
+                x.as_ptr(),
+                out.as_mut_ptr(),
+                d as i32,
+                iinter as i32,
+            )
+        };
+        for (dsc, r) in descs.iter_mut().zip(raw.iter()) {
+            dsc.tensor = r.tensor;
+        }
+        match rc {
+            r if r > 0 => Ok(Some(())),
+            0 => Ok(None),
+            _ => Err(()),
+        }
     }
 
     pub fn shared_mxfp4_drop_model(model_id: u64) {
-        if model_id != 0 { unsafe { coli_metal_shared_mxfp4_drop_model(model_id) }; }
+        if model_id != 0 {
+            unsafe { coli_metal_shared_mxfp4_drop_model(model_id) };
+        }
     }
 
     /// CPU BF16 GEMV through Accelerate/BNNS. No weight copy is retained.
@@ -521,9 +801,7 @@ mod imp {
 
     pub fn mio_batch_wait(event_value: i64, slots: &[i32]) -> bool {
         event_value > 0
-            && unsafe {
-                metalio_batch_wait(event_value, slots.as_ptr(), slots.len() as i32) == 0
-            }
+            && unsafe { metalio_batch_wait(event_value, slots.as_ptr(), slots.len() as i32) == 0 }
     }
 
     /// The crate keeps ONE MTLIOFileHandle per shard file for the process
@@ -557,11 +835,7 @@ mod imp {
     /// contiguously (dst offsets 0..total) so a single `moe_topk`/`swiglu`
     /// submission can consume the expert. Returns (slot, event) on success.
     /// The caller owns the slot until it frees it (or drops it into a cache).
-    fn mio_load_expert_kind(
-        fid: i32,
-        regions: &[(u64, usize)],
-        kind: i32,
-    ) -> Option<(i32, i64)> {
+    fn mio_load_expert_kind(fid: i32, regions: &[(u64, usize)], kind: i32) -> Option<(i32, i64)> {
         if !mio_init() || regions.is_empty() {
             return None;
         }
@@ -573,9 +847,9 @@ mod imp {
         let coalesce = std::env::var("QWEN_MIO_COALESCE_EXPERT")
             .map(|v| v != "0")
             .unwrap_or(true);
-        let contiguous = regions.windows(2).all(|w| {
-            w[0].0.checked_add(w[0].1 as u64) == Some(w[1].0)
-        });
+        let contiguous = regions
+            .windows(2)
+            .all(|w| w[0].0.checked_add(w[0].1 as u64) == Some(w[1].0));
         let mut cr: Vec<ColiMetalioRegion> = if coalesce && contiguous {
             vec![ColiMetalioRegion {
                 file: fid,
@@ -599,9 +873,7 @@ mod imp {
                 })
                 .collect()
         };
-        let ev = unsafe {
-            metalio_loadv(slot, cr.as_mut_ptr(), cr.len() as i32, kind)
-        };
+        let ev = unsafe { metalio_loadv(slot, cr.as_mut_ptr(), cr.len() as i32, kind) };
         if ev < 0 {
             unsafe { metalio_slot_free(slot) };
             return None;
@@ -610,19 +882,13 @@ mod imp {
     }
 
     /// Demand/async expert load used by the canonical routed path.
-    pub fn mio_load_expert(
-        fid: i32,
-        regions: &[(u64, usize)],
-    ) -> Option<(i32, i64)> {
+    pub fn mio_load_expert(fid: i32, regions: &[(u64, usize)]) -> Option<(i32, i64)> {
         mio_load_expert_kind(fid, regions, 1) // MIO_LOAD_ASYNC
     }
 
     /// Speculative expert load. Same physical path, but tagged so MetalIO
     /// telemetry can distinguish prediction work from demand work.
-    pub fn mio_prefetch_expert(
-        fid: i32,
-        regions: &[(u64, usize)],
-    ) -> Option<(i32, i64)> {
+    pub fn mio_prefetch_expert(fid: i32, regions: &[(u64, usize)]) -> Option<(i32, i64)> {
         mio_load_expert_kind(fid, regions, 2) // MIO_LOAD_SPEC
     }
 
@@ -720,6 +986,14 @@ mod imp {
             fused_calls: *mut u64,
             fused_experts: *mut u64,
         );
+        pub fn coli_apple8_metalio_profile_detail_get(
+            gdn_wait_ns: *mut u64,
+            gdn_kernel_ns: *mut u64,
+            gdn_calls: *mut u64,
+            moe_wait_ns: *mut u64,
+            moe_kernel_ns: *mut u64,
+            moe_calls: *mut u64,
+        );
         // Generic BF16 GEMV (S x I rows -> O): attention q/k/v/o projections.
         pub fn coli_apple8_metalio_bf16_matmul(
             w: *const u16,
@@ -731,6 +1005,33 @@ mod imp {
         ) -> i32;
         // GDN (coalesced Metal kernels, qwen_moe.c seam contract)
         pub fn coli_apple8_metalio_gdn_drop_model(model_id: u64);
+        pub fn coli_apple8_metalio_gdn_begin(
+            model_id: u64,
+            layer: i32,
+            x: *const f32,
+            wqkv: *const u16,
+            wz: *const u16,
+            wa: *const u16,
+            wb: *const u16,
+            wout: *const u16,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            conv_w: *const f32,
+            norm_w: *const f32,
+            state: *mut f32,
+            conv_state: *mut f32,
+            d: i32,
+            kheads: i32,
+            kd: i32,
+            vheads: i32,
+            vd: i32,
+            kk: i32,
+            output_gate: i32,
+            eps: f32,
+            pending_out: *mut *mut c_void,
+        ) -> i32;
+        pub fn coli_apple8_metalio_gdn_finish(pending: *mut c_void, out: *mut f32) -> i32;
+        pub fn coli_apple8_metalio_gdn_discard(pending: *mut c_void);
         pub fn coli_apple8_metalio_gdn_token(
             model_id: u64,
             layer: i32,
@@ -982,6 +1283,20 @@ mod imp {
         (e, s, w, k, fc, fe)
     }
 
+    /// Per-island synchronization detail for the two decode-critical Metal
+    /// blocks. These counters make driver/queue stalls visible separately
+    /// from actual GPU execution.
+    pub fn metal_profile_detail() -> (u64, u64, u64, u64, u64, u64) {
+        let (mut gw, mut gk, mut gc, mut mw, mut mk, mut mc) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        unsafe {
+            coli_apple8_metalio_profile_detail_get(
+                &mut gw, &mut gk, &mut gc, &mut mw, &mut mk, &mut mc,
+            );
+        }
+        (gw, gk, gc, mw, mk, mc)
+    }
+
     /// Release native GDN wrappers for one model before its aligned Rust
     /// backing allocations are dropped. The native side serializes this with
     /// token execution and therefore cannot retain zero-copy buffers past the
@@ -990,6 +1305,97 @@ mod imp {
         if model_id != 0 && direct_available() {
             unsafe { coli_apple8_metalio_gdn_drop_model(model_id) };
         }
+    }
+
+    /// Owning split-phase full-GDN command. The handle must retire before the
+    /// model-owned aligned weights/state are freed. Logan's Model::gdn_token
+    /// keeps it stack-local; Drop waits/discards defensively on unwind.
+    pub struct GdnPending {
+        raw: Option<std::ptr::NonNull<c_void>>,
+        hidden: usize,
+    }
+
+    impl Drop for GdnPending {
+        fn drop(&mut self) {
+            if let Some(raw) = self.raw.take() {
+                unsafe { coli_apple8_metalio_gdn_discard(raw.as_ptr()) };
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_token_begin(
+        model_id: u64,
+        layer: usize,
+        x: &[f32],
+        wqkv: &[u8],
+        wz: &[u8],
+        wa: &[u8],
+        wb: &[u8],
+        wout: &[u8],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        conv_w: &[f32],
+        norm_w: &[f32],
+        state: &mut [f32],
+        conv_state: &mut [f32],
+        d: usize,
+        kheads: usize,
+        kd: usize,
+        vheads: usize,
+        vd: usize,
+        kk: usize,
+        output_gate: i32,
+        eps: f32,
+    ) -> Option<GdnPending> {
+        if !direct_available() || x.len() < d || d > i32::MAX as usize {
+            return None;
+        }
+        let mut pending: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            coli_apple8_metalio_gdn_begin(
+                model_id,
+                layer as i32,
+                x.as_ptr(),
+                wqkv.as_ptr() as *const u16,
+                wz.as_ptr() as *const u16,
+                wa.as_ptr() as *const u16,
+                wb.as_ptr() as *const u16,
+                wout.as_ptr() as *const u16,
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                conv_w.as_ptr(),
+                norm_w.as_ptr(),
+                state.as_mut_ptr(),
+                conv_state.as_mut_ptr(),
+                d as i32,
+                kheads as i32,
+                kd as i32,
+                vheads as i32,
+                vd as i32,
+                kk as i32,
+                output_gate,
+                eps,
+                &mut pending,
+            )
+        };
+        let raw = std::ptr::NonNull::new(pending)?;
+        if rc == 1 {
+            Some(GdnPending { raw: Some(raw), hidden: d })
+        } else {
+            unsafe { coli_apple8_metalio_gdn_discard(raw.as_ptr()) };
+            None
+        }
+    }
+
+    pub fn gdn_token_finish(mut pending: GdnPending, out: &mut [f32]) -> i32 {
+        if out.len() < pending.hidden {
+            return 0;
+        }
+        let Some(raw) = pending.raw.take() else {
+            return 0;
+        };
+        unsafe { coli_apple8_metalio_gdn_finish(raw.as_ptr(), out.as_mut_ptr()) }
     }
 
     /// Decode-only Metal GDN token, byte-exact C seam contract:
@@ -1069,6 +1475,46 @@ mod imp {
     #[repr(C)]
     pub struct ColiMetalTensor {
         _private: [u8; 0],
+    }
+
+    pub struct MetalSharedSurface;
+    pub struct MetalGdnConvSilu;
+
+    impl MetalGdnConvSilu {
+        pub fn new(
+            _input: &MetalSharedSurface,
+            _output: &MetalSharedSurface,
+            _weights: &[f32],
+            _channels: usize,
+            _spatial: usize,
+            _kernel: usize,
+        ) -> Option<Self> {
+            None
+        }
+        pub fn run(&mut self) -> bool {
+            false
+        }
+    }
+
+    impl MetalSharedSurface {
+        pub unsafe fn from_iosurface(
+            _raw_surface: *mut std::os::raw::c_void,
+            _logical_bytes: usize,
+        ) -> Option<Self> {
+            None
+        }
+        pub fn len(&self) -> usize {
+            0
+        }
+        pub fn is_empty(&self) -> bool {
+            true
+        }
+        pub fn allocation_len(&self) -> usize {
+            0
+        }
+        pub unsafe fn contents_ptr(&self) -> *mut u8 {
+            std::ptr::null_mut()
+        }
     }
 
     pub struct MetalMatmulDesc<'a> {
@@ -1265,16 +1711,39 @@ mod imp {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_mxfp4(
-        _model_id: u64, _layer: usize, _descs: &mut [MetalWeightDesc<'_>],
-        _x: &[f32], _out: &mut [f32], _a_log: &[f32], _dt_bias: &[f32],
-        _conv_w: &[f32], _norm_w: &[f32], _state: &mut [f32], _conv_state: &mut [f32],
-        _d: usize, _kheads: usize, _kd: usize, _vheads: usize, _vd: usize, _kk: usize,
-        _output_gate: i32, _eps: f32,
-    ) -> i32 { 0 }
+        _model_id: u64,
+        _layer: usize,
+        _descs: &mut [MetalWeightDesc<'_>],
+        _x: &[f32],
+        _out: &mut [f32],
+        _a_log: &[f32],
+        _dt_bias: &[f32],
+        _conv_w: &[f32],
+        _norm_w: &[f32],
+        _state: &mut [f32],
+        _conv_state: &mut [f32],
+        _d: usize,
+        _kheads: usize,
+        _kd: usize,
+        _vheads: usize,
+        _vd: usize,
+        _kk: usize,
+        _output_gate: i32,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
     pub fn shared_mxfp4(
-        _model_id: u64, _layer: usize, _descs: &mut [MetalWeightDesc<'_>],
-        _x: &[f32], _out: &mut [f32], _d: usize, _iinter: usize,
-    ) -> Result<Option<()>, ()> { Ok(None) }
+        _model_id: u64,
+        _layer: usize,
+        _descs: &mut [MetalWeightDesc<'_>],
+        _x: &[f32],
+        _out: &mut [f32],
+        _d: usize,
+        _iinter: usize,
+    ) -> Result<Option<()>, ()> {
+        Ok(None)
+    }
     pub fn shared_mxfp4_drop_model(_model_id: u64) {}
 
     pub fn gdn_mxfp4_drop_model(_model_id: u64) {}

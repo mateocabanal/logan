@@ -16,7 +16,7 @@ use crate::{
 
 pub mod machine;
 
-pub use machine::{MachineProfile, metal_available_for};
+pub use machine::{MachineProfile, ane_available_for, metal_available_for};
 
 const TENSOR_HEADER_BYTES: usize = 128;
 

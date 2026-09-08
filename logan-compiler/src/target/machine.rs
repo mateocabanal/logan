@@ -23,6 +23,12 @@ pub struct MachineProfile {
     pub unified_memory: bool,
     /// Metal backend reachable (static OS gate + `COLI_METAL` mirror).
     pub metal_available: bool,
+    /// Private Apple Neural Engine runtime/compiler appears usable on this
+    /// native host. Runtime ABI probing remains authoritative before execution.
+    pub ane_available: bool,
+    /// Metal and ANE can exchange activations through one IOSurface-backed UMA
+    /// allocation without an explicit host copy on this host.
+    pub ane_iosurface_interop: bool,
     /// Apple8/MXFP4 direct-execution ABI available. Mirrors the runtime's
     /// direct-path gate as far as a read-only probe can see (device-level
     /// FFI init is checked again at runtime before execution).
@@ -43,13 +49,23 @@ impl MachineProfile {
         let architecture = std::env::consts::ARCH;
         let coli_metal = std::env::var("COLI_METAL").ok();
         let metal_available = metal_available_for(operating_system, coli_metal.as_deref());
+        let ane_gate = std::env::var("LOGAN_ANE").ok();
+        let ane_available = ane_available_for(
+            operating_system,
+            architecture,
+            ane_gate.as_deref(),
+            private_ane_frameworks_present(),
+        );
+        let unified_memory = operating_system == "macos" && architecture == "aarch64";
         let direct = std::env::var("QWEN_APPLE8_DIRECT").ok();
         MachineProfile {
             operating_system,
             architecture,
             ram_bytes: detect_ram_bytes(),
-            unified_memory: operating_system == "macos" && architecture == "aarch64",
+            unified_memory,
             metal_available,
+            ane_available,
+            ane_iosurface_interop: ane_available && metal_available && unified_memory,
             apple8_abi: Self::apple8_abi_for(
                 operating_system,
                 architecture,
@@ -79,6 +95,35 @@ impl MachineProfile {
 /// macOS can run Metal; `COLI_METAL=0` mirrors the C engine's kill-switch.
 pub fn metal_available_for(operating_system: &str, coli_metal: Option<&str>) -> bool {
     operating_system == "macos" && coli_metal.map(|v| v != "0").unwrap_or(true)
+}
+
+/// Read-only compiler-side ANE gate. The runtime still validates private
+/// classes/selectors/type encodings before executing any ANE island.
+pub fn ane_available_for(
+    operating_system: &str,
+    architecture: &str,
+    logan_ane: Option<&str>,
+    private_frameworks_present: bool,
+) -> bool {
+    operating_system == "macos"
+        && architecture == "aarch64"
+        && private_frameworks_present
+        && logan_ane.map(|v| v != "0").unwrap_or(true)
+}
+
+fn private_ane_frameworks_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        const ANE: &str =
+            "/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine";
+        const COMPILER: &str =
+            "/System/Library/PrivateFrameworks/ANECompiler.framework/ANECompiler";
+        std::path::Path::new(ANE).is_file() && std::path::Path::new(COMPILER).is_file()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// Physical RAM: `RAM_GB` (GiB) env override, else `hw.memsize` on macOS,
@@ -138,6 +183,16 @@ mod tests {
     }
 
     #[test]
+    fn ane_requires_apple_silicon_private_frameworks_and_respects_kill_switch() {
+        assert!(ane_available_for("macos", "aarch64", None, true));
+        assert!(ane_available_for("macos", "aarch64", Some("1"), true));
+        assert!(!ane_available_for("macos", "aarch64", Some("0"), true));
+        assert!(!ane_available_for("macos", "x86_64", None, true));
+        assert!(!ane_available_for("linux", "aarch64", None, true));
+        assert!(!ane_available_for("macos", "aarch64", None, false));
+    }
+
+    #[test]
     fn apple8_abi_requires_macos_aarch64_metal_and_live_direct_path() {
         let ok = |metal: bool, direct: Option<&str>| {
             MachineProfile::apple8_abi_for("macos", "aarch64", metal, direct)
@@ -147,8 +202,12 @@ mod tests {
         // mirrors the runtime direct-path gate exactly
         assert!(!ok(true, Some("0")));
         assert!(!ok(false, None));
-        assert!(!MachineProfile::apple8_abi_for("macos", "x86_64", true, None));
-        assert!(!MachineProfile::apple8_abi_for("linux", "aarch64", true, None));
+        assert!(!MachineProfile::apple8_abi_for(
+            "macos", "x86_64", true, None
+        ));
+        assert!(!MachineProfile::apple8_abi_for(
+            "linux", "aarch64", true, None
+        ));
     }
 
     #[test]
@@ -159,6 +218,10 @@ mod tests {
             machine.operating_system == "macos" && machine.architecture == "aarch64"
         );
         assert_eq!(machine.apple_gpu_family_min, 8);
+        assert_eq!(
+            machine.ane_iosurface_interop,
+            machine.unified_memory && machine.metal_available && machine.ane_available
+        );
         // A machine that passes every static gate reports the Apple8 ABI.
         assert_eq!(
             machine.apple8_abi,

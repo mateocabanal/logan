@@ -334,7 +334,8 @@ fn hash_numerical_policy(h: &mut Sha256, model: &Model) {
     h.update(b"QWEN_GDN_MXFP4_FULL");
     h.update([0]);
     h.update([effective_gdn_mxfp4_full as u8]);
-    let effective_shared_mxfp4_full = model.metal_direct && env_bool("QWEN_SHARED_MXFP4_FULL", true);
+    let effective_shared_mxfp4_full =
+        model.metal_direct && env_bool("QWEN_SHARED_MXFP4_FULL", true);
     h.update(b"QWEN_SHARED_MXFP4_FULL");
     h.update([0]);
     h.update([effective_shared_mxfp4_full as u8]);
@@ -427,6 +428,12 @@ fn validate_key_for_model(model: &Model, key: &PrefixCacheKey) -> Result<(), Str
         return Err("prefix cache key belongs to a different model/numerical policy".into());
     }
     Ok(())
+}
+
+/// Exact payload bytes required to represent the live causal prefix state.
+/// This is a geometry calculation only; it does not copy model state.
+pub fn prefix_state_payload_bytes(model: &Model, prefix_len: usize) -> Result<u64, String> {
+    expected_payload_bytes(model, prefix_len)
 }
 
 fn expected_payload_bytes(model: &Model, prefix_len: usize) -> Result<u64, String> {

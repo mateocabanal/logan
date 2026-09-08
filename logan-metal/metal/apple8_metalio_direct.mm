@@ -399,7 +399,15 @@ static std::mutex g_lock;
 static struct {
     uint64_t encode_ns, submit_ns, wait_ns, kernel_ns;
     uint64_t command_buffers, fused_calls, fused_experts;
+    uint64_t gdn_wait_ns, gdn_kernel_ns, gdn_calls;
+    uint64_t moe_wait_ns, moe_kernel_ns, moe_calls;
 } g_prof;
+
+enum DirectProfileKind {
+    DIRECT_PROFILE_GENERAL = 0,
+    DIRECT_PROFILE_GDN = 1,
+    DIRECT_PROFILE_MOE = 2,
+};
 
 /* Split-phase fused MoE handle. The Objective-C object fields are retained by
  * ARC, so the command buffer and shared output remain alive while the host
@@ -441,16 +449,28 @@ static void profile_completed_locked(id<MTLCommandBuffer> cb,
                                      uint64_t encode_ns,
                                      uint64_t submit_ns,
                                      uint64_t wait_ns,
-                                     int fused_experts) {
+                                     int fused_experts,
+                                     DirectProfileKind kind) {
+    uint64_t kernel_ns = 0;
+    if (cb.GPUEndTime > cb.GPUStartTime && cb.GPUStartTime > 0.0)
+        kernel_ns = (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1.0e9);
     g_prof.encode_ns += encode_ns;
     g_prof.submit_ns += submit_ns;
     g_prof.wait_ns += wait_ns;
+    g_prof.kernel_ns += kernel_ns;
     g_prof.command_buffers++;
-    if (cb.GPUEndTime > cb.GPUStartTime && cb.GPUStartTime > 0.0)
-        g_prof.kernel_ns += (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1.0e9);
     if (fused_experts > 0) {
         g_prof.fused_calls++;
         g_prof.fused_experts += (uint64_t)fused_experts;
+    }
+    if (kind == DIRECT_PROFILE_GDN) {
+        g_prof.gdn_wait_ns += wait_ns;
+        g_prof.gdn_kernel_ns += kernel_ns;
+        g_prof.gdn_calls++;
+    } else if (kind == DIRECT_PROFILE_MOE) {
+        g_prof.moe_wait_ns += wait_ns;
+        g_prof.moe_kernel_ns += kernel_ns;
+        g_prof.moe_calls++;
     }
 }
 
@@ -551,15 +571,26 @@ inline float qwen_gdn_bf16_dot_lane(device const ushort *wr,
                                     device const float *x,
                                     int I,
                                     uint lane) {
+    // Match the proven generic mm_gemv BF16 access pattern: each lane owns
+    // one 8-element chunk per SIMD-width stride, using vector loads for both
+    // weights and activations. Qwen3.8's D=2560 and vdim=6144 are divisible
+    // by 8, while the scalar tail keeps the helper general.
+    device const ushort4 *w4 = (device const ushort4 *)wr;
+    device const float4 *x4 = (device const float4 *)x;
+    const int I8 = (I & 7) ? 0 : (I / 8);
     float acc = 0.0f;
-    int i = (int)lane;
-    for (; i + 96 < I; i += 128) {
-        acc += x[i + 0]  * qwen_bf16(wr, i + 0);
-        acc += x[i + 32] * qwen_bf16(wr, i + 32);
-        acc += x[i + 64] * qwen_bf16(wr, i + 64);
-        acc += x[i + 96] * qwen_bf16(wr, i + 96);
+    for (int c = (int)lane; c < I8; c += 32) {
+        const ushort4 a = w4[2 * c];
+        const ushort4 b = w4[2 * c + 1];
+        const float4 w0 = float4(
+            as_type<float>((uint)a.x << 16), as_type<float>((uint)a.y << 16),
+            as_type<float>((uint)a.z << 16), as_type<float>((uint)a.w << 16));
+        const float4 w1 = float4(
+            as_type<float>((uint)b.x << 16), as_type<float>((uint)b.y << 16),
+            as_type<float>((uint)b.z << 16), as_type<float>((uint)b.w << 16));
+        acc += dot(w0, x4[2 * c]) + dot(w1, x4[2 * c + 1]);
     }
-    for (; i < I; i += 32)
+    for (int i = I8 * 8 + (int)lane; i < I; i += 32)
         acc += x[i] * qwen_bf16(wr, i);
     return acc;
 }
@@ -584,7 +615,6 @@ kernel void qwen_gdn_input_bf16(
     uint tg                   [[threadgroup_position_in_grid]],
     uint tid                  [[thread_index_in_threadgroup]])
 {
-    threadgroup float partial[QWEN_GDN_DOT_THREADS];
     const uint row_slot = tid / QWEN_GDN_DOT_LANES;
     const uint lane = tid - row_slot * QWEN_GDN_DOT_LANES;
     const uint row = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
@@ -610,14 +640,8 @@ kernel void qwen_gdn_input_bf16(
         }
         acc = qwen_gdn_bf16_dot_lane(w + (long)o * D, x, D, lane);
     }
-    partial[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (row < total && lane == 0) {
-        float sum = 0.0f;
-        const uint pb = row_slot * QWEN_GDN_DOT_LANES;
-        for (uint p = 0; p < QWEN_GDN_DOT_LANES; ++p) sum += partial[pb + p];
-        dst[o] = sum;
-    }
+    acc = simd_sum(acc);
+    if (row < total && lane == 0) dst[o] = acc;
 }
 
 inline float qwen_gdn_conv_one(
@@ -779,21 +803,14 @@ kernel void qwen_gdn_output_bf16(
     uint tg                      [[threadgroup_position_in_grid]],
     uint tid                     [[thread_index_in_threadgroup]])
 {
-    threadgroup float partial[QWEN_GDN_DOT_THREADS];
     const uint row_slot = tid / QWEN_GDN_DOT_LANES;
     const uint lane = tid - row_slot * QWEN_GDN_DOT_LANES;
     const uint o = tg * QWEN_GDN_ROWS_PER_TG + row_slot;
     float acc = 0.0f;
     if (o < (uint)O)
         acc = qwen_gdn_bf16_dot_lane(w + (long)o * I, x, I, lane);
-    partial[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (o < (uint)O && lane == 0) {
-        float sum = 0.0f;
-        const uint pb = row_slot * QWEN_GDN_DOT_LANES;
-        for (uint p = 0; p < QWEN_GDN_DOT_LANES; ++p) sum += partial[pb + p];
-        out[o] = sum;
-    }
+    acc = simd_sum(acc);
+    if (o < (uint)O && lane == 0) out[o] = acc;
 }
 )METAL";
 
@@ -813,6 +830,21 @@ struct QwenGdnMetalLayer {
     id<MTLBuffer> xb = nil, outb = nil;
     id<MTLBuffer> qkv = nil, z = nil, a = nil, b = nil, normed = nil;
     int D = 0, kheads = 0, kd = 0, vheads = 0, vd = 0, kk = 0;
+    bool in_use = false;
+};
+
+/* Split-phase GDN handle. begin() owns one layer scratch lease until finish()
+ * or discard() retires the command. Strong Objective-C references keep the
+ * command buffer/output alive while the CPU performs independent MetalIO. */
+struct Apple8GdnPending {
+    id<MTLCommandBuffer> cb = nil;
+    id<MTLBuffer> outb = nil;
+    QwenGdnMetalLayer *ctx = nullptr;
+    size_t out_bytes = 0;
+    int layer = -1;
+    NSUInteger input_rows = 0;
+    uint64_t encode_ns = 0;
+    uint64_t submit_ns = 0;
 };
 static std::vector<QwenGdnMetalLayer *> g_gdn_layers;
 
@@ -821,12 +853,17 @@ static size_t qwen_gdn_round_page(size_t bytes) {
     return (bytes + 16383u) & ~(size_t)16383u;
 }
 
-static id<MTLBuffer> qwen_gdn_wrap_nocopy_locked(const void *ptr, size_t bytes) {
+static id<MTLBuffer> qwen_gdn_wrap_nocopy_locked(const void *ptr, size_t bytes,
+                                                       bool immutable_weight) {
     const size_t rounded = qwen_gdn_round_page(bytes);
     if (!g_device || !ptr || !rounded || (((uintptr_t)ptr) & 16383u) != 0) return nil;
+    MTLResourceOptions options = MTLResourceStorageModeShared;
+    const char *untracked = getenv("QWEN_GDN_UNTRACKED_WEIGHTS");
+    if (immutable_weight && untracked && atoi(untracked) != 0)
+        options |= MTLResourceHazardTrackingModeUntracked;
     return [g_device newBufferWithBytesNoCopy:(void *)ptr
                                        length:rounded
-                                      options:MTLResourceStorageModeShared
+                                      options:options
                                   deallocator:nil];
 }
 
@@ -944,13 +981,13 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
     ctx->host_state = state; ctx->host_conv_state = conv_state;
     ctx->D = D; ctx->kheads = kheads; ctx->kd = kd;
     ctx->vheads = vheads; ctx->vd = vd; ctx->kk = kk;
-    ctx->wqkv = qwen_gdn_wrap_nocopy_locked(wqkv, wqkv_b);
-    ctx->wz = qwen_gdn_wrap_nocopy_locked(wz, wz_b);
-    ctx->wa = qwen_gdn_wrap_nocopy_locked(wa, wa_b);
-    ctx->wb = qwen_gdn_wrap_nocopy_locked(wb, wb_b);
-    ctx->wout = qwen_gdn_wrap_nocopy_locked(wout, wout_b);
-    ctx->state = qwen_gdn_wrap_nocopy_locked(state, state_b);
-    if (kk > 1) ctx->conv_state = qwen_gdn_wrap_nocopy_locked(conv_state, conv_state_b);
+    ctx->wqkv = qwen_gdn_wrap_nocopy_locked(wqkv, wqkv_b, true);
+    ctx->wz = qwen_gdn_wrap_nocopy_locked(wz, wz_b, true);
+    ctx->wa = qwen_gdn_wrap_nocopy_locked(wa, wa_b, true);
+    ctx->wb = qwen_gdn_wrap_nocopy_locked(wb, wb_b, true);
+    ctx->wout = qwen_gdn_wrap_nocopy_locked(wout, wout_b, true);
+    ctx->state = qwen_gdn_wrap_nocopy_locked(state, state_b, false);
+    if (kk > 1) ctx->conv_state = qwen_gdn_wrap_nocopy_locked(conv_state, conv_state_b, false);
     else ctx->conv_state = [g_device newBufferWithLength:sizeof(float)
                                                 options:MTLResourceStorageModeShared];
     ctx->A_log = [g_device newBufferWithBytes:A_log
@@ -1007,21 +1044,25 @@ extern "C" void coli_apple8_metalio_gdn_drop_model(uint64_t model_id) {
     }
 }
 
-extern "C" int coli_apple8_metalio_gdn_token(
-    uint64_t model_id, int layer, const float *x, float *out,
+extern "C" int coli_apple8_metalio_gdn_begin(
+    uint64_t model_id, int layer, const float *x,
     const uint16_t *wqkv, const uint16_t *wz,
     const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
     const float *A_log, const float *dt_bias,
     const float *conv_w, const float *norm_w,
     float *state, float *conv_state,
-    int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps)
+    int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps,
+    void **pending_out)
 {
-    if (!x || !out || !(eps > 0.0f)) return 0;
+    if (!pending_out) return 0;
+    *pending_out = nullptr;
+    if (!x || !(eps > 0.0f)) return 0;
+
     std::lock_guard<std::mutex> guard(g_lock);
     QwenGdnMetalLayer *ctx = qwen_gdn_layer_locked(
         model_id, layer, wqkv, wz, wa, wb, wout, A_log, dt_bias, conv_w, norm_w,
         state, conv_state, D, kheads, kd, vheads, vd, kk);
-    if (!ctx || !g_queue || !g_device) return 0;
+    if (!ctx || !g_queue || !g_device || ctx->in_use) return 0;
 
     const int kdim = kheads * kd;
     const int vdim = vheads * vd;
@@ -1032,91 +1073,174 @@ extern "C" int coli_apple8_metalio_gdn_token(
                                       3u * (NSUInteger)rep + 3u;
     memcpy(ctx->xb.contents, x, (size_t)D * sizeof(float));
 
+    Apple8GdnPending *pending = new (std::nothrow) Apple8GdnPending();
+    if (!pending) return 0;
     uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    if (!cb) return 0;
+    if (!cb) { delete pending; return 0; }
 
-    id<MTLComputeCommandEncoder> inp = [cb computeCommandEncoder];
-    if (!inp) return 0;
-    [inp setComputePipelineState:g_gdn_input_pipeline];
-    [inp setBuffer:ctx->wqkv offset:0 atIndex:0];
-    [inp setBuffer:ctx->wz offset:0 atIndex:1];
-    [inp setBuffer:ctx->wa offset:0 atIndex:2];
-    [inp setBuffer:ctx->wb offset:0 atIndex:3];
-    [inp setBuffer:ctx->xb offset:0 atIndex:4];
-    [inp setBuffer:ctx->qkv offset:0 atIndex:5];
-    [inp setBuffer:ctx->z offset:0 atIndex:6];
-    [inp setBuffer:ctx->a offset:0 atIndex:7];
-    [inp setBuffer:ctx->b offset:0 atIndex:8];
-    [inp setBytes:&D length:sizeof(D) atIndex:9];
-    [inp setBytes:&C length:sizeof(C) atIndex:10];
-    [inp setBytes:&vdim length:sizeof(vdim) atIndex:11];
-    [inp setBytes:&vheads length:sizeof(vheads) atIndex:12];
     const NSUInteger input_rows = (NSUInteger)C + (NSUInteger)vdim +
                                   2u * (NSUInteger)vheads;
-    [inp dispatchThreadgroups:MTLSizeMake((input_rows + 7u) / 8u, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [inp endEncoding];
+    auto encode_input = [&](id<MTLComputeCommandEncoder> e) {
+        [e setComputePipelineState:g_gdn_input_pipeline];
+        [e setBuffer:ctx->wqkv offset:0 atIndex:0];
+        [e setBuffer:ctx->wz offset:0 atIndex:1];
+        [e setBuffer:ctx->wa offset:0 atIndex:2];
+        [e setBuffer:ctx->wb offset:0 atIndex:3];
+        [e setBuffer:ctx->xb offset:0 atIndex:4];
+        [e setBuffer:ctx->qkv offset:0 atIndex:5];
+        [e setBuffer:ctx->z offset:0 atIndex:6];
+        [e setBuffer:ctx->a offset:0 atIndex:7];
+        [e setBuffer:ctx->b offset:0 atIndex:8];
+        [e setBytes:&D length:sizeof(D) atIndex:9];
+        [e setBytes:&C length:sizeof(C) atIndex:10];
+        [e setBytes:&vdim length:sizeof(vdim) atIndex:11];
+        [e setBytes:&vheads length:sizeof(vheads) atIndex:12];
+        [e dispatchThreadgroups:MTLSizeMake((input_rows + 7u) / 8u, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
+    auto encode_recur = [&](id<MTLComputeCommandEncoder> e) {
+        [e setComputePipelineState:g_gdn_recur_pipeline];
+        [e setBuffer:ctx->qkv offset:0 atIndex:0];
+        [e setBuffer:ctx->conv_w offset:0 atIndex:1];
+        [e setBuffer:ctx->conv_state offset:0 atIndex:2];
+        [e setBuffer:ctx->a offset:0 atIndex:3];
+        [e setBuffer:ctx->b offset:0 atIndex:4];
+        [e setBuffer:ctx->z offset:0 atIndex:5];
+        [e setBuffer:ctx->A_log offset:0 atIndex:6];
+        [e setBuffer:ctx->dt_bias offset:0 atIndex:7];
+        [e setBuffer:ctx->norm_w offset:0 atIndex:8];
+        [e setBuffer:ctx->state offset:0 atIndex:9];
+        [e setBuffer:ctx->normed offset:0 atIndex:10];
+        [e setBytes:&kheads length:sizeof(kheads) atIndex:11];
+        [e setBytes:&kd length:sizeof(kd) atIndex:12];
+        [e setBytes:&vheads length:sizeof(vheads) atIndex:13];
+        [e setBytes:&vd length:sizeof(vd) atIndex:14];
+        [e setBytes:&kk length:sizeof(kk) atIndex:15];
+        [e setBytes:&eps length:sizeof(eps) atIndex:16];
+        [e setBytes:&output_gate length:sizeof(output_gate) atIndex:17];
+        [e setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)kheads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(recur_threads, 1, 1)];
+    };
+    auto encode_output = [&](id<MTLComputeCommandEncoder> e) {
+        [e setComputePipelineState:g_gdn_output_pipeline];
+        [e setBuffer:ctx->wout offset:0 atIndex:0];
+        [e setBuffer:ctx->normed offset:0 atIndex:1];
+        [e setBuffer:ctx->outb offset:0 atIndex:2];
+        [e setBytes:&vdim length:sizeof(vdim) atIndex:3];
+        [e setBytes:&D length:sizeof(D) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)D + 7u) / 8u, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    };
 
-    id<MTLComputeCommandEncoder> rec = [cb computeCommandEncoder];
-    if (!rec) return 0;
-    [rec setComputePipelineState:g_gdn_recur_pipeline];
-    [rec setBuffer:ctx->qkv offset:0 atIndex:0];
-    [rec setBuffer:ctx->conv_w offset:0 atIndex:1];
-    [rec setBuffer:ctx->conv_state offset:0 atIndex:2];
-    [rec setBuffer:ctx->a offset:0 atIndex:3];
-    [rec setBuffer:ctx->b offset:0 atIndex:4];
-    [rec setBuffer:ctx->z offset:0 atIndex:5];
-    [rec setBuffer:ctx->A_log offset:0 atIndex:6];
-    [rec setBuffer:ctx->dt_bias offset:0 atIndex:7];
-    [rec setBuffer:ctx->norm_w offset:0 atIndex:8];
-    [rec setBuffer:ctx->state offset:0 atIndex:9];
-    [rec setBuffer:ctx->normed offset:0 atIndex:10];
-    [rec setBytes:&kheads length:sizeof(kheads) atIndex:11];
-    [rec setBytes:&kd length:sizeof(kd) atIndex:12];
-    [rec setBytes:&vheads length:sizeof(vheads) atIndex:13];
-    [rec setBytes:&vd length:sizeof(vd) atIndex:14];
-    [rec setBytes:&kk length:sizeof(kk) atIndex:15];
-    [rec setBytes:&eps length:sizeof(eps) atIndex:16];
-    [rec setBytes:&output_gate length:sizeof(output_gate) atIndex:17];
-    [rec setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
-    [rec dispatchThreadgroups:MTLSizeMake((NSUInteger)kheads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(recur_threads, 1, 1)];
-    [rec endEncoding];
+    const char *single_env = getenv("QWEN_GDN_SINGLE_ENCODER");
+    // One encoder + explicit buffer barriers is materially cheaper than three
+    // encoder boundaries on Apple Silicon. Default ON; keep an opt-out for
+    // regression bisects and older-driver qualification.
+    const bool single_encoder = !single_env || atoi(single_env) != 0;
+    if (single_encoder) {
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        if (!e) { delete pending; return 0; }
+        encode_input(e);
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        encode_recur(e);
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        encode_output(e);
+        [e endEncoding];
+    } else {
+        id<MTLComputeCommandEncoder> inp = [cb computeCommandEncoder];
+        if (!inp) { delete pending; return 0; }
+        encode_input(inp);
+        [inp endEncoding];
 
-    id<MTLComputeCommandEncoder> op = [cb computeCommandEncoder];
-    if (!op) return 0;
-    [op setComputePipelineState:g_gdn_output_pipeline];
-    [op setBuffer:ctx->wout offset:0 atIndex:0];
-    [op setBuffer:ctx->normed offset:0 atIndex:1];
-    [op setBuffer:ctx->outb offset:0 atIndex:2];
-    [op setBytes:&vdim length:sizeof(vdim) atIndex:3];
-    [op setBytes:&D length:sizeof(D) atIndex:4];
-    [op dispatchThreadgroups:MTLSizeMake(((NSUInteger)D + 7u) / 8u, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [op endEncoding];
+        id<MTLComputeCommandEncoder> rec = [cb computeCommandEncoder];
+        if (!rec) { delete pending; return 0; }
+        encode_recur(rec);
+        [rec endEncoding];
+
+        id<MTLComputeCommandEncoder> op = [cb computeCommandEncoder];
+        if (!op) { delete pending; return 0; }
+        encode_output(op);
+        [op endEncoding];
+    }
 
     const uint64_t encode_ns = direct_now_ns() - encode_begin;
     const uint64_t submit_begin = direct_now_ns();
+    ctx->in_use = true;
     [cb commit];
     const uint64_t submit_ns = direct_now_ns() - submit_begin;
-    const uint64_t wait_begin = direct_now_ns();
-    [cb waitUntilCompleted];
-    const uint64_t wait_ns = direct_now_ns() - wait_begin;
-    if (cb.status != MTLCommandBufferStatusCompleted) {
-        fprintf(stderr, "[qwen-gdn-metal] command failed after submission: %s\n",
-                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
-        return -1;
-    }
-    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
-    memcpy(out, ctx->outb.contents, (size_t)D * sizeof(float));
-    if (getenv("QWEN_GDN_DEBUG")) {
-        const double t_total = (double)(direct_now_ns() - encode_begin) / 1.0e6;
-        fprintf(stderr, "[qwen-gdn-metal] layer=%d rows=%d enc=%.2fms sub=%.2fms wait=%.2fms tot=%.2fms\n",
-                layer, input_rows, (double)encode_ns / 1.0e6, (double)submit_ns / 1.0e6,
-                (double)wait_ns / 1.0e6, t_total);
-    }
+
+    pending->cb = cb;
+    pending->outb = ctx->outb;
+    pending->ctx = ctx;
+    pending->out_bytes = (size_t)D * sizeof(float);
+    pending->layer = layer;
+    pending->input_rows = input_rows;
+    pending->encode_ns = encode_ns;
+    pending->submit_ns = submit_ns;
+    *pending_out = pending;
     return 1;
+}
+
+static int apple8_gdn_pending_retire(Apple8GdnPending *pending, float *out) {
+    if (!pending) return 0;
+    const uint64_t wait_begin = direct_now_ns();
+    [pending->cb waitUntilCompleted];
+    const uint64_t wait_ns = direct_now_ns() - wait_begin;
+    const int ok = pending->cb.status == MTLCommandBufferStatusCompleted;
+    if (ok && out) memcpy(out, pending->outb.contents, pending->out_bytes);
+
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        if (ok)
+            profile_completed_locked(pending->cb, pending->encode_ns,
+                                     pending->submit_ns, wait_ns, 0, DIRECT_PROFILE_GDN);
+        if (pending->ctx) pending->ctx->in_use = false;
+    }
+    if (!ok) {
+        fprintf(stderr, "[qwen-gdn-metal] command failed after submission: %s\n",
+                pending->cb.error ? pending->cb.error.localizedDescription.UTF8String : "unknown");
+    }
+    const char *gdn_debug = getenv("QWEN_GDN_DEBUG");
+    if (gdn_debug && atoi(gdn_debug) != 0) {
+        fprintf(stderr, "[qwen-gdn-metal] layer=%d rows=%lu enc=%.2fms sub=%.2fms wait=%.2fms\n",
+                pending->layer, (unsigned long)pending->input_rows,
+                (double)pending->encode_ns / 1.0e6,
+                (double)pending->submit_ns / 1.0e6,
+                (double)wait_ns / 1.0e6);
+    }
+    delete pending;
+    return ok ? 1 : -1;
+}
+
+extern "C" int coli_apple8_metalio_gdn_finish(void *opaque, float *out) {
+    if (!opaque || !out) return 0;
+    return apple8_gdn_pending_retire(static_cast<Apple8GdnPending *>(opaque), out);
+}
+
+extern "C" void coli_apple8_metalio_gdn_discard(void *opaque) {
+    if (!opaque) return;
+    (void)apple8_gdn_pending_retire(static_cast<Apple8GdnPending *>(opaque), nullptr);
+}
+
+extern "C" int coli_apple8_metalio_gdn_token(
+    uint64_t model_id, int layer, const float *x, float *out,
+    const uint16_t *wqkv, const uint16_t *wz,
+    const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
+    const float *A_log, const float *dt_bias,
+    const float *conv_w, const float *norm_w,
+    float *state, float *conv_state,
+    int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps)
+{
+    if (!out) return 0;
+    void *pending = nullptr;
+    if (!coli_apple8_metalio_gdn_begin(
+            model_id, layer, x, wqkv, wz, wa, wb, wout,
+            A_log, dt_bias, conv_w, norm_w, state, conv_state,
+            D, kheads, kd, vheads, vd, kk, output_gate, eps, &pending))
+        return 0;
+    return coli_apple8_metalio_gdn_finish(pending, out);
 }
 
 extern "C" int coli_apple8_metalio_direct_init(void) {
@@ -1200,6 +1324,18 @@ extern "C" void coli_apple8_metalio_profile_get(uint64_t *encode_ns,
     if (fused_experts) *fused_experts = g_prof.fused_experts;
 }
 
+extern "C" void coli_apple8_metalio_profile_detail_get(
+    uint64_t *gdn_wait_ns, uint64_t *gdn_kernel_ns, uint64_t *gdn_calls,
+    uint64_t *moe_wait_ns, uint64_t *moe_kernel_ns, uint64_t *moe_calls) {
+    std::lock_guard<std::mutex> guard(g_lock);
+    if (gdn_wait_ns) *gdn_wait_ns = g_prof.gdn_wait_ns;
+    if (gdn_kernel_ns) *gdn_kernel_ns = g_prof.gdn_kernel_ns;
+    if (gdn_calls) *gdn_calls = g_prof.gdn_calls;
+    if (moe_wait_ns) *moe_wait_ns = g_prof.moe_wait_ns;
+    if (moe_kernel_ns) *moe_kernel_ns = g_prof.moe_kernel_ns;
+    if (moe_calls) *moe_calls = g_prof.moe_calls;
+}
+
 static id<MTLBuffer> slot_buffer_locked(int slot, size_t *slot_bytes_out) {
     void *opaque = metalio_slot_native_buffer(slot);
     if (!opaque) return nil;
@@ -1281,7 +1417,7 @@ extern "C" int coli_apple8_metalio_matmul_slot(int slot,
                 cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
         return 0;
     }
-    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0, DIRECT_PROFILE_GENERAL);
     memcpy(y, yb.contents, y_bytes);
     metalio_slot_consumed(slot);
     return 1;
@@ -1340,7 +1476,7 @@ extern "C" int coli_apple8_metalio_bf16_matmul(
                 cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
         return -1;
     }
-    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0, DIRECT_PROFILE_GENERAL);
     memcpy(y, yb.contents, y_bytes);
     return 1;
 }
@@ -1426,7 +1562,7 @@ extern "C" int coli_apple8_metalio_swiglu_slot(int slot,
                 cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
         return 0;
     }
-    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0);
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, 0, DIRECT_PROFILE_GENERAL);
     memcpy(y, yb.contents, y_bytes);
     metalio_slot_consumed(slot);
     return 1;
@@ -1542,7 +1678,7 @@ extern "C" int coli_apple8_metalio_moe_rows(
                 cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
         return 0;
     }
-    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, expert_count);
+    profile_completed_locked(cb, encode_ns, submit_ns, wait_ns, expert_count, DIRECT_PROFILE_MOE);
     memcpy(y, yb.contents, y_bytes);
     for (int e = 0; e < expert_count; ++e)
         metalio_slot_consumed(experts[e].slot);
@@ -1738,7 +1874,7 @@ static int apple8_moe_pending_retire(Apple8MoePending *pending, float *y) {
         if (ok)
             profile_completed_locked(pending->cb, pending->encode_ns,
                                      pending->submit_ns, wait_ns,
-                                     pending->expert_count);
+                                     pending->expert_count, DIRECT_PROFILE_MOE);
         for (int i = 0; i < pending->expert_count; ++i)
             metalio_slot_consumed(pending->slots[i]);
         g_moe_scratch.in_use = false;

@@ -8,5 +8,6 @@
 pub mod expert;
 pub mod math;
 pub mod sched;
+pub mod shared;
 pub mod storage;
 pub mod telemetry;

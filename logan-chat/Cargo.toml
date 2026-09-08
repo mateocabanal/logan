@@ -8,9 +8,18 @@ license.workspace = true
 name = "logan-chat"
 path = "src/main.rs"
 
+[[bin]]
+name = "logand"
+path = "src/bin/logand.rs"
+
 [dependencies]
 logan-qwen4 = { path = "../logan-qwen4" }
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokenizers = "0.23.1"
 libc = "0.2"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-stream = "0.1"

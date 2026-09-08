@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use logan_qwen4::colisource::ColiSource;
 use logan_qwen4::plan::prefix_runtime::{
     apply_max_performance_defaults, persist_prefix_boundary, restore_longest_prefix,
 };
-use logan_qwen4::plan::{RuntimeFeatures, RuntimeStats};
-use logan_qwen4::{load_cfg, Cfg, Model};
+use logan_qwen4::plan::{QwenStateSnapshot, RuntimeFeatures, RuntimeStats};
+use logan_qwen4::{Cfg, Model, load_cfg};
 use tokenizers::Tokenizer;
 
 /// Qwen3.8-Flash-Next's official non-thinking assistant generation prefix.
@@ -17,8 +17,7 @@ use tokenizers::Tokenizer;
 /// The model's chat template does not start generation directly after
 /// `<|im_start|>assistant\n`. Even with thinking disabled it emits an empty
 /// think block first.
-const ASSISTANT_NON_THINKING_PREFIX: &str =
-    "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const ASSISTANT_NON_THINKING_PREFIX: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
 #[derive(Clone, Debug)]
 pub struct GenerationSettings {
@@ -67,7 +66,10 @@ pub struct TurnMetrics {
     pub input_tokens: usize,
     pub forwarded_prompt_tokens: usize,
     pub live_reused_tokens: usize,
+    pub ram_cached_tokens: usize,
     pub ssd_cached_tokens: usize,
+    pub ram_cache_restore_ms: f64,
+    pub ram_cache_write_ms: f64,
     pub cache_restore_ms: f64,
     pub cache_write_ms: f64,
     pub prompt_ms: f64,
@@ -77,6 +79,13 @@ pub struct TurnMetrics {
     pub generated_tokens: usize,
     pub forward_tokens: usize,
     pub context_tokens: usize,
+    /// Exact bytes held by reusable in-RAM prefix snapshots.
+    pub hot_cache_bytes: u64,
+    pub hot_cache_entries: usize,
+    pub hot_cache_tokens: usize,
+    /// Exact payload bytes represented by the currently active causal state.
+    /// This excludes model weights and allocator/container overhead.
+    pub active_state_bytes: u64,
     pub stop_reason: Option<StopReason>,
 }
 
@@ -88,6 +97,12 @@ pub enum EngineCommand {
     },
     Reset {
         system_prompt: String,
+    },
+    ClearHot,
+    Complete {
+        prompt: String,
+        settings: GenerationSettings,
+        updates: mpsc::Sender<CompletionUpdate>,
     },
     Shutdown,
 }
@@ -120,6 +135,25 @@ pub enum EngineEvent {
     Error(String),
 }
 
+#[derive(Clone, Debug)]
+pub enum CompletionUpdate {
+    Started {
+        metrics: TurnMetrics,
+    },
+    Token {
+        chunk: String,
+        token_id: u32,
+        metrics: TurnMetrics,
+        stats: RuntimeStats,
+    },
+    Done {
+        text: String,
+        metrics: TurnMetrics,
+        stats: RuntimeStats,
+    },
+    Error(String),
+}
+
 pub struct EngineHandle {
     pub tx: mpsc::Sender<EngineCommand>,
     pub rx: mpsc::Receiver<EngineEvent>,
@@ -133,38 +167,83 @@ pub fn spawn(package: PathBuf, system_prompt: String) -> EngineHandle {
     let worker_cancel = Arc::clone(&cancel);
 
     std::thread::spawn(move || {
-        let mut worker = match ChatWorker::load(package, system_prompt, &event_tx) {
-            Ok(worker) => worker,
-            Err(error) => {
-                let _ = event_tx.send(EngineEvent::Error(error));
-                return;
-            }
-        };
-
-        while let Ok(command) = cmd_rx.recv() {
-            match command {
-                EngineCommand::Send { text, settings } => {
-                    worker_cancel.store(false, Ordering::Relaxed);
-                    if let Err(error) =
-                        worker.run_turn(&text, &settings, &worker_cancel, &event_tx)
-                    {
-                        let _ = event_tx.send(EngineEvent::Error(error));
-                    }
+        let panic_events = event_tx.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut worker = match ChatWorker::load(package, system_prompt, &event_tx) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    let _ = event_tx.send(EngineEvent::Error(error));
+                    return;
                 }
-                EngineCommand::Reset { system_prompt } => {
-                    worker_cancel.store(true, Ordering::Relaxed);
-                    let _ = event_tx.send(EngineEvent::Loading("resetting model state".into()));
-                    match worker.reset(system_prompt) {
-                        Ok(()) => {
-                            let _ = event_tx.send(EngineEvent::ResetDone);
-                        }
-                        Err(error) => {
+            };
+
+            while let Ok(command) = cmd_rx.recv() {
+                match command {
+                    EngineCommand::Send { text, settings } => {
+                        worker_cancel.store(false, Ordering::Relaxed);
+                        if let Err(error) =
+                            worker.run_turn(&text, &settings, &worker_cancel, &event_tx)
+                        {
                             let _ = event_tx.send(EngineEvent::Error(error));
                         }
                     }
+                    EngineCommand::Reset { system_prompt } => {
+                        worker_cancel.store(true, Ordering::Relaxed);
+                        let _ = event_tx.send(EngineEvent::Loading("resetting model state".into()));
+                        match worker.reset(system_prompt) {
+                            Ok(()) => {
+                                let _ = event_tx.send(EngineEvent::ResetDone);
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(EngineEvent::Error(error));
+                            }
+                        }
+                    }
+                    EngineCommand::ClearHot => {
+                        worker_cancel.store(true, Ordering::Relaxed);
+                        worker.hot_cache.clear();
+                        let system_prompt = worker.system_prompt.clone();
+                        let _ =
+                            event_tx.send(EngineEvent::Loading("clearing RAM prefix cache".into()));
+                        match worker.reset(system_prompt) {
+                            Ok(()) => {
+                                let _ = event_tx.send(EngineEvent::ResetDone);
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(EngineEvent::Error(error));
+                            }
+                        }
+                    }
+                    EngineCommand::Complete {
+                        prompt,
+                        settings,
+                        updates,
+                    } => {
+                        worker_cancel.store(false, Ordering::Relaxed);
+                        if let Err(error) = worker.run_prompt(
+                            &prompt,
+                            &settings,
+                            &worker_cancel,
+                            &event_tx,
+                            &updates,
+                        ) {
+                            let _ = updates.send(CompletionUpdate::Error(error.clone()));
+                            let _ = event_tx.send(EngineEvent::Error(error));
+                        }
+                    }
+                    EngineCommand::Shutdown => break,
                 }
-                EngineCommand::Shutdown => break,
             }
+        }));
+        if let Err(payload) = result {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown worker panic".into());
+            let _ = panic_events.send(EngineEvent::Error(format!(
+                "inference worker panicked: {message}"
+            )));
         }
     });
 
@@ -175,10 +254,160 @@ pub fn spawn(package: PathBuf, system_prompt: String) -> EngineHandle {
     }
 }
 
+struct HotPrefixEntry {
+    tokens: Vec<u32>,
+    snapshot: QwenStateSnapshot,
+    /// Logits emitted by the final cached token. Keeping these in RAM lets
+    /// an exact prompt hit resume decode without replaying a boundary token.
+    last_logits: Vec<f32>,
+    bytes: u64,
+    last_used: u64,
+}
+
+struct HotPrefixCache {
+    entries: Vec<HotPrefixEntry>,
+    bytes: u64,
+    budget: u64,
+    clock: u64,
+}
+
+struct HotRestoreStats {
+    cached_tokens: usize,
+    restore_ms: f64,
+    last_logits: Vec<f32>,
+}
+
+struct HotWriteStats {
+    write_ms: f64,
+}
+
+impl HotPrefixCache {
+    fn from_env() -> Self {
+        const DEFAULT_BUDGET: u64 = 512 * 1024 * 1024;
+        let budget = std::env::var("LOGAN_HOT_PREFIX_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .or_else(|| {
+                std::env::var("LOGAN_HOT_PREFIX_CACHE_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|mb| mb.saturating_mul(1024 * 1024))
+            })
+            .unwrap_or(DEFAULT_BUDGET);
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            budget,
+            clock: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+        self.clock = 0;
+    }
+
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn cached_tokens(&self) -> usize {
+        self.entries
+            .iter()
+            .fold(0usize, |sum, entry| sum.saturating_add(entry.tokens.len()))
+    }
+
+    fn restore_longest(
+        &mut self,
+        model: &mut Model,
+        prompt: &[u32],
+    ) -> Result<Option<HotRestoreStats>, String> {
+        let Some(index) = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.tokens.len() <= prompt.len() && prompt.starts_with(&entry.tokens)
+            })
+            .max_by_key(|(_, entry)| entry.tokens.len())
+            .map(|(index, _)| index)
+        else {
+            return Ok(None);
+        };
+
+        let started = Instant::now();
+        model.restore_state(&self.entries[index].snapshot)?;
+        let restore_ms = started.elapsed().as_secs_f64() * 1e3;
+        self.clock = self.clock.wrapping_add(1);
+        self.entries[index].last_used = self.clock;
+        Ok(Some(HotRestoreStats {
+            cached_tokens: self.entries[index].tokens.len(),
+            restore_ms,
+            last_logits: self.entries[index].last_logits.clone(),
+        }))
+    }
+
+    fn insert(
+        &mut self,
+        model: &Model,
+        tokens: &[u32],
+        last_logits: &[f32],
+    ) -> Result<Option<HotWriteStats>, String> {
+        if self.budget == 0 || tokens.is_empty() || last_logits.is_empty() {
+            return Ok(None);
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.tokens == tokens) {
+            self.clock = self.clock.wrapping_add(1);
+            self.entries[index].last_used = self.clock;
+            return Ok(None);
+        }
+
+        let started = Instant::now();
+        let snapshot = model.snapshot_state(tokens.len())?;
+        let bytes = (snapshot.payload_bytes() as u64)
+            .saturating_add((last_logits.len() as u64).saturating_mul(4))
+            .saturating_add((tokens.len() as u64).saturating_mul(4));
+        if bytes > self.budget {
+            return Ok(None);
+        }
+
+        while self.bytes.saturating_add(bytes) > self.budget && !self.entries.is_empty() {
+            let lru = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .unwrap();
+            let evicted = self.entries.swap_remove(lru);
+            self.bytes = self.bytes.saturating_sub(evicted.bytes);
+        }
+
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.push(HotPrefixEntry {
+            tokens: tokens.to_vec(),
+            snapshot,
+            last_logits: last_logits.to_vec(),
+            bytes,
+            last_used: self.clock,
+        });
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(Some(HotWriteStats {
+            write_ms: started.elapsed().as_secs_f64() * 1e3,
+        }))
+    }
+}
+
 struct ChatWorker {
     package: PathBuf,
     cfg: Cfg,
     model: Model,
+    zero_state: QwenStateSnapshot,
     tokenizer: Tokenizer,
     system_prompt: String,
     im_end_id: u32,
@@ -194,6 +423,7 @@ struct ChatWorker {
     /// the logits that predict the NEXT token; keeping them avoids replaying
     /// the final prompt token at a synthetic duplicate position.
     last_logits: Option<Vec<f32>>,
+    hot_cache: HotPrefixCache,
     turns: usize,
     rng: TinyRng,
 }
@@ -216,6 +446,7 @@ impl ChatWorker {
         let _ = events.send(EngineEvent::Loading("loading Qwen4 package".into()));
         let cfg = load_cfg(&package.join("config.json"))?;
         let model = load_model(&package, &cfg)?;
+        let zero_state = model.snapshot_state(0)?;
         let stats = model.runtime_stats();
         let eos_id = (stats.eos_token_id >= 0).then_some(stats.eos_token_id as u32);
         let model_name = package
@@ -238,6 +469,7 @@ impl ChatWorker {
             package,
             cfg,
             model,
+            zero_state,
             tokenizer,
             system_prompt,
             im_end_id,
@@ -246,6 +478,7 @@ impl ChatWorker {
             consumed: 0,
             position: 0,
             last_logits: None,
+            hot_cache: HotPrefixCache::from_env(),
             turns: 0,
             rng: TinyRng::new(),
         })
@@ -253,18 +486,19 @@ impl ChatWorker {
 
     fn reset(&mut self, system_prompt: String) -> Result<(), String> {
         apply_max_performance_defaults();
-        self.model = load_model(&self.package, &self.cfg)?;
+        self.restore_zero_state()?;
         self.system_prompt = system_prompt;
-        self.tokens.clear();
-        self.consumed = 0;
-        self.position = 0;
-        self.last_logits = None;
         self.turns = 0;
         Ok(())
     }
 
     fn reload_pristine(&mut self) -> Result<(), String> {
-        self.model = load_model(&self.package, &self.cfg)?;
+        self.restore_zero_state()
+    }
+
+    fn restore_zero_state(&mut self) -> Result<(), String> {
+        self.model.restore_state(&self.zero_state)?;
+        self.tokens.clear();
         self.consumed = 0;
         self.position = 0;
         self.last_logits = None;
@@ -339,30 +573,59 @@ impl ChatWorker {
         let input_tokens = input_ids.len();
 
         let prompt_start = Instant::now();
-        let mut cached_tokens = 0usize;
+        let mut ram_cached_tokens = 0usize;
+        let mut ssd_cached_tokens = 0usize;
+        let mut ram_cache_restore_ms = 0.0;
+        let mut ram_cache_write_ms = 0.0;
         let mut cache_restore_ms = 0.0;
         let mut cache_write_ms = 0.0;
 
         if self.turns == 0 && self.consumed == 0 && self.position == 0 {
             self.tokens = input_ids.clone();
-            match restore_longest_prefix(&mut self.model, &self.tokens) {
+            let mut try_ssd = true;
+            match self
+                .hot_cache
+                .restore_longest(&mut self.model, &self.tokens)
+            {
                 Ok(Some(hit)) => {
-                    cached_tokens = hit.cached_tokens;
-                    cache_restore_ms = hit.restore_ms;
+                    ram_cached_tokens = hit.cached_tokens;
+                    ram_cache_restore_ms = hit.restore_ms;
                     self.consumed = hit.cached_tokens;
                     self.position = hit.cached_tokens;
-                    // Prefix files contain causal state but no logits. The
-                    // restore helper guarantees a strict prefix, so consuming
-                    // the remaining suffix below will repopulate last_logits.
-                    self.last_logits = None;
+                    self.last_logits = Some(hit.last_logits);
+                    try_ssd = false;
                 }
                 Ok(None) => {}
                 Err(error) => {
                     let _ = events.send(EngineEvent::Warning(format!(
-                        "persistent prefix rejected; replaying from a fresh model: {error}"
+                        "RAM prefix rejected; clearing hot cache and retrying from SSD: {error}"
                     )));
+                    self.hot_cache.clear();
                     self.reload_pristine()?;
                     stats_before = self.model.runtime_stats();
+                }
+            }
+
+            if try_ssd {
+                match restore_longest_prefix(&mut self.model, &self.tokens) {
+                    Ok(Some(hit)) => {
+                        ssd_cached_tokens = hit.cached_tokens;
+                        cache_restore_ms = hit.restore_ms;
+                        self.consumed = hit.cached_tokens;
+                        self.position = hit.cached_tokens;
+                        // Prefix snapshots contain causal state but no logits.
+                        // The restore helpers only accept strict prefixes, so
+                        // consuming the suffix repopulates last_logits.
+                        self.last_logits = None;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = events.send(EngineEvent::Warning(format!(
+                            "persistent prefix rejected; replaying from a fresh model: {error}"
+                        )));
+                        self.reload_pristine()?;
+                        stats_before = self.model.runtime_stats();
+                    }
                 }
             }
         } else {
@@ -386,6 +649,19 @@ impl ChatWorker {
                 forward_tokens += self.consume_logical_until(system_end)?;
             }
             if self.consumed == system_end && self.position == self.consumed {
+                match self.hot_cache.insert(
+                    &self.model,
+                    &self.tokens[..system_end],
+                    self.last_logits.as_deref().unwrap_or(&[]),
+                ) {
+                    Ok(Some(write)) => ram_cache_write_ms += write.write_ms,
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = events.send(EngineEvent::Warning(format!(
+                            "system-prefix RAM cache write failed (non-fatal): {error}"
+                        )));
+                    }
+                }
                 match persist_prefix_boundary(&self.model, &self.tokens[..system_end]) {
                     Ok(Some(write)) if !write.already_existed => {
                         cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
@@ -407,6 +683,19 @@ impl ChatWorker {
         // Persist the exact completed prompt before generation. Unlike the old
         // synthetic-repeat driver, logical and physical positions remain equal.
         if self.position == self.consumed {
+            match self.hot_cache.insert(
+                &self.model,
+                &self.tokens,
+                self.last_logits.as_deref().unwrap_or(&[]),
+            ) {
+                Ok(Some(write)) => ram_cache_write_ms += write.write_ms,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = events.send(EngineEvent::Warning(format!(
+                        "prompt RAM cache write failed (non-fatal): {error}"
+                    )));
+                }
+            }
             match persist_prefix_boundary(&self.model, &self.tokens) {
                 Ok(Some(write)) if !write.already_existed => {
                     cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
@@ -424,11 +713,22 @@ impl ChatWorker {
             input_tokens,
             forwarded_prompt_tokens: prompt_forward_tokens,
             live_reused_tokens: live_reused,
-            ssd_cached_tokens: cached_tokens,
+            ram_cached_tokens,
+            ssd_cached_tokens,
+            ram_cache_restore_ms,
+            ram_cache_write_ms,
             cache_restore_ms,
             cache_write_ms,
             prompt_ms,
             context_tokens: self.position,
+            hot_cache_bytes: self.hot_cache.resident_bytes(),
+            hot_cache_entries: self.hot_cache.entry_count(),
+            hot_cache_tokens: self.hot_cache.cached_tokens(),
+            active_state_bytes: logan_qwen4::plan::prefix_state_payload_bytes(
+                &self.model,
+                self.position,
+            )
+            .unwrap_or(0),
             ..Default::default()
         };
         let _ = events.send(EngineEvent::TurnStarted {
@@ -487,6 +787,12 @@ impl ChatWorker {
             metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
             metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
             metrics.context_tokens = self.position;
+            metrics.hot_cache_bytes = self.hot_cache.resident_bytes();
+            metrics.hot_cache_entries = self.hot_cache.entry_count();
+            metrics.hot_cache_tokens = self.hot_cache.cached_tokens();
+            metrics.active_state_bytes =
+                logan_qwen4::plan::prefix_state_payload_bytes(&self.model, self.position)
+                    .unwrap_or(0);
             metrics.forward_tokens = forward_tokens;
             let stats = self.model.runtime_stats().delta_from(&stats_before);
             let _ = events.send(EngineEvent::Token {
@@ -527,10 +833,266 @@ impl ChatWorker {
         metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
         metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
         metrics.context_tokens = self.position;
+        metrics.hot_cache_bytes = self.hot_cache.resident_bytes();
+        metrics.hot_cache_entries = self.hot_cache.entry_count();
+        metrics.hot_cache_tokens = self.hot_cache.cached_tokens();
+        metrics.active_state_bytes =
+            logan_qwen4::plan::prefix_state_payload_bytes(&self.model, self.position).unwrap_or(0);
         metrics.forward_tokens = forward_tokens;
         metrics.stop_reason = Some(stop_reason);
         let stats = self.model.runtime_stats().delta_from(&stats_before);
         let _ = events.send(EngineEvent::TurnDone {
+            text,
+            metrics,
+            stats,
+        });
+        Ok(())
+    }
+
+    fn run_prompt(
+        &mut self,
+        prompt: &str,
+        settings: &GenerationSettings,
+        cancel: &AtomicBool,
+        events: &mpsc::Sender<EngineEvent>,
+        updates: &mpsc::Sender<CompletionUpdate>,
+    ) -> Result<(), String> {
+        if prompt.trim().is_empty() {
+            return Err("completion prompt is empty".into());
+        }
+
+        self.restore_zero_state()?;
+        let turn_t0 = Instant::now();
+        let mut stats_before = self.model.runtime_stats();
+        self.tokens = self.encode(prompt)?;
+        let input_tokens = self.tokens.len();
+        if input_tokens == 0 {
+            return Err("completion prompt tokenized to zero tokens".into());
+        }
+        if input_tokens >= self.model.context_limit() {
+            return Err(format!(
+                "prompt has {input_tokens} tokens but model context is {}",
+                self.model.context_limit()
+            ));
+        }
+
+        let prompt_start = Instant::now();
+        let mut ram_cached_tokens = 0usize;
+        let mut ssd_cached_tokens = 0usize;
+        let mut ram_cache_restore_ms = 0.0;
+        let mut ram_cache_write_ms = 0.0;
+        let mut cache_restore_ms = 0.0;
+        let mut cache_write_ms = 0.0;
+        let mut forward_tokens = 0usize;
+        let mut try_ssd = true;
+
+        match self
+            .hot_cache
+            .restore_longest(&mut self.model, &self.tokens)
+        {
+            Ok(Some(hit)) => {
+                ram_cached_tokens = hit.cached_tokens;
+                ram_cache_restore_ms = hit.restore_ms;
+                self.consumed = hit.cached_tokens;
+                self.position = hit.cached_tokens;
+                self.last_logits = Some(hit.last_logits);
+                try_ssd = false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = events.send(EngineEvent::Warning(format!(
+                    "RAM prefix rejected; clearing hot cache and retrying from SSD: {error}"
+                )));
+                self.hot_cache.clear();
+                self.restore_zero_state()?;
+                self.tokens = self.encode(prompt)?;
+                stats_before = self.model.runtime_stats();
+            }
+        }
+
+        if try_ssd {
+            match restore_longest_prefix(&mut self.model, &self.tokens) {
+                Ok(Some(hit)) => {
+                    ssd_cached_tokens = hit.cached_tokens;
+                    cache_restore_ms = hit.restore_ms;
+                    self.consumed = hit.cached_tokens;
+                    self.position = hit.cached_tokens;
+                    self.last_logits = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = events.send(EngineEvent::Warning(format!(
+                        "persistent prefix rejected; replaying from zero state: {error}"
+                    )));
+                    self.restore_zero_state()?;
+                    self.tokens = self.encode(prompt)?;
+                    stats_before = self.model.runtime_stats();
+                }
+            }
+        }
+
+        forward_tokens += self.consume_logical_until(self.tokens.len())?;
+        let prompt_ms = prompt_start.elapsed().as_secs_f64() * 1e3;
+        let prompt_forward_tokens = forward_tokens;
+
+        if self.position == self.consumed {
+            match self.hot_cache.insert(
+                &self.model,
+                &self.tokens,
+                self.last_logits.as_deref().unwrap_or(&[]),
+            ) {
+                Ok(Some(write)) => ram_cache_write_ms += write.write_ms,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = events.send(EngineEvent::Warning(format!(
+                        "prompt RAM cache write failed (non-fatal): {error}"
+                    )));
+                }
+            }
+            match persist_prefix_boundary(&self.model, &self.tokens) {
+                Ok(Some(write)) if !write.already_existed => {
+                    cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = events.send(EngineEvent::Warning(format!(
+                        "prefix cache write failed (non-fatal): {error}"
+                    )));
+                }
+            }
+        }
+
+        let mut metrics = TurnMetrics {
+            input_tokens,
+            forwarded_prompt_tokens: prompt_forward_tokens,
+            live_reused_tokens: 0,
+            ram_cached_tokens,
+            ssd_cached_tokens,
+            ram_cache_restore_ms,
+            ram_cache_write_ms,
+            cache_restore_ms,
+            cache_write_ms,
+            prompt_ms,
+            context_tokens: self.position,
+            hot_cache_bytes: self.hot_cache.resident_bytes(),
+            hot_cache_entries: self.hot_cache.entry_count(),
+            hot_cache_tokens: self.hot_cache.cached_tokens(),
+            active_state_bytes: logan_qwen4::plan::prefix_state_payload_bytes(
+                &self.model,
+                self.position,
+            )
+            .unwrap_or(0),
+            ..Default::default()
+        };
+        let _ = events.send(EngineEvent::TurnStarted {
+            metrics: metrics.clone(),
+        });
+        let _ = updates.send(CompletionUpdate::Started {
+            metrics: metrics.clone(),
+        });
+
+        let mut logits = self
+            .last_logits
+            .take()
+            .ok_or_else(|| "completion prompt produced no final-token logits".to_string())?;
+        let generation_t0 = Instant::now();
+        let tokenizer = self.tokenizer.clone();
+        let mut decode_stream = tokenizer.decode_stream(true);
+        let mut text = String::new();
+        let mut generated_tokens = 0usize;
+        let mut first_token_seen = false;
+        let mut stop_reason = StopReason::MaxTokens;
+
+        for step in 0..settings.max_new {
+            if cancel.load(Ordering::Relaxed) {
+                stop_reason = StopReason::Cancelled;
+                break;
+            }
+
+            let next = sample_token(&mut logits, &self.tokens, settings, &mut self.rng);
+            if next == self.im_end_id {
+                stop_reason = StopReason::EndOfTurn;
+                break;
+            }
+            if self.eos_id == Some(next) {
+                stop_reason = StopReason::Eos;
+                break;
+            }
+
+            self.tokens.push(next);
+            generated_tokens += 1;
+            let chunk = decode_stream
+                .step(next)
+                .map_err(|e| format!("decode token {next}: {e}"))?
+                .unwrap_or_default();
+            text.push_str(&chunk);
+
+            if !first_token_seen {
+                metrics.first_token_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
+                first_token_seen = true;
+            }
+            metrics.generated_tokens = generated_tokens;
+            metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
+            metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
+            metrics.context_tokens = self.position;
+            metrics.hot_cache_bytes = self.hot_cache.resident_bytes();
+            metrics.hot_cache_entries = self.hot_cache.entry_count();
+            metrics.hot_cache_tokens = self.hot_cache.cached_tokens();
+            metrics.active_state_bytes =
+                logan_qwen4::plan::prefix_state_payload_bytes(&self.model, self.position)
+                    .unwrap_or(0);
+            metrics.forward_tokens = forward_tokens;
+            let stats = self.model.runtime_stats().delta_from(&stats_before);
+            let _ = events.send(EngineEvent::Token {
+                chunk: chunk.clone(),
+                token_id: next,
+                metrics: metrics.clone(),
+                stats: stats.clone(),
+            });
+            let _ = updates.send(CompletionUpdate::Token {
+                chunk,
+                token_id: next,
+                metrics: metrics.clone(),
+                stats,
+            });
+
+            if step + 1 >= settings.max_new {
+                stop_reason = StopReason::MaxTokens;
+                break;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                stop_reason = StopReason::Cancelled;
+                break;
+            }
+            if self.position >= self.model.context_limit() {
+                stop_reason = StopReason::ContextFull;
+                break;
+            }
+
+            logits = self.model.forward_token(next as usize, self.position);
+            self.position += 1;
+            self.consumed += 1;
+            forward_tokens += 1;
+        }
+
+        metrics.generated_tokens = generated_tokens;
+        metrics.generation_ms = generation_t0.elapsed().as_secs_f64() * 1e3;
+        metrics.total_ms = turn_t0.elapsed().as_secs_f64() * 1e3;
+        metrics.context_tokens = self.position;
+        metrics.hot_cache_bytes = self.hot_cache.resident_bytes();
+        metrics.hot_cache_entries = self.hot_cache.entry_count();
+        metrics.hot_cache_tokens = self.hot_cache.cached_tokens();
+        metrics.active_state_bytes =
+            logan_qwen4::plan::prefix_state_payload_bytes(&self.model, self.position).unwrap_or(0);
+        metrics.forward_tokens = forward_tokens;
+        metrics.stop_reason = Some(stop_reason);
+        let stats = self.model.runtime_stats().delta_from(&stats_before);
+        let _ = events.send(EngineEvent::TurnDone {
+            text: text.clone(),
+            metrics: metrics.clone(),
+            stats: stats.clone(),
+        });
+        let _ = updates.send(CompletionUpdate::Done {
             text,
             metrics,
             stats,

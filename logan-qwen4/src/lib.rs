@@ -12,6 +12,7 @@ use std::path::Path;
 pub mod coliload;
 pub mod colisource;
 pub mod ffi;
+mod gdn_ane;
 pub mod plan;
 pub mod scheduled;
 
@@ -21,43 +22,100 @@ use logan_core::expert::Slot as _; // for SlotExpert::release
 // safetensors reader (same minimal F32 adapter as qwen-rs)
 // ---------------------------------------------------------------------------
 
+const MAX_RESIDENT_PLE_NGRAM_BYTES: usize = 64 * 1024 * 1024;
+
+fn is_ple_ngram_weight(name: &str) -> bool {
+    name.ends_with("ple_embedding.ngram_embedding.weight")
+        || name.ends_with("ple.ngram_embedding.weight")
+}
+
 pub struct StFile {
-    data: Vec<u8>,
+    // Keep safetensors file-backed. The old reference loader used
+    // std::fs::read(), which made the entire source file resident before any
+    // tensor was requested. Production Flash-Next uses .coli, but keeping this
+    // adapter range-read prevents accidental whole-file residency as well.
+    file: std::sync::Mutex<std::fs::File>,
     tensors: std::collections::HashMap<String, (Vec<u64>, usize, usize)>,
 }
 
 impl StFile {
     pub fn open(path: &Path) -> Result<StFile, String> {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let n = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        let mut nbuf = [0_u8; 8];
+        file.read_exact(&mut nbuf).map_err(|e| e.to_string())?;
+        let n = u64::from_le_bytes(nbuf);
+        let data_start_u64 = 8_u64
+            .checked_add(n)
+            .ok_or_else(|| "safetensors header length overflow".to_string())?;
+        if data_start_u64 > file_len {
+            return Err(format!(
+                "safetensors header extends past EOF: {data_start_u64} > {file_len}"
+            ));
+        }
+        let n_usize = usize::try_from(n)
+            .map_err(|_| "safetensors header too large for this host".to_string())?;
+        let mut header_bytes = vec![0_u8; n_usize];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| e.to_string())?;
         let header: serde_json::Value =
-            serde_json::from_slice(&bytes[8..8 + n as usize]).map_err(|e| e.to_string())?;
-        let obj = header.as_object().unwrap();
-        let data_start = 8 + n as usize;
+            serde_json::from_slice(&header_bytes).map_err(|e| e.to_string())?;
+        let obj = header
+            .as_object()
+            .ok_or_else(|| "safetensors header is not an object".to_string())?;
+        usize::try_from(data_start_u64)
+            .map_err(|_| "safetensors data offset too large for this host".to_string())?;
         let mut tensors = std::collections::HashMap::new();
         for (name, spec) in obj {
-            let dtype = spec["dtype"].as_str().unwrap().to_string();
+            if name == "__metadata__" {
+                continue;
+            }
+            let dtype = spec["dtype"]
+                .as_str()
+                .ok_or_else(|| format!("{name}: missing dtype"))?;
             let shape: Vec<u64> = spec["shape"]
                 .as_array()
-                .unwrap()
+                .ok_or_else(|| format!("{name}: missing shape"))?
                 .iter()
-                .map(|v| v.as_u64().unwrap())
-                .collect();
-            let offs = spec["data_offsets"].as_array().unwrap();
-            let offset = offs[0].as_u64().unwrap() as usize;
-            let len = offs[1].as_u64().unwrap() as usize - offset;
+                .map(|v| v.as_u64().ok_or_else(|| format!("{name}: invalid shape")))
+                .collect::<Result<_, _>>()?;
+            let offs = spec["data_offsets"]
+                .as_array()
+                .ok_or_else(|| format!("{name}: missing data_offsets"))?;
+            if offs.len() != 2 {
+                return Err(format!("{name}: invalid data_offsets"));
+            }
+            let begin = offs[0]
+                .as_u64()
+                .ok_or_else(|| format!("{name}: invalid start offset"))?;
+            let end = offs[1]
+                .as_u64()
+                .ok_or_else(|| format!("{name}: invalid end offset"))?;
+            if end < begin || data_start_u64.checked_add(end).is_none_or(|v| v > file_len) {
+                return Err(format!(
+                    "{name}: tensor range is outside the safetensors file"
+                ));
+            }
+            let offset = usize::try_from(data_start_u64 + begin)
+                .map_err(|_| format!("{name}: tensor offset too large for this host"))?;
+            let len = usize::try_from(end - begin)
+                .map_err(|_| format!("{name}: tensor length too large for this host"))?;
             if dtype != "F32" {
                 return Err(format!("{name}: only F32 supported, got {dtype}"));
             }
-            tensors.insert(name.clone(), (shape, data_start + offset, len));
+            tensors.insert(name.clone(), (shape, offset, len));
         }
         Ok(StFile {
-            data: bytes,
+            file: std::sync::Mutex::new(file),
             tensors,
         })
     }
 
     pub fn f32(&self, name: &str, expect: &[u64]) -> Result<Vec<f32>, String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
         let (shape, offset, len) = self
             .tensors
             .get(name)
@@ -70,7 +128,21 @@ impl StFile {
                 *len
             ));
         }
-        Ok(self.data[*offset..*offset + *len]
+        if is_ple_ngram_weight(name) && *len > MAX_RESIDENT_PLE_NGRAM_BYTES {
+            return Err(format!(
+                "{name}: refusing to materialize {} bytes of PLE n-gram weights; compile/use a .coli package so n-gram rows stay on NVMe and are range-read on demand",
+                *len
+            ));
+        }
+        let mut raw = vec![0_u8; *len];
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| "safetensors file lock poisoned".to_string())?;
+        file.seek(SeekFrom::Start(*offset as u64))
+            .map_err(|e| e.to_string())?;
+        file.read_exact(&mut raw).map_err(|e| e.to_string())?;
+        Ok(raw
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect())
@@ -328,8 +400,12 @@ pub enum SchedForward {
 }
 
 pub enum WtBytes {
-    /// Canonical BF16 row-major matrix.
-    Bf16(Vec<u8>),
+    /// Canonical BF16 row-major matrix. The optional Metal tensor is created
+    /// lazily and remains tied to this exact byte allocation.
+    Bf16 {
+        weights: Vec<u8>,
+        metal_tensor: std::sync::Mutex<usize>,
+    },
     /// OCP MXFP4 row-major packed E2M1 nibbles plus one E8M0 scale byte per
     /// 32 input columns. The optional Metal tensor is created lazily on first
     /// use and is owned by this weight representation.
@@ -338,17 +414,38 @@ pub enum WtBytes {
         scales: Vec<u8>,
         metal_tensor: std::sync::Mutex<usize>,
     },
+    /// Signed INT8 with one FP32 scale per 32 input columns. This is an
+    /// experimental GDN qualification format; weights remain row-major.
+    Q8Block {
+        weights: Vec<u8>,
+        scales: Vec<u8>,
+        block: usize,
+        residuals: usize,
+        metal_tensor: std::sync::Mutex<usize>,
+    },
 }
 
 impl Clone for WtBytes {
     fn clone(&self) -> Self {
         match self {
-            Self::Bf16(bytes) => Self::Bf16(bytes.clone()),
-            Self::Mxfp4 { weights, scales, .. } => Self::Mxfp4 {
+            Self::Bf16 { weights, .. } => Self::Bf16 {
+                weights: weights.clone(),
+                metal_tensor: std::sync::Mutex::new(0),
+            },
+            Self::Mxfp4 {
+                weights, scales, ..
+            } => Self::Mxfp4 {
                 weights: weights.clone(),
                 scales: scales.clone(),
                 // A native tensor handle is tied to the original byte buffers.
                 // Clones must create their own handle lazily.
+                metal_tensor: std::sync::Mutex::new(0),
+            },
+            Self::Q8Block { weights, scales, block, residuals, .. } => Self::Q8Block {
+                weights: weights.clone(),
+                scales: scales.clone(),
+                block: *block,
+                residuals: *residuals,
                 metal_tensor: std::sync::Mutex::new(0),
             },
         }
@@ -357,18 +454,19 @@ impl Clone for WtBytes {
 
 impl Drop for WtBytes {
     fn drop(&mut self) {
-        if let Self::Mxfp4 { metal_tensor, .. } = self {
-            let raw = std::mem::take(
-                metal_tensor
-                    .get_mut()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            );
-            if raw != 0 {
-                unsafe {
-                    logan_metal::coli_metal_tensor_free(
-                        raw as *mut logan_metal::ColiMetalTensor,
-                    );
-                }
+        let metal_tensor = match self {
+            Self::Bf16 { metal_tensor, .. }
+            | Self::Mxfp4 { metal_tensor, .. }
+            | Self::Q8Block { metal_tensor, .. } => metal_tensor,
+        };
+        let raw = std::mem::take(
+            metal_tensor
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if raw != 0 {
+            unsafe {
+                logan_metal::coli_metal_tensor_free(raw as *mut logan_metal::ColiMetalTensor);
             }
         }
     }
@@ -387,8 +485,8 @@ pub struct Wt {
 impl Wt {
     fn bf16_bytes(&self) -> Option<&[u8]> {
         match self.bytes.as_ref()? {
-            WtBytes::Bf16(bytes) => Some(bytes),
-            WtBytes::Mxfp4 { .. } => None,
+            WtBytes::Bf16 { weights, .. } => Some(weights),
+            WtBytes::Mxfp4 { .. } | WtBytes::Q8Block { .. } => None,
         }
     }
 
@@ -397,29 +495,82 @@ impl Wt {
         if !self.f.is_empty() {
             return self.f[row * self.i..(row + 1) * self.i].to_vec();
         }
-        match self.bytes.as_ref().expect("resident weight has physical bytes") {
-            WtBytes::Bf16(bytes) => (0..self.i)
+        match self
+            .bytes
+            .as_ref()
+            .expect("resident weight has physical bytes")
+        {
+            WtBytes::Bf16 { weights, .. } => (0..self.i)
                 .map(|col| {
                     let off = (row * self.i + col) * 2;
-                    let u = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                    let u = u16::from_le_bytes([weights[off], weights[off + 1]]);
                     f32::from_bits((u as u32) << 16)
                 })
                 .collect(),
-            WtBytes::Mxfp4 { weights, scales, .. } => {
+            WtBytes::Mxfp4 {
+                weights, scales, ..
+            } => {
                 let rb = self.i.div_ceil(2);
                 let ng = self.i.div_ceil(32);
                 let wr = &weights[row * rb..(row + 1) * rb];
                 let sr = &scales[row * ng..(row + 1) * ng];
                 const MX4: [f32; 16] = [
-                    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+                    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0,
+                    -4.0, -6.0,
                 ];
                 (0..self.i)
                     .map(|col| {
                         let packed = wr[col / 2];
-                        let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+                        let code = if col & 1 == 0 {
+                            packed & 0x0f
+                        } else {
+                            packed >> 4
+                        };
                         let scale = f32::from_bits((sr[col / 32] as u32) << 23);
-                        MX4[code as usize] * scale
+                        let mut value = MX4[code as usize] * scale;
+                        let full_wb = self.o * rb;
+                        let full_sb = self.o * ng;
+                        if weights.len() >= full_wb * 2 && scales.len() >= full_sb * 2 {
+                            let wr2 = &weights[full_wb + row * rb..full_wb + (row + 1) * rb];
+                            let sr2 = &scales[full_sb + row * ng..full_sb + (row + 1) * ng];
+                            let p2 = wr2[col / 2];
+                            let c2 = if col & 1 == 0 { p2 & 0x0f } else { p2 >> 4 };
+                            let s2 = f32::from_bits((sr2[col / 32] as u32) << 23);
+                            value += MX4[c2 as usize] * s2;
+                        }
+                        if weights.len() >= full_wb * 3 && scales.len() >= full_sb * 3 {
+                            let wr3 = &weights[2 * full_wb + row * rb..2 * full_wb + (row + 1) * rb];
+                            let sr3 = &scales[2 * full_sb + row * ng..2 * full_sb + (row + 1) * ng];
+                            let p3 = wr3[col / 2];
+                            let c3 = if col & 1 == 0 { p3 & 0x0f } else { p3 >> 4 };
+                            let s3 = f32::from_bits((sr3[col / 32] as u32) << 23);
+                            value += MX4[c3 as usize] * s3;
+                        }
+                        value
+                    })
+                    .collect()
+            },
+            WtBytes::Q8Block { weights, scales, block, residuals, .. } => {
+                let ng = self.i.div_ceil(*block);
+                (0..self.i)
+                    .map(|col| {
+                        let q = weights[row * self.i + col] as i8 as f32;
+                        let so = (row * ng + col / *block) * 4;
+                        let scale = f32::from_le_bytes(scales[so..so + 4].try_into().unwrap());
+                        let mut value = q * scale;
+                        if *residuals == 1 && *block == 32 {
+                            let base = self.o * self.i;
+                            let rv_base = base;
+                            let ri_base = rv_base + self.o * ng * 2;
+                            let group = col / 32;
+                            let idx = weights[ri_base + row * ng + group] as usize;
+                            if col % 32 == idx {
+                                let ro = rv_base + (row * ng + group) * 2;
+                                let rb = u16::from_le_bytes([weights[ro], weights[ro + 1]]);
+                                value += f32::from_bits((rb as u32) << 16);
+                            }
+                        }
+                        value
                     })
                     .collect()
             }
@@ -632,6 +783,13 @@ pub struct Model {
     coli: Option<colisource::ColiSource>,
     embed: Wt,
     lm_head: Wt,
+    /// Optional single-copy 16 KiB-aligned BF16 LM head storage. The generic
+    /// Metal backend can wrap this allocation zero-copy instead of snapshotting
+    /// the ~1.27 GiB Qwen3.8 head on first decode.
+    lm_head_aligned: Option<AlignedBuf>,
+    /// Persistent native wrapper for `lm_head_aligned` (stored as usize so the
+    /// model remains Send without exposing the opaque C++ pointer type).
+    lm_head_metal_tensor: usize,
     final_norm: Vec<f32>,
     layers: Vec<Layer>,
     experts: Vec<Vec<[Wt; 3]>>,
@@ -694,6 +852,9 @@ pub struct Model {
     /// there is exactly ONE copy of the GDN weights (moved, not duplicated —
     /// the 16 GB M2 budget).
     gdn_metal: Vec<Option<GdnMetalLayer>>,
+    /// Experimental constant-weight ANE input-projection islands. Each entry
+    /// stays uninitialized unless explicitly selected by QWEN_GDN_ANE.
+    gdn_ane: Vec<gdn_ane::GdnAneState>,
     /// Per-attention-layer Metal BF16 projection buffers (lazy build,
     /// mirror of gdn_metal). QWEN_ATTN_METAL=0 opts out.
     attn_metal: Vec<Option<AttnMetalLayer>>,
@@ -730,6 +891,14 @@ impl Drop for Model {
         // aligned backing allocations. The native call shares the GDN mutex
         // with token execution and therefore also waits for any synchronous
         // GDN submission to retire before releasing its wrappers.
+        if self.lm_head_metal_tensor != 0 {
+            unsafe {
+                logan_metal::coli_metal_tensor_free(
+                    self.lm_head_metal_tensor as *mut logan_metal::ColiMetalTensor,
+                );
+            }
+            self.lm_head_metal_tensor = 0;
+        }
         logan_metal::shared_mxfp4_drop_model(self.metal_model_id);
         logan_metal::gdn_mxfp4_drop_model(self.metal_model_id);
         crate::ffi::gdn_drop_model(self.metal_model_id);
@@ -773,7 +942,7 @@ fn lazy_zeroed_f32(n: usize) -> Vec<f32> {
 unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {
-    fn zeroed(len: usize) -> Option<AlignedBuf> {
+    fn uninitialized(len: usize) -> Option<AlignedBuf> {
         if len == 0 {
             return None;
         }
@@ -789,8 +958,13 @@ impl AlignedBuf {
         if rc != 0 || ptr.is_null() {
             return None;
         }
-        unsafe { std::ptr::write_bytes(ptr, 0, rounded) };
         Some(AlignedBuf { ptr, len: rounded })
+    }
+
+    fn zeroed(len: usize) -> Option<AlignedBuf> {
+        let buf = Self::uninitialized(len)?;
+        unsafe { std::ptr::write_bytes(buf.ptr, 0, buf.len) };
+        Some(buf)
     }
     fn as_mut_f32(&mut self) -> &mut [f32] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut f32, self.len / 4) }
@@ -848,12 +1022,34 @@ struct GdnMetalLayer {
     wb: *mut u8,
     /// [hidden, vdim] BF16 out_proj
     wout: *mut u8,
+    /// Lazily-created zero-copy Metal wrappers for the five aligned BF16
+    /// projections. They must be released before `_bufs` frees the backing pages.
+    tqkv: *mut logan_metal::ColiMetalTensor,
+    tz: *mut logan_metal::ColiMetalTensor,
+    ta: *mut logan_metal::ColiMetalTensor,
+    tb: *mut logan_metal::ColiMetalTensor,
+    tout: *mut logan_metal::ColiMetalTensor,
     /// [vheads * kd * vd] recurrent state (f32, GPU-mutated in place)
     state: *mut f32,
     /// [cdim * (kk-1)] conv state (f32, GPU-mutated in place)
     conv_state: *mut f32,
     /// Keeps every allocation alive for the model lifetime.
     _bufs: Vec<AlignedBuf>,
+}
+
+impl Drop for GdnMetalLayer {
+    fn drop(&mut self) {
+        for tensor in [self.tqkv, self.tz, self.ta, self.tb, self.tout] {
+            if !tensor.is_null() {
+                unsafe { logan_metal::coli_metal_tensor_free(tensor) };
+            }
+        }
+        self.tqkv = std::ptr::null_mut();
+        self.tz = std::ptr::null_mut();
+        self.ta = std::ptr::null_mut();
+        self.tb = std::ptr::null_mut();
+        self.tout = std::ptr::null_mut();
+    }
 }
 
 /// Per-token scratch, allocated once at load (hidden/vocab sized).
@@ -935,7 +1131,33 @@ fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize)
     let neon = false;
 
     if neon {
-        matmul_bf16_neon(y, x, bytes, o, i);
+        if parallel {
+            std::thread::scope(|scope| {
+                let available = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let nthreads = std::env::var("QWEN_BF16_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(available)
+                    .min(available)
+                    .min(o.max(1));
+                let chunk = o.div_ceil(nthreads);
+                for (c, yslice) in y.chunks_mut(chunk).enumerate() {
+                    let first_row = c * chunk;
+                    let rows = yslice.len();
+                    let byte_start = first_row * i * 2;
+                    let byte_end = byte_start + rows * i * 2;
+                    let wslice = &bytes[byte_start..byte_end];
+                    scope.spawn(move || {
+                        matmul_bf16_neon(yslice, x, wslice, rows, i);
+                    });
+                }
+            });
+        } else {
+            matmul_bf16_neon(y, x, bytes, o, i);
+        }
         return;
     }
 
@@ -975,17 +1197,9 @@ fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize)
     }
 }
 
-fn matmul_mxfp4_bytes(
-    y: &mut [f32],
-    x: &[f32],
-    weights: &[u8],
-    scales: &[u8],
-    o: usize,
-    i: usize,
-) {
+fn matmul_mxfp4_bytes(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize) {
     const MX4: [f32; 16] = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
     ];
     let rb = i.div_ceil(2);
     let ng = i.div_ceil(32);
@@ -997,7 +1211,11 @@ fn matmul_mxfp4_bytes(
         let mut acc = 0.0_f32;
         for col in 0..i {
             let packed = wr[col / 2];
-            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let code = if col & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
             let scale = f32::from_bits((sr[col / 32] as u32) << 23);
             acc += x[col] * MX4[code as usize] * scale;
         }
@@ -1005,11 +1223,480 @@ fn matmul_mxfp4_bytes(
     }
 }
 
+fn mxfp4_storage_fmt(weights: &[u8], scales: &[u8], o: usize, i: usize) -> i32 {
+    let wb = o.saturating_mul(i.div_ceil(2));
+    let sb = o.saturating_mul(i.div_ceil(32));
+    if weights.len() >= wb.saturating_mul(3) && scales.len() >= sb.saturating_mul(3) {
+        10
+    } else if weights.len() >= wb.saturating_mul(2) && scales.len() >= sb.saturating_mul(2) {
+        9
+    } else {
+        7
+    }
+}
+
+fn matmul_mxfp4_storage(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize) {
+    let wb = o * i.div_ceil(2);
+    let sb = o * i.div_ceil(32);
+    matmul_mxfp4_bytes(y, x, &weights[..wb], &scales[..sb], o, i);
+    let fmt = mxfp4_storage_fmt(weights, scales, o, i);
+    if fmt >= 9 {
+        let mut residual = vec![0.0f32; o];
+        matmul_mxfp4_bytes(&mut residual, x, &weights[wb..wb*2], &scales[sb..sb*2], o, i);
+        for (dst, corr) in y.iter_mut().zip(residual.iter()) { *dst += *corr; }
+    }
+    if fmt == 10 {
+        let mut residual = vec![0.0f32; o];
+        matmul_mxfp4_bytes(&mut residual, x, &weights[wb*2..wb*3], &scales[sb*2..sb*3], o, i);
+        for (dst, corr) in y.iter_mut().zip(residual.iter()) { *dst += *corr; }
+    }
+}
+
+const MXFP4_GROUP_SIZE: usize = 32;
+const MXFP4_MAX_E2M1: f32 = 6.0;
+const MXFP4_E2M1_MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+#[inline]
+fn mxfp4_runtime_scale(code: u8) -> f32 {
+    debug_assert!((1..=254).contains(&code));
+    f32::from_bits(u32::from(code) << 23)
+}
+
+#[inline]
+fn mxfp4_choose_scale(max_abs: f32) -> (u8, f32) {
+    if max_abs == 0.0 {
+        return (127, 1.0);
+    }
+    let bits = max_abs.to_bits();
+    let biased = ((bits >> 23) & 0xff) as i32;
+    let max_exp = if biased == 0 {
+        let mantissa = bits & 0x007f_ffff;
+        (31 - mantissa.leading_zeros() as i32) - 149
+    } else {
+        biased - 127
+    };
+    let mut scale_exp = (max_exp - 2).clamp(-126, 127);
+    let mut code = (scale_exp + 127) as u8;
+    let mut scale = mxfp4_runtime_scale(code);
+    if max_abs > MXFP4_MAX_E2M1 * scale && scale_exp < 127 {
+        scale_exp += 1;
+        code = (scale_exp + 127) as u8;
+        scale = mxfp4_runtime_scale(code);
+    }
+    (code, scale)
+}
+
+#[inline]
+fn mxfp4_quantize_value(value: f32, scale: f32) -> u8 {
+    let magnitude = (value.abs() / scale).min(MXFP4_MAX_E2M1);
+    let mut best_code = 0u8;
+    let mut best_error = f32::INFINITY;
+    for (code, candidate) in MXFP4_E2M1_MAGNITUDES.iter().copied().enumerate() {
+        let error = (magnitude - candidate).abs();
+        if error < best_error || (error == best_error && (code & 1) == 0 && (best_code & 1) != 0) {
+            best_error = error;
+            best_code = code as u8;
+        }
+    }
+    if value.is_sign_negative() { best_code | 0x8 } else { best_code }
+}
+
+#[inline]
+fn mxfp4_decode_value(code: u8, scale: f32) -> f32 {
+    let magnitude = MXFP4_E2M1_MAGNITUDES[(code & 0x7) as usize];
+    let signed = if code & 0x8 != 0 { -magnitude } else { magnitude };
+    signed * scale
+}
+
+/// Deterministic in-memory BF16 -> canonical OCP MXFP4 conversion used only
+/// for runtime qualification of dense GDN weights. The permanent production
+/// form should be emitted offline by logan-compiler once quality is qualified.
+fn quantize_bf16_to_mxfp4(weights: &[u8], rows: usize, cols: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    if rows == 0 || cols == 0 || weights.len() != rows.checked_mul(cols)?.checked_mul(2)? {
+        return None;
+    }
+    let clip_rms = std::env::var("QWEN_GDN_RUNTIME_MXFP4_CLIP_RMS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    let mse_scale = std::env::var("QWEN_GDN_RUNTIME_MXFP4_MSE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    let mse_radius = std::env::var("QWEN_GDN_RUNTIME_MXFP4_MSE_RADIUS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(3)
+        .clamp(1, 8);
+    let src_row_bytes = cols * 2;
+    let packed_row_bytes = cols.div_ceil(2);
+    let scale_row_bytes = cols.div_ceil(MXFP4_GROUP_SIZE);
+    let mut packed = vec![0u8; rows.checked_mul(packed_row_bytes)?];
+    let mut scales = vec![0u8; rows.checked_mul(scale_row_bytes)?];
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows);
+    let rows_per = rows.div_ceil(nthreads);
+
+    std::thread::scope(|scope| {
+        for ((src_rows, out_rows), scale_rows) in weights
+            .chunks(src_row_bytes * rows_per)
+            .zip(packed.chunks_mut(packed_row_bytes * rows_per))
+            .zip(scales.chunks_mut(scale_row_bytes * rows_per))
+        {
+            scope.spawn(move || {
+                for ((src, dst), dst_scales) in src_rows
+                    .chunks_exact(src_row_bytes)
+                    .zip(out_rows.chunks_mut(packed_row_bytes))
+                    .zip(scale_rows.chunks_mut(scale_row_bytes))
+                {
+                    for (group, scale_out) in dst_scales.iter_mut().enumerate() {
+                        let c0 = group * MXFP4_GROUP_SIZE;
+                        let c1 = (c0 + MXFP4_GROUP_SIZE).min(cols);
+                        let mut max_abs = 0.0f32;
+                        let mut sum_sq = 0.0f32;
+                        for col in c0..c1 {
+                            let off = col * 2;
+                            let bits = u16::from_le_bytes([src[off], src[off + 1]]);
+                            let value = f32::from_bits(u32::from(bits) << 16);
+                            if !value.is_finite() {
+                                // Source model validation should already forbid this.
+                                continue;
+                            }
+                            max_abs = max_abs.max(value.abs());
+                            sum_sq += value * value;
+                        }
+                        let scale_target = if let Some(clip) = clip_rms {
+                            let rms = (sum_sq / (c1 - c0).max(1) as f32).sqrt();
+                            max_abs.min(rms * clip)
+                        } else {
+                            max_abs
+                        };
+                        let (mut scale_code, mut scale) = mxfp4_choose_scale(scale_target);
+                        if mse_scale && max_abs != 0.0 {
+                            // Search smaller neighboring power-of-two scales (which
+                            // trade a small amount of saturation for finer E2M1
+                            // resolution) plus one larger scale. The max-based
+                            // code is always included, so MSE selection cannot be
+                            // worse for weight reconstruction than canonical max.
+                            let base = scale_code as i32;
+                            let lo = (base - mse_radius).max(1);
+                            let hi = (base + 1).min(254);
+                            let mut best_code = scale_code;
+                            let mut best_scale = scale;
+                            let mut best_error = f64::INFINITY;
+                            for candidate in lo..=hi {
+                                let candidate_code = candidate as u8;
+                                let candidate_scale = mxfp4_runtime_scale(candidate_code);
+                                let mut error = 0.0f64;
+                                for col in c0..c1 {
+                                    let off = col * 2;
+                                    let bits = u16::from_le_bytes([src[off], src[off + 1]]);
+                                    let value = f32::from_bits(u32::from(bits) << 16);
+                                    let code = mxfp4_quantize_value(value, candidate_scale);
+                                    let delta = value - mxfp4_decode_value(code, candidate_scale);
+                                    error += (delta as f64) * (delta as f64);
+                                }
+                                if error < best_error {
+                                    best_error = error;
+                                    best_code = candidate_code;
+                                    best_scale = candidate_scale;
+                                }
+                            }
+                            scale_code = best_code;
+                            scale = best_scale;
+                        }
+                        *scale_out = scale_code;
+                        let mut col = c0;
+                        while col < c1 {
+                            let off0 = col * 2;
+                            let b0 = u16::from_le_bytes([src[off0], src[off0 + 1]]);
+                            let v0 = f32::from_bits(u32::from(b0) << 16);
+                            let low = mxfp4_quantize_value(v0, scale) & 0x0f;
+                            let high = if col + 1 < c1 {
+                                let off1 = (col + 1) * 2;
+                                let b1 = u16::from_le_bytes([src[off1], src[off1 + 1]]);
+                                let v1 = f32::from_bits(u32::from(b1) << 16);
+                                (mxfp4_quantize_value(v1, scale) & 0x0f) << 4
+                            } else { 0 };
+                            dst[col / 2] = low | high;
+                            col += 2;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Some((packed, scales))
+}
+
+fn quantize_bf16_to_mxfp4x2(weights: &[u8], rows: usize, cols: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (base_w, base_s) = quantize_bf16_to_mxfp4(weights, rows, cols)?;
+    let rb = cols.div_ceil(2);
+    let ng = cols.div_ceil(32);
+    let mut residual_bf16 = vec![0u8; weights.len()];
+    for row in 0..rows {
+        let wr = &base_w[row * rb..(row + 1) * rb];
+        let sr = &base_s[row * ng..(row + 1) * ng];
+        for col in 0..cols {
+            let src_off = (row * cols + col) * 2;
+            let bits = u16::from_le_bytes([weights[src_off], weights[src_off + 1]]);
+            let value = f32::from_bits(u32::from(bits) << 16);
+            let packed = wr[col / 2];
+            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let scale = mxfp4_runtime_scale(sr[col / 32]);
+            let residual = value - mxfp4_decode_value(code, scale);
+            let rb16 = crate::colisource::f32_to_bf16(residual).to_le_bytes();
+            residual_bf16[src_off] = rb16[0];
+            residual_bf16[src_off + 1] = rb16[1];
+        }
+    }
+    let (res_w, res_s) = quantize_bf16_to_mxfp4(&residual_bf16, rows, cols)?;
+    let mut all_w = Vec::with_capacity(base_w.len() + res_w.len());
+    all_w.extend_from_slice(&base_w);
+    all_w.extend_from_slice(&res_w);
+    let mut all_s = Vec::with_capacity(base_s.len() + res_s.len());
+    all_s.extend_from_slice(&base_s);
+    all_s.extend_from_slice(&res_s);
+    Some((all_w, all_s))
+}
+
+fn mxfp4_residual_bf16(source: &[u8], qweights: &[u8], qscales: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
+    if source.len() != rows.checked_mul(cols)?.checked_mul(2)? { return None; }
+    let rb = cols.div_ceil(2);
+    let ng = cols.div_ceil(32);
+    if qweights.len() < rows * rb || qscales.len() < rows * ng { return None; }
+    let mut residual = vec![0u8; source.len()];
+    for row in 0..rows {
+        let wr = &qweights[row * rb..(row + 1) * rb];
+        let sr = &qscales[row * ng..(row + 1) * ng];
+        for col in 0..cols {
+            let off = (row * cols + col) * 2;
+            let bits = u16::from_le_bytes([source[off], source[off + 1]]);
+            let value = f32::from_bits(u32::from(bits) << 16);
+            let packed = wr[col / 2];
+            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let scale = mxfp4_runtime_scale(sr[col / 32]);
+            let delta = value - mxfp4_decode_value(code, scale);
+            let out = crate::colisource::f32_to_bf16(delta).to_le_bytes();
+            residual[off] = out[0]; residual[off + 1] = out[1];
+        }
+    }
+    Some(residual)
+}
+
+fn quantize_bf16_to_mxfp4x3(weights: &[u8], rows: usize, cols: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (w0, s0) = quantize_bf16_to_mxfp4(weights, rows, cols)?;
+    let r1 = mxfp4_residual_bf16(weights, &w0, &s0, rows, cols)?;
+    let (w1, s1) = quantize_bf16_to_mxfp4(&r1, rows, cols)?;
+    let r2 = mxfp4_residual_bf16(&r1, &w1, &s1, rows, cols)?;
+    let (w2, s2) = quantize_bf16_to_mxfp4(&r2, rows, cols)?;
+    let mut all_w = Vec::with_capacity(w0.len() + w1.len() + w2.len());
+    all_w.extend_from_slice(&w0); all_w.extend_from_slice(&w1); all_w.extend_from_slice(&w2);
+    let mut all_s = Vec::with_capacity(s0.len() + s1.len() + s2.len());
+    all_s.extend_from_slice(&s0); all_s.extend_from_slice(&s1); all_s.extend_from_slice(&s2);
+    Some((all_w, all_s))
+}
+
+fn quantize_bf16_to_q8_block(weights: &[u8], rows: usize, cols: usize, block: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    if rows == 0 || cols == 0 || weights.len() != rows.checked_mul(cols)?.checked_mul(2)? {
+        return None;
+    }
+    if !matches!(block, 8 | 16 | 32) { return None; }
+    let ng = cols.div_ceil(block);
+    let mut q = vec![0u8; rows.checked_mul(cols)?];
+    let mut scales = vec![0u8; rows.checked_mul(ng)?.checked_mul(4)?];
+    let row_bytes = cols * 2;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows);
+    let rows_per = rows.div_ceil(nthreads);
+    std::thread::scope(|scope| {
+        for ((src_rows, q_rows), scale_rows) in weights
+            .chunks(row_bytes * rows_per)
+            .zip(q.chunks_mut(cols * rows_per))
+            .zip(scales.chunks_mut(ng * 4 * rows_per))
+        {
+            scope.spawn(move || {
+                for ((src, dst), sdst) in src_rows
+                    .chunks_exact(row_bytes)
+                    .zip(q_rows.chunks_mut(cols))
+                    .zip(scale_rows.chunks_mut(ng * 4))
+                {
+                    for group in 0..ng {
+                        let c0 = group * block;
+                        let c1 = (c0 + block).min(cols);
+                        let mut max_abs = 0.0f32;
+                        for col in c0..c1 {
+                            let off = col * 2;
+                            let bits = u16::from_le_bytes([src[off], src[off + 1]]);
+                            let value = f32::from_bits(u32::from(bits) << 16);
+                            if value.is_finite() { max_abs = max_abs.max(value.abs()); }
+                        }
+                        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+                        let sb = scale.to_le_bytes();
+                        sdst[group * 4..group * 4 + 4].copy_from_slice(&sb);
+                        for col in c0..c1 {
+                            let off = col * 2;
+                            let bits = u16::from_le_bytes([src[off], src[off + 1]]);
+                            let value = f32::from_bits(u32::from(bits) << 16);
+                            let qi = if value.is_finite() {
+                                (value / scale).round().clamp(-127.0, 127.0) as i8
+                            } else { 0 };
+                            dst[col] = qi as u8;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Some((q, scales))
+}
+
+fn matmul_q8_block_bytes(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize, block: usize, residuals: usize) {
+    let ng = i.div_ceil(block);
+    debug_assert!(weights.len() >= o * i);
+    debug_assert!(scales.len() >= o * ng * 4);
+    for row in 0..o {
+        let wr = &weights[row * i..(row + 1) * i];
+        let sr = &scales[row * ng * 4..(row + 1) * ng * 4];
+        let mut acc = 0.0f32;
+        for group in 0..ng {
+            let so = group * 4;
+            let scale = f32::from_le_bytes(sr[so..so + 4].try_into().unwrap());
+            let c0 = group * block;
+            let c1 = (c0 + block).min(i);
+            for col in c0..c1 {
+                acc += x[col] * (wr[col] as i8 as f32) * scale;
+            }
+        }
+        if residuals == 1 && block == 32 {
+            let base = o * i;
+            let rv_base = base;
+            let ri_base = rv_base + o * ng * 2;
+            for group in 0..ng {
+                let idx = weights[ri_base + row * ng + group] as usize;
+                let col = group * 32 + idx;
+                if col < i {
+                    let ro = rv_base + (row * ng + group) * 2;
+                    let bits = u16::from_le_bytes([weights[ro], weights[ro + 1]]);
+                    acc += f32::from_bits((bits as u32) << 16) * x[col];
+                }
+            }
+        }
+        y[row] = acc;
+    }
+}
+
+fn q8_append_residual1(source: &[u8], mut q: Vec<u8>, scales: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
+    let block = 32usize;
+    let ng = cols.div_ceil(block);
+    if source.len() != rows.checked_mul(cols)?.checked_mul(2)? || q.len() != rows * cols || scales.len() < rows * ng * 4 {
+        return None;
+    }
+    let mut residual_values = vec![0u8; rows * ng * 2];
+    let mut residual_indices = vec![0u8; rows * ng];
+    for row in 0..rows {
+        for group in 0..ng {
+            let so = (row * ng + group) * 4;
+            let scale = f32::from_le_bytes(scales[so..so + 4].try_into().unwrap());
+            let c0 = group * block;
+            let c1 = (c0 + block).min(cols);
+            let mut best_idx = 0usize;
+            let mut best_residual = 0.0f32;
+            for col in c0..c1 {
+                let off = (row * cols + col) * 2;
+                let bits = u16::from_le_bytes([source[off], source[off + 1]]);
+                let value = f32::from_bits((bits as u32) << 16);
+                let recon = (q[row * cols + col] as i8 as f32) * scale;
+                let residual = value - recon;
+                if residual.abs() > best_residual.abs() {
+                    best_residual = residual;
+                    best_idx = col - c0;
+                }
+            }
+            let rb = crate::colisource::f32_to_bf16(best_residual).to_le_bytes();
+            let ro = (row * ng + group) * 2;
+            residual_values[ro] = rb[0]; residual_values[ro + 1] = rb[1];
+            residual_indices[row * ng + group] = best_idx as u8;
+        }
+    }
+    q.extend_from_slice(&residual_values);
+    q.extend_from_slice(&residual_indices);
+    Some(q)
+}
+
+fn quantize_wt_bf16_to_q8_block(w: &mut Wt, block: usize, residuals: usize) -> bool {
+    let Some(source) = w.bf16_bytes() else {
+        return matches!(w.bytes, Some(WtBytes::Q8Block { block: b, residuals: r, .. }) if b == block && r == residuals);
+    };
+    let Some((base_weights, scales)) = quantize_bf16_to_q8_block(source, w.o, w.i, block) else { return false; };
+    let weights = if residuals == 1 {
+        if block != 32 { return false; }
+        let Some(v) = q8_append_residual1(source, base_weights, &scales, w.o, w.i) else { return false; };
+        v
+    } else {
+        base_weights
+    };
+    w.bytes = Some(WtBytes::Q8Block {
+        weights,
+        scales,
+        block,
+        residuals,
+        metal_tensor: std::sync::Mutex::new(0),
+    });
+    true
+}
+
+fn quantize_wt_bf16_to_mxfp4(w: &mut Wt) -> bool {
+    let Some(source) = w.bf16_bytes() else { return matches!(w.bytes, Some(WtBytes::Mxfp4 { .. })); };
+    let residual3 = std::env::var("QWEN_GDN_RUNTIME_MXFP4_RESIDUAL3")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    let residual2 = std::env::var("QWEN_GDN_RUNTIME_MXFP4_RESIDUAL2")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    let packed = if residual3 {
+        quantize_bf16_to_mxfp4x3(source, w.o, w.i)
+    } else if residual2 {
+        quantize_bf16_to_mxfp4x2(source, w.o, w.i)
+    } else {
+        quantize_bf16_to_mxfp4(source, w.o, w.i)
+    };
+    let Some((weights, scales)) = packed else { return false; };
+    w.bytes = Some(WtBytes::Mxfp4 {
+        weights,
+        scales,
+        metal_tensor: std::sync::Mutex::new(0),
+    });
+    true
+}
+
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
     if let Some(bytes) = &w.bytes {
         match bytes {
-            WtBytes::Bf16(bytes) => matmul_bf16_bytes(y, x, bytes, o, i),
+            WtBytes::Bf16 {
+                weights,
+                metal_tensor,
+            } => {
+                // Large dense BF16 GEMVs (most importantly the ~1.27 GiB LM
+                // head) are bandwidth-bound and dramatically faster on Metal
+                // than the scalar/NEON fallback. Keep the threshold high so
+                // small projections do not pay command-buffer overhead or
+                // acquire duplicate Metal storage unnecessarily.
+                let metal_bf16 = std::env::var("QWEN_METAL_BF16")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+                    && o >= 65_536;
+                if metal_bf16 {
+                    let mut handle = metal_tensor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut tensor = *handle as *mut logan_metal::ColiMetalTensor;
+                    if logan_metal::metal_matmul(&mut tensor, y, x, weights, &[], 5, i, o) {
+                        *handle = tensor as usize;
+                        return;
+                    }
+                    *handle = tensor as usize;
+                }
+                matmul_bf16_bytes(y, x, weights, o, i);
+            }
             WtBytes::Mxfp4 {
                 weights,
                 scales,
@@ -1019,22 +1706,34 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let mut tensor = *handle as *mut logan_metal::ColiMetalTensor;
-                if logan_metal::metal_matmul(
-                    &mut tensor,
-                    y,
-                    x,
-                    weights,
-                    scales,
-                    7,
-                    i,
-                    o,
-                ) {
+                let fmt = mxfp4_storage_fmt(weights, scales, o, i);
+                if logan_metal::metal_matmul(&mut tensor, y, x, weights, scales, fmt, i, o) {
                     *handle = tensor as usize;
                     return;
                 }
                 *handle = tensor as usize;
                 drop(handle);
-                matmul_mxfp4_bytes(y, x, weights, scales, o, i);
+                matmul_mxfp4_storage(y, x, weights, scales, o, i);
+            }
+            WtBytes::Q8Block {
+                weights,
+                scales,
+                block,
+                residuals,
+                metal_tensor,
+            } => {
+                let mut handle = metal_tensor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut tensor = *handle as *mut logan_metal::ColiMetalTensor;
+                let fmt = if *block == 32 && *residuals == 1 { 14 } else { match *block { 32 => 11, 16 => 12, 8 => 13, _ => 0 } };
+                if fmt != 0 && logan_metal::metal_matmul(&mut tensor, y, x, weights, scales, fmt, i, o) {
+                    *handle = tensor as usize;
+                    return;
+                }
+                *handle = tensor as usize;
+                drop(handle);
+                matmul_q8_block_bytes(y, x, weights, scales, o, i, *block, *residuals);
             }
         }
         return;
@@ -1096,11 +1795,19 @@ fn matmul_mxfp4_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
         else {
             return false;
         };
-        parts.push((weights.as_slice(), scales.as_slice(), metal_tensor, w.i, w.o));
+        let fmt = mxfp4_storage_fmt(weights, scales, w.o, w.i);
+        parts.push((
+            weights.as_slice(),
+            scales.as_slice(),
+            metal_tensor,
+            w.i,
+            w.o,
+            fmt,
+        ));
     }
 
     let mut guards = Vec::with_capacity(parts.len());
-    for (_, _, metal_tensor, _, _) in &parts {
+    for (_, _, metal_tensor, _, _, _) in &parts {
         guards.push(
             metal_tensor
                 .lock()
@@ -1110,13 +1817,13 @@ fn matmul_mxfp4_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
 
     let mut descs = Vec::with_capacity(parts.len());
     for ((y, part), guard) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()) {
-        let (weights, scales, _, input, output) = *part;
+        let (weights, scales, _, input, output, fmt) = *part;
         descs.push(logan_metal::MetalMatmulDesc {
             tensor: **guard as *mut logan_metal::ColiMetalTensor,
             y: &mut **y,
             weights,
             scales,
-            fmt: 7,
+            fmt,
             i: input,
             o: output,
         });
@@ -1129,9 +1836,9 @@ fn matmul_mxfp4_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
     ok
 }
 
-/// Full one-command-buffer MXFP4 Gated DeltaNet decode. Uses the same
-/// persistent ColiMetalTensor handles as the ordinary MXFP4 GEMV path and the
-/// state-only GdnMetalLayer for page-aligned recurrent state.
+/// Full one-command-buffer quantized Gated DeltaNet decode. Supports MXFP4
+/// qualification formats and block-scaled INT8 while sharing persistent Metal
+/// tensor handles and state-only GdnMetalLayer storage.
 fn gdn_mxfp4_full_token(
     model_id: u64,
     li: usize,
@@ -1153,21 +1860,46 @@ fn gdn_mxfp4_full_token(
     ];
     let mut parts = Vec::with_capacity(ws.len());
     for &w in &ws {
-        let Some(WtBytes::Mxfp4 { weights, scales, metal_tensor }) = w.bytes.as_ref() else {
-            return 0;
+        let (weights, scales, metal_tensor, fmt): (&[u8], &[u8], &std::sync::Mutex<usize>, i32) = match w.bytes.as_ref() {
+            Some(WtBytes::Bf16 { weights, metal_tensor }) => {
+                (weights.as_slice(), &[], metal_tensor, 5)
+            }
+            Some(WtBytes::Mxfp4 { weights, scales, metal_tensor }) => {
+                (weights.as_slice(), scales.as_slice(), metal_tensor, mxfp4_storage_fmt(weights, scales, w.o, w.i))
+            }
+            Some(WtBytes::Q8Block { weights, scales, block, residuals, metal_tensor }) => {
+                let fmt = if *block == 32 && *residuals == 1 { 14 } else { match *block { 32 => 11, 16 => 12, 8 => 13, _ => return 0 } };
+                (weights.as_slice(), scales.as_slice(), metal_tensor, fmt)
+            }
+            _ => return 0,
         };
-        parts.push((weights.as_slice(), scales.as_slice(), metal_tensor, w.i, w.o));
+        parts.push((
+            weights,
+            scales,
+            metal_tensor,
+            w.i,
+            w.o,
+            fmt,
+        ));
     }
     let mut guards = Vec::with_capacity(parts.len());
-    for (_, _, metal_tensor, _, _) in &parts {
-        guards.push(metal_tensor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    for (_, _, metal_tensor, _, _, _) in &parts {
+        guards.push(
+            metal_tensor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
     }
     let mut descs = Vec::with_capacity(parts.len());
     for (part, guard) in parts.iter().zip(guards.iter()) {
-        let (weights, scales, _, input, output) = *part;
+        let (weights, scales, _, input, output, fmt) = *part;
         descs.push(logan_metal::MetalWeightDesc {
             tensor: **guard as *mut logan_metal::ColiMetalTensor,
-            weights, scales, fmt: 7, i: input, o: output,
+            weights,
+            scales,
+            fmt,
+            i: input,
+            o: output,
         });
     }
 
@@ -1177,11 +1909,25 @@ fn gdn_mxfp4_full_token(
     let state = unsafe { std::slice::from_raw_parts_mut(gm.state, state_len) };
     let conv_state = unsafe { std::slice::from_raw_parts_mut(gm.conv_state, conv_len) };
     let rc = logan_metal::gdn_mxfp4(
-        model_id, li, &mut descs, x, out,
-        &layer.gdn_a_log, &layer.gdn_dt_bias, &layer.gdn_conv1d, &layer.gdn_norm,
-        state, conv_state, cfg.hidden, cfg.lin_k_heads, cfg.lin_k_dim,
-        cfg.lin_v_heads, cfg.lin_v_dim, cfg.conv_kernel,
-        cfg.output_gate.gdn_metal_code(), cfg.eps,
+        model_id,
+        li,
+        &mut descs,
+        x,
+        out,
+        &layer.gdn_a_log,
+        &layer.gdn_dt_bias,
+        &layer.gdn_conv1d,
+        &layer.gdn_norm,
+        state,
+        conv_state,
+        cfg.hidden,
+        cfg.lin_k_heads,
+        cfg.lin_k_dim,
+        cfg.lin_v_heads,
+        cfg.lin_v_dim,
+        cfg.conv_kernel,
+        cfg.output_gate.gdn_metal_code(),
+        cfg.eps,
     );
     for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
         **guard = desc.tensor as usize;
@@ -1411,6 +2157,179 @@ impl Model {
         }
     }
 
+    /// Qualification-only load-time conversion of GDN dense matrices to
+    /// signed INT8 with one FP32 scale per 32 input columns. The permanent
+    /// representation should be emitted offline if quality/performance passes.
+    pub(crate) fn quantize_gdn_runtime_q8(&mut self) -> bool {
+        let enabled = std::env::var("QWEN_GDN_RUNTIME_Q8")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if !enabled { return false; }
+        let scope = std::env::var("QWEN_GDN_RUNTIME_Q8_SCOPE").unwrap_or_else(|_| "all".into());
+        let layer_spec = std::env::var("QWEN_GDN_RUNTIME_Q8_LAYERS").unwrap_or_else(|_| "all".into());
+        let block = std::env::var("QWEN_GDN_RUNTIME_Q8_BLOCK")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32);
+        if !matches!(block, 8 | 16 | 32) {
+            eprintln!("qwen4-rs: unsupported Q8 GDN block size {block}; use 8, 16, or 32");
+            return false;
+        }
+        let residuals = std::env::var("QWEN_GDN_RUNTIME_Q8_RESIDUALS")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        if residuals > 1 || (residuals == 1 && block != 32) {
+            eprintln!("qwen4-rs: Q8 GDN residuals currently supports only residuals=1 with block=32");
+            return false;
+        }
+        let selected = |name: &str| scope == "all" || scope.split(',').any(|part| part.trim() == name);
+        let selected_layer = |layer: usize| {
+            if layer_spec.trim().eq_ignore_ascii_case("all") { return true; }
+            layer_spec.split(',').any(|piece| {
+                let piece = piece.trim();
+                if piece.is_empty() { return false; }
+                if let Some((lo, hi)) = piece.split_once('-') {
+                    match (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                        (Ok(lo), Ok(hi)) => lo <= layer && layer <= hi,
+                        _ => false,
+                    }
+                } else {
+                    piece.parse::<usize>().ok() == Some(layer)
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut converted = 0usize;
+        let mut before = 0usize;
+        let mut after = 0usize;
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            if !layer.is_gdn || !selected_layer(li) { continue; }
+            let matrices = [
+                ("qkv", &mut layer.gdn_in_qkv),
+                ("z", &mut layer.gdn_in_z),
+                ("a", &mut layer.gdn_in_a),
+                ("b", &mut layer.gdn_in_b),
+                ("out", &mut layer.gdn_out),
+            ];
+            for (name, w) in matrices {
+                if !selected(name) { continue; }
+                if let Some(bytes) = w.bf16_bytes() {
+                    before += bytes.len();
+                    if !quantize_wt_bf16_to_q8_block(w, block, residuals) {
+                        eprintln!("qwen4-rs: runtime Q8 GDN quantization failed at layer {li} matrix {name}");
+                        return false;
+                    }
+                    if let Some(WtBytes::Q8Block { weights, scales, .. }) = w.bytes.as_ref() {
+                        after += weights.len() + scales.len();
+                    }
+                    converted += 1;
+                } else if let Some(WtBytes::Q8Block { weights, scales, .. }) = w.bytes.as_ref() {
+                    after += weights.len() + scales.len();
+                } else {
+                    eprintln!("qwen4-rs: runtime Q8 GDN encountered unsupported weight at layer {li} matrix {name}");
+                    return false;
+                }
+            }
+        }
+        eprintln!(
+            "qwen4-rs: runtime Q8 GDN scope={scope} layers={layer_spec} block={block} residuals={residuals} converted {converted} matrices in {:.1} ms ({:.1} MiB BF16 -> {:.1} MiB Q8)",
+            started.elapsed().as_secs_f64() * 1e3,
+            before as f64 / (1024.0 * 1024.0),
+            after as f64 / (1024.0 * 1024.0),
+        );
+        converted != 0
+    }
+
+    /// Experimental load-time conversion of the five dense GDN matrices to
+    /// canonical MXFP4. This deliberately runs before `build_gdn_metal`, so
+    /// that object becomes state-only and `gdn_mxfp4_full_token` owns dense
+    /// execution. The BF16 Vec is replaced immediately after each matrix is
+    /// packed, keeping peak memory close to one matrix's packed output.
+    pub(crate) fn quantize_gdn_runtime_mxfp4(&mut self) -> bool {
+        let enabled = std::env::var("QWEN_GDN_RUNTIME_MXFP4")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if !enabled { return false; }
+        let scope = std::env::var("QWEN_GDN_RUNTIME_MXFP4_SCOPE").unwrap_or_else(|_| "all".into());
+        let layer_spec = std::env::var("QWEN_GDN_RUNTIME_MXFP4_LAYERS").unwrap_or_else(|_| "all".into());
+        let selected = |name: &str| {
+            scope == "all" || scope.split(',').any(|part| part.trim() == name)
+        };
+        let selected_layer = |layer: usize| {
+            if layer_spec.trim().eq_ignore_ascii_case("all") { return true; }
+            layer_spec.split(',').any(|piece| {
+                let piece = piece.trim();
+                if piece.is_empty() { return false; }
+                if let Some((lo, hi)) = piece.split_once('-') {
+                    match (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                        (Ok(lo), Ok(hi)) => lo <= layer && layer <= hi,
+                        _ => false,
+                    }
+                } else {
+                    piece.parse::<usize>().ok() == Some(layer)
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut converted = 0usize;
+        let mut before = 0usize;
+        let mut after = 0usize;
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            if !layer.is_gdn || !selected_layer(li) { continue; }
+            let matrices = [
+                ("qkv", &mut layer.gdn_in_qkv),
+                ("z", &mut layer.gdn_in_z),
+                ("a", &mut layer.gdn_in_a),
+                ("b", &mut layer.gdn_in_b),
+                ("out", &mut layer.gdn_out),
+            ];
+            for (name, w) in matrices {
+                if !selected(name) { continue; }
+                if let Some(bytes) = w.bf16_bytes() {
+                    before += bytes.len();
+                    if !quantize_wt_bf16_to_mxfp4(w) {
+                        eprintln!("qwen4-rs: runtime MXFP4 GDN quantization failed at layer {li} matrix {name}");
+                        return false;
+                    }
+                    if let Some(WtBytes::Mxfp4 { weights, scales, .. }) = w.bytes.as_ref() {
+                        after += weights.len() + scales.len();
+                    }
+                    converted += 1;
+                } else if let Some(WtBytes::Mxfp4 { weights, scales, .. }) = w.bytes.as_ref() {
+                    after += weights.len() + scales.len();
+                } else {
+                    eprintln!("qwen4-rs: runtime MXFP4 GDN encountered unsupported weight at layer {li} matrix {name}");
+                    return false;
+                }
+            }
+        }
+        let scale_policy = if std::env::var("QWEN_GDN_RUNTIME_MXFP4_RESIDUAL3")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+        {
+            "mx4+2xmx4res".to_string()
+        } else if std::env::var("QWEN_GDN_RUNTIME_MXFP4_RESIDUAL2")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+        {
+            "mx4+mx4res".to_string()
+        } else if std::env::var("QWEN_GDN_RUNTIME_MXFP4_MSE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+        {
+            let radius = std::env::var("QWEN_GDN_RUNTIME_MXFP4_MSE_RADIUS").unwrap_or_else(|_| "3".into());
+            format!("mse:r{radius}")
+        } else {
+            std::env::var("QWEN_GDN_RUNTIME_MXFP4_CLIP_RMS")
+                .map(|v| format!("rms-clip:{v}"))
+                .unwrap_or_else(|_| "max".into())
+        };
+        eprintln!(
+            "qwen4-rs: runtime MXFP4 GDN scope={scope} layers={layer_spec} scale={scale_policy} converted {converted} matrices in {:.1} ms ({:.1} MiB BF16 -> {:.1} MiB MXFP4)",
+            started.elapsed().as_secs_f64() * 1e3,
+            before as f64 / (1024.0 * 1024.0),
+            after as f64 / (1024.0 * 1024.0),
+        );
+        converted != 0
+    }
+
     /// Move one GDN layer's BF16 weights into page-aligned buffers (C
     /// contract: newBufferWithBytesNoCopy requires 16 KiB-aligned pointers,
     /// length page-rounded). Returns None if any alloc fails (Metal GDN then
@@ -1455,6 +2374,11 @@ impl Model {
                 wa: std::ptr::null_mut(),
                 wb: std::ptr::null_mut(),
                 wout: std::ptr::null_mut(),
+                tqkv: std::ptr::null_mut(),
+                tz: std::ptr::null_mut(),
+                ta: std::ptr::null_mut(),
+                tb: std::ptr::null_mut(),
+                tout: std::ptr::null_mut(),
                 state: state_ptr,
                 conv_state: conv_state_ptr,
                 _bufs: vec![state, conv_state],
@@ -1473,6 +2397,11 @@ impl Model {
             wa: wa.ptr,
             wb: wb.ptr,
             wout: wout.ptr,
+            tqkv: std::ptr::null_mut(),
+            tz: std::ptr::null_mut(),
+            ta: std::ptr::null_mut(),
+            tb: std::ptr::null_mut(),
+            tout: std::ptr::null_mut(),
             state: state_ptr,
             conv_state: conv_state_ptr,
             _bufs: vec![wqkv, wz, wa, wb, wout, state, conv_state],
@@ -1492,6 +2421,171 @@ impl Model {
             layer.gdn_out.bytes = None;
         }
         Some(metal)
+    }
+
+    /// Compile/load explicitly selected ANE GDN input-projection islands during
+    /// model load instead of charging compilation to the first decoded token.
+    ///
+    /// Selected BF16 GDN layers are also moved into the existing single-copy
+    /// page-aligned storage here. The ANE compiler consumes those immutable
+    /// bytes as constants; CPU/Metal fallback and the GDN output projection
+    /// continue to use the same authoritative allocation.
+    pub(crate) fn warm_selected_gdn_ane(&mut self) {
+        if std::env::var("QWEN_GDN_ANE")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let cfg = self.cfg.clone();
+        let kd = cfg.lin_k_dim;
+        let kheads = cfg.lin_k_heads;
+        let vd = cfg.lin_v_dim;
+        let vheads = cfg.lin_v_heads;
+        let cdim = kd * kheads * 2 + vd * vheads;
+        let vdim = vd * vheads;
+        let state_len = vheads * kd * vd;
+        let conv_len = cdim * cfg.conv_kernel.saturating_sub(1);
+        let started = std::time::Instant::now();
+        let mut requested = 0usize;
+        let mut warmed = 0usize;
+
+        for li in 0..self.layers.len() {
+            if !self.layers[li].is_gdn || !gdn_ane::requested(li) {
+                continue;
+            }
+            requested += 1;
+
+            if self.gdn_metal[li].is_none() {
+                let built = Self::build_gdn_metal(&mut self.layers[li], &cfg);
+                if let Some(gm) = built.as_ref() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(self.gdn_s[li].as_ptr(), gm.state, state_len);
+                        if conv_len != 0 {
+                            std::ptr::copy_nonoverlapping(
+                                self.gdn_conv[li].as_ptr(),
+                                gm.conv_state,
+                                conv_len,
+                            );
+                        }
+                    }
+                }
+                self.gdn_metal[li] = built;
+            }
+
+            let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) else {
+                eprintln!(
+                    "qwen4-rs: ANE GDN layer {li} warmup skipped: BF16 aligned weights unavailable"
+                );
+                continue;
+            };
+
+            let ok = unsafe {
+                gdn_ane::warm(
+                    &mut self.gdn_ane[li],
+                    li,
+                    cfg.hidden,
+                    cdim,
+                    vdim,
+                    vheads,
+                    std::slice::from_raw_parts(gm.wqkv, cdim * cfg.hidden * 2),
+                    std::slice::from_raw_parts(gm.wz, vdim * cfg.hidden * 2),
+                    std::slice::from_raw_parts(gm.wa, vheads * cfg.hidden * 2),
+                    std::slice::from_raw_parts(gm.wb, vheads * cfg.hidden * 2),
+                    &self.layers[li].gdn_conv1d,
+                    cfg.conv_kernel,
+                )
+            };
+            warmed += usize::from(ok);
+        }
+
+        if requested != 0 {
+            eprintln!(
+                "qwen4-rs: ANE GDN warmup {warmed}/{requested} layers in {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
+    /// Re-home the resident BF16 LM head into one page-aligned allocation.
+    /// The old Vec is dropped immediately after the copy, so steady-state
+    /// residency remains single-copy and Metal can use newBufferWithBytesNoCopy.
+    pub(crate) fn rehome_lm_head_bf16(&mut self) -> bool {
+        let enabled = std::env::var("QWEN_LM_HEAD_ALIGNED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if !enabled || self.lm_head_aligned.is_some() {
+            return self.lm_head_aligned.is_some();
+        }
+        let need = match self
+            .cfg
+            .vocab
+            .checked_mul(self.cfg.hidden)
+            .and_then(|n| n.checked_mul(2))
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        let Some(src) = self.lm_head.bf16_bytes() else {
+            return false;
+        };
+        if src.len() != need {
+            return false;
+        }
+        let Some(mut aligned) = AlignedBuf::uninitialized(need) else {
+            return false;
+        };
+        aligned.as_mut_u8()[..need].copy_from_slice(src);
+        // The aligned allocation is now authoritative. The CPU fallback below
+        // reads these same bytes, so clearing the Vec loses no fallback path.
+        self.lm_head.bytes = None;
+        self.lm_head_aligned = Some(aligned);
+        true
+    }
+
+    /// Exact-BF16 LM-head GEMV over the aligned single-copy storage. Backend
+    /// selection is deliberately separate from the rest of dense decode so an
+    /// LM-head A/B cannot accidentally redirect all GDN projections too.
+    /// QWEN_LM_HEAD_BACKEND accepts `cpu`, `bnns`, or `metal` (default `cpu`
+    /// until full-runtime residency behaviour is qualified).
+    fn lm_head_matmul(&mut self, y: &mut [f32], x: &[f32]) {
+        let Some(aligned) = self.lm_head_aligned.as_ref() else {
+            matmul(y, x, &self.lm_head);
+            return;
+        };
+        let need = self.cfg.vocab * self.cfg.hidden * 2;
+        let bytes = unsafe { std::slice::from_raw_parts(aligned.ptr, need) };
+        let backend = std::env::var("QWEN_LM_HEAD_BACKEND")
+            .unwrap_or_else(|_| "cpu".to_string());
+        if backend.eq_ignore_ascii_case("metal") {
+            let mut tensor = self.lm_head_metal_tensor as *mut logan_metal::ColiMetalTensor;
+            let ok = logan_metal::metal_matmul(
+                &mut tensor,
+                y,
+                x,
+                bytes,
+                &[],
+                5,
+                self.cfg.hidden,
+                self.cfg.vocab,
+            );
+            self.lm_head_metal_tensor = tensor as usize;
+            if ok {
+                return;
+            }
+        } else if backend.eq_ignore_ascii_case("bnns")
+            && logan_metal::bnns_bf16_matmul(
+                bytes,
+                x,
+                y,
+                self.cfg.vocab,
+                self.cfg.hidden,
+            )
+        {
+            return;
+        }
+        matmul_bf16_bytes(y, x, bytes, self.cfg.vocab, self.cfg.hidden);
     }
 
     fn build_attn_metal(layer: &Layer, cfg: &Cfg) -> Option<AttnMetalLayer> {
@@ -1595,8 +2689,15 @@ impl Model {
         if !gm.bf16_weights {
             return false;
         }
-        let (wqkv, wz, wa, wb, wout, state_ptr, conv_ptr) =
-            (gm.wqkv, gm.wz, gm.wa, gm.wb, gm.wout, gm.state, gm.conv_state);
+        let (wqkv, wz, wa, wb, wout, state_ptr, conv_ptr) = (
+            gm.wqkv,
+            gm.wz,
+            gm.wa,
+            gm.wb,
+            gm.wout,
+            gm.state,
+            gm.conv_state,
+        );
 
         let mut x_all = Vec::with_capacity(rows * d);
         for x in xs {
@@ -1720,8 +2821,8 @@ impl Model {
             let recur_t0 = std::time::Instant::now();
             let mut kv_mem = vec![0.0_f32; vd];
             for h in 0..vheads {
-                let ga = -layer.gdn_a_log[h].exp()
-                    * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
+                let ga =
+                    -layer.gdn_a_log[h].exp() * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
                 let gt = ga.exp();
                 let bt = 1.0 / (1.0 + (-b[h]).exp());
                 let sh = &mut state[h * kd * vd..(h + 1) * kd * vd];
@@ -1815,7 +2916,11 @@ impl Model {
         let vdim = vd * vheads;
         let cdim = kdim * 2 + vdim;
         let kk = c.conv_kernel;
-        let profile_gdn_parts = logan_core::telemetry::enabled();
+        let profile_gdn_parts = logan_core::telemetry::enabled()
+            || std::env::var("QWEN_PROFILE_GDN_PARTS")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+        let ane_requested = gdn_ane::requested(li);
 
         // One-time aligned re-home (C calloc_checked/coli_wt intercept): move
         // the five BF16 GDN matrices into 16 KiB-aligned buffers so Metal can
@@ -1849,25 +2954,25 @@ impl Model {
         // back to CPU merely because it uses the newer sigmoid gate.
         let gdn_enabled = std::env::var("QWEN_GDN_METAL")
             .map(|v| v != "0")
-            .unwrap_or(true);
+            .unwrap_or(false);
         let gdn_mxfp4_full = std::env::var("QWEN_GDN_MXFP4_FULL")
             .map(|v| v != "0")
             .unwrap_or(false);
         // This gate is intentionally independent of legacy QWEN_GDN_METAL.
         // The latter remains off by default on Apple Silicon because the old
         // BF16 full-GDN path lost to BNNS; MXFP4 is qualified separately.
-        if gdn_mxfp4_full {
+        if gdn_mxfp4_full && !ane_requested {
             if let Some(gm) = self.gdn_metal[li].as_mut() {
                 if !gm.bf16_weights {
-                    let rc = gdn_mxfp4_full_token(
-                        self.metal_model_id, li, layer, gm, &c, x, out,
-                    );
+                    let rc = gdn_mxfp4_full_token(self.metal_model_id, li, layer, gm, &c, x, out);
                     if rc > 0 {
                         self.spans.gdn_metal_ok += 1;
                         return;
                     }
                     if rc < 0 {
-                        eprintln!("qwen4-rs: full MXFP4 Metal GDN failed after submission (layer {li})");
+                        eprintln!(
+                            "qwen4-rs: full MXFP4 Metal GDN failed after submission (layer {li})"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -1875,50 +2980,93 @@ impl Model {
         }
 
         if let Some(gm) = &self.gdn_metal[li] {
-            if gdn_enabled && gm.bf16_weights {
-                // SAFETY: exact-length views over the layer's aligned blocks
-                // (kept alive by gm._bufs for the model lifetime). The GPU
-                // mutates state/conv_state in place; the CPU fallback syncs
-                // (below) so both paths share one source of truth.
+            if !ane_requested && gdn_enabled && gm.bf16_weights {
+                // SAFETY: exact-length views over model-lifetime aligned
+                // storage. In overlap mode begin() commits the complete GDN
+                // command buffer, then the host uses the otherwise-idle wait
+                // window to issue the previous route's MetalIO before finish().
                 let (n_state, n_conv) = (vheads * kd * vd, cdim * (kk - 1));
-                let rc = unsafe {
-                    crate::ffi::gdn_token(
-                        self.metal_model_id,
-                        li,
-                        x,
-                        out,
-                        std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
-                        std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
-                        std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
-                        std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
-                        std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
-                        &layer.gdn_a_log,
-                        &layer.gdn_dt_bias,
-                        &layer.gdn_conv1d,
-                        &layer.gdn_norm,
-                        std::slice::from_raw_parts_mut(gm.state, n_state),
-                        std::slice::from_raw_parts_mut(gm.conv_state, n_conv),
-                        c.hidden,
-                        kheads,
-                        kd,
-                        vheads,
-                        vd,
-                        kk,
-                        c.output_gate.gdn_metal_code(),
-                        c.eps,
-                    )
-                };
-                if rc > 0 {
-                    self.spans.gdn_metal_ok += 1;
-                    return;
+                let overlap_prefetch = std::env::var("QWEN_GDN_PREFETCH_OVERLAP")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+                if overlap_prefetch {
+                    let pending = unsafe {
+                        crate::ffi::gdn_token_begin(
+                            self.metal_model_id,
+                            li,
+                            x,
+                            std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                            &layer.gdn_a_log,
+                            &layer.gdn_dt_bias,
+                            &layer.gdn_conv1d,
+                            &layer.gdn_norm,
+                            std::slice::from_raw_parts_mut(gm.state, n_state),
+                            std::slice::from_raw_parts_mut(gm.conv_state, n_conv),
+                            c.hidden,
+                            kheads,
+                            kd,
+                            vheads,
+                            vd,
+                            kk,
+                            c.output_gate.gdn_metal_code(),
+                            c.eps,
+                        )
+                    };
+                    if let Some(pending) = pending {
+                        self.prefetch_previous_route_now(li);
+                        let rc = crate::ffi::gdn_token_finish(pending, out);
+                        if rc > 0 {
+                            self.spans.gdn_metal_ok += 1;
+                            return;
+                        }
+                        if rc < 0 {
+                            eprintln!("qwen4-rs: async Metal GDN failed after submission (layer {li})");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    let rc = unsafe {
+                        crate::ffi::gdn_token(
+                            self.metal_model_id,
+                            li,
+                            x,
+                            out,
+                            std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                            &layer.gdn_a_log,
+                            &layer.gdn_dt_bias,
+                            &layer.gdn_conv1d,
+                            &layer.gdn_norm,
+                            std::slice::from_raw_parts_mut(gm.state, n_state),
+                            std::slice::from_raw_parts_mut(gm.conv_state, n_conv),
+                            c.hidden,
+                            kheads,
+                            kd,
+                            vheads,
+                            vd,
+                            kk,
+                            c.output_gate.gdn_metal_code(),
+                            c.eps,
+                        )
+                    };
+                    if rc > 0 {
+                        self.spans.gdn_metal_ok += 1;
+                        return;
+                    }
+                    if rc < 0 {
+                        eprintln!("qwen4-rs: Metal GDN failed after submission (layer {li})");
+                        std::process::exit(1);
+                    }
                 }
-                if rc < 0 {
-                    eprintln!("qwen4-rs: Metal GDN failed after submission (layer {li})");
-                    std::process::exit(1);
-                }
-                // rc == 0: declined pre-submit. The scalar path below
-                // operates directly on the aligned state when it exists, so
-                // no multi-megabyte GPU->CPU mirror copy is needed here.
+                // Pre-submit decline: scalar path below remains safe because
+                // no recurrent state mutation has been submitted.
             }
         }
 
@@ -1928,60 +3076,130 @@ impl Model {
         let mut z = vec![0.0; vdim];
         let gdn_in_t0 = profile_gdn_parts.then(std::time::Instant::now);
 
-        if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
-            // SAFETY: GdnMetalLayer owns every aligned allocation for the
-            // entire model lifetime. These are the exact BF16 package bytes.
-            unsafe {
-                matmul_bf16_bytes(
-                    &mut qkv,
-                    x,
-                    std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
-                    cdim,
-                    c.hidden,
-                );
-                matmul_bf16_bytes(
-                    &mut z,
-                    x,
-                    std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
-                    vdim,
-                    c.hidden,
-                );
-                matmul_bf16_bytes(
-                    &mut a,
-                    x,
-                    std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
-                    vheads,
-                    c.hidden,
-                );
-                matmul_bf16_bytes(
-                    &mut b,
-                    x,
-                    std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
-                    vheads,
-                    c.hidden,
-                );
-            }
-        } else {
-            let fused_input = std::env::var("QWEN_GDN_FUSED_INPUT")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            let fused_ok = if fused_input {
-                let mut ys: [&mut [f32]; 4] = [&mut qkv, &mut a, &mut b, &mut z];
-                let ws = [
-                    &layer.gdn_in_qkv,
-                    &layer.gdn_in_a,
-                    &layer.gdn_in_b,
-                    &layer.gdn_in_z,
-                ];
-                matmul_mxfp4_multi(&mut ys, x, &ws)
+        let ane_ok = if ane_requested {
+            if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
+                // SAFETY: GdnMetalLayer owns these exact-length model-lifetime
+                // BF16 buffers. ANE compilation consumes them as immutable
+                // constants; recurrent state is not touched by this island.
+                unsafe {
+                    gdn_ane::try_input(
+                        &mut self.gdn_ane[li],
+                        li,
+                        c.hidden,
+                        cdim,
+                        vdim,
+                        vheads,
+                        std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                        &layer.gdn_conv1d,
+                        kk,
+                        x,
+                        &mut qkv,
+                        &mut z,
+                        &mut a,
+                        &mut b,
+                    )
+                }
             } else {
                 false
-            };
-            if !fused_ok {
-                matmul(&mut qkv, x, &layer.gdn_in_qkv);
-                matmul(&mut a, x, &layer.gdn_in_a);
-                matmul(&mut b, x, &layer.gdn_in_b);
-                matmul(&mut z, x, &layer.gdn_in_z);
+            }
+        } else {
+            false
+        };
+
+        if !ane_ok {
+            if let Some(gm) = self.gdn_metal[li].as_mut().filter(|gm| gm.bf16_weights) {
+                // These BF16 buffers are already 16 KiB aligned and page-rounded,
+                // so the generic Metal GEMV can wrap them zero-copy. Fuse all four
+                // input projections into one command buffer; a pre-submit decline
+                // falls back to the established CPU/BNNS path below.
+                let metal_bf16 = std::env::var("QWEN_GDN_BF16_METAL")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+                let metal_ok = if metal_bf16 {
+                    let (wqkv, wz, wa, wb) = unsafe {
+                        (
+                            std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                        )
+                    };
+                    let mut descs = [
+                        logan_metal::MetalMatmulDesc { tensor: gm.tqkv, y: &mut qkv, weights: wqkv, scales: &[], fmt: 5, i: c.hidden, o: cdim },
+                        logan_metal::MetalMatmulDesc { tensor: gm.tz, y: &mut z, weights: wz, scales: &[], fmt: 5, i: c.hidden, o: vdim },
+                        logan_metal::MetalMatmulDesc { tensor: gm.ta, y: &mut a, weights: wa, scales: &[], fmt: 5, i: c.hidden, o: vheads },
+                        logan_metal::MetalMatmulDesc { tensor: gm.tb, y: &mut b, weights: wb, scales: &[], fmt: 5, i: c.hidden, o: vheads },
+                    ];
+                    let ok = logan_metal::metal_matmul_multi(x, &mut descs);
+                    let handles = [descs[0].tensor, descs[1].tensor, descs[2].tensor, descs[3].tensor];
+                    drop(descs);
+                    gm.tqkv = handles[0];
+                    gm.tz = handles[1];
+                    gm.ta = handles[2];
+                    gm.tb = handles[3];
+                    ok
+                } else {
+                    false
+                };
+                if !metal_ok {
+                    // SAFETY: GdnMetalLayer owns every aligned allocation for the
+                    // entire model lifetime. These are the exact BF16 package bytes.
+                    unsafe {
+                        matmul_bf16_bytes(
+                            &mut qkv,
+                            x,
+                            std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                            cdim,
+                            c.hidden,
+                        );
+                        matmul_bf16_bytes(
+                            &mut z,
+                            x,
+                            std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                            vdim,
+                            c.hidden,
+                        );
+                        matmul_bf16_bytes(
+                            &mut a,
+                            x,
+                            std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                            vheads,
+                            c.hidden,
+                        );
+                        matmul_bf16_bytes(
+                            &mut b,
+                            x,
+                            std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                            vheads,
+                            c.hidden,
+                        );
+                    }
+                }
+            } else {
+                let fused_input = std::env::var("QWEN_GDN_FUSED_INPUT")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                let fused_ok = if fused_input {
+                    let mut ys: [&mut [f32]; 4] = [&mut qkv, &mut a, &mut b, &mut z];
+                    let ws = [
+                        &layer.gdn_in_qkv,
+                        &layer.gdn_in_a,
+                        &layer.gdn_in_b,
+                        &layer.gdn_in_z,
+                    ];
+                    matmul_mxfp4_multi(&mut ys, x, &ws)
+                } else {
+                    false
+                };
+                if !fused_ok {
+                    matmul(&mut qkv, x, &layer.gdn_in_qkv);
+                    matmul(&mut a, x, &layer.gdn_in_a);
+                    matmul(&mut b, x, &layer.gdn_in_b);
+                    matmul(&mut z, x, &layer.gdn_in_z);
+                }
             }
         }
         if let Some(t0) = gdn_in_t0 {
@@ -1990,37 +3208,61 @@ impl Model {
 
         let gdn_conv_t0 = profile_gdn_parts.then(std::time::Instant::now);
         let mut y = vec![0.0; cdim];
-        if kk > 1 {
-            // build_gdn_metal() is also the single-copy BF16 re-home on Apple,
-            // even when Metal GDN execution is disabled. Use its aligned conv
-            // state directly so CPU decode does not maintain/copy a second
-            // mirror every token.
-            let conv_st: &mut [f32] = if let Some(gm) = self.gdn_metal[li].as_mut() {
-                unsafe { std::slice::from_raw_parts_mut(gm.conv_state, cdim * (kk - 1)) }
+
+        // Heterogeneous fused front-half: ANE produced qkv/z/a/b into
+        // IOSurfaces; Metal consumes the SAME qkv IOSurface for causal
+        // Conv1D+SiLU. The host conv state is advanced only after successful
+        // GPU completion, so a declined Metal continuation can fall through
+        // to the exact scalar path below without repairing state.
+        let ane_conv_ok = if ane_ok {
+            let conv_len = cdim * kk.saturating_sub(1);
+            let (ane_states, metal_layers, cpu_conv) =
+                (&mut self.gdn_ane, &mut self.gdn_metal, &mut self.gdn_conv);
+            let conv_st: &mut [f32] = if conv_len == 0 {
+                &mut []
+            } else if let Some(gm) = metal_layers[li].as_mut() {
+                unsafe { std::slice::from_raw_parts_mut(gm.conv_state, conv_len) }
             } else {
-                &mut self.gdn_conv[li]
+                &mut cpu_conv[li]
             };
-            for ch in 0..cdim {
-                let mut acc = 0.0_f32;
-                for j in 0..kk {
-                    let vv = if j == kk - 1 {
-                        qkv[ch]
-                    } else {
-                        conv_st[ch * (kk - 1) + j]
-                    };
-                    acc += layer.gdn_conv1d[ch * kk + j] * vv;
-                }
-                y[ch] = silu(acc);
-            }
-            for ch in 0..cdim {
-                for s in 0..kk - 2 {
-                    conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
-                }
-                conv_st[ch * (kk - 1) + (kk - 2)] = qkv[ch];
-            }
+            gdn_ane::try_conv_silu(&mut ane_states[li], li, &qkv, conv_st, &mut y)
         } else {
-            for ch in 0..cdim {
-                y[ch] = silu(layer.gdn_conv1d[ch] * qkv[ch]);
+            false
+        };
+
+        if !ane_conv_ok {
+            if kk > 1 {
+                // build_gdn_metal() is also the single-copy BF16 re-home on Apple,
+                // even when Metal GDN execution is disabled. Use its aligned conv
+                // state directly so CPU decode does not maintain/copy a second
+                // mirror every token.
+                let conv_st: &mut [f32] = if let Some(gm) = self.gdn_metal[li].as_mut() {
+                    unsafe { std::slice::from_raw_parts_mut(gm.conv_state, cdim * (kk - 1)) }
+                } else {
+                    &mut self.gdn_conv[li]
+                };
+                for ch in 0..cdim {
+                    let mut acc = 0.0_f32;
+                    for j in 0..kk {
+                        let vv = if j == kk - 1 {
+                            qkv[ch]
+                        } else {
+                            conv_st[ch * (kk - 1) + j]
+                        };
+                        acc += layer.gdn_conv1d[ch * kk + j] * vv;
+                    }
+                    y[ch] = silu(acc);
+                }
+                for ch in 0..cdim {
+                    for s in 0..kk - 2 {
+                        conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
+                    }
+                    conv_st[ch * (kk - 1) + (kk - 2)] = qkv[ch];
+                }
+            } else {
+                for ch in 0..cdim {
+                    y[ch] = silu(layer.gdn_conv1d[ch] * qkv[ch]);
+                }
             }
         }
         if let Some(t0) = gdn_conv_t0 {
@@ -2127,16 +3369,28 @@ impl Model {
         }
 
         let gdn_out_t0 = profile_gdn_parts.then(std::time::Instant::now);
-        if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
-            // SAFETY: model-lifetime aligned BF16 storage.
-            unsafe {
-                matmul_bf16_bytes(
+        if let Some(gm) = self.gdn_metal[li].as_mut().filter(|gm| gm.bf16_weights) {
+            let metal_bf16 = std::env::var("QWEN_GDN_BF16_METAL")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let wout = unsafe {
+                std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2)
+            };
+            let mut tensor = gm.tout;
+            let metal_ok = metal_bf16
+                && logan_metal::metal_matmul(
+                    &mut tensor,
                     out,
                     &normed,
-                    std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
-                    c.hidden,
+                    wout,
+                    &[],
+                    5,
                     vdim,
+                    c.hidden,
                 );
+            gm.tout = tensor;
+            if !metal_ok {
+                matmul_bf16_bytes(out, &normed, wout, c.hidden, vdim);
             }
         } else {
             matmul(out, &normed, &layer.gdn_out);
@@ -2184,13 +3438,14 @@ impl Model {
         let mut q_all = vec![0.0_f32; rows * rows_q];
         let mut k_all = vec![0.0_f32; rows * rows_kv];
         let mut v_all = vec![0.0_f32; rows * rows_kv];
-        if !crate::ffi::bnns_bf16_matmul_batch(
-            q_bytes, &x_all, &mut q_all, rows, rows_q, c.hidden,
-        ) || !crate::ffi::bnns_bf16_matmul_batch(
-            k_bytes, &x_all, &mut k_all, rows, rows_kv, c.hidden,
-        ) || !crate::ffi::bnns_bf16_matmul_batch(
-            v_bytes, &x_all, &mut v_all, rows, rows_kv, c.hidden,
-        ) {
+        if !crate::ffi::bnns_bf16_matmul_batch(q_bytes, &x_all, &mut q_all, rows, rows_q, c.hidden)
+            || !crate::ffi::bnns_bf16_matmul_batch(
+                k_bytes, &x_all, &mut k_all, rows, rows_kv, c.hidden,
+            )
+            || !crate::ffi::bnns_bf16_matmul_batch(
+                v_bytes, &x_all, &mut v_all, rows, rows_kv, c.hidden,
+            )
+        {
             return None;
         }
 
@@ -2218,9 +3473,9 @@ impl Model {
                 qg: q_all[row * rows_q..(row + 1) * rows_q].to_vec(),
                 k: k_all[row * rows_kv..(row + 1) * rows_kv].to_vec(),
                 v: v_all[row * rows_kv..(row + 1) * rows_kv].to_vec(),
-                index_qk: index_all.as_mut().map(|all| {
-                    all[row * index_rows..(row + 1) * index_rows].to_vec()
-                }),
+                index_qk: index_all
+                    .as_mut()
+                    .map(|all| all[row * index_rows..(row + 1) * index_rows].to_vec()),
                 // This flag means the output projection is Metal-resident;
                 // batched BNNS input projections intentionally leave it false.
                 metal_ok: false,
@@ -2678,7 +3933,9 @@ impl Model {
                 let recs = coli.pkg_ref().expert_records(li, ei);
                 let rec = recs.first()?;
                 let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
-                if regions.len() < 3 || dims.len() < 3 { return None; }
+                if regions.len() < 3 || dims.len() < 3 {
+                    return None;
+                }
                 (
                     rec.shard_id,
                     [regions[0], regions[1], regions[2]],
@@ -2730,16 +3987,24 @@ impl Model {
     /// With 8/layer residency this is normally a zero-I/O probe (the whole
     /// previous route is retained); it remains useful as an opt-in policy for
     /// smaller/global caches and records speculative MetalIO separately.
-    fn prefetch_previous_route(&mut self, li: usize) {
-        if self.sched_mode
-            || !std::env::var("QWEN_PREV_ROUTE_PREFETCH").map(|v| v != "0").unwrap_or(false)
-        {
+    fn prefetch_previous_route_now(&mut self, li: usize) {
+        if self.sched_mode {
             return;
         }
         let previous = self.route_prev[li].clone();
         for ei in previous {
             let _ = self.cached_expert_issue(li as i32, ei as i32, true);
         }
+    }
+
+    fn prefetch_previous_route(&mut self, li: usize) {
+        if !std::env::var("QWEN_PREV_ROUTE_PREFETCH")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.prefetch_previous_route_now(li);
     }
 
     /// Phase 2 (drain): wait for a previously-issued expert's MetalIO event.
@@ -2866,19 +4131,28 @@ impl Model {
         let [gb, ub, db] = cb;
         let g = Wt {
             f: vec![],
-            bytes: Some(WtBytes::Bf16(gb)),
+            bytes: Some(WtBytes::Bf16 {
+                weights: gb,
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
             o: se.rows[0],
             i: se.cols[0],
         };
         let u = Wt {
             f: vec![],
-            bytes: Some(WtBytes::Bf16(ub)),
+            bytes: Some(WtBytes::Bf16 {
+                weights: ub,
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
             o: se.rows[1],
             i: se.cols[1],
         };
         let dw = Wt {
             f: vec![],
-            bytes: Some(WtBytes::Bf16(db)),
+            bytes: Some(WtBytes::Bf16 {
+                weights: db,
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
             o: se.rows[2],
             i: se.cols[2],
         };
@@ -2905,8 +4179,19 @@ impl Model {
             let mut parts = Vec::with_capacity(3);
             let mut all_mx = true;
             for &w in &ws {
-                if let Some(WtBytes::Mxfp4 { weights, scales, metal_tensor }) = w.bytes.as_ref() {
-                    parts.push((weights.as_slice(), scales.as_slice(), metal_tensor, w.i, w.o));
+                if let Some(WtBytes::Mxfp4 {
+                    weights,
+                    scales,
+                    metal_tensor,
+                }) = w.bytes.as_ref()
+                {
+                    parts.push((
+                        weights.as_slice(),
+                        scales.as_slice(),
+                        metal_tensor,
+                        w.i,
+                        w.o,
+                    ));
                 } else {
                     all_mx = false;
                     break;
@@ -2915,20 +4200,33 @@ impl Model {
             if all_mx {
                 let mut guards = Vec::with_capacity(3);
                 for (_, _, metal_tensor, _, _) in &parts {
-                    guards.push(metal_tensor.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+                    guards.push(
+                        metal_tensor
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
                 }
                 let mut descs = Vec::with_capacity(3);
                 for (part, guard) in parts.iter().zip(guards.iter()) {
                     let (weights, scales, _, input, output) = *part;
                     descs.push(logan_metal::MetalWeightDesc {
                         tensor: **guard as *mut logan_metal::ColiMetalTensor,
-                        weights, scales, fmt: 7, i: input, o: output,
+                        weights,
+                        scales,
+                        fmt: 7,
+                        i: input,
+                        o: output,
                     });
                 }
                 let mut sy = vec![0.0f32; self.cfg.hidden];
                 match logan_metal::shared_mxfp4(
-                    self.metal_model_id, li, &mut descs, x, &mut sy,
-                    self.cfg.hidden, self.cfg.shared_inter,
+                    self.metal_model_id,
+                    li,
+                    &mut descs,
+                    x,
+                    &mut sy,
+                    self.cfg.hidden,
+                    self.cfg.shared_inter,
                 ) {
                     Ok(Some(())) => {
                         for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
@@ -3024,10 +4322,16 @@ impl Model {
         let d = c.hidden;
 
         let current_route = &idx[..k.min(idx.len())];
-        if std::env::var("QWEN_ROUTE_OVERLAP").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("QWEN_ROUTE_OVERLAP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
             let previous = &self.route_prev[li];
             if previous.len() == current_route.len() && !previous.is_empty() {
-                let common = current_route.iter().filter(|&&e| previous.contains(&e)).count() as u64;
+                let common = current_route
+                    .iter()
+                    .filter(|&&e| previous.contains(&e))
+                    .count() as u64;
                 self.route_overlap_common[li] += common;
                 self.route_overlap_total[li] += current_route.len() as u64;
                 self.route_overlap_pairs[li] += 1;
@@ -3237,7 +4541,10 @@ impl Model {
             return;
         }
 
-        if std::env::var("QWEN_MOE_FALLBACK_DIAG").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("QWEN_MOE_FALLBACK_DIAG")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
             eprintln!("[moe-fallback] layer={li} reason={fallback_reason}");
         }
         let mut _fill_t = logan_core::telemetry::Span::begin("fill");
@@ -3273,19 +4580,28 @@ impl Model {
                         [
                             Wt {
                                 f: vec![],
-                                bytes: Some(WtBytes::Bf16(m[0].bytes.clone())),
+                                bytes: Some(WtBytes::Bf16 {
+                                    weights: m[0].bytes.clone(),
+                                    metal_tensor: std::sync::Mutex::new(0),
+                                }),
                                 o: m[0].o,
                                 i: m[0].i,
                             },
                             Wt {
                                 f: vec![],
-                                bytes: Some(WtBytes::Bf16(m[1].bytes.clone())),
+                                bytes: Some(WtBytes::Bf16 {
+                                    weights: m[1].bytes.clone(),
+                                    metal_tensor: std::sync::Mutex::new(0),
+                                }),
                                 o: m[1].o,
                                 i: m[1].i,
                             },
                             Wt {
                                 f: vec![],
-                                bytes: Some(WtBytes::Bf16(m[2].bytes.clone())),
+                                bytes: Some(WtBytes::Bf16 {
+                                    weights: m[2].bytes.clone(),
+                                    metal_tensor: std::sync::Mutex::new(0),
+                                }),
                                 o: m[2].o,
                                 i: m[2].i,
                             },
@@ -3598,12 +4914,7 @@ impl Model {
                 let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
                 if !self.gdn_chunk_batched(&mut layer, l, &mixed_rows, &mut temporal_rows) {
                     for row in 0..tokens.len() {
-                        self.gdn_token(
-                            &mut layer,
-                            l,
-                            &mixed_rows[row],
-                            &mut temporal_rows[row],
-                        );
+                        self.gdn_token(&mut layer, l, &mixed_rows[row], &mut temporal_rows[row]);
                     }
                 }
                 self.spans.gdn_ms += _gdn_t.end();
@@ -3765,8 +5076,7 @@ impl Model {
                         );
                         self.spans.gpu_ms += _gpu_t.end();
                         if gpu_ok {
-                            let mut contrib =
-                                vec![0.0_f32; tokens.len() * c.topk * c.hidden];
+                            let mut contrib = vec![0.0_f32; tokens.len() * c.topk * c.hidden];
                             for (grouped_row, &(row, rank)) in scatter.iter().enumerate() {
                                 let src = &grouped_y
                                     [grouped_row * c.hidden..(grouped_row + 1) * c.hidden];
@@ -3784,9 +5094,9 @@ impl Model {
                                         moe[dd] += contrib[off + dd] * w;
                                     }
                                 }
-                                let mut _shared_t =
-                                    logan_core::telemetry::Span::begin("shared");
-                                let (sy, gs) = self.shared_expert_value(&layer, l, &moe_inputs[row]);
+                                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                                let (sy, gs) =
+                                    self.shared_expert_value(&layer, l, &moe_inputs[row]);
                                 self.spans.shared_ms += _shared_t.end();
                                 for dd in 0..c.hidden {
                                     moe[dd] += sy[dd] * gs;
@@ -3809,15 +5119,7 @@ impl Model {
                 for row in 0..tokens.len() {
                     let mut moe = vec![0.0; c.hidden];
                     let (idx, val, wsum) = &routes[row];
-                    self.moe_token_routed(
-                        &layer,
-                        l,
-                        &moe_inputs[row],
-                        &mut moe,
-                        idx,
-                        val,
-                        *wsum,
-                    );
+                    self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
                     for g in 0..c.hc_count {
                         for dd in 0..c.hidden {
                             streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
@@ -3988,7 +5290,7 @@ impl Model {
             // RMSNorm convention into model.norm.weight before quantization.
             rmsnorm_row_shifted(&mut normed, stream, &self.final_norm, c.eps);
             let mut logits = vec![0.0; c.vocab];
-            matmul(&mut logits, &normed, &self.lm_head);
+            self.lm_head_matmul(&mut logits, &normed);
             self.spans.head_ms += _head_t.end();
             return logits;
         }
@@ -4013,9 +5315,9 @@ impl Model {
         if !self.final_norm.is_empty() {
             let mut normed = vec![0.0; d];
             rmsnorm_row(&mut normed, &out, &self.final_norm, c.eps);
-            matmul(&mut logits, &normed, &self.lm_head);
+            self.lm_head_matmul(&mut logits, &normed);
         } else {
-            matmul(&mut logits, &out, &self.lm_head);
+            self.lm_head_matmul(&mut logits, &out);
         }
         self.spans.head_ms += _head_t.end();
         logits
@@ -4201,18 +5503,33 @@ impl Model {
             self.expert_store.hits,
             self.expert_store.misses,
         );
-        if std::env::var("QWEN_ROUTE_OVERLAP").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("QWEN_ROUTE_OVERLAP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
             let common: u64 = self.route_overlap_common.iter().sum();
             let total: u64 = self.route_overlap_total.iter().sum();
             let pairs: u64 = self.route_overlap_pairs.iter().sum();
             eprintln!(
                 "logan route-overlap: common={common} total={total} pairs={pairs} rate={:.3}",
-                if total == 0 { 0.0 } else { common as f64 / total as f64 }
+                if total == 0 {
+                    0.0
+                } else {
+                    common as f64 / total as f64
+                }
             );
-            let detail = self.route_overlap_common.iter().zip(&self.route_overlap_total)
+            let detail = self
+                .route_overlap_common
+                .iter()
+                .zip(&self.route_overlap_total)
                 .zip(&self.route_overlap_pairs)
                 .enumerate()
-                .map(|(li, ((&c, &t), &p))| format!("{li}:{:.3}/{p}", if t == 0 { 0.0 } else { c as f64 / t as f64 }))
+                .map(|(li, ((&c, &t), &p))| {
+                    format!(
+                        "{li}:{:.3}/{p}",
+                        if t == 0 { 0.0 } else { c as f64 / t as f64 }
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!("logan route-overlap layers: {detail}");
@@ -4233,6 +5550,7 @@ impl Model {
 /// 256-slot default until they have their own measured residency curve.
 fn make_expert_store(
     layers: usize,
+    topk: usize,
 ) -> logan_core::expert::ExpertStore<crate::colisource::SlotExpert> {
     // Explicit override: 0 restores the legacy global LRU for A/Bs.
     if let Some(per_layer) = std::env::var("QWEN4_CACHE_PER_LAYER")
@@ -4249,10 +5567,15 @@ fn make_expert_store(
     // Measured on the 16 GiB M2 Qwen3.6-35B-A3B workload: 8/layer cuts
     // routed-expert misses ~30% versus the 128-entry global LRU and beats
     // 10/layer end-to-end because the latter adds UMA/residency pressure.
+    // A layer-local cache must be able to hold one complete active route. Use
+    // the model's declared routing top-k directly rather than assuming a value
+    // from the model family: REAP/custom checkpoints may change it. A zero
+    // value is malformed metadata, so keep a one-slot defensive floor here;
+    // normal model validation should reject such a config earlier.
     if cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && detect_physical_ram_bytes().is_some_and(|bytes| bytes <= 16 * 1024 * 1024 * 1024)
     {
-        return logan_core::expert::ExpertStore::new_layered(layers, 8);
+        return logan_core::expert::ExpertStore::new_layered(layers, topk.max(1));
     }
     logan_core::expert::ExpertStore::new(cache_cap())
 }
@@ -4758,6 +6081,8 @@ impl Model {
             coli: None,
             embed: load_wt(st, "model.embed_tokens.weight", cfg.vocab, cfg.hidden)?,
             lm_head: load_wt(st, "lm_head.weight", cfg.vocab, cfg.hidden)?,
+            lm_head_aligned: None,
+            lm_head_metal_tensor: 0,
             // qwen4 drops norm.weight when hyper connections are active
             final_norm: match st.f32("model.norm.weight", &[cfg.hidden as u64]) {
                 Ok(v) => v,
@@ -4852,7 +6177,7 @@ impl Model {
                 hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
             ],
             expert_plan: None,
-            expert_store: make_expert_store(cfg.layers),
+            expert_store: make_expert_store(cfg.layers, cfg.topk),
             spans: logan_core::telemetry::TokenSpans::default(),
             route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
             route_overlap_common: vec![0; cfg.layers],
@@ -4871,6 +6196,9 @@ impl Model {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             gdn_metal: (0..cfg.layers).map(|_| None).collect(),
+            gdn_ane: (0..cfg.layers)
+                .map(|_| gdn_ane::GdnAneState::default())
+                .collect(),
             attn_metal: (0..cfg.layers).map(|_| None).collect(),
             sched_mode: false,
             sched_blocked: None,
@@ -4940,8 +6268,46 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        causal_conv1d_sample, default_cache_cap_for_ram, rmsnorm_row, rmsnorm_row_shifted,
+        causal_conv1d_sample, default_cache_cap_for_ram, quantize_bf16_to_mxfp4, rmsnorm_row,
+        rmsnorm_row_shifted, StFile, MAX_RESIDENT_PLE_NGRAM_BYTES,
     };
+
+    #[test]
+    fn giant_ple_ngram_safetensor_is_refused_without_reading_payload() {
+        use std::io::Write as _;
+
+        let name = "model.ple.ple_embedding.ngram_embedding.weight";
+        let payload_len = MAX_RESIDENT_PLE_NGRAM_BYTES + 4;
+        let elems = payload_len / 4;
+        let header = serde_json::to_vec(&serde_json::json!({
+            name: {
+                "dtype": "F32",
+                "shape": [elems],
+                "data_offsets": [0, payload_len]
+            }
+        }))
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "logan-ngram-residency-{}-{}.safetensors",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        // Sparse extension: if StFile::open ever reverts to std::fs::read(),
+        // this regression test becomes expensive/fails instead of silently
+        // accepting whole-file residency.
+        file.set_len(8 + header.len() as u64 + payload_len as u64)
+            .unwrap();
+        drop(file);
+
+        let st = StFile::open(&path).unwrap();
+        let err = st.f32(name, &[elems as u64]).unwrap_err();
+        assert!(err.contains("refusing to materialize"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
@@ -4959,6 +6325,19 @@ mod tests {
         let history = [4.0_f32, 3.0, 2.0];
         let weights = [1.0_f32, 10.0, 100.0];
         assert_eq!(causal_conv1d_sample(5.0, &history, &weights, 1), 543.0);
+    }
+
+    #[test]
+    fn runtime_mxfp4_quantizer_matches_canonical_nibble_order() {
+        let values = [
+            0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let mut bf16 = Vec::with_capacity(values.len() * 2);
+        for value in values { bf16.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes()); }
+        let (weights, scales) = quantize_bf16_to_mxfp4(&bf16, 1, values.len()).unwrap();
+        assert_eq!(scales, vec![127]);
+        assert_eq!(weights, vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
     }
 
     #[test]

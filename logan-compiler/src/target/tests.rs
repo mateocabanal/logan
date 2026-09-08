@@ -20,6 +20,8 @@ fn apple_machine() -> MachineProfile {
         ram_bytes: None,
         unified_memory: true,
         metal_available: true,
+        ane_available: true,
+        ane_iosurface_interop: true,
         apple8_abi: true,
         avx2: false,
         apple_gpu_family_min: 8,
@@ -33,6 +35,8 @@ fn linux_machine(avx2: bool) -> MachineProfile {
         ram_bytes: None,
         unified_memory: false,
         metal_available: false,
+        ane_available: false,
+        ane_iosurface_interop: false,
         apple8_abi: false,
         avx2,
         apple_gpu_family_min: 8,
@@ -71,6 +75,8 @@ fn apple8_is_never_auto_selected_on_an_intel_mac() {
     let intel_mac = MachineProfile {
         operating_system: "macos",
         architecture: "x86_64",
+        ane_available: false,
+        ane_iosurface_interop: false,
         apple8_abi: false,
         ..apple_machine()
     };

@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use crate::shared::SharedAllocationId;
+
 /// A resolved tensor: where its bytes live and how to read them.
 #[derive(Debug, Clone)]
 pub enum TensorStorage {
@@ -27,6 +29,15 @@ pub enum TensorStorage {
         handle: u64,
         /// CPU-visible pointer (valid while the handle is alive).
         ptr: *mut u8,
+        len: usize,
+    },
+    /// View into a backend-owned physical allocation that may be visible to
+    /// multiple execution devices (e.g. an IOSurface shared by Metal + ANE).
+    /// Native handles/lifetimes live in the backend registries; the core only
+    /// carries the stable allocation identity and byte range.
+    Shared {
+        allocation: SharedAllocationId,
+        offset: usize,
         len: usize,
     },
 }

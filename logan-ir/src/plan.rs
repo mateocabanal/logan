@@ -5,10 +5,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{graph::Graph, optimizer::ParetoPlan, resource::ResourcePlan};
+use crate::{
+    execution::ExecutionPlan, graph::Graph, optimizer::ParetoPlan, resource::ResourcePlan,
+};
 
-/// Artifact format version. Bump on any breaking change to the schema.
-pub const PLAN_ARTIFACT_VERSION: u32 = 4;
+/// Artifact format version. V5 adds the optional heterogeneous execution
+/// overlay. The reader retains V4 compatibility and upgrades it to
+/// `execution = None` in memory.
+pub const PLAN_ARTIFACT_VERSION: u32 = 5;
+const LEGACY_PLAN_ARTIFACT_VERSION: u32 = 4;
 
 /// Transitional compatibility projection for runtimes that have not migrated
 /// to `ResourcePlan` yet.
@@ -78,9 +83,21 @@ pub struct PlanArtifact {
     pub package_fingerprint: String,
     pub graph: Graph,
     pub memory: MemoryPlan,
+    /// Optional heterogeneous execution overlay. `None` means the runtime may
+    /// use its legacy engine-defined placement or construct an overlay at load.
+    pub execution: Option<ExecutionPlan>,
     /// The selected Pareto point, including per-group reasoning. `None` for
     /// legacy/manual plans that did not run the optimizer.
     pub optimizer: Option<ParetoPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct LegacyPlanArtifactV4 {
+    version: u32,
+    package_fingerprint: String,
+    graph: Graph,
+    memory: MemoryPlan,
+    optimizer: Option<ParetoPlan>,
 }
 
 impl PlanArtifact {
@@ -90,6 +107,7 @@ impl PlanArtifact {
             package_fingerprint,
             graph,
             memory,
+            execution: None,
             optimizer: None,
         }
     }
@@ -99,22 +117,52 @@ impl PlanArtifact {
         self
     }
 
+    pub fn with_execution(mut self, execution: ExecutionPlan) -> Result<PlanArtifact, String> {
+        execution.validate(&self.graph)?;
+        self.execution = Some(execution);
+        Ok(self)
+    }
+
     /// Serialize to a compact binary form (bincode-style framing via serde).
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         self.memory.validate_resources()?;
+        if let Some(execution) = &self.execution {
+            execution.validate(&self.graph)?;
+        }
         bincode::serialize(self).map_err(|e| format!("plan serialize: {e}"))
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<PlanArtifact, String> {
-        let plan: PlanArtifact =
-            bincode::deserialize(bytes).map_err(|e| format!("plan deserialize: {e}"))?;
-        if plan.version != PLAN_ARTIFACT_VERSION {
-            return Err(format!(
-                "plan artifact version {} != supported {}",
-                plan.version, PLAN_ARTIFACT_VERSION
-            ));
+        if bytes.len() < std::mem::size_of::<u32>() {
+            return Err("plan deserialize: truncated version field".into());
         }
+        let version = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let plan = match version {
+            PLAN_ARTIFACT_VERSION => {
+                bincode::deserialize(bytes).map_err(|e| format!("plan deserialize: {e}"))?
+            }
+            LEGACY_PLAN_ARTIFACT_VERSION => {
+                let legacy: LegacyPlanArtifactV4 = bincode::deserialize(bytes)
+                    .map_err(|e| format!("legacy v4 plan deserialize: {e}"))?;
+                PlanArtifact {
+                    version: PLAN_ARTIFACT_VERSION,
+                    package_fingerprint: legacy.package_fingerprint,
+                    graph: legacy.graph,
+                    memory: legacy.memory,
+                    execution: None,
+                    optimizer: legacy.optimizer,
+                }
+            }
+            other => {
+                return Err(format!(
+                    "plan artifact version {other} != supported {PLAN_ARTIFACT_VERSION} (legacy {LEGACY_PLAN_ARTIFACT_VERSION} is also accepted)"
+                ));
+            }
+        };
         plan.memory.validate_resources()?;
+        if let Some(execution) = &plan.execution {
+            execution.validate(&plan.graph)?;
+        }
         Ok(plan)
     }
 
@@ -136,6 +184,7 @@ impl PlanArtifact {
 mod tests {
     use super::*;
     use crate::{
+        execution::{ExecutionBackend, ExecutionIsland, ExecutionPlan},
         graph::{Op, ValueType},
         resource::{MemoryPoolId, ResourcePlan, StoragePoolId},
     };
@@ -216,7 +265,50 @@ mod tests {
         let bytes = plan.to_bytes().unwrap();
         let back = PlanArtifact::from_bytes(&bytes).unwrap();
         assert_eq!(plan, back);
-        assert_eq!(back.version, 4);
+        assert_eq!(back.version, PLAN_ARTIFACT_VERSION);
+    }
+
+    #[test]
+    fn execution_overlay_round_trips() {
+        let plan = sample_plan()
+            .with_execution(ExecutionPlan {
+                islands: vec![ExecutionIsland {
+                    id: 0,
+                    backend: ExecutionBackend::Ane,
+                    nodes: vec![0],
+                    inputs: vec![0, 1],
+                    outputs: vec![2],
+                    fixed_shape: true,
+                    cache_key: Some("dense-64x64".into()),
+                    rationale: Some("ANE dense island".into()),
+                }],
+                edges: vec![],
+            })
+            .unwrap();
+        let bytes = plan.to_bytes().unwrap();
+        let back = PlanArtifact::from_bytes(&bytes).unwrap();
+        assert_eq!(back.execution, plan.execution);
+        assert_eq!(
+            back.execution.as_ref().unwrap().backend_for_node(0),
+            Some(ExecutionBackend::Ane)
+        );
+    }
+
+    #[test]
+    fn legacy_v4_plan_upgrades_without_execution_overlay() {
+        let current = sample_plan();
+        let legacy = LegacyPlanArtifactV4 {
+            version: LEGACY_PLAN_ARTIFACT_VERSION,
+            package_fingerprint: current.package_fingerprint.clone(),
+            graph: current.graph.clone(),
+            memory: current.memory.clone(),
+            optimizer: current.optimizer.clone(),
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let upgraded = PlanArtifact::from_bytes(&bytes).unwrap();
+        assert_eq!(upgraded.version, PLAN_ARTIFACT_VERSION);
+        assert_eq!(upgraded.package_fingerprint, current.package_fingerprint);
+        assert!(upgraded.execution.is_none());
     }
 
     #[test]

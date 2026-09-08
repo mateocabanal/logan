@@ -92,6 +92,26 @@ impl DeviceRegistry {
             .into_iter()
             .find(|target| target.accepts(kind))
     }
+
+    /// First target of a specific device class, in ascending `DeviceId` order.
+    pub fn find_kind(&self, device_kind: DeviceKind) -> Option<&ExecutionTarget> {
+        self.targets()
+            .into_iter()
+            .find(|target| target.kind == device_kind)
+    }
+
+    /// First target matching both a device class and action capability. This
+    /// is the heterogeneous execution lookup: an ANE island asks for
+    /// `(Neural, Accelerator)` and cannot accidentally land on the GPU.
+    pub fn find_kind_capable(
+        &self,
+        device_kind: DeviceKind,
+        action_kind: ActionKind,
+    ) -> Option<&ExecutionTarget> {
+        self.targets()
+            .into_iter()
+            .find(|target| target.kind == device_kind && target.accepts(action_kind))
+    }
 }
 
 #[cfg(test)]
@@ -144,21 +164,59 @@ mod tests {
     fn caps_route_by_accepted_action_kind() {
         let mut registry = DeviceRegistry::new();
         registry
-            .register(target(5, DeviceKind::Gpu, vec![ActionKind::Cpu, ActionKind::Accelerator]))
+            .register(target(
+                5,
+                DeviceKind::Gpu,
+                vec![ActionKind::Cpu, ActionKind::Accelerator],
+            ))
             .unwrap();
         registry
             .register(target(3, DeviceKind::Cpu, vec![ActionKind::Cpu]))
             .unwrap();
         // Ascending id order: CPU-only device wins the CPU route.
-        assert_eq!(registry.find_capable(ActionKind::Cpu).unwrap().device, DeviceId(3));
         assert_eq!(
-            registry.find_capable(ActionKind::Accelerator).unwrap().device,
+            registry.find_capable(ActionKind::Cpu).unwrap().device,
+            DeviceId(3)
+        );
+        assert_eq!(
+            registry
+                .find_capable(ActionKind::Accelerator)
+                .unwrap()
+                .device,
             DeviceId(5)
         );
         assert_eq!(registry.find_capable(ActionKind::Io), None);
         // Unregister removes the route.
         registry.unregister(DeviceId(3)).unwrap();
-        assert_eq!(registry.find_capable(ActionKind::Cpu).unwrap().device, DeviceId(5));
+        assert_eq!(
+            registry.find_capable(ActionKind::Cpu).unwrap().device,
+            DeviceId(5)
+        );
+    }
+
+    #[test]
+    fn kind_capable_distinguishes_gpu_from_neural_accelerators() {
+        let mut registry = DeviceRegistry::new();
+        registry
+            .register(target(2, DeviceKind::Gpu, vec![ActionKind::Accelerator]))
+            .unwrap();
+        registry
+            .register(target(3, DeviceKind::Neural, vec![ActionKind::Accelerator]))
+            .unwrap();
+        assert_eq!(
+            registry
+                .find_kind_capable(DeviceKind::Neural, ActionKind::Accelerator)
+                .unwrap()
+                .device,
+            DeviceId(3)
+        );
+        assert_eq!(
+            registry
+                .find_kind_capable(DeviceKind::Gpu, ActionKind::Accelerator)
+                .unwrap()
+                .device,
+            DeviceId(2)
+        );
     }
 
     #[test]

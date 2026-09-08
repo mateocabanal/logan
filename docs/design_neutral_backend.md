@@ -46,6 +46,8 @@ logan/ (workspace)
 │                          residency), decode loop, telemetry, math primitives
 ├── logan-metal     NEW  — Metal/MetalIO backend (kernels, device, streaming);
 │                          engine-neutral; CPU-only fallback when absent
+├── logan-ane       NEW  — low-level Apple Neural Engine backend; private
+│                          runtime ABI, MIL compilation, IOSurface sharing
 ├── logan-compiler  (exists) — frontends → IR → planner → quant → package+plan
 │   └── frontends/  deepseek_v4, qwen_moe, qwen4 (model → IR)
 ├── logan-qwen      (exists, thins out) — graph builder + engine-specific ops

@@ -106,6 +106,41 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     for (int i = slane; i < I; i += 32) {
       uchar b = wr[i>>2]; int v = (b >> (2*(i&3))) & 0x3; acc += float(v-2) * xr[i];
     }
+  } else if (fmt == 5) {                            // raw BF16 rows: one ushort/element, no scale
+    device const ushort* wr = (device const ushort*)w + (long)o * I;
+    device const ushort4* w4 = (device const ushort4*)wr;
+    for (int c = slane; c < I8; c += 32) {
+      ushort4 a = w4[2*c], b = w4[2*c+1];
+      float4 w0 = float4(as_type<float>(uint(a.x)<<16), as_type<float>(uint(a.y)<<16),
+                         as_type<float>(uint(a.z)<<16), as_type<float>(uint(a.w)<<16));
+      float4 w1 = float4(as_type<float>(uint(b.x)<<16), as_type<float>(uint(b.y)<<16),
+                         as_type<float>(uint(b.z)<<16), as_type<float>(uint(b.w)<<16));
+      acc += dot(w0,x4[2*c]) + dot(w1,x4[2*c+1]);
+    }
+    for (int i = I8*8 + slane; i < I; i += 32)
+      acc += as_type<float>(uint(wr[i])<<16) * xr[i];
+  } else if ((fmt >= 11 && fmt <= 13) || fmt == 14) { // block-scaled int8; fmt14 adds 1 BF16 residual/block
+    int block = (fmt == 12) ? 16 : ((fmt == 13) ? 8 : 32);
+    int ng = (I + block - 1) / block;
+    device const char* wr = (device const char*)w + (long)o * I;
+    device const float* scl = scale + (long)o * ng;
+    long qbytes = (long)O * I;
+    device const ushort* rv = (device const ushort*)(w + qbytes);
+    device const uchar* ri = w + qbytes + (long)O * ng * 2;
+    for (int i = slane; i < I; i += 32) {
+      acc += float(wr[i]) * xr[i] * scl[i/block];
+      if (fmt == 14 && slane == 0) {
+        int g = i / 32;
+        if (g < ng) {
+          int idx = (int)ri[(long)o * ng + g];
+          int col = g * 32 + idx;
+          if (col < I) {
+            float corr = as_type<float>((uint)rv[(long)o * ng + g] << 16);
+            acc += corr * xr[col];
+          }
+        }
+      }
+    }
   } else if (fmt == 4) {                            // int4 GROUPED: same nibble packing as fmt=2,
                                                      // one f32 scale per gsz-element group along I.
                                                      // Each lane owns one packed byte (2 elements) per
@@ -164,6 +199,35 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
         acc += mx4_lut[b >> 4] * xr[i+1] * sc1;
       }
     }
+  } else if (fmt == 9 || fmt == 10) {               // MXFP4 residual expansion: 2 or 3 planes
+    int rb = (I+1)/2, ng = (I+31)/32;
+    const float mx4_lut2[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
+                                -0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+    long plane_w = (long)O * rb, plane_s = (long)O * ng;
+    device const uchar* wr0 = w + (long)o * rb;
+    device const uchar* wr1 = w + plane_w + (long)o * rb;
+    device const uchar* wr2 = w + 2*plane_w + (long)o * rb;
+    device const uchar* all_s = (device const uchar*)scale;
+    device const uchar* sc0p = all_s + (long)o * ng;
+    device const uchar* sc1p = all_s + plane_s + (long)o * ng;
+    device const uchar* sc2p = all_s + 2*plane_s + (long)o * ng;
+    for (int i = slane*2; i < I; i += 64) {
+      uchar b0 = wr0[i>>1], b1 = wr1[i>>1];
+      int g0 = i/32;
+      float s00 = as_type<float>((uint)sc0p[g0] << 23);
+      float s10 = as_type<float>((uint)sc1p[g0] << 23);
+      float wv0 = mx4_lut2[b0 & 0xF] * s00 + mx4_lut2[b1 & 0xF] * s10;
+      if (fmt == 10) { uchar b2 = wr2[i>>1]; float s20 = as_type<float>((uint)sc2p[g0] << 23); wv0 += mx4_lut2[b2 & 0xF] * s20; }
+      acc += wv0 * xr[i];
+      if (i+1 < I) {
+        int g1 = (i+1)/32;
+        float s01 = (g1==g0) ? s00 : as_type<float>((uint)sc0p[g1] << 23);
+        float s11 = (g1==g0) ? s10 : as_type<float>((uint)sc1p[g1] << 23);
+        float wv1 = mx4_lut2[b0 >> 4] * s01 + mx4_lut2[b1 >> 4] * s11;
+        if (fmt == 10) { uchar b2 = wr2[i>>1]; float s21 = (g1==g0) ? as_type<float>((uint)sc2p[g0] << 23) : as_type<float>((uint)sc2p[g1] << 23); wv1 += mx4_lut2[b2 >> 4] * s21; }
+        acc += wv1 * xr[i+1];
+      }
+    }
   } else {                                          // f32
     device const float* wr = (device const float*)(w) + (long)o * I;
     device const float4* w4 = (device const float4*)wr;
@@ -171,9 +235,8 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     for (int i = I8*8 + slane; i < I; i += 32) acc += wr[i] * xr[i];
   }
   acc = simd_sum(acc);
-  // fmt==4/7/8 (per-group MXFP4, per-block) already folded their scale into acc
-  // above -- do not scale again.
-  if (slane == 0) y[row] = (fmt == 4 || fmt == 7 || fmt == 8) ? acc : acc * scale[o];
+  // fmt==4/7/8 fold scale into acc; raw BF16 fmt==5 has no scale.
+  if (slane == 0) y[row] = (fmt == 4 || fmt == 5 || fmt == 7 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 11 || fmt == 12 || fmt == 13 || fmt == 14) ? acc : acc * scale[o];
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -902,8 +965,13 @@ static size_t fmt_bytes(int fmt, int I, int O) {
   if (fmt == 2) return (size_t)O * ((I+1)/2);
   if (fmt == 3) return (size_t)O * ((I+3)/4);
   if (fmt == 4) return (size_t)O * ((I+1)/2);   // grouped int4: identical packed-nibble layout to fmt=2
-  if (fmt == 7) return (size_t)O * ((I+1)/2);   // MXFP4: same packed-nibble layout, e2m1 values + e8m0 byte scales
-  if (fmt == 8) return (size_t)O * I;           // fp8 e4m3: one raw byte/element, same as fmt=1
+  if (fmt == 5) return (size_t)O * I * sizeof(uint16_t); // raw BF16
+  if (fmt == 7) return (size_t)O * ((I+1)/2);   // MXFP4: one packed E2M1 plane
+  if (fmt == 9) return 2u * (size_t)O * ((I+1)/2); // MXFP4x2
+  if (fmt == 10) return 3u * (size_t)O * ((I+1)/2); // MXFP4x3
+  if (fmt == 8) return (size_t)O * I;           // fp8 e4m3
+  if (fmt >= 11 && fmt <= 13) return (size_t)O * I; // block-scaled int8
+  if (fmt == 14) return (size_t)O * I + (size_t)O * ((I + 31) / 32) * 3u; // q8 + bf16 residual + u8 index
   return (size_t)O * I * sizeof(float);
 }
 // Grouped-int4 (fmt=4) scale-array size: one f32 per gsz-element group, per row -> O*ceil(I/gsz).
@@ -916,9 +984,17 @@ static size_t fmt_bytes(int fmt, int I, int O) {
 // UE8M0 encoding exists at all: qt_resolve_fmt refuses it on the CPU read path before any
 // tensor in that encoding could ever reach this Metal-side sizing helper.
 static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
+  if (fmt == 5) return sizeof(float); // bound dummy; raw BF16 shader never reads scales
   if (fmt == 4) return (size_t)O * ((I + gs - 1) / gs) * sizeof(float);
   if (fmt == 7) return (size_t)O * ((I + 31) / 32);      // raw e8m0 bytes, one per 32-group
+  if (fmt == 9) return 2u * (size_t)O * ((I + 31) / 32); // MXFP4x2 scales
+  if (fmt == 10) return 3u * (size_t)O * ((I + 31) / 32); // MXFP4x3 scales
   if (fmt == 8) return (size_t)((O + 127) / 128) * (size_t)((I + 127) / 128) * sizeof(float);
+  if (fmt >= 11 && fmt <= 13) {
+    int block = (fmt == 11) ? 32 : ((fmt == 12) ? 16 : 8);
+    return (size_t)O * (size_t)((I + block - 1) / block) * sizeof(float);
+  }
+  if (fmt == 14) return (size_t)O * (size_t)((I + 31) / 32) * sizeof(float);
   return (size_t)O * sizeof(float);
 }
 
@@ -1245,9 +1321,9 @@ extern "C" int coli_metal_kda_state(float *S, const float *qn, const float *kn,
 extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int gs) {
-  /* fmt==8 (fp8 passthrough) and fmt==7 (MXFP4) are explicit allow-list entries,
-   * not folded into the 0..4 contiguous range check below: they are not adjacent. */
-  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 7 && fmt != 8)) return 0;
+  /* fmt==5 (raw BF16), fmt==7 (MXFP4), and fmt==8 (FP8) are explicit
+   * allow-list entries beyond the legacy 0..4 range. */
+  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 5 && fmt != 7 && fmt != 8 && fmt != 9 && fmt != 10 && fmt != 11 && fmt != 12 && fmt != 13 && fmt != 14)) return 0;
   uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
   @autoreleasepool {
       ColiMetalTensor *t = *tp;
@@ -1320,7 +1396,7 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
       if (!d.y || !d.weights || !d.scales || d.I != I || d.O <= 0 ||
-          d.fmt < 0 || (d.fmt > 4 && d.fmt != 7 && d.fmt != 8)) return 0;
+          d.fmt < 0 || (d.fmt > 4 && d.fmt != 5 && d.fmt != 7 && d.fmt != 8 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14)) return 0;
 
       ColiMetalTensor *t = d.tensor;
       if (t && (t->fmt != d.fmt || t->I != d.I || t->O != d.O)) return 0;
@@ -1515,7 +1591,7 @@ static QwenGdnMxCtx *qwen_gdn_mx_ctx_locked(
 }
 
 static ColiMetalTensor *qwen_gdn_mx_tensor(ColiMetalMatmulDesc &d) {
-  if (!d.weights || !d.scales || d.fmt != 7 || d.I <= 0 || d.O <= 0) return nullptr;
+  if (!d.weights || !d.scales || (d.fmt != 5 && d.fmt != 7 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14) || d.I <= 0 || d.O <= 0) return nullptr;
   ColiMetalTensor *t = d.tensor;
   if (t) {
     if (t->fmt != d.fmt || t->I != d.I || t->O != d.O) return nullptr;
@@ -1545,7 +1621,7 @@ static ColiMetalTensor *qwen_gdn_mx_tensor(ColiMetalMatmulDesc &d) {
 static void qwen_gdn_mx_encode_gemv(id<MTLComputeCommandEncoder> e,
                                      ColiMetalTensor *t, id<MTLBuffer> x,
                                      id<MTLBuffer> y, int I, int O) {
-  const int S = 1, NT = O, fmt = 7, gs = 0;
+  const int S = 1, NT = O, fmt = t->fmt, gs = 0;
   [e setComputePipelineState:g_gemv];
   [e setBuffer:t->w offset:t->woff atIndex:0];
   [e setBuffer:t->s offset:t->soff atIndex:1];
@@ -1577,7 +1653,7 @@ extern "C" int coli_metal_gdn_mxfp4(
   const int expected_I[5] = {D,D,D,D,vdim};
   const int expected_O[5] = {C,vdim,vheads,vheads,D};
   for (int i = 0; i < 5; ++i)
-    if (descs[i].fmt != 7 || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
+    if ((descs[i].fmt != 5 && descs[i].fmt != 7 && descs[i].fmt != 9 && descs[i].fmt != 10 && descs[i].fmt != 11 && descs[i].fmt != 12 && descs[i].fmt != 13 && descs[i].fmt != 14) || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
       return 0;
 
   std::lock_guard<std::mutex> lk(g_op_mtx);
