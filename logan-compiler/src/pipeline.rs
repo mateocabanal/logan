@@ -11,6 +11,7 @@ use crate::{
     ir::{Architecture, SemanticModel},
     model::deepseek_v4::DeepSeekV4Frontend,
     model::qwen_moe::QwenMoeFrontend,
+    model::spark::SparkFrontend,
     quant::mxfp4_record,
     source,
     storage::{self, LoweredRecord, ManifestRecord, StoragePlan},
@@ -221,7 +222,9 @@ pub fn inspect_source(source_path: &std::path::Path) -> Result<source::SourceInv
 }
 
 pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<SemanticModel>> {
-    if DeepSeekV4Frontend::probe(inventory)? {
+    if SparkFrontend::probe(inventory)? {
+        Ok(Some(SparkFrontend::build(inventory)?))
+    } else if DeepSeekV4Frontend::probe(inventory)? {
         Ok(Some(DeepSeekV4Frontend::build(inventory)?))
     } else if QwenMoeFrontend::probe(inventory)? {
         Ok(Some(QwenMoeFrontend::build(inventory)?))

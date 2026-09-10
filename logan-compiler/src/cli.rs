@@ -31,7 +31,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan run MODEL_OR_PACKAGE [--prompt \"TOKEN_IDS\"] [--max-new N]\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -566,6 +566,29 @@ mod tests {
                 ["compile", "fixture", "--target", "portable-v1", "--dry-run"].map(str::to_owned)
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_run_command() {
+        assert_eq!(
+            parse(
+                [
+                    "run",
+                    "spark.coli",
+                    "--prompt",
+                    "1 2 3 4 5",
+                    "--max-new",
+                    "4",
+                ]
+                .map(str::to_owned)
+            )
+            .unwrap(),
+            Command::Run {
+                package: PathBuf::from("spark.coli"),
+                prompt: "1 2 3 4 5".to_owned(),
+                max_new: 4,
+            }
         );
     }
 

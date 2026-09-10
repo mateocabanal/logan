@@ -95,6 +95,14 @@ mod imp {
 
         pub fn coli_metal_init() -> i32;
         pub fn coli_metal_available() -> i32;
+        fn coli_metal_profile_set_on(on: i32);
+        fn coli_metal_profile_reset();
+        fn coli_metal_profile_get(
+            encode: *mut u64,
+            submit: *mut u64,
+            wait: *mut u64,
+            kernel: *mut u64,
+        );
         pub fn coli_metal_matmul(
             tensor: *mut *mut ColiMetalTensor,
             y: *mut f32,
@@ -136,6 +144,109 @@ mod imp {
             eps: f32,
         ) -> i32;
         fn coli_metal_gdn_mxfp4_drop_model(model_id: u64);
+        fn coli_metal_spark_layer(
+            model_id: u64,
+            layer: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            x: *mut f32,
+            input_norm: *const f32,
+            post_norm: *const f32,
+            d: i32,
+            inter: i32,
+            heads: i32,
+            kv_heads: i32,
+            head_dim: i32,
+            sliding: i32,
+            window: i32,
+            pos: i32,
+            rotary_dim: i32,
+            theta: f32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_spark_token_begin(model_id: u64, x: *const f32, d: i32, pos: i32) -> i32;
+        fn coli_metal_spark_layer_encode(
+            model_id: u64,
+            layer: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            input_norm: *const f32,
+            post_norm: *const f32,
+            d: i32,
+            inter: i32,
+            heads: i32,
+            kv_heads: i32,
+            head_dim: i32,
+            sliding: i32,
+            window: i32,
+            pos: i32,
+            rotary_dim: i32,
+            theta: f32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_spark_token_end(model_id: u64, x: *mut f32, d: i32, pos: i32) -> i32;
+        fn coli_metal_spark_token_end_top1(
+            model_id: u64,
+            head: *mut ColiMetalMatmulDescRaw,
+            norm: *const f32,
+            token: *mut u32,
+            d: i32,
+            vocab: i32,
+            pos: i32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_spark_token_end_logits(
+            model_id: u64,
+            head: *mut ColiMetalMatmulDescRaw,
+            norm: *const f32,
+            logits: *mut f32,
+            d: i32,
+            vocab: i32,
+            pos: i32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_spark_token_abort(model_id: u64);
+        fn coli_metal_spark_prefill_begin(
+            model_id: u64,
+            x: *const f32,
+            s: i32,
+            d: i32,
+            base: i32,
+        ) -> i32;
+        fn coli_metal_spark_prefill_layer_encode(
+            model_id: u64,
+            layer: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            input_norm: *const f32,
+            post_norm: *const f32,
+            d: i32,
+            inter: i32,
+            heads: i32,
+            kv_heads: i32,
+            head_dim: i32,
+            sliding: i32,
+            window: i32,
+            base: i32,
+            s: i32,
+            rotary_dim: i32,
+            theta: f32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_spark_prefill_end(model_id: u64, base: i32, s: i32) -> i32;
+        fn coli_metal_spark_prefill_end_logits(
+            model_id: u64,
+            head: *mut ColiMetalMatmulDescRaw,
+            norm: *const f32,
+            logits: *mut f32,
+            d: i32,
+            vocab: i32,
+            base: i32,
+            s: i32,
+            eps: f32,
+        ) -> i32;
+        fn coli_metal_spark_prefill_abort(model_id: u64);
+        fn coli_metal_spark_drop_model(model_id: u64);
         fn coli_metal_shared_mxfp4(
             model_id: u64,
             layer: i32,
@@ -294,8 +405,28 @@ mod imp {
         unsafe { AVAILABLE && coli_metal_available() == 1 }
     }
 
+    pub fn dense_profile_start() {
+        if metal_available() {
+            unsafe {
+                coli_metal_profile_reset();
+                coli_metal_profile_set_on(1);
+            }
+        }
+    }
+    pub fn dense_profile_stop() -> (u64, u64, u64, u64) {
+        let (mut e, mut s, mut w, mut k) = (0, 0, 0, 0);
+        if metal_available() {
+            unsafe {
+                coli_metal_profile_set_on(0);
+                coli_metal_profile_get(&mut e, &mut s, &mut w, &mut k);
+            }
+        }
+        (e, s, w, k)
+    }
+
     /// y[O] = x[I] @ W^T for one token. Supported dense formats include
-    /// raw BF16 (`fmt=5`), MXFP4 (`fmt=7`), and FP8 (`fmt=8`).
+    /// raw BF16 (`fmt=5`), MXFP4 (`fmt=7`), FP8 (`fmt=8`), and Spark/MLX
+    /// affine-8 (`fmt=15`).
     /// Returns true if Metal ran the matmul.
     pub fn metal_matmul(
         tensor: &mut *mut ColiMetalTensor,
@@ -321,6 +452,7 @@ mod imp {
             12 => (o * i, o * i.div_ceil(16) * std::mem::size_of::<f32>()),
             13 => (o * i, o * i.div_ceil(8) * std::mem::size_of::<f32>()),
             14 => (o * i + o * i.div_ceil(32) * 3, o * i.div_ceil(32) * std::mem::size_of::<f32>()),
+            15 => (o * i, 2 * o * i.div_ceil(64) * std::mem::size_of::<u16>()),
             _ => return false,
         };
         if weights.len() < weight_bytes || scales.len() < scale_bytes {
@@ -376,6 +508,10 @@ mod imp {
                 12 => (d.o * d.i, d.o * d.i.div_ceil(16) * std::mem::size_of::<f32>()),
                 13 => (d.o * d.i, d.o * d.i.div_ceil(8) * std::mem::size_of::<f32>()),
                 14 => (d.o * d.i + d.o * d.i.div_ceil(32) * 3, d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>()),
+                15 => (
+                    d.o * d.i,
+                    2 * d.o * d.i.div_ceil(64) * std::mem::size_of::<u16>(),
+                ),
                 _ => return false,
             };
             if d.weights.len() < weight_bytes || d.scales.len() < scale_bytes {
@@ -405,6 +541,480 @@ mod imp {
             d.tensor = r.tensor;
         }
         ok
+    }
+
+    pub fn spark_token_begin(model_id: u64, x: &[f32], d: usize, pos: usize) -> bool {
+        if !metal_available()
+            || model_id == 0
+            || d == 0
+            || x.len() < d
+            || d > i32::MAX as usize
+            || pos > i32::MAX as usize
+        {
+            return false;
+        }
+        unsafe { coli_metal_spark_token_begin(model_id, x.as_ptr(), d as i32, pos as i32) == 1 }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_layer_encode(
+        model_id: u64,
+        layer: usize,
+        descs: &mut [MetalWeightDesc<'_>],
+        input_norm: &[f32],
+        post_norm: &[f32],
+        d: usize,
+        inter: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        sliding: bool,
+        window: usize,
+        pos: usize,
+        rotary_dim: usize,
+        theta: f32,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available()
+            || descs.len() != 6
+            || input_norm.len() < d
+            || post_norm.len() < d
+            || [
+                d,
+                inter,
+                heads,
+                kv_heads,
+                head_dim,
+                window,
+                pos + 1,
+                rotary_dim,
+            ]
+            .into_iter()
+            .any(|v| v > i32::MAX as usize)
+        {
+            return 0;
+        }
+        let mut raw = Vec::with_capacity(6);
+        for desc in descs.iter() {
+            if desc.fmt != 15 || desc.i > i32::MAX as usize || desc.o > i32::MAX as usize {
+                return 0;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: desc.tensor,
+                y: std::ptr::null_mut(),
+                weights: desc.weights.as_ptr() as *const c_void,
+                scales: desc.scales.as_ptr() as *const f32,
+                fmt: 15,
+                i: desc.i as i32,
+                o: desc.o as i32,
+                gs: 64,
+            });
+        }
+        let rc = unsafe {
+            coli_metal_spark_layer_encode(
+                model_id,
+                layer as i32,
+                raw.as_mut_ptr(),
+                raw.len() as i32,
+                input_norm.as_ptr(),
+                post_norm.as_ptr(),
+                d as i32,
+                inter as i32,
+                heads as i32,
+                kv_heads as i32,
+                head_dim as i32,
+                sliding as i32,
+                window as i32,
+                pos as i32,
+                rotary_dim as i32,
+                theta,
+                eps,
+            )
+        };
+        for (desc, r) in descs.iter_mut().zip(raw.iter()) {
+            desc.tensor = r.tensor;
+        }
+        rc
+    }
+
+    pub fn spark_token_end(model_id: u64, x: &mut [f32], d: usize, pos: usize) -> i32 {
+        if !metal_available()
+            || model_id == 0
+            || d == 0
+            || x.len() < d
+            || d > i32::MAX as usize
+            || pos > i32::MAX as usize
+        {
+            return 0;
+        }
+        unsafe { coli_metal_spark_token_end(model_id, x.as_mut_ptr(), d as i32, pos as i32) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_token_end_top1(
+        model_id: u64,
+        head: &mut MetalWeightDesc<'_>,
+        norm: &[f32],
+        token: &mut u32,
+        d: usize,
+        vocab: usize,
+        pos: usize,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available()
+            || model_id == 0
+            || norm.len() < d
+            || head.fmt != 15
+            || head.i != d
+            || head.o != vocab
+            || [d, vocab, pos + 1]
+                .into_iter()
+                .any(|v| v > i32::MAX as usize)
+        {
+            return 0;
+        }
+        let mut raw = ColiMetalMatmulDescRaw {
+            tensor: head.tensor,
+            y: std::ptr::null_mut(),
+            weights: head.weights.as_ptr() as *const c_void,
+            scales: head.scales.as_ptr() as *const f32,
+            fmt: 15,
+            i: d as i32,
+            o: vocab as i32,
+            gs: 64,
+        };
+        let rc = unsafe {
+            coli_metal_spark_token_end_top1(
+                model_id,
+                &mut raw,
+                norm.as_ptr(),
+                token as *mut u32,
+                d as i32,
+                vocab as i32,
+                pos as i32,
+                eps,
+            )
+        };
+        head.tensor = raw.tensor;
+        rc
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_token_end_logits(
+        model_id: u64,
+        head: &mut MetalWeightDesc<'_>,
+        norm: &[f32],
+        logits: &mut [f32],
+        d: usize,
+        vocab: usize,
+        pos: usize,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available()
+            || model_id == 0
+            || norm.len() < d
+            || logits.len() < vocab
+            || [d, vocab, pos + 1]
+                .into_iter()
+                .any(|v| v > i32::MAX as usize)
+            || head.fmt != 15
+            || head.i != d
+            || head.o != vocab
+        {
+            return 0;
+        }
+        let mut raw = ColiMetalMatmulDescRaw {
+            tensor: head.tensor,
+            y: std::ptr::null_mut(),
+            weights: head.weights.as_ptr() as *const c_void,
+            scales: head.scales.as_ptr() as *const f32,
+            fmt: 15,
+            i: d as i32,
+            o: vocab as i32,
+            gs: 64,
+        };
+        let rc = unsafe {
+            coli_metal_spark_token_end_logits(
+                model_id,
+                &mut raw,
+                norm.as_ptr(),
+                logits.as_mut_ptr(),
+                d as i32,
+                vocab as i32,
+                pos as i32,
+                eps,
+            )
+        };
+        head.tensor = raw.tensor;
+        rc
+    }
+
+    pub fn spark_prefill_begin(model_id: u64, x: &[f32], s: usize, d: usize, base: usize) -> bool {
+        if !metal_available()
+            || model_id == 0
+            || s <= 1
+            || x.len() < s * d
+            || [s, d, base + 1].into_iter().any(|v| v > i32::MAX as usize)
+        {
+            return false;
+        }
+        unsafe {
+            coli_metal_spark_prefill_begin(model_id, x.as_ptr(), s as i32, d as i32, base as i32)
+                == 1
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_prefill_layer_encode(
+        model_id: u64,
+        layer: usize,
+        descs: &mut [MetalWeightDesc<'_>],
+        input_norm: &[f32],
+        post_norm: &[f32],
+        d: usize,
+        inter: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        sliding: bool,
+        window: usize,
+        base: usize,
+        srows: usize,
+        rotary_dim: usize,
+        theta: f32,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available()
+            || descs.len() != 6
+            || input_norm.len() < d
+            || post_norm.len() < d
+            || [
+                layer,
+                d,
+                inter,
+                heads,
+                kv_heads,
+                head_dim,
+                window,
+                base + 1,
+                srows,
+                rotary_dim,
+            ]
+            .into_iter()
+            .any(|v| v > i32::MAX as usize)
+        {
+            return 0;
+        }
+        let mut raw = Vec::with_capacity(6);
+        for desc in descs.iter() {
+            if desc.fmt != 15 || desc.i > i32::MAX as usize || desc.o > i32::MAX as usize {
+                return 0;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: desc.tensor,
+                y: std::ptr::null_mut(),
+                weights: desc.weights.as_ptr() as *const c_void,
+                scales: desc.scales.as_ptr() as *const f32,
+                fmt: 15,
+                i: desc.i as i32,
+                o: desc.o as i32,
+                gs: 64,
+            });
+        }
+        let rc = unsafe {
+            coli_metal_spark_prefill_layer_encode(
+                model_id,
+                layer as i32,
+                raw.as_mut_ptr(),
+                raw.len() as i32,
+                input_norm.as_ptr(),
+                post_norm.as_ptr(),
+                d as i32,
+                inter as i32,
+                heads as i32,
+                kv_heads as i32,
+                head_dim as i32,
+                sliding as i32,
+                window as i32,
+                base as i32,
+                srows as i32,
+                rotary_dim as i32,
+                theta,
+                eps,
+            )
+        };
+        for (desc, r) in descs.iter_mut().zip(raw.iter()) {
+            desc.tensor = r.tensor;
+        }
+        rc
+    }
+
+    pub fn spark_prefill_end(model_id: u64, base: usize, srows: usize) -> i32 {
+        if !metal_available()
+            || model_id == 0
+            || srows == 0
+            || [base + 1, srows].into_iter().any(|v| v > i32::MAX as usize)
+        {
+            return 0;
+        }
+        unsafe { coli_metal_spark_prefill_end(model_id, base as i32, srows as i32) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_prefill_end_logits(
+        model_id: u64,
+        head: &mut MetalWeightDesc<'_>,
+        norm: &[f32],
+        logits: &mut [f32],
+        d: usize,
+        vocab: usize,
+        base: usize,
+        srows: usize,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available()
+            || model_id == 0
+            || norm.len() < d
+            || logits.len() < vocab
+            || head.fmt != 15
+            || head.i != d
+            || head.o != vocab
+            || [d, vocab, base + 1, srows]
+                .into_iter()
+                .any(|v| v > i32::MAX as usize)
+        {
+            return 0;
+        }
+        let mut raw = ColiMetalMatmulDescRaw {
+            tensor: head.tensor,
+            y: std::ptr::null_mut(),
+            weights: head.weights.as_ptr() as *const c_void,
+            scales: head.scales.as_ptr() as *const f32,
+            fmt: 15,
+            i: d as i32,
+            o: vocab as i32,
+            gs: 64,
+        };
+        let rc = unsafe {
+            coli_metal_spark_prefill_end_logits(
+                model_id,
+                &mut raw,
+                norm.as_ptr(),
+                logits.as_mut_ptr(),
+                d as i32,
+                vocab as i32,
+                base as i32,
+                srows as i32,
+                eps,
+            )
+        };
+        head.tensor = raw.tensor;
+        rc
+    }
+
+    pub fn spark_prefill_abort(model_id: u64) {
+        if model_id != 0 && metal_available() {
+            unsafe { coli_metal_spark_prefill_abort(model_id) }
+        }
+    }
+
+    pub fn spark_token_abort(model_id: u64) {
+        if model_id != 0 && metal_available() {
+            unsafe { coli_metal_spark_token_abort(model_id) };
+        }
+    }
+
+    /// Full Spark-X2.5 dense layer decode in one Metal command buffer.
+    /// `descs` = [qkv, attn_gate, out, mlp_gate, mlp_up, mlp_down], all fmt=15.
+    /// Returns >0 on success, 0 on a pre-submit decline, <0 on a submitted GPU fault.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_layer(
+        model_id: u64,
+        layer: usize,
+        descs: &mut [MetalWeightDesc<'_>],
+        x: &mut [f32],
+        input_norm: &[f32],
+        post_norm: &[f32],
+        d: usize,
+        inter: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        sliding: bool,
+        window: usize,
+        pos: usize,
+        rotary_dim: usize,
+        theta: f32,
+        eps: f32,
+    ) -> i32 {
+        if !metal_available()
+            || descs.len() != 6
+            || x.len() < d
+            || input_norm.len() < d
+            || post_norm.len() < d
+            || [
+                d,
+                inter,
+                heads,
+                kv_heads,
+                head_dim,
+                window,
+                pos + 1,
+                rotary_dim,
+            ]
+            .into_iter()
+            .any(|v| v > i32::MAX as usize)
+        {
+            return 0;
+        }
+        let mut raw = Vec::with_capacity(6);
+        for desc in descs.iter() {
+            if desc.fmt != 15 || desc.i > i32::MAX as usize || desc.o > i32::MAX as usize {
+                return 0;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: desc.tensor,
+                y: std::ptr::null_mut(),
+                weights: desc.weights.as_ptr() as *const c_void,
+                scales: desc.scales.as_ptr() as *const f32,
+                fmt: 15,
+                i: desc.i as i32,
+                o: desc.o as i32,
+                gs: 64,
+            });
+        }
+        let rc = unsafe {
+            coli_metal_spark_layer(
+                model_id,
+                layer as i32,
+                raw.as_mut_ptr(),
+                raw.len() as i32,
+                x.as_mut_ptr(),
+                input_norm.as_ptr(),
+                post_norm.as_ptr(),
+                d as i32,
+                inter as i32,
+                heads as i32,
+                kv_heads as i32,
+                head_dim as i32,
+                sliding as i32,
+                window as i32,
+                pos as i32,
+                rotary_dim as i32,
+                theta,
+                eps,
+            )
+        };
+        for (desc, r) in descs.iter_mut().zip(raw.iter()) {
+            desc.tensor = r.tensor;
+        }
+        rc
+    }
+
+    pub fn spark_drop_model(model_id: u64) {
+        if model_id != 0 && metal_available() {
+            unsafe { coli_metal_spark_drop_model(model_id) };
+        }
     }
 
     /// Full one-command-buffer MXFP4 Qwen Gated DeltaNet decode. `descs`
@@ -1544,6 +2154,10 @@ mod imp {
     pub fn metal_available() -> bool {
         false
     }
+    pub fn dense_profile_start() {}
+    pub fn dense_profile_stop() -> (u64, u64, u64, u64) {
+        (0, 0, 0, 0)
+    }
     pub fn metal_matmul(
         _tensor: &mut *mut ColiMetalTensor,
         _y: &mut [f32],
@@ -1559,6 +2173,137 @@ mod imp {
     pub fn metal_matmul_multi(_x: &[f32], _descs: &mut [MetalMatmulDesc<'_>]) -> bool {
         false
     }
+    pub fn spark_token_begin(_model_id: u64, _x: &[f32], _d: usize, _pos: usize) -> bool {
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_layer_encode(
+        _model_id: u64,
+        _layer: usize,
+        _descs: &mut [MetalWeightDesc<'_>],
+        _input_norm: &[f32],
+        _post_norm: &[f32],
+        _d: usize,
+        _inter: usize,
+        _heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _sliding: bool,
+        _window: usize,
+        _pos: usize,
+        _rotary_dim: usize,
+        _theta: f32,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
+    pub fn spark_token_end(_model_id: u64, _x: &mut [f32], _d: usize, _pos: usize) -> i32 {
+        0
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_token_end_top1(
+        _model_id: u64,
+        _head: &mut MetalWeightDesc<'_>,
+        _norm: &[f32],
+        _token: &mut u32,
+        _d: usize,
+        _vocab: usize,
+        _pos: usize,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_token_end_logits(
+        _model_id: u64,
+        _head: &mut MetalWeightDesc<'_>,
+        _norm: &[f32],
+        _logits: &mut [f32],
+        _d: usize,
+        _vocab: usize,
+        _pos: usize,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
+
+    pub fn spark_prefill_begin(
+        _model_id: u64,
+        _x: &[f32],
+        _s: usize,
+        _d: usize,
+        _base: usize,
+    ) -> bool {
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_prefill_layer_encode(
+        _model_id: u64,
+        _layer: usize,
+        _descs: &mut [MetalWeightDesc<'_>],
+        _input_norm: &[f32],
+        _post_norm: &[f32],
+        _d: usize,
+        _inter: usize,
+        _heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _sliding: bool,
+        _window: usize,
+        _base: usize,
+        _srows: usize,
+        _rotary_dim: usize,
+        _theta: f32,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
+    pub fn spark_prefill_end(_model_id: u64, _base: usize, _srows: usize) -> i32 {
+        0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_prefill_end_logits(
+        _model_id: u64,
+        _head: &mut MetalWeightDesc<'_>,
+        _norm: &[f32],
+        _logits: &mut [f32],
+        _d: usize,
+        _vocab: usize,
+        _base: usize,
+        _srows: usize,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
+    pub fn spark_prefill_abort(_model_id: u64) {}
+
+    pub fn spark_token_abort(_model_id: u64) {}
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spark_layer(
+        _model_id: u64,
+        _layer: usize,
+        _descs: &mut [MetalWeightDesc<'_>],
+        _x: &mut [f32],
+        _input_norm: &[f32],
+        _post_norm: &[f32],
+        _d: usize,
+        _inter: usize,
+        _heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _sliding: bool,
+        _window: usize,
+        _pos: usize,
+        _rotary_dim: usize,
+        _theta: f32,
+        _eps: f32,
+    ) -> i32 {
+        0
+    }
+    pub fn spark_drop_model(_model_id: u64) {}
     pub fn metal_rmsnorm(_x: &mut [f32], _w: &[f32], _n: usize, _nrows: usize, _eps: f32) -> bool {
         false
     }

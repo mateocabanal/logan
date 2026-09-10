@@ -26,6 +26,8 @@
 // just spot values) -- see run_fp8_lut().
 static const char *SHADER = R"METAL(
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 
 // fmt=6 E8/IQ3 magnitude grid — generated from quant.h e8_grid (must stay identical;
@@ -158,6 +160,22 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
         acc += float(int(b>>4)-8) * xr[i+1] * sc1;
       }
     }
+  } else if (fmt == 15) {                           // MLX affine int8: raw unsigned bytes,
+                                                     // BF16 scales then BF16 biases, fixed MLX group=64.
+    const int qgs = 64;
+    int ng = I / qgs;
+    device const uchar* wr = w + (long)o * I;
+    device const ushort* aux = (device const ushort*)scale;
+    device const ushort* scl = aux + (long)o * ng;
+    device const ushort* bia = aux + (long)O * ng + (long)o * ng;
+    for (int g = 0; g < ng; ++g) {
+      float sc = as_type<float>((uint)scl[g] << 16);
+      float bi = as_type<float>((uint)bia[g] << 16);
+      int ii = g*qgs + int(slane)*2;
+      uchar2 q = *((device const uchar2*)(wr + ii));
+      float x0=xr[ii], x1=xr[ii+1];
+      acc += sc*(float(q.x)*x0 + float(q.y)*x1) + bi*(x0+x1);
+    }
   } else if (fmt == 8) {                            // fp8 e4m3 passthrough: one raw byte per
                                                        // element (like fmt=1), scale per 128x128
                                                        // block folded into acc (like a grouped fmt).
@@ -235,8 +253,8 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     for (int i = I8*8 + slane; i < I; i += 32) acc += wr[i] * xr[i];
   }
   acc = simd_sum(acc);
-  // fmt==4/7/8 fold scale into acc; raw BF16 fmt==5 has no scale.
-  if (slane == 0) y[row] = (fmt == 4 || fmt == 5 || fmt == 7 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 11 || fmt == 12 || fmt == 13 || fmt == 14) ? acc : acc * scale[o];
+  // Quantized/grouped formats fold scale into acc; raw BF16 fmt==5 has no scale.
+  if (slane == 0) y[row] = (fmt == 4 || fmt == 5 || fmt == 7 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 11 || fmt == 12 || fmt == 13 || fmt == 14 || fmt == 15) ? acc : acc * scale[o];
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -761,6 +779,399 @@ kernel void qwen_gdn_conv_recur_norm_mx(
   const float gate = output_gate == 1 ? sig : zv * sig;
   normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * gate;
 }
+
+
+
+// MLX-style affine-8 QMV for decode: two SIMDgroups/threadgroup, four output
+// rows per SIMDgroup. Each lane loads 8 activation values once per 256-wide K
+// block and reuses them across four weight rows. This mirrors MLX qmv_fast_impl
+// for bits=8/group_size=64 while keeping Logan's f32 activation ABI.
+kernel void spark_qmv_affine8_fast(device const uchar* w [[buffer(0)]],
+                                   device const ushort* aux [[buffer(1)]],
+                                   device const float* x [[buffer(2)]],
+                                   device float* y [[buffer(3)]],
+                                   constant int& I [[buffer(4)]],
+                                   constant int& O [[buffer(5)]],
+                                   uint tg [[threadgroup_position_in_grid]],
+                                   uint sgid [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+  const int rows_per_simd=4;
+  const int rows_per_tg=8;
+  const int vals_per_lane=8;
+  const int block=256;
+  const int ng=I/64;
+  int row0=int(tg)*rows_per_tg+int(sgid)*rows_per_simd;
+  if(row0>=O)return;
+  float r0=0.0f,r1=0.0f,r2=0.0f,r3=0.0f;
+  for(int k=0;k<I;k+=block){
+    int xi=k+int(lane)*vals_per_lane;
+    float x0=x[xi+0],x1=x[xi+1],x2=x[xi+2],x3=x[xi+3];
+    float x4=x[xi+4],x5=x[xi+5],x6=x[xi+6],x7=x[xi+7];
+    float xs=x0+x1+x2+x3+x4+x5+x6+x7;
+    int g=k/64+int(lane)/8;
+#define SPARK_QMV_ROW(R,ACC) do { if(row0+(R)<O){ \
+      int rr=row0+(R); device const uchar* q=w+(long)rr*I+xi; \
+      float sc=as_type<float>(uint(aux[(long)rr*ng+g])<<16); \
+      float bi=as_type<float>(uint(aux[(long)O*ng+(long)rr*ng+g])<<16); \
+      float qd=float(q[0])*x0+float(q[1])*x1+float(q[2])*x2+float(q[3])*x3+ \
+               float(q[4])*x4+float(q[5])*x5+float(q[6])*x6+float(q[7])*x7; \
+      (ACC)+=sc*qd+bi*xs; }} while(0)
+    SPARK_QMV_ROW(0,r0);SPARK_QMV_ROW(1,r1);SPARK_QMV_ROW(2,r2);SPARK_QMV_ROW(3,r3);
+#undef SPARK_QMV_ROW
+  }
+  r0=simd_sum(r0);r1=simd_sum(r1);r2=simd_sum(r2);r3=simd_sum(r3);
+  if(lane==0){if(row0+0<O)y[row0+0]=r0;if(row0+1<O)y[row0+1]=r1;if(row0+2<O)y[row0+2]=r2;if(row0+3<O)y[row0+3]=r3;}
+}
+
+// ===== Spark-X2.5 decode kernels ==========================================
+inline float spark_bf16(float x) {
+  uint u = as_type<uint>(x);
+  u = u + 0x7fffu + ((u >> 16) & 1u);
+  return as_type<float>(u & 0xffff0000u);
+}
+inline ushort spark_bf16_bits(float x) {
+  uint u = as_type<uint>(x);
+  u = u + 0x7fffu + ((u >> 16) & 1u);
+  return ushort(u >> 16);
+}
+inline float spark_from_bf16(ushort x) { return as_type<float>(uint(x) << 16); }
+
+kernel void spark_rmsnorm_bf16(device float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+                                  constant int& n [[buffer(2)]], constant float& eps [[buffer(3)]],
+                                  uint row [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                                  uint tgsz [[threads_per_threadgroup]]) {
+  device float* xr=x+(long)row*n; threadgroup float red[256];
+  float ss=0.0f; for(int i=int(lid);i<n;i+=int(tgsz)) ss+=xr[i]*xr[i];
+  red[lid]=ss;threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=tgsz/2;k>0;k>>=1){if(lid<k)red[lid]+=red[lid+k];threadgroup_barrier(mem_flags::mem_threadgroup);}
+  float r=rsqrt(red[0]/float(n)+eps);threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(int i=int(lid);i<n;i+=int(tgsz))xr[i]=spark_bf16(xr[i]*r*w[i]);
+}
+
+// Finalize one or more QKV rows in the exact order used by MLX/Spark:
+// projection -> BF16 -> partial RoPE -> BF16. Every output element is owned by
+// exactly one thread, so there are no paired RoPE write/read races.
+kernel void spark_qkv_finalize(device float* qkv [[buffer(0)]], constant int& S [[buffer(1)]],
+                               constant int& H [[buffer(2)]], constant int& KH [[buffer(3)]],
+                               constant int& hd [[buffer(4)]], constant int& rd [[buffer(5)]],
+                               constant int& base [[buffer(6)]], constant float& theta [[buffer(7)]],
+                               uint gid [[thread_position_in_grid]]) {
+  int rh=rd/2, qdim=H*hd, kvdim=KH*hd, rowdim=qdim+2*kvdim;
+  int pq=H*rh, pk=KH*rh, uq=H*(hd-rd), uk=KH*(hd-rd);
+  int tasks=pq+pk+uq+uk+kvdim; int sr=int(gid)/tasks, t=int(gid)%tasks;if(sr>=S)return;
+  device float* row=qkv+(long)sr*rowdim; int pos=base+sr;
+  if(t<pq){int h=t/rh,j=t%rh;device float*v=row+(long)h*hd;float a=spark_bf16(v[j]),b=spark_bf16(v[j+rh]);float inv=pow(theta,-2.0f*float(j)/float(rd)),ang=float(pos)*inv,cs=cos(ang),sn=sin(ang);v[j]=spark_bf16(a*cs-b*sn);v[j+rh]=spark_bf16(b*cs+a*sn);return;}
+  t-=pq;if(t<pk){int h=t/rh,j=t%rh;device float*v=row+qdim+(long)h*hd;float a=spark_bf16(v[j]),b=spark_bf16(v[j+rh]);float inv=pow(theta,-2.0f*float(j)/float(rd)),ang=float(pos)*inv,cs=cos(ang),sn=sin(ang);v[j]=spark_bf16(a*cs-b*sn);v[j+rh]=spark_bf16(b*cs+a*sn);return;}
+  t-=pk;if(t<uq){int h=t/(hd-rd),j=t%(hd-rd);int i=h*hd+rd+j;row[i]=spark_bf16(row[i]);return;}
+  t-=uq;if(t<uk){int h=t/(hd-rd),j=t%(hd-rd);int i=qdim+h*hd+rd+j;row[i]=spark_bf16(row[i]);return;}
+  t-=uk;int i=qdim+kvdim+t;row[i]=spark_bf16(row[i]);
+}
+
+kernel void spark_round(device float* x [[buffer(0)]], constant int& n [[buffer(1)]],
+                        uint i [[thread_position_in_grid]]) {
+  if (i < uint(n)) x[i] = spark_bf16(x[i]);
+}
+kernel void spark_copy(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                       constant int& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i < uint(n)) y[i] = x[i];
+}
+kernel void spark_residual_copy(device float* x [[buffer(0)]], device const float* a [[buffer(1)]],
+                                device float* y [[buffer(2)]], constant int& n [[buffer(3)]],
+                                uint i [[thread_position_in_grid]]) {
+  if (i < uint(n)) { float z=spark_bf16(x[i]+spark_bf16(a[i])); x[i]=z; y[i]=z; }
+}
+kernel void spark_residual(device float* x [[buffer(0)]], device const float* a [[buffer(1)]],
+                           constant int& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i < uint(n)) x[i]=spark_bf16(x[i]+spark_bf16(a[i]));
+}
+kernel void spark_rope(device float* qkv [[buffer(0)]], constant int& qheads [[buffer(1)]],
+                       constant int& kvheads [[buffer(2)]], constant int& hd [[buffer(3)]],
+                       constant int& rd [[buffer(4)]], constant int& pos [[buffer(5)]],
+                       constant float& theta [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+  int rh=rd/2, qn=qheads*rh;
+  bool isk=int(gid)>=qn; int z=isk ? int(gid)-qn : int(gid);
+  int h=z/rh, j=z%rh; int qdim=qheads*hd;
+  device float* v=qkv + (isk ? qdim + h*hd : h*hd);
+  float inv=pow(theta,-2.0f*float(j)/float(rd)); float ang=float(pos)*inv;
+  float cs=cos(ang), sn=sin(ang), a=v[j], b=v[j+rh];
+  v[j]=spark_bf16(a*cs-b*sn); v[j+rh]=spark_bf16(b*cs+a*sn);
+}
+kernel void spark_cache_store(device const float* qkv [[buffer(0)]], device ushort* kc [[buffer(1)]],
+                              device ushort* vc [[buffer(2)]], constant int& qdim [[buffer(3)]],
+                              constant int& kvdim [[buffer(4)]], constant int& slot [[buffer(5)]],
+                              uint i [[thread_position_in_grid]]) {
+  if (i >= uint(kvdim)) return;
+  kc[(long)slot*kvdim+i]=spark_bf16_bits(qkv[qdim+i]);
+  vc[(long)slot*kvdim+i]=spark_bf16_bits(qkv[qdim+kvdim+i]);
+}
+kernel void spark_attn_score(device const float* qkv [[buffer(0)]], device const ushort* kc [[buffer(1)]],
+                             device float* score [[buffer(2)]], constant int& H [[buffer(3)]],
+                             constant int& KH [[buffer(4)]], constant int& hd [[buffer(5)]],
+                             constant int& kvdim [[buffer(6)]], constant int& T [[buffer(7)]],
+                             constant int& start [[buffer(8)]], constant int& window [[buffer(9)]],
+                             constant int& sliding [[buffer(10)]],
+                             uint tg [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  int h=int(tg)/T, ti=int(tg)%T; if(h>=H) return; int rep=H/KH, kh=h/rep;
+  int abspos=start+ti, slot=sliding ? abspos%window : abspos;
+  device const float* q=qkv+(long)h*hd; device const ushort* k=kc+(long)slot*kvdim+(long)kh*hd;
+  float acc=0.0f; for(int d=int(lane);d<hd;d+=32) acc += q[d]*spark_from_bf16(k[d]);
+  acc=simd_sum(acc); if(lane==0) score[(long)h*T+ti]=acc*rsqrt(float(hd));
+}
+kernel void spark_softmax(device float* score [[buffer(0)]], constant int& T [[buffer(1)]],
+                          uint h [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+                          uint nt [[threads_per_threadgroup]]) {
+  threadgroup float red[256]; device float* s=score+(long)h*T;
+  float m=-INFINITY; for(int i=int(lid);i<T;i+=int(nt)) m=max(m,s[i]); red[lid]=m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=nt/2;k>0;k>>=1){if(lid<k)red[lid]=max(red[lid],red[lid+k]);threadgroup_barrier(mem_flags::mem_threadgroup);} m=red[0];
+  float sm=0.0f; for(int i=int(lid);i<T;i+=int(nt)){float e=exp(s[i]-m);s[i]=e;sm+=e;} red[lid]=sm;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=nt/2;k>0;k>>=1){if(lid<k)red[lid]+=red[lid+k];threadgroup_barrier(mem_flags::mem_threadgroup);} float inv=1.0f/max(red[0],FLT_MIN);
+  for(int i=int(lid);i<T;i+=int(nt)) s[i]*=inv;
+}
+kernel void spark_attn_ctx_gate(device const float* score [[buffer(0)]], device const ushort* vc [[buffer(1)]],
+                                device const float* gates [[buffer(2)]], device float* out [[buffer(3)]],
+                                constant int& H [[buffer(4)]], constant int& KH [[buffer(5)]],
+                                constant int& hd [[buffer(6)]], constant int& kvdim [[buffer(7)]],
+                                constant int& T [[buffer(8)]], constant int& start [[buffer(9)]],
+                                constant int& window [[buffer(10)]], constant int& sliding [[buffer(11)]],
+                                uint gid [[thread_position_in_grid]]) {
+  int h=int(gid)/hd,d=int(gid)%hd;if(h>=H)return;int kh=h/(H/KH);float acc=0.0f;
+  for(int ti=0;ti<T;++ti){int abspos=start+ti,slot=sliding?abspos%window:abspos;
+    acc += score[(long)h*T+ti]*spark_from_bf16(vc[(long)slot*kvdim+(long)kh*hd+d]);}
+  float g=spark_bf16(1.0f/(1.0f+exp(-spark_bf16(gates[h])))); out[gid]=spark_bf16(acc*g);
+}
+inline float spark_erf(float x) {
+  float sg = x < 0.0f ? -1.0f : 1.0f, a = fabs(x);
+  float t = 1.0f / (1.0f + 0.3275911f * a);
+  float p = (((((1.061405429f*t - 1.453152027f)*t + 1.421413741f)*t - 0.284496736f)*t + 0.254829592f)*t);
+  return sg * (1.0f - p * exp(-a*a));
+}
+kernel void spark_gelu_mul(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
+                           constant int& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if(i>=uint(n))return; float z=spark_bf16(g[i]), uv=spark_bf16(u[i]); float ge=z*(1.0f+spark_erf(z*0.7071067811865475f))*0.5f;
+  g[i]=spark_bf16(spark_bf16(ge)*uv);
+}
+
+
+// Prefill-only BF16 scratch helpers. The residual stream remains FP32 with
+// BF16-rounded values; large projection/attention/MLP intermediates are stored
+// natively as BF16 to halve activation traffic without moving rounding points.
+kernel void spark_rms_f32_to_bf16(device const float* x [[buffer(0)]],
+                                   device const float* w [[buffer(1)]],
+                                   device bfloat* y [[buffer(2)]],
+                                   constant int& n [[buffer(3)]],
+                                   constant float& eps [[buffer(4)]],
+                                   uint row [[threadgroup_position_in_grid]],
+                                   uint lid [[thread_position_in_threadgroup]],
+                                   uint nt [[threads_per_threadgroup]]) {
+  device const float* xr=x+(long)row*n; device bfloat* yr=y+(long)row*n;
+  threadgroup float red[256]; float ss=0.0f;
+  for(int i=int(lid);i<n;i+=int(nt)) ss += xr[i]*xr[i];
+  red[lid]=ss; threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=nt/2;k>0;k>>=1){ if(lid<k) red[lid]+=red[lid+k]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+  float r=rsqrt(red[0]/float(n)+eps);
+  for(int i=int(lid);i<n;i+=int(nt)) yr[i]=bfloat(xr[i]*r*w[i]);
+}
+kernel void spark_rms_bf16(device bfloat* x [[buffer(0)]],
+                            device const float* w [[buffer(1)]],
+                            constant int& n [[buffer(2)]],
+                            constant float& eps [[buffer(3)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint lid [[thread_position_in_threadgroup]],
+                            uint nt [[threads_per_threadgroup]]) {
+  device bfloat* xr=x+(long)row*n; threadgroup float red[256]; float ss=0.0f;
+  for(int i=int(lid);i<n;i+=int(nt)){ float v=float(xr[i]); ss += v*v; }
+  red[lid]=ss; threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=nt/2;k>0;k>>=1){ if(lid<k) red[lid]+=red[lid+k]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+  float r=rsqrt(red[0]/float(n)+eps);
+  for(int i=int(lid);i<n;i+=int(nt)) xr[i]=bfloat(float(xr[i])*r*w[i]);
+}
+kernel void spark_residual_copy_bf16(device float* x [[buffer(0)]],
+                                      device const bfloat* a [[buffer(1)]],
+                                      device bfloat* y [[buffer(2)]],
+                                      constant int& n [[buffer(3)]],
+                                      uint i [[thread_position_in_grid]]) {
+  if(i<uint(n)){ float z=spark_bf16(x[i]+float(a[i])); x[i]=z; y[i]=bfloat(z); }
+}
+kernel void spark_residual_bf16(device float* x [[buffer(0)]],
+                                 device const bfloat* a [[buffer(1)]],
+                                 constant int& n [[buffer(2)]],
+                                 uint i [[thread_position_in_grid]]) {
+  if(i<uint(n)) x[i]=spark_bf16(x[i]+float(a[i]));
+}
+kernel void spark_gelu_mul_bf16(device bfloat* g [[buffer(0)]],
+                                 device const bfloat* u [[buffer(1)]],
+                                 constant int& n [[buffer(2)]],
+                                 uint i [[thread_position_in_grid]]) {
+  if(i>=uint(n))return;
+  float z=float(g[i]), uv=float(u[i]);
+  float ge=z*(1.0f+spark_erf(z*0.7071067811865475f))*0.5f;
+  g[i]=bfloat(spark_bf16(ge)*uv);
+}
+
+// Greedy decode reduction. One 256-thread group scans the vocab in coalesced
+// strides, then reduces 256 local maxima. V=131072 means 512 values/thread.
+kernel void spark_argmax(device const float* x [[buffer(0)]], device uint* out [[buffer(1)]],
+                         constant int& n [[buffer(2)]], uint lid [[thread_position_in_threadgroup]],
+                         uint nt [[threads_per_threadgroup]]) {
+  threadgroup float bv[256]; threadgroup uint bi[256];
+  float best=-INFINITY; uint idx=0;
+  for(uint i=lid;i<uint(n);i+=nt){float v=spark_bf16(x[i]);if(v>best){best=v;idx=i;}}
+  bv[lid]=best;bi[lid]=idx;threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint k=nt/2;k>0;k>>=1){if(lid<k){float v=bv[lid+k];uint j=bi[lid+k];if(v>bv[lid]){bv[lid]=v;bi[lid]=j;}}threadgroup_barrier(mem_flags::mem_threadgroup);}
+  if(lid==0)out[0]=bi[0];
+}
+
+
+
+// Spark affine-8 batched QMM for prefill. A 16x8 output tile shares a 256-K
+// activation/weight tile in threadgroup memory. This turns S repeated model
+// scans into ceil(S/16) scans while preserving MLX's group-64 affine formula.
+kernel void spark_qmm_affine8_t16o8(device const uchar* w [[buffer(0)]],
+                                    device const ushort* aux [[buffer(1)]],
+                                    device const bfloat* x [[buffer(2)]],
+                                    device bfloat* y [[buffer(3)]],
+                                    constant int& S [[buffer(4)]],
+                                    constant int& I [[buffer(5)]],
+                                    constant int& O [[buffer(6)]],
+                                    uint2 tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint sgid [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+  // 32x32x32 tile, 4 SIMD groups in a 2x2 layout. Each SIMD group owns a
+  // 16x16 output tile made of four 8x8 simdgroup_matrix fragments.
+  constexpr int BM=32, BN=32, BK=32, PAD=40, GS=64;
+  threadgroup bfloat Xs[BM*PAD];
+  threadgroup bfloat Ws[BN*PAD]; // BF16 [N,K], matching MLX Steel's T staging
+
+  int m0=int(tg.y)*BM, n0=int(tg.x)*BN;
+  int ng=I/GS;
+
+  simdgroup_matrix<float,8,8> c00,c01,c10,c11;
+  c00.thread_elements()[0]=0.0f;c00.thread_elements()[1]=0.0f;
+  c01.thread_elements()[0]=0.0f;c01.thread_elements()[1]=0.0f;
+  c10.thread_elements()[0]=0.0f;c10.thread_elements()[1]=0.0f;
+  c11.thread_elements()[0]=0.0f;c11.thread_elements()[1]=0.0f;
+
+  const int qid=int(lane)/4;
+  const int fm=(qid&4)+((int(lane)/2)%4);
+  const int fn=(qid&2)*2+(int(lane)%2)*2;
+  const int moff=(int(sgid)/2)*16;
+  const int noff=(int(sgid)%2)*16;
+
+  for(int k0=0;k0<I;k0+=BK){
+    // 128 threads: four 8-value contiguous segments for each of 32 rows.
+    int rr=int(tid)>>2, seg=(int(tid)&3)*8;
+    int mr=m0+rr, nr=n0+rr;
+    for(int j=0;j<8;++j) Xs[rr*PAD+seg+j]=(mr<S)?x[(long)mr*I+k0+seg+j]:bfloat(0.0f);
+    if(nr<O){
+      int g=(k0+seg)/GS;
+      float sc=spark_from_bf16(aux[(long)nr*ng+g]);
+      float bi=spark_from_bf16(aux[(long)O*ng+(long)nr*ng+g]);
+      device const uchar* qw=w+(long)nr*I+k0+seg;
+      for(int j=0;j<8;++j) Ws[rr*PAD+seg+j]=bfloat(float(qw[j])*sc+bi);
+    }else{
+      for(int j=0;j<8;++j) Ws[rr*PAD+seg+j]=bfloat(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for(int kk=0;kk<BK;kk+=8){
+      simdgroup_matrix<float,8,8> a0,a1,b0,b1;
+      a0.thread_elements()[0]=float(Xs[(moff+fm)*PAD+kk+fn]);
+      a0.thread_elements()[1]=float(Xs[(moff+fm)*PAD+kk+fn+1]);
+      a1.thread_elements()[0]=float(Xs[(moff+8+fm)*PAD+kk+fn]);
+      a1.thread_elements()[1]=float(Xs[(moff+8+fm)*PAD+kk+fn+1]);
+      // Logical B is [K,N], while Ws is staged [N,K].
+      b0.thread_elements()[0]=float(Ws[(noff+fn)*PAD+kk+fm]);
+      b0.thread_elements()[1]=float(Ws[(noff+fn+1)*PAD+kk+fm]);
+      b1.thread_elements()[0]=float(Ws[(noff+8+fn)*PAD+kk+fm]);
+      b1.thread_elements()[1]=float(Ws[(noff+8+fn+1)*PAD+kk+fm]);
+      simdgroup_multiply_accumulate(c00,a0,b0,c00);
+      simdgroup_multiply_accumulate(c01,a0,b1,c01);
+      simdgroup_multiply_accumulate(c10,a1,b0,c10);
+      simdgroup_multiply_accumulate(c11,a1,b1,c11);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  int r0=m0+moff+fm, r1=r0+8;
+  int c0=n0+noff+fn, c1=c0+8;
+  if(r0<S){
+    if(c0<O){y[(long)r0*O+c0]=bfloat(c00.thread_elements()[0]);if(c0+1<O)y[(long)r0*O+c0+1]=bfloat(c00.thread_elements()[1]);}
+    if(c1<O){y[(long)r0*O+c1]=bfloat(c01.thread_elements()[0]);if(c1+1<O)y[(long)r0*O+c1+1]=bfloat(c01.thread_elements()[1]);}
+  }
+  if(r1<S){
+    if(c0<O){y[(long)r1*O+c0]=bfloat(c10.thread_elements()[0]);if(c0+1<O)y[(long)r1*O+c0+1]=bfloat(c10.thread_elements()[1]);}
+    if(c1<O){y[(long)r1*O+c1]=bfloat(c11.thread_elements()[0]);if(c1+1<O)y[(long)r1*O+c1+1]=bfloat(c11.thread_elements()[1]);}
+  }
+}
+
+kernel void spark_rope_batch(device bfloat* qkv [[buffer(0)]], constant int& S [[buffer(1)]],
+                             constant int& qheads [[buffer(2)]], constant int& kvheads [[buffer(3)]],
+                             constant int& hd [[buffer(4)]], constant int& rd [[buffer(5)]],
+                             constant int& base [[buffer(6)]], constant float& theta [[buffer(7)]],
+                             uint gid [[thread_position_in_grid]]) {
+  int rh=rd/2, hp=qheads+kvheads, per=hp*rh;
+  int s=int(gid)/per, z=int(gid)%per; if(s>=S)return;
+  bool isk=z>=qheads*rh; int zz=isk?z-qheads*rh:z;
+  int h=zz/rh,j=zz%rh; int qdim=qheads*hd,kvdim=kvheads*hd,rowdim=qdim+2*kvdim;
+  device bfloat* v=qkv+(long)s*rowdim+(isk?qdim+h*hd:h*hd);
+  float inv=pow(theta,-2.0f*float(j)/float(rd)),ang=float(base+s)*inv;
+  float cs=cos(ang),sn=sin(ang),a=float(v[j]),b=float(v[j+rh]);
+  v[j]=bfloat(a*cs-b*sn);v[j+rh]=bfloat(b*cs+a*sn);
+}
+
+kernel void spark_cache_store_batch(device const bfloat* qkv [[buffer(0)]], device ushort* kc [[buffer(1)]],
+                                    device ushort* vc [[buffer(2)]], constant int& S [[buffer(3)]],
+                                    constant int& qdim [[buffer(4)]], constant int& kvdim [[buffer(5)]],
+                                    constant int& base [[buffer(6)]], constant int& sliding [[buffer(7)]],
+                                    constant int& window [[buffer(8)]], uint gid [[thread_position_in_grid]]) {
+  int s=int(gid)/kvdim,i=int(gid)%kvdim;if(s>=S)return;int pos=base+s,slot=sliding?pos%window:pos;
+  device const ushort* row=(device const ushort*)(qkv+(long)s*(qdim+2*kvdim));
+  kc[(long)slot*kvdim+i]=row[qdim+i];
+  vc[(long)slot*kvdim+i]=row[qdim+kvdim+i];
+}
+
+// Online causal attention: one SIMDgroup per (query, head), four groups/TG.
+// No score tensor: numerically-stable online softmax accumulates V directly.
+kernel void spark_attn_online_batch(device const bfloat* qkv [[buffer(0)]], device const ushort* kc [[buffer(1)]],
+                                    device const ushort* vc [[buffer(2)]], device const bfloat* gates [[buffer(3)]],
+                                    device bfloat* out [[buffer(4)]], constant int& S [[buffer(5)]],
+                                    constant int& H [[buffer(6)]], constant int& KH [[buffer(7)]],
+                                    constant int& hd [[buffer(8)]], constant int& base [[buffer(9)]],
+                                    constant int& sliding [[buffer(10)]], constant int& window [[buffer(11)]],
+                                    uint tg [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+  int idx=int(tg)*4+int(sgid); if(idx>=S*H)return; int s=idx/H,h=idx%H,kh=h/(H/KH);
+  int qdim=H*hd,kvdim=KH*hd,rowdim=qdim+2*kvdim,abspos=base+s;
+  int start=sliding?max(0,abspos+1-window):0;
+  device const bfloat* q=qkv+(long)s*rowdim+(long)h*hd;
+  float m=-INFINITY,l=0.0f; float ov[8]={0,0,0,0,0,0,0,0};
+  for(int kp=start;kp<=abspos;++kp){
+    // Do not commit the current batch to the rotating cache until all queries
+    // have consumed the pre-batch history. New K/V live losslessly (already
+    // BF16-rounded) in qkv and are read directly here. This prevents a future
+    // token in the batch from overwriting an old ring slot still needed by an
+    // earlier query once base >= window.
+    bool staged = kp >= base;
+    int ns = kp-base;
+    int slot=sliding?kp%window:kp;
+    device const bfloat* nk = staged ? qkv+(long)ns*rowdim+qdim+(long)kh*hd : nullptr;
+    device const ushort* ok = staged ? nullptr : kc+(long)slot*kvdim+(long)kh*hd;
+    float d=0.0f;
+    for(int j=int(lane);j<hd;j+=32)d+=float(q[j])*(staged?float(nk[j]):spark_from_bf16(ok[j]));
+    d=simd_sum(d)*rsqrt(float(hd)); float nm=max(m,d),aa=(m==-INFINITY)?0.0f:exp(m-nm),bb=exp(d-nm);
+    device const bfloat* nv = staged ? qkv+(long)ns*rowdim+qdim+kvdim+(long)kh*hd : nullptr;
+    device const ushort* ovp = staged ? nullptr : vc+(long)slot*kvdim+(long)kh*hd;
+    for(int r=0;r<8;++r){int j=int(lane)+r*32;if(j<hd){float vv=staged?float(nv[j]):spark_from_bf16(ovp[j]);ov[r]=ov[r]*aa+bb*vv;}}
+    l=l*aa+bb;m=nm;
+  }
+  float gate=spark_bf16(1.0f/(1.0f+exp(-float(gates[(long)s*H+h])))),inv=1.0f/max(l,FLT_MIN);
+  for(int r=0;r<8;++r){int j=int(lane)+r*32;if(j<hd)out[(long)s*qdim+(long)h*hd+j]=bfloat(ov[r]*inv*gate);}
+}
+
 )METAL";
 
 struct ColiMetalTensor {
@@ -799,6 +1210,7 @@ static id<MTLBuffer> fwht_signs(int n) {
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
 static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
 static id<MTLComputePipelineState> g_kda_conv_silu, g_kda_l2_norm, g_kda_state, g_qwen_gdn_recur;
+static id<MTLComputePipelineState> g_sp_qmv, g_sp_qmm, g_sp_round, g_sp_rms, g_sp_qkv_final, g_sp_copy, g_sp_rescopy, g_sp_resid, g_sp_rope, g_sp_rope_batch, g_sp_store, g_sp_store_batch, g_sp_score, g_sp_softmax, g_sp_ctxgate, g_sp_attn_batch, g_sp_gelu, g_sp_argmax, g_sp_prms_f2b, g_sp_prms_bf16, g_sp_prescopy_bf16, g_sp_presid_bf16, g_sp_pgelu_bf16;
 static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
                                   // serial kernel — see coli_metal_init.
 static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
@@ -832,6 +1244,11 @@ extern "C" void coli_metal_profile_get(uint64_t *encode, uint64_t *submit,
   if (submit) *submit = g_metal_prof.submit_ns;
   if (wait) *wait = g_metal_prof.wait_ns;
   if (kernel) *kernel = g_metal_prof.kernel_ns;
+}
+static inline void profile_gpu_cb(id<MTLCommandBuffer> cb) {
+  if (!g_coli_metal_profile_on || !cb) return;
+  CFTimeInterval a=cb.GPUStartTime,b=cb.GPUEndTime;
+  if (b>a) g_metal_prof.kernel_ns += (uint64_t)((b-a)*1e9);
 }
 
 extern "C" void coli_metal_moe_counts(uint64_t *ok, uint64_t *fb, uint64_t *ex) {
@@ -967,11 +1384,12 @@ static size_t fmt_bytes(int fmt, int I, int O) {
   if (fmt == 4) return (size_t)O * ((I+1)/2);   // grouped int4: identical packed-nibble layout to fmt=2
   if (fmt == 5) return (size_t)O * I * sizeof(uint16_t); // raw BF16
   if (fmt == 7) return (size_t)O * ((I+1)/2);   // MXFP4: one packed E2M1 plane
+  if (fmt == 8) return (size_t)O * I;           // fp8 e4m3
   if (fmt == 9) return 2u * (size_t)O * ((I+1)/2); // MXFP4x2
   if (fmt == 10) return 3u * (size_t)O * ((I+1)/2); // MXFP4x3
-  if (fmt == 8) return (size_t)O * I;           // fp8 e4m3
   if (fmt >= 11 && fmt <= 13) return (size_t)O * I; // block-scaled int8
   if (fmt == 14) return (size_t)O * I + (size_t)O * ((I + 31) / 32) * 3u; // q8 + bf16 residual + u8 index
+  if (fmt == 15) return (size_t)O * I;          // Spark/MLX affine-8
   return (size_t)O * I * sizeof(float);
 }
 // Grouped-int4 (fmt=4) scale-array size: one f32 per gsz-element group, per row -> O*ceil(I/gsz).
@@ -995,6 +1413,7 @@ static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
     return (size_t)O * (size_t)((I + block - 1) / block) * sizeof(float);
   }
   if (fmt == 14) return (size_t)O * (size_t)((I + 31) / 32) * sizeof(float);
+  if (fmt == 15) return (size_t)2 * O * ((I + 63) / 64) * sizeof(uint16_t);
   return (size_t)O * sizeof(float);
 }
 
@@ -1031,7 +1450,16 @@ extern "C" int coli_metal_init(void) {
     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
     g_kda_conv_silu=P("kda_conv_silu"); g_kda_l2_norm=P("kda_l2_norm"); g_kda_state=P("kda_state");
     g_qwen_gdn_recur=P("qwen_gdn_conv_recur_norm_mx");
-    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state||!g_qwen_gdn_recur){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    g_sp_qmv=P("spark_qmv_affine8_fast"); g_sp_qmm=P("spark_qmm_affine8_t16o8");
+    g_sp_round=P("spark_round"); g_sp_rms=P("spark_rmsnorm_bf16"); g_sp_qkv_final=P("spark_qkv_finalize"); g_sp_copy=P("spark_copy"); g_sp_rescopy=P("spark_residual_copy");
+    g_sp_resid=P("spark_residual"); g_sp_rope=P("spark_rope"); g_sp_rope_batch=P("spark_rope_batch");
+    g_sp_store=P("spark_cache_store"); g_sp_store_batch=P("spark_cache_store_batch");
+    g_sp_score=P("spark_attn_score"); g_sp_softmax=P("spark_softmax"); g_sp_ctxgate=P("spark_attn_ctx_gate");
+    g_sp_attn_batch=P("spark_attn_online_batch"); g_sp_gelu=P("spark_gelu_mul"); g_sp_argmax=P("spark_argmax");
+    g_sp_prms_f2b=P("spark_rms_f32_to_bf16"); g_sp_prms_bf16=P("spark_rms_bf16");
+    g_sp_prescopy_bf16=P("spark_residual_copy_bf16"); g_sp_presid_bf16=P("spark_residual_bf16"); g_sp_pgelu_bf16=P("spark_gelu_mul_bf16");
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state||!g_qwen_gdn_recur||
+       !g_sp_qmv||!g_sp_qmm||!g_sp_round||!g_sp_rms||!g_sp_qkv_final||!g_sp_copy||!g_sp_rescopy||!g_sp_resid||!g_sp_rope||!g_sp_rope_batch||!g_sp_store||!g_sp_store_batch||!g_sp_score||!g_sp_softmax||!g_sp_ctxgate||!g_sp_attn_batch||!g_sp_gelu||!g_sp_argmax||!g_sp_prms_f2b||!g_sp_prms_bf16||!g_sp_prescopy_bf16||!g_sp_presid_bf16||!g_sp_pgelu_bf16){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
     // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
     // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
@@ -1321,9 +1749,8 @@ extern "C" int coli_metal_kda_state(float *S, const float *qn, const float *kn,
 extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int gs) {
-  /* fmt==5 (raw BF16), fmt==7 (MXFP4), and fmt==8 (FP8) are explicit
-   * allow-list entries beyond the legacy 0..4 range. */
-  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 5 && fmt != 7 && fmt != 8 && fmt != 9 && fmt != 10 && fmt != 11 && fmt != 12 && fmt != 13 && fmt != 14)) return 0;
+  /* Explicit allow-list entries beyond the legacy 0..4 range. */
+  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 5 && fmt != 7 && fmt != 8 && fmt != 9 && fmt != 10 && fmt != 11 && fmt != 12 && fmt != 13 && fmt != 14 && fmt != 15)) return 0;
   uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
   @autoreleasepool {
       ColiMetalTensor *t = *tp;
@@ -1374,6 +1801,7 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
     if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.submit_ns += t1 - t0; t0 = t1; }
     [cb waitUntilCompleted];
     if (t0) g_metal_prof.wait_ns += mnow_ns() - t0;
+    profile_gpu_cb(cb);
     memcpy(y, [by contents], (size_t)S*O*sizeof(float));
   }
   return 1;
@@ -1396,7 +1824,7 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
       if (!d.y || !d.weights || !d.scales || d.I != I || d.O <= 0 ||
-          d.fmt < 0 || (d.fmt > 4 && d.fmt != 5 && d.fmt != 7 && d.fmt != 8 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14)) return 0;
+          d.fmt < 0 || (d.fmt > 4 && d.fmt != 5 && d.fmt != 7 && d.fmt != 8 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14 && d.fmt != 15)) return 0;
 
       ColiMetalTensor *t = d.tensor;
       if (t && (t->fmt != d.fmt || t->I != d.I || t->O != d.O)) return 0;
@@ -1459,6 +1887,7 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
     if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.submit_ns += t1 - t0; t0 = t1; }
     [cb waitUntilCompleted];
     if (t0) g_metal_prof.wait_ns += mnow_ns() - t0;
+    profile_gpu_cb(cb);
 
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
@@ -1468,6 +1897,271 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
   return 1;
 }
 
+
+
+// ---- Spark-X2.5 one-command-buffer dense layer decode --------------------
+struct SparkLayerCtx {
+  uint64_t model_id=0; int layer=-1;
+  const float *host_in_norm=nullptr,*host_post_norm=nullptr;
+  int D=0,inter=0,H=0,KH=0,hd=0,sliding=0,window=0,rd=0; float theta=0,eps=0;
+  int tokens=0, cache_cap=0;
+  id<MTLBuffer> in_norm=nil,post_norm=nil,x=nil,xn=nil,qkv=nil,gates=nil,att=nil,ao=nil,pn=nil,mg=nil,mu=nil,mo=nil;
+  id<MTLBuffer> kc=nil,vc=nil,score=nil;
+};
+static std::vector<SparkLayerCtx*> g_spark_layers;
+
+static id<MTLBuffer> spark_wrap_readonly(const void *p,size_t n){
+  MTLResourceOptions o=MTLResourceStorageModeShared|MTLResourceHazardTrackingModeUntracked;
+  const size_t pg=16384;
+  if(((uintptr_t)p%pg)==0&&(n%pg)==0) return [g_dev newBufferWithBytesNoCopy:(void*)p length:n options:o deallocator:nil];
+  return [g_dev newBufferWithBytes:p length:n options:o];
+}
+static ColiMetalTensor *spark_tensor(ColiMetalMatmulDesc &d) {
+  if(!d.weights||!d.scales||d.fmt!=9||d.I<=0||d.O<=0)return nullptr;
+  ColiMetalTensor *t=d.tensor;
+  if(t){if(t->fmt!=9||t->I!=d.I||t->O!=d.O)return nullptr;return t;}
+  uint64_t wa=0,sa=0; id<MTLBuffer> wr=resolve(d.weights,&wa),sr=resolve(d.scales,&sa);
+  t=new(std::nothrow) ColiMetalTensor(); if(!t)return nullptr;
+  t->fmt=9;t->I=d.I;t->O=d.O;t->wbytes=fmt_bytes(9,d.I,d.O);
+  if(wr&&sr){t->w=wr;t->s=sr;t->woff=(size_t)(wa-(uint64_t)wr.gpuAddress);t->soff=(size_t)(sa-(uint64_t)sr.gpuAddress);}
+  else{t->w=spark_wrap_readonly(d.weights,t->wbytes);t->s=spark_wrap_readonly(d.scales,fmt_scale_bytes(9,d.I,d.O,64));t->woff=t->soff=0;}
+  if(!t->w||!t->s){delete t;return nullptr;} d.tensor=t;g_tensor_count++;g_tensor_bytes+=t->wbytes;return t;
+}
+static void spark_gemv(id<MTLComputeCommandEncoder> e,ColiMetalTensor*t,id<MTLBuffer>x,id<MTLBuffer>y,int I,int O){
+  [e setComputePipelineState:g_sp_qmv];[e setBuffer:t->w offset:t->woff atIndex:0];[e setBuffer:t->s offset:t->soff atIndex:1];
+  [e setBuffer:x offset:0 atIndex:2];[e setBuffer:y offset:0 atIndex:3];[e setBytes:&I length:4 atIndex:4];[e setBytes:&O length:4 atIndex:5];
+  [e dispatchThreadgroups:MTLSizeMake(((size_t)O+7)/8,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+}
+static void spark_qmm(id<MTLComputeCommandEncoder> e,ColiMetalTensor*t,id<MTLBuffer>x,id<MTLBuffer>y,int S,int I,int O){
+  [e setComputePipelineState:g_sp_qmm];[e setBuffer:t->w offset:t->woff atIndex:0];[e setBuffer:t->s offset:t->soff atIndex:1];
+  [e setBuffer:x offset:0 atIndex:2];[e setBuffer:y offset:0 atIndex:3];[e setBytes:&S length:4 atIndex:4];[e setBytes:&I length:4 atIndex:5];[e setBytes:&O length:4 atIndex:6];
+  [e dispatchThreadgroups:MTLSizeMake(((size_t)O+31)/32,((size_t)S+31)/32,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+}
+static void spark_round_buf(id<MTLComputeCommandEncoder>e,id<MTLBuffer>b,int n){[e setComputePipelineState:g_sp_round];[e setBuffer:b offset:0 atIndex:0];[e setBytes:&n length:4 atIndex:1];[e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];}
+static bool spark_resize_cache(SparkLayerCtx*c,int need){
+  int cap=c->sliding?c->window:((need+255)/256)*256;if(cap<=c->cache_cap)return true;
+  size_t kv=(size_t)c->KH*c->hd,bytes=(size_t)cap*kv*sizeof(uint16_t);
+  id<MTLBuffer> nk=[g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared],nv=[g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+  id<MTLBuffer> ns=[g_dev newBufferWithLength:(size_t)c->H*cap*sizeof(float) options:MTLResourceStorageModePrivate];if(!nk||!nv||!ns)return false;
+  if(c->kc&&c->tokens>0){size_t old=(size_t)c->cache_cap*kv*sizeof(uint16_t);memcpy(nk.contents,c->kc.contents,old);memcpy(nv.contents,c->vc.contents,old);} c->kc=nk;c->vc=nv;c->score=ns;c->cache_cap=cap;return true;
+}
+static SparkLayerCtx *spark_ctx(uint64_t model_id,int layer,const float*in_norm,const float*post_norm,int D,int inter,int H,int KH,int hd,int sliding,int window,int rd,float theta,float eps){
+  for(auto*c:g_spark_layers)if(c&&c->model_id==model_id&&c->layer==layer){if(c->host_in_norm!=in_norm||c->host_post_norm!=post_norm||c->D!=D||c->inter!=inter||c->H!=H||c->KH!=KH||c->hd!=hd||c->sliding!=sliding||c->window!=window||c->rd!=rd)return nullptr;return c;}
+  if(!in_norm||!post_norm||D<=0||inter<=0||H<=0||KH<=0||H%KH||hd<=0||rd<=0||rd>hd||rd%2||!(eps>0))return nullptr;
+  auto*c=new(std::nothrow) SparkLayerCtx();if(!c)return nullptr;c->model_id=model_id;c->layer=layer;c->host_in_norm=in_norm;c->host_post_norm=post_norm;c->D=D;c->inter=inter;c->H=H;c->KH=KH;c->hd=hd;c->sliding=sliding;c->window=window;c->rd=rd;c->theta=theta;c->eps=eps;
+  int qdim=H*hd,kvdim=KH*hd,qkvdim=qdim+2*kvdim;
+  c->in_norm=[g_dev newBufferWithBytes:in_norm length:(size_t)D*sizeof(float) options:MTLResourceStorageModeShared];c->post_norm=[g_dev newBufferWithBytes:post_norm length:(size_t)D*sizeof(float) options:MTLResourceStorageModeShared];
+  auto B=[&](size_t n,MTLResourceOptions o=MTLResourceStorageModePrivate){return[g_dev newBufferWithLength:n options:o];};
+  c->x=B((size_t)D*4,MTLResourceStorageModeShared);c->xn=B((size_t)D*4);c->qkv=B((size_t)qkvdim*4);c->gates=B((size_t)H*4);c->att=B((size_t)qdim*4);c->ao=B((size_t)D*4);c->pn=B((size_t)D*4);c->mg=B((size_t)inter*4);c->mu=B((size_t)inter*4);c->mo=B((size_t)D*4);
+  if(!c->in_norm||!c->post_norm||!c->x||!c->xn||!c->qkv||!c->gates||!c->att||!c->ao||!c->pn||!c->mg||!c->mu||!c->mo||!spark_resize_cache(c,1)){delete c;return nullptr;}g_spark_layers.push_back(c);return c;
+}
+
+static bool spark_encode_layer(id<MTLComputeCommandEncoder> e,
+                               id<MTLBuffer> xbuf,
+                               SparkLayerCtx *c,
+                               ColiMetalTensor **wt,
+                               int D,int inter,int H,int KH,int hd,
+                               int sliding,int window,int pos,int rd,float theta,float eps) {
+  if(!e||!xbuf||!c||!wt)return false;
+  int qdim=H*hd,kvdim=KH*hd,qkvdim=qdim+2*kvdim;
+  int T=sliding?std::min(pos+1,window):pos+1,start=pos+1-T,slot=sliding?pos%window:pos;
+  [e setComputePipelineState:g_sp_copy];[e setBuffer:xbuf offset:0 atIndex:0];[e setBuffer:c->xn offset:0 atIndex:1];[e setBytes:&D length:4 atIndex:2];[e dispatchThreads:MTLSizeMake(D,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [e setComputePipelineState:g_sp_rms];[e setBuffer:c->xn offset:0 atIndex:0];[e setBuffer:c->in_norm offset:0 atIndex:1];[e setBytes:&D length:4 atIndex:2];[e setBytes:&eps length:4 atIndex:3];[e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_gemv(e,wt[0],c->xn,c->qkv,D,qkvdim);spark_gemv(e,wt[1],c->xn,c->gates,D,H);
+  int one=1; [e setComputePipelineState:g_sp_qkv_final];[e setBuffer:c->qkv offset:0 atIndex:0];[e setBytes:&one length:4 atIndex:1];[e setBytes:&H length:4 atIndex:2];[e setBytes:&KH length:4 atIndex:3];[e setBytes:&hd length:4 atIndex:4];[e setBytes:&rd length:4 atIndex:5];[e setBytes:&pos length:4 atIndex:6];[e setBytes:&theta length:4 atIndex:7];
+  int qtasks=H*(rd/2)+KH*(rd/2)+H*(hd-rd)+KH*(hd-rd)+kvdim; [e dispatchThreads:MTLSizeMake(qtasks,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [e setComputePipelineState:g_sp_store];[e setBuffer:c->qkv offset:0 atIndex:0];[e setBuffer:c->kc offset:0 atIndex:1];[e setBuffer:c->vc offset:0 atIndex:2];[e setBytes:&qdim length:4 atIndex:3];[e setBytes:&kvdim length:4 atIndex:4];[e setBytes:&slot length:4 atIndex:5];[e dispatchThreads:MTLSizeMake(kvdim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [e setComputePipelineState:g_sp_score];[e setBuffer:c->qkv offset:0 atIndex:0];[e setBuffer:c->kc offset:0 atIndex:1];[e setBuffer:c->score offset:0 atIndex:2];[e setBytes:&H length:4 atIndex:3];[e setBytes:&KH length:4 atIndex:4];[e setBytes:&hd length:4 atIndex:5];[e setBytes:&kvdim length:4 atIndex:6];[e setBytes:&T length:4 atIndex:7];[e setBytes:&start length:4 atIndex:8];[e setBytes:&window length:4 atIndex:9];[e setBytes:&sliding length:4 atIndex:10];[e dispatchThreadgroups:MTLSizeMake((size_t)H*T,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+  [e setComputePipelineState:g_sp_softmax];[e setBuffer:c->score offset:0 atIndex:0];[e setBytes:&T length:4 atIndex:1];[e dispatchThreadgroups:MTLSizeMake(H,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [e setComputePipelineState:g_sp_ctxgate];[e setBuffer:c->score offset:0 atIndex:0];[e setBuffer:c->vc offset:0 atIndex:1];[e setBuffer:c->gates offset:0 atIndex:2];[e setBuffer:c->att offset:0 atIndex:3];[e setBytes:&H length:4 atIndex:4];[e setBytes:&KH length:4 atIndex:5];[e setBytes:&hd length:4 atIndex:6];[e setBytes:&kvdim length:4 atIndex:7];[e setBytes:&T length:4 atIndex:8];[e setBytes:&start length:4 atIndex:9];[e setBytes:&window length:4 atIndex:10];[e setBytes:&sliding length:4 atIndex:11];[e dispatchThreads:MTLSizeMake(qdim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_gemv(e,wt[2],c->att,c->ao,qdim,D);
+  [e setComputePipelineState:g_sp_rescopy];[e setBuffer:xbuf offset:0 atIndex:0];[e setBuffer:c->ao offset:0 atIndex:1];[e setBuffer:c->pn offset:0 atIndex:2];[e setBytes:&D length:4 atIndex:3];[e dispatchThreads:MTLSizeMake(D,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [e setComputePipelineState:g_sp_rms];[e setBuffer:c->pn offset:0 atIndex:0];[e setBuffer:c->post_norm offset:0 atIndex:1];[e setBytes:&D length:4 atIndex:2];[e setBytes:&eps length:4 atIndex:3];[e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_gemv(e,wt[3],c->pn,c->mg,D,inter);spark_gemv(e,wt[4],c->pn,c->mu,D,inter);
+  [e setComputePipelineState:g_sp_gelu];[e setBuffer:c->mg offset:0 atIndex:0];[e setBuffer:c->mu offset:0 atIndex:1];[e setBytes:&inter length:4 atIndex:2];[e dispatchThreads:MTLSizeMake(inter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_gemv(e,wt[5],c->mg,c->mo,inter,D);
+  [e setComputePipelineState:g_sp_resid];[e setBuffer:xbuf offset:0 atIndex:0];[e setBuffer:c->mo offset:0 atIndex:1];[e setBytes:&D length:4 atIndex:2];[e dispatchThreads:MTLSizeMake(D,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  return true;
+}
+
+static bool spark_prepare_layer(uint64_t model_id,int layer,ColiMetalMatmulDesc*descs,int count,
+                                const float*in_norm,const float*post_norm,
+                                int D,int inter,int H,int KH,int hd,int sliding,int window,int pos,int rd,float theta,float eps,
+                                SparkLayerCtx **out_ctx, ColiMetalTensor **wt) {
+  if(!descs||count!=6||!out_ctx||!wt||model_id==0||layer<0||pos<0)return false;
+  int qdim=H*hd,kvdim=KH*hd,qkvdim=qdim+2*kvdim;
+  const int EI[6]={D,D,qdim,D,D,inter},EO[6]={qkvdim,H,D,inter,inter,D};
+  for(int i=0;i<6;i++)if(descs[i].fmt!=9||descs[i].I!=EI[i]||descs[i].O!=EO[i])return false;
+  SparkLayerCtx*c=spark_ctx(model_id,layer,in_norm,post_norm,D,inter,H,KH,hd,sliding,window,rd,theta,eps);
+  if(!c||c->tokens!=pos||!spark_resize_cache(c,pos+1))return false;
+  for(int i=0;i<6;i++){wt[i]=spark_tensor(descs[i]);if(!wt[i])return false;}
+  *out_ctx=c;return true;
+}
+
+extern "C" int coli_metal_spark_layer(uint64_t model_id,int layer,ColiMetalMatmulDesc*descs,int count,float*x,const float*in_norm,const float*post_norm,int D,int inter,int H,int KH,int hd,int sliding,int window,int pos,int rd,float theta,float eps){
+  if(!g_dev||!g_queue||!x)return 0;
+  std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{
+    SparkLayerCtx*c=nullptr;ColiMetalTensor*wt[6]={};
+    if(!spark_prepare_layer(model_id,layer,descs,count,in_norm,post_norm,D,inter,H,KH,hd,sliding,window,pos,rd,theta,eps,&c,wt))return 0;
+    memcpy(c->x.contents,x,(size_t)D*sizeof(float));uint64_t t0=g_coli_metal_profile_on?mnow_ns():0;
+    id<MTLCommandBuffer>cb=[g_queue commandBuffer];id<MTLComputeCommandEncoder>e=[cb computeCommandEncoder];if(!cb||!e)return 0;
+    if(!spark_encode_layer(e,c->x,c,wt,D,inter,H,KH,hd,sliding,window,pos,rd,theta,eps))return 0;[e endEncoding];
+    if(t0){uint64_t t1=mnow_ns();g_metal_prof.encode_ns+=t1-t0;t0=t1;}[cb commit];if(t0){uint64_t t1=mnow_ns();g_metal_prof.submit_ns+=t1-t0;t0=t1;}[cb waitUntilCompleted];if(t0)g_metal_prof.wait_ns+=mnow_ns()-t0;profile_gpu_cb(cb);
+    if(cb.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[metal-spark] layer %d command failed: %s\n",layer,cb.error?cb.error.localizedDescription.UTF8String:"unknown");return -1;}
+    memcpy(x,c->x.contents,(size_t)D*sizeof(float));c->tokens=pos+1;return 1;
+  }
+}
+
+struct SparkHeadCtx {
+  uint64_t model_id=0; const float *host_norm=nullptr; int D=0,V=0;
+  id<MTLBuffer> norm=nil, logits=nil, token=nil, xnorm=nil;
+};
+static std::vector<SparkHeadCtx*> g_spark_heads;
+static SparkHeadCtx *spark_head_ctx(uint64_t model_id,const float*norm,int D,int V){
+  for(auto*h:g_spark_heads) if(h&&h->model_id==model_id){
+    if(h->host_norm!=norm||h->D!=D||h->V!=V)return nullptr; return h;
+  }
+  if(!norm||D<=0||V<=0)return nullptr;
+  auto*h=new(std::nothrow) SparkHeadCtx(); if(!h)return nullptr;
+  h->model_id=model_id;h->host_norm=norm;h->D=D;h->V=V;
+  h->norm=[g_dev newBufferWithBytes:norm length:(size_t)D*sizeof(float) options:MTLResourceStorageModeShared];
+  h->logits=[g_dev newBufferWithLength:(size_t)V*sizeof(float) options:MTLResourceStorageModeShared];
+  h->token=[g_dev newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+  h->xnorm=[g_dev newBufferWithLength:(size_t)D*sizeof(float) options:MTLResourceStorageModePrivate];
+  if(!h->norm||!h->logits||!h->token||!h->xnorm){delete h;return nullptr;} g_spark_heads.push_back(h); return h;
+}
+
+struct SparkTokenPending { uint64_t model_id=0;int pos=-1,D=0;id<MTLBuffer>x=nil;id<MTLCommandBuffer>cb=nil;id<MTLComputeCommandEncoder>e=nil;std::vector<SparkLayerCtx*> touched;uint64_t t0=0; };
+static SparkTokenPending *g_spark_pending=nullptr;
+
+extern "C" int coli_metal_spark_token_begin(uint64_t model_id,const float*x,int D,int pos){
+  if(!g_dev||!g_queue||!x||!model_id||D<=0||pos<0)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{
+    if(g_spark_pending)return 0;auto*p=new(std::nothrow) SparkTokenPending();if(!p)return 0;p->model_id=model_id;p->pos=pos;p->D=D;
+    p->x=[g_dev newBufferWithBytes:x length:(size_t)D*sizeof(float) options:MTLResourceStorageModeShared];p->cb=[g_queue commandBuffer];p->e=[p->cb computeCommandEncoder];
+    if(!p->x||!p->cb||!p->e){delete p;return 0;}p->t0=g_coli_metal_profile_on?mnow_ns():0;g_spark_pending=p;return 1;
+  }
+}
+extern "C" int coli_metal_spark_layer_encode(uint64_t model_id,int layer,ColiMetalMatmulDesc*descs,int count,const float*in_norm,const float*post_norm,int D,int inter,int H,int KH,int hd,int sliding,int window,int pos,int rd,float theta,float eps){
+  if(!g_dev||!g_spark_pending)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);auto*p=g_spark_pending;
+  if(!p||p->model_id!=model_id||p->pos!=pos||p->D!=D)return 0;SparkLayerCtx*c=nullptr;ColiMetalTensor*wt[6]={};
+  if(!spark_prepare_layer(model_id,layer,descs,count,in_norm,post_norm,D,inter,H,KH,hd,sliding,window,pos,rd,theta,eps,&c,wt))return 0;
+  if(!spark_encode_layer(p->e,p->x,c,wt,D,inter,H,KH,hd,sliding,window,pos,rd,theta,eps))return 0;p->touched.push_back(c);return 1;
+}
+extern "C" int coli_metal_spark_token_end(uint64_t model_id,float*x,int D,int pos){
+  if(!g_dev||!g_spark_pending||!x)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{auto*p=g_spark_pending;
+    if(!p||p->model_id!=model_id||p->pos!=pos||p->D!=D)return 0;[p->e endEncoding];uint64_t t0=p->t0;
+    if(t0){uint64_t t1=mnow_ns();g_metal_prof.encode_ns+=t1-t0;t0=t1;}[p->cb commit];if(t0){uint64_t t1=mnow_ns();g_metal_prof.submit_ns+=t1-t0;t0=t1;}[p->cb waitUntilCompleted];if(t0)g_metal_prof.wait_ns+=mnow_ns()-t0;profile_gpu_cb(p->cb);
+    int rc=1;if(p->cb.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[metal-spark] token command failed: %s\n",p->cb.error?p->cb.error.localizedDescription.UTF8String:"unknown");rc=-1;}
+    else{memcpy(x,p->x.contents,(size_t)D*sizeof(float));for(auto*c:p->touched)c->tokens=pos+1;}g_spark_pending=nullptr;delete p;return rc;
+  }
+}
+extern "C" int coli_metal_spark_token_end_top1(uint64_t model_id,ColiMetalMatmulDesc*head,const float*norm,uint32_t*token,int D,int V,int pos,float eps){
+  if(!g_dev||!g_spark_pending||!head||!norm||!token)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{auto*p=g_spark_pending;
+    if(!p||p->model_id!=model_id||p->pos!=pos||p->D!=D||head->fmt!=9||head->I!=D||head->O!=V)return 0;
+    ColiMetalTensor*wt=spark_tensor(*head);SparkHeadCtx*h=spark_head_ctx(model_id,norm,D,V);if(!wt||!h)return 0;
+    [p->e setComputePipelineState:g_sp_rms];[p->e setBuffer:p->x offset:0 atIndex:0];[p->e setBuffer:h->norm offset:0 atIndex:1];
+    [p->e setBytes:&D length:4 atIndex:2];[p->e setBytes:&eps length:4 atIndex:3];[p->e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    spark_gemv(p->e,wt,p->x,h->logits,D,V);
+    [p->e setComputePipelineState:g_sp_argmax];[p->e setBuffer:h->logits offset:0 atIndex:0];[p->e setBuffer:h->token offset:0 atIndex:1];[p->e setBytes:&V length:4 atIndex:2];
+    [p->e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[p->e endEncoding];uint64_t t0=p->t0;
+    if(t0){uint64_t t1=mnow_ns();g_metal_prof.encode_ns+=t1-t0;t0=t1;}[p->cb commit];if(t0){uint64_t t1=mnow_ns();g_metal_prof.submit_ns+=t1-t0;t0=t1;}[p->cb waitUntilCompleted];if(t0)g_metal_prof.wait_ns+=mnow_ns()-t0;profile_gpu_cb(p->cb);
+    int rc=1;if(p->cb.status!=MTLCommandBufferStatusCompleted){rc=-1;}else{*token=*((uint32_t*)h->token.contents);for(auto*c:p->touched)c->tokens=pos+1;}
+    g_spark_pending=nullptr;delete p;return rc;
+  }
+}
+
+extern "C" int coli_metal_spark_token_end_logits(uint64_t model_id,ColiMetalMatmulDesc*head,const float*norm,float*logits,int D,int V,int pos,float eps){
+  if(!g_dev||!g_spark_pending||!head||!norm||!logits)return 0; std::lock_guard<std::mutex>lk(g_op_mtx); @autoreleasepool { auto*p=g_spark_pending;
+    if(!p||p->model_id!=model_id||p->pos!=pos||p->D!=D||head->fmt!=9||head->I!=D||head->O!=V)return 0;
+    ColiMetalTensor*wt=spark_tensor(*head); SparkHeadCtx*h=spark_head_ctx(model_id,norm,D,V); if(!wt||!h)return 0;
+    [p->e setComputePipelineState:g_a_rms]; [p->e setBuffer:p->x offset:0 atIndex:0]; [p->e setBuffer:h->norm offset:0 atIndex:1];
+    [p->e setBytes:&D length:4 atIndex:2]; [p->e setBytes:&eps length:4 atIndex:3];
+    [p->e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; spark_round_buf(p->e,p->x,D);
+    spark_gemv(p->e,wt,p->x,h->logits,D,V); spark_round_buf(p->e,h->logits,V);
+    [p->e endEncoding]; uint64_t t0=p->t0;
+    if(t0){uint64_t t1=mnow_ns();g_metal_prof.encode_ns+=t1-t0;t0=t1;} [p->cb commit];
+    if(t0){uint64_t t1=mnow_ns();g_metal_prof.submit_ns+=t1-t0;t0=t1;} [p->cb waitUntilCompleted];
+    if(t0)g_metal_prof.wait_ns+=mnow_ns()-t0; profile_gpu_cb(p->cb); int rc=1;
+    if(p->cb.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[metal-spark] token+head command failed: %s\n",p->cb.error?p->cb.error.localizedDescription.UTF8String:"unknown");rc=-1;}
+    else { memcpy(logits,h->logits.contents,(size_t)V*sizeof(float)); for(auto*c:p->touched)c->tokens=pos+1; }
+    g_spark_pending=nullptr; delete p; return rc;
+  }
+}
+
+extern "C" void coli_metal_spark_token_abort(uint64_t model_id){std::lock_guard<std::mutex>lk(g_op_mtx);if(g_spark_pending&&g_spark_pending->model_id==model_id){auto*p=g_spark_pending;g_spark_pending=nullptr;delete p;}}
+
+struct SparkPrefillPending {
+  uint64_t model_id=0; int base=0,S=0,D=0,inter=0,H=0,KH=0,hd=0;
+  id<MTLBuffer>x=nil,xn=nil,qkv=nil,gates=nil,att=nil,ao=nil,pn=nil,mg=nil,mu=nil,mo=nil;
+  id<MTLCommandBuffer>cb=nil;id<MTLComputeCommandEncoder>e=nil;
+  std::vector<SparkLayerCtx*> touched;uint64_t t0=0;
+};
+static SparkPrefillPending *g_spark_prefill=nullptr;
+static bool spark_prefill_scratch(SparkPrefillPending*p,int inter,int H,int KH,int hd){
+  if(!p)return false;if(p->inter){return p->inter==inter&&p->H==H&&p->KH==KH&&p->hd==hd;}
+  p->inter=inter;p->H=H;p->KH=KH;p->hd=hd;int qdim=H*hd,kvdim=KH*hd,qkvdim=qdim+2*kvdim;size_t S=(size_t)p->S;
+  auto B=[&](size_t n){return[g_dev newBufferWithLength:n options:MTLResourceStorageModePrivate];};
+  p->xn=B(S*p->D*2);p->qkv=B(S*qkvdim*2);p->gates=B(S*H*2);p->att=B(S*qdim*2);p->ao=B(S*p->D*2);p->pn=B(S*p->D*2);
+  p->mg=B(S*inter*2);p->mu=B(S*inter*2);p->mo=B(S*p->D*2);
+  return p->xn&&p->qkv&&p->gates&&p->att&&p->ao&&p->pn&&p->mg&&p->mu&&p->mo;
+}
+extern "C" int coli_metal_spark_prefill_begin(uint64_t model_id,const float*x,int S,int D,int base){
+  if(!g_dev||!g_queue||!x||!model_id||S<=1||D<=0||base<0)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{
+    if(g_spark_pending||g_spark_prefill)return 0;auto*p=new(std::nothrow) SparkPrefillPending();if(!p)return 0;
+    p->model_id=model_id;p->base=base;p->S=S;p->D=D;p->x=[g_dev newBufferWithBytes:x length:(size_t)S*D*4 options:MTLResourceStorageModeShared];
+    p->cb=[g_queue commandBuffer];p->e=[p->cb computeCommandEncoder];if(!p->x||!p->cb||!p->e){delete p;return 0;}
+    p->t0=g_coli_metal_profile_on?mnow_ns():0;g_spark_prefill=p;return 1;
+  }
+}
+extern "C" int coli_metal_spark_prefill_layer_encode(uint64_t model_id,int layer,ColiMetalMatmulDesc*descs,int count,
+ const float*in_norm,const float*post_norm,int D,int inter,int H,int KH,int hd,int sliding,int window,int base,int S,int rd,float theta,float eps){
+  if(!g_dev||!g_spark_prefill)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);auto*p=g_spark_prefill;
+  if(!p||p->model_id!=model_id||p->base!=base||p->S!=S||p->D!=D||!descs||count!=6)return 0;
+  if(!spark_prefill_scratch(p,inter,H,KH,hd))return 0;
+  int qdim=H*hd,kvdim=KH*hd,qkvdim=qdim+2*kvdim;const int EI[6]={D,D,qdim,D,D,inter},EO[6]={qkvdim,H,D,inter,inter,D};
+  for(int i=0;i<6;i++)if(descs[i].fmt!=9||descs[i].I!=EI[i]||descs[i].O!=EO[i])return 0;
+  SparkLayerCtx*c=spark_ctx(model_id,layer,in_norm,post_norm,D,inter,H,KH,hd,sliding,window,rd,theta,eps);
+  if(!c||c->tokens!=base||!spark_resize_cache(c,base+S))return 0;ColiMetalTensor*wt[6]={};for(int i=0;i<6;i++){wt[i]=spark_tensor(descs[i]);if(!wt[i])return 0;}
+  int n=S*D;
+  [p->e setComputePipelineState:g_sp_prms_f2b];[p->e setBuffer:p->x offset:0 atIndex:0];[p->e setBuffer:c->in_norm offset:0 atIndex:1];[p->e setBuffer:p->xn offset:0 atIndex:2];[p->e setBytes:&D length:4 atIndex:3];[p->e setBytes:&eps length:4 atIndex:4];[p->e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_qmm(p->e,wt[0],p->xn,p->qkv,S,D,qkvdim);spark_qmm(p->e,wt[1],p->xn,p->gates,S,D,H);
+  [p->e setComputePipelineState:g_sp_rope_batch];[p->e setBuffer:p->qkv offset:0 atIndex:0];[p->e setBytes:&S length:4 atIndex:1];[p->e setBytes:&H length:4 atIndex:2];[p->e setBytes:&KH length:4 atIndex:3];[p->e setBytes:&hd length:4 atIndex:4];[p->e setBytes:&rd length:4 atIndex:5];[p->e setBytes:&base length:4 atIndex:6];[p->e setBytes:&theta length:4 atIndex:7];[p->e dispatchThreads:MTLSizeMake((size_t)S*(H+KH)*(rd/2),1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [p->e setComputePipelineState:g_sp_attn_batch];[p->e setBuffer:p->qkv offset:0 atIndex:0];[p->e setBuffer:c->kc offset:0 atIndex:1];[p->e setBuffer:c->vc offset:0 atIndex:2];[p->e setBuffer:p->gates offset:0 atIndex:3];[p->e setBuffer:p->att offset:0 atIndex:4];[p->e setBytes:&S length:4 atIndex:5];[p->e setBytes:&H length:4 atIndex:6];[p->e setBytes:&KH length:4 atIndex:7];[p->e setBytes:&hd length:4 atIndex:8];[p->e setBytes:&base length:4 atIndex:9];[p->e setBytes:&sliding length:4 atIndex:10];[p->e setBytes:&window length:4 atIndex:11];[p->e dispatchThreadgroups:MTLSizeMake(((size_t)S*H+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+  [p->e setComputePipelineState:g_sp_store_batch];[p->e setBuffer:p->qkv offset:0 atIndex:0];[p->e setBuffer:c->kc offset:0 atIndex:1];[p->e setBuffer:c->vc offset:0 atIndex:2];[p->e setBytes:&S length:4 atIndex:3];[p->e setBytes:&qdim length:4 atIndex:4];[p->e setBytes:&kvdim length:4 atIndex:5];[p->e setBytes:&base length:4 atIndex:6];[p->e setBytes:&sliding length:4 atIndex:7];[p->e setBytes:&window length:4 atIndex:8];[p->e dispatchThreads:MTLSizeMake((size_t)S*kvdim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_qmm(p->e,wt[2],p->att,p->ao,S,qdim,D);
+  [p->e setComputePipelineState:g_sp_prescopy_bf16];[p->e setBuffer:p->x offset:0 atIndex:0];[p->e setBuffer:p->ao offset:0 atIndex:1];[p->e setBuffer:p->pn offset:0 atIndex:2];[p->e setBytes:&n length:4 atIndex:3];[p->e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  [p->e setComputePipelineState:g_sp_prms_bf16];[p->e setBuffer:p->pn offset:0 atIndex:0];[p->e setBuffer:c->post_norm offset:0 atIndex:1];[p->e setBytes:&D length:4 atIndex:2];[p->e setBytes:&eps length:4 atIndex:3];[p->e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_qmm(p->e,wt[3],p->pn,p->mg,S,D,inter);spark_qmm(p->e,wt[4],p->pn,p->mu,S,D,inter);
+  int ni=S*inter;[p->e setComputePipelineState:g_sp_pgelu_bf16];[p->e setBuffer:p->mg offset:0 atIndex:0];[p->e setBuffer:p->mu offset:0 atIndex:1];[p->e setBytes:&ni length:4 atIndex:2];[p->e dispatchThreads:MTLSizeMake(ni,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  spark_qmm(p->e,wt[5],p->mg,p->mo,S,inter,D);
+  [p->e setComputePipelineState:g_sp_presid_bf16];[p->e setBuffer:p->x offset:0 atIndex:0];[p->e setBuffer:p->mo offset:0 atIndex:1];[p->e setBytes:&n length:4 atIndex:2];[p->e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  p->touched.push_back(c);return 1;
+}
+extern "C" int coli_metal_spark_prefill_end(uint64_t model_id,int base,int S){
+  if(!g_dev||!g_spark_prefill)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{auto*p=g_spark_prefill;
+    if(!p||p->model_id!=model_id||p->base!=base||p->S!=S)return 0;
+    [p->e endEncoding];uint64_t t0=p->t0;if(t0){uint64_t t1=mnow_ns();g_metal_prof.encode_ns+=t1-t0;t0=t1;}[p->cb commit];if(t0){uint64_t t1=mnow_ns();g_metal_prof.submit_ns+=t1-t0;t0=t1;}[p->cb waitUntilCompleted];if(t0)g_metal_prof.wait_ns+=mnow_ns()-t0;profile_gpu_cb(p->cb);
+    int rc=1;if(p->cb.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[metal-spark] prefill command failed: %s\\n",p->cb.error?p->cb.error.localizedDescription.UTF8String:"unknown");rc=-1;}
+    else for(auto*c:p->touched)c->tokens=base+S;g_spark_prefill=nullptr;delete p;return rc;
+  }
+}
+
+extern "C" int coli_metal_spark_prefill_end_logits(uint64_t model_id,ColiMetalMatmulDesc*head,const float*norm,float*logits,int D,int V,int base,int S,float eps){
+  if(!g_dev||!g_spark_prefill||!head||!norm||!logits)return 0;std::lock_guard<std::mutex>lk(g_op_mtx);@autoreleasepool{auto*p=g_spark_prefill;
+    if(!p||p->model_id!=model_id||p->base!=base||p->S!=S||p->D!=D||head->fmt!=9||head->I!=D||head->O!=V)return 0;
+    ColiMetalTensor*wt=spark_tensor(*head);SparkHeadCtx*h=spark_head_ctx(model_id,norm,D,V);if(!wt||!h)return 0;
+    // Copy only the last hidden row: prefill needs one next-token distribution, not S vocab rows.
+    [p->e setComputePipelineState:g_sp_copy];[p->e setBuffer:p->x offset:(size_t)(S-1)*D*4 atIndex:0];[p->e setBuffer:h->xnorm offset:0 atIndex:1];[p->e setBytes:&D length:4 atIndex:2];[p->e dispatchThreads:MTLSizeMake(D,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [p->e setComputePipelineState:g_a_rms];[p->e setBuffer:h->xnorm offset:0 atIndex:0];[p->e setBuffer:h->norm offset:0 atIndex:1];[p->e setBytes:&D length:4 atIndex:2];[p->e setBytes:&eps length:4 atIndex:3];[p->e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];spark_round_buf(p->e,h->xnorm,D);
+    spark_gemv(p->e,wt,h->xnorm,h->logits,D,V);spark_round_buf(p->e,h->logits,V);[p->e endEncoding];uint64_t t0=p->t0;
+    if(t0){uint64_t t1=mnow_ns();g_metal_prof.encode_ns+=t1-t0;t0=t1;}[p->cb commit];if(t0){uint64_t t1=mnow_ns();g_metal_prof.submit_ns+=t1-t0;t0=t1;}[p->cb waitUntilCompleted];if(t0)g_metal_prof.wait_ns+=mnow_ns()-t0;profile_gpu_cb(p->cb);
+    int rc=1;if(p->cb.status!=MTLCommandBufferStatusCompleted){fprintf(stderr,"[metal-spark] prefill command failed: %s\n",p->cb.error?p->cb.error.localizedDescription.UTF8String:"unknown");rc=-1;}
+    else{memcpy(logits,h->logits.contents,(size_t)V*4);for(auto*c:p->touched)c->tokens=base+S;}g_spark_prefill=nullptr;delete p;return rc;
+  }
+}
+extern "C" void coli_metal_spark_prefill_abort(uint64_t model_id){std::lock_guard<std::mutex>lk(g_op_mtx);if(g_spark_prefill&&g_spark_prefill->model_id==model_id){auto*p=g_spark_prefill;g_spark_prefill=nullptr;delete p;}}
+
+extern "C" void coli_metal_spark_drop_model(uint64_t model_id){if(!model_id)return;std::lock_guard<std::mutex>lk(g_op_mtx);if(g_spark_prefill&&g_spark_prefill->model_id==model_id){auto*p=g_spark_prefill;g_spark_prefill=nullptr;delete p;}if(g_spark_pending&&g_spark_pending->model_id==model_id){auto*p=g_spark_pending;g_spark_pending=nullptr;delete p;}for(auto it=g_spark_layers.begin();it!=g_spark_layers.end();){auto*c=*it;if(c&&c->model_id==model_id){delete c;it=g_spark_layers.erase(it);}else++it;}for(auto it=g_spark_heads.begin();it!=g_spark_heads.end();){auto*h=*it;if(h&&h->model_id==model_id){delete h;it=g_spark_heads.erase(it);}else++it;}}
 
 // ---- Qwen3.5/3.6 full MXFP4 Gated DeltaNet -------------------------------
 // Reuses the persistent ColiMetalTensor wrappers already owned by each dense

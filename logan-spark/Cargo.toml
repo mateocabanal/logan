@@ -1,0 +1,12 @@
+[package]
+name = "logan-spark"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Resident Spark-X2.5 inference runtime for Logan"
+
+[dependencies]
+serde_json = "1.0"
+libm = "0.2"
+logan-format = { path = "../logan-format" }
+logan-metal = { path = "../logan-metal" }

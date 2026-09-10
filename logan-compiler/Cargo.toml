@@ -20,3 +20,4 @@ logan-format = { path = "../logan-format" }
 logan-ir = { path = "../logan-ir" }
 logan-qwen4 = { path = "../logan-qwen4" }
 logan-qwen = { path = "../logan-qwen" }
+logan-spark = { path = "../logan-spark" }

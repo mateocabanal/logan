@@ -959,6 +959,7 @@ dependencies = [
  "logan-ir",
  "logan-qwen",
  "logan-qwen4",
+ "logan-spark",
  "serde_json",
  "sha2",
 ]
@@ -1009,6 +1010,16 @@ dependencies = [
  "logan-metal",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "logan-spark"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "logan-format",
+ "logan-metal",
+ "serde_json",
 ]
 
 [[package]]

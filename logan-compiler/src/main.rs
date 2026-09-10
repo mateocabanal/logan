@@ -325,7 +325,7 @@ fn run() -> logan_compiler::Result<()> {
                 println!("config_fingerprint={config_fingerprint}");
             }
             if let Some(model) = pipeline::build_semantic_ir(&inventory)? {
-                println!("semantic_architecture=deepseek_v4");
+                println!("semantic_architecture={:?}", model.architecture);
                 println!("semantic_layers={}", model.geometry.layers);
                 println!("semantic_routed_experts={}", model.routed_experts.len());
                 println!(
@@ -399,6 +399,14 @@ fn run() -> logan_compiler::Result<()> {
                 })
                 .unwrap_or_else(|| "qwen4_exp_text".to_string());
             let out = match model_type.as_str() {
+                "spark2_5" => {
+                    logan_spark::run_greedy(&package, &prompt_ids, max_new).map_err(|e| {
+                        logan_compiler::ColicError::Unsupported {
+                            stage: "run",
+                            detail: e,
+                        }
+                    })?
+                }
                 "qwen4_exp_text" | "qwen4_exp" => {
                     let cfg = logan_qwen4::load_cfg(&cfg_path).map_err(|e| {
                         logan_compiler::ColicError::Unsupported {
