@@ -6753,7 +6753,7 @@ mod tests {
             matmul_mxfp4_bytes(&mut expected, &x, weights, scales, w.o, w.i);
             assert_eq!(*got, expected);
         }
-        let bf16 = Wt { f: vec![], bytes: Some(WtBytes::Bf16(vec![0; 16 * 64 * 2])), o: 16, i: 64 };
+        let bf16 = Wt { f: vec![], bytes: Some(WtBytes::Bf16 { weights: vec![0; 16 * 64 * 2], metal_tensor: std::sync::Mutex::new(0) }), o: 16, i: 64 };
         let before = actual.clone();
         assert!(!matmul_mxfp4_multi(
             &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(), &x,

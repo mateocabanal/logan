@@ -184,7 +184,6 @@ mod tests {
 
     #[test]
     fn head_mix_deterministic() {
-        let d = 2usize;
         let hc = 1usize;
         let lr = 1usize;
         let m = MtpHead {
