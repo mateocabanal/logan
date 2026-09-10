@@ -829,12 +829,22 @@ fn is_sensitive_dense(name: &str) -> bool {
 
 /// Stored representation kind for a dense tensor, from its source dtype.
 fn dense_quant_kind(dtype: &str) -> &'static str {
+    if dtype.starts_with(crate::model::qwen4_exp::PLE_BF16_TO_F8_PREFIX) {
+        return "f8-e4m3";
+    }
+    if dtype.starts_with(crate::model::qwen4_exp::PLE_CONST_BF16_PREFIX) {
+        return KIND_BF16;
+    }
     match dtype {
         "BF16" => KIND_BF16,
         "F32" => "f32",
-        "F8_E4M3FN" => "f8-e4m3",
+        "F8_E4M3" | "F8_E4M3FN" => "f8-e4m3",
         _ => KIND_EXACT,
     }
+}
+
+fn is_streamed_dense(name: &str) -> bool {
+    name.contains("ple.ple_embedding.ngram_embedding.shard_")
 }
 
 fn exact_expert_quant_kind(expert: &crate::ir::RoutedExpert) -> &'static str {
@@ -988,6 +998,7 @@ fn build_physical_plan(
         let kind = dtype;
         let placed = match source {
             ExactSource::Expert { .. } => Placement::Streamed,
+            ExactSource::Tensor { .. } if is_streamed_dense(&name) => Placement::Streamed,
             ExactSource::Tensor { .. } => Placement::Resident,
         };
         if matches!(source, ExactSource::Tensor { .. })
