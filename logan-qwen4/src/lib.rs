@@ -6381,7 +6381,11 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
     // final prompt token in recurrent/KV state and is not causal-LM decode.
     let mut logits = Vec::new();
     for (i, &t) in prompt.iter().enumerate() {
-        logits = model.forward_token(t as usize, i);
+        if i + 1 == prompt.len() {
+            logits = model.forward_token(t as usize, i);
+        } else {
+            model.prefill_token(t as usize, i);
+        }
     }
 
     let mut out = Vec::with_capacity(max_new);
