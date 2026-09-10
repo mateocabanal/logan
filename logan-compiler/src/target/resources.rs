@@ -202,11 +202,13 @@ impl MachineProfile {
             }]
         };
         let mut canonical = format!(
-            "os={};arch={};uma={};metal={};apple8={};avx2={};apple_gpu_family_min={};",
+            "os={};arch={};uma={};metal={};ane={};ane_iosurface={};apple8={};avx2={};apple_gpu_family_min={};",
             self.operating_system,
             self.architecture,
             u8::from(self.unified_memory),
             u8::from(self.metal_available),
+            u8::from(self.ane_available),
+            u8::from(self.ane_iosurface_interop),
             u8::from(self.apple8_abi),
             u8::from(self.avx2),
             self.apple_gpu_family_min,
@@ -416,6 +418,8 @@ mod tests {
             ram_bytes,
             unified_memory: true,
             metal_available: true,
+            ane_available: true,
+            ane_iosurface_interop: true,
             apple8_abi: true,
             avx2: false,
             apple_gpu_family_min: 8,
@@ -429,6 +433,8 @@ mod tests {
             ram_bytes,
             unified_memory: false,
             metal_available: false,
+            ane_available: false,
+            ane_iosurface_interop: false,
             apple8_abi: false,
             avx2: true,
             apple_gpu_family_min: 8,

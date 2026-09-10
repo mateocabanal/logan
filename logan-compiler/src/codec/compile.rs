@@ -499,10 +499,13 @@ fn resolve_quantization(
     match &request.quant {
         QuantRequest::Exact => Ok(ExpertQuantization::Exact),
         QuantRequest::Profile(profile) if profile == "mxfp4" => {
-            if model.architecture != Architecture::Qwen3_5MoeMoE {
+            if !matches!(
+                model.architecture,
+                Architecture::Qwen3_5MoeMoE | Architecture::Qwen4Exp
+            ) {
                 return Err(ColicError::unsupported(
                     Stage::TargetPlanning.as_str(),
-                    "`--quant mxfp4` currently supports Qwen3.5/3.6/3.7 MoE routed experts only",
+                    "`--quant mxfp4` currently supports Qwen3.x/Qwen4Exp MoE routed experts",
                 ));
             }
             Ok(ExpertQuantization::Mxfp4)

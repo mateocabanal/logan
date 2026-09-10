@@ -10,6 +10,7 @@ use crate::{
     error::{ColicError, Result},
     ir::{Architecture, SemanticModel},
     model::deepseek_v4::DeepSeekV4Frontend,
+    model::qwen4_exp::Qwen4ExpFrontend,
     model::qwen_moe::QwenMoeFrontend,
     model::spark::SparkFrontend,
     quant::mxfp4_record,
@@ -226,6 +227,8 @@ pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<S
         Ok(Some(SparkFrontend::build(inventory)?))
     } else if DeepSeekV4Frontend::probe(inventory)? {
         Ok(Some(DeepSeekV4Frontend::build(inventory)?))
+    } else if Qwen4ExpFrontend::probe(inventory)? {
+        Ok(Some(Qwen4ExpFrontend::build(inventory)?))
     } else if QwenMoeFrontend::probe(inventory)? {
         Ok(Some(QwenMoeFrontend::build(inventory)?))
     } else {
@@ -259,10 +262,13 @@ fn resolve_expert_quantization(
     match &request.quant {
         QuantRequest::Exact => Ok(ExpertQuantization::Exact),
         QuantRequest::Profile(profile) if profile == "mxfp4" => {
-            if model.architecture != Architecture::Qwen3_5MoeMoE {
+            if !matches!(
+                model.architecture,
+                Architecture::Qwen3_5MoeMoE | Architecture::Qwen4Exp
+            ) {
                 return Err(ColicError::unsupported(
                     Stage::TargetPlanning.as_str(),
-                    "`--quant mxfp4` currently supports Qwen3.5/3.6/3.7 MoE routed experts only",
+                    "`--quant mxfp4` currently supports Qwen3.x/Qwen4Exp MoE routed experts",
                 ));
             }
             Ok(ExpertQuantization::Mxfp4)
