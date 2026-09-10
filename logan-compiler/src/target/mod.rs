@@ -16,13 +16,14 @@ use crate::{
 
 pub mod machine;
 
-pub use machine::{MachineProfile, ane_available_for, metal_available_for};
+pub use machine::{ane_available_for, metal_available_for, MachineProfile};
 
 const TENSOR_HEADER_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Metal,
+    Cuda,
     Cpu,
 }
 
@@ -73,7 +74,27 @@ pub const LINUX_X86_64_AVX2_V1: TargetProfile = TargetProfile {
     preferred_io_granularity: target_registry::LINUX_X86_64_AVX2_V1.io_granularity,
 };
 
-pub const PROFILES: &[TargetProfile] = &[MACOS_ARM64_METAL_APPLE8_V1, LINUX_X86_64_AVX2_V1];
+pub const WINDOWS_X86_64_CUDA_GGML_V1: TargetProfile = TargetProfile {
+    id: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.profile_id,
+    name: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.name,
+    operating_system: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.operating_system,
+    architecture: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.architecture,
+    backend: Backend::Cuda,
+    target_profile_abi: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.target_profile_abi,
+    execution_layout_abi: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.execution_layout_abi,
+    kernel_abi: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.kernel_abi,
+    target_class: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.target_class,
+    compiler_emission_supported: target_registry::WINDOWS_X86_64_CUDA_GGML_V1
+        .compiler_emission_supported,
+    record_alignment: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.record_alignment,
+    preferred_io_granularity: target_registry::WINDOWS_X86_64_CUDA_GGML_V1.io_granularity,
+};
+
+pub const PROFILES: &[TargetProfile] = &[
+    MACOS_ARM64_METAL_APPLE8_V1,
+    LINUX_X86_64_AVX2_V1,
+    WINDOWS_X86_64_CUDA_GGML_V1,
+];
 
 pub fn resolve(request: &TargetRequest, machine: &MachineProfile) -> Result<TargetProfile> {
     let profile = match request {
@@ -90,9 +111,8 @@ pub fn resolve(request: &TargetRequest, machine: &MachineProfile) -> Result<Targ
         return Err(ColicError::unsupported(
             "target planning",
             format!(
-                "target profile `{}` is frozen to execution layout 0x{:04x}, but its production lowerer is not implemented; refusing to emit a row/canonical artifact under that profile",
-                profile.name,
-                target_registry::APPLE8_MXFP4_TILE_LAYOUT
+                "target profile `{}` is registered, but its production lowerer is not implemented or has not passed its correctness gates; refusing package emission",
+                profile.name
             ),
         ));
     }
@@ -107,10 +127,7 @@ fn from_machine(machine: &MachineProfile) -> Result<TargetProfile> {
     if machine.apple8_abi {
         return Ok(MACOS_ARM64_METAL_APPLE8_V1);
     }
-    if machine.operating_system == "linux"
-        && machine.architecture == "x86_64"
-        && machine.avx2
-    {
+    if machine.operating_system == "linux" && machine.architecture == "x86_64" && machine.avx2 {
         return Ok(LINUX_X86_64_AVX2_V1);
     }
     Err(ColicError::unsupported(

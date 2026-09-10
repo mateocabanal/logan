@@ -2,3 +2,4 @@
 
 pub mod mxfp4;
 pub mod mxfp4_record;
+pub mod precision_policy;

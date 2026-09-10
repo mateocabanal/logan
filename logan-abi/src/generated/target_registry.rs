@@ -37,7 +37,16 @@ pub const LINUX_X86_64_AVX2_V1: TargetProfileSpec = TargetProfileSpec {
     io_granularity: 4096, resident_alignment: 16, allowed_layouts: LINUX_X86_64_AVX2_V1_ALLOWED_LAYOUTS,
 };
 
-pub const PROFILES: &[TargetProfileSpec] = &[PORTABLE_V1, MACOS_ARM64_METAL_APPLE8_V1, LINUX_X86_64_AVX2_V1];
+pub const WINDOWS_X86_64_CUDA_GGML_V1_ALLOWED_LAYOUTS: &[u16] = &[0x0000, 0x0201];
+pub const WINDOWS_X86_64_CUDA_GGML_V1: TargetProfileSpec = TargetProfileSpec {
+    name: "windows-x86_64-cuda-ggml-v1", profile_id: 3, target_profile_abi: 1,
+    execution_layout_abi: 1, kernel_abi: 1, target_class: 0x02000001,
+    compiler_emission_supported: false, operating_system: "windows",
+    architecture: "x86_64", backend: "cuda", record_alignment: 4096,
+    io_granularity: 4096, resident_alignment: 256, allowed_layouts: WINDOWS_X86_64_CUDA_GGML_V1_ALLOWED_LAYOUTS,
+};
+
+pub const PROFILES: &[TargetProfileSpec] = &[PORTABLE_V1, MACOS_ARM64_METAL_APPLE8_V1, LINUX_X86_64_AVX2_V1, WINDOWS_X86_64_CUDA_GGML_V1];
 
 pub const APPLE8_PROFILE_NAME: &str = MACOS_ARM64_METAL_APPLE8_V1.name;
 pub const APPLE8_PROFILE_ID: u32 = MACOS_ARM64_METAL_APPLE8_V1.profile_id;
@@ -64,5 +73,5 @@ pub const APPLE8_MXFP4_SCALE_BYTES: u64 = 8;
 pub const APPLE8_MXFP4_TILE_BYTES: u64 = 136;
 
 pub fn profile_by_name(name: &str) -> Option<&'static TargetProfileSpec> { PROFILES.iter().find(|p| p.name == name) }
-pub fn layout_registered(layout: u16) -> bool { layout == 0 || layout == APPLE8_MXFP4_TILE_LAYOUT }
+pub fn layout_registered(layout: u16) -> bool { layout == 0x0000 || layout == 0x0201 || layout == 0x0103 }
 pub fn profile_allows_layout(profile: &TargetProfileSpec, layout: u16) -> bool { profile.allowed_layouts.contains(&layout) }

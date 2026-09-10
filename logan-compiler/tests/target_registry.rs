@@ -16,3 +16,19 @@ fn apple8_profile_uses_generated_production_identity() {
     assert_eq!(target_registry::APPLE8_MXFP4_TILE_COLUMNS, 32);
     assert_eq!(target_registry::APPLE8_MXFP4_TILE_BYTES, 136);
 }
+
+#[test]
+fn windows_cuda_profile_is_registered_but_not_yet_emittable() {
+    let profile = target::WINDOWS_X86_64_CUDA_GGML_V1;
+    assert_eq!(profile.id, 3);
+    assert_eq!(profile.name, "windows-x86_64-cuda-ggml-v1");
+    assert_eq!(profile.backend, target::Backend::Cuda);
+    assert_eq!(profile.record_alignment, 4096);
+    assert_eq!(profile.preferred_io_granularity, 4096);
+    assert!(!profile.compiler_emission_supported);
+    assert!(target_registry::layout_registered(0x0201));
+    assert!(target_registry::profile_allows_layout(
+        &target_registry::WINDOWS_X86_64_CUDA_GGML_V1,
+        0x0201
+    ));
+}

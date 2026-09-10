@@ -3,6 +3,12 @@ schema = 1
 [layouts.canonical]
 id = 0x0000
 
+# Native GGML/GGUF quant blocks (Q4_K, Q5_0, Q6_K, Q8_0, ...).
+# This layout changes storage locality only; the quant block semantics and
+# nominal weight-code precision remain those of the source tensor.
+[layouts.ggml_native_blocks_v1]
+id = 0x0201
+
 [layouts.apple_mxfp4_tile8x32_v1]
 id = 0x0103
 math_format = 0x0020
@@ -83,3 +89,28 @@ cpu_feature_mask = 0x0000000000000002
 gpu_family_min = 0
 required_runtime_features = 0
 allowed_layouts = [0x0000]
+
+[profiles.windows_x86_64_cuda_ggml_v1]
+name = "windows-x86_64-cuda-ggml-v1"
+profile_id = 3
+target_profile_abi = 1
+execution_layout_abi = 1
+kernel_abi = 1
+target_class = 0x02000001
+# Keep this false until GGUF byte-parity, CUDA quant-kernel parity, and the
+# Windows async-I/O lifetime tests are all implemented.
+compiler_emission_supported = false
+operating_system = "windows"
+architecture = "x86_64"
+backend = "cuda"
+record_alignment = 4096
+io_granularity = 4096
+resident_alignment = 256
+target_os = 3
+target_arch = 2
+backend_id = 3
+gpu_kind = 2
+cpu_feature_mask = 0x0000000000000002
+gpu_family_min = 61
+required_runtime_features = 0
+allowed_layouts = [0x0000, 0x0201]
