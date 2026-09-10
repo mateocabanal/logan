@@ -462,6 +462,7 @@ pub fn recompile(request: &RecompileRequest) -> Result<RecompileSummary> {
             target,
             fingerprint,
             request,
+            selected_optimizer.as_ref(),
         )?;
     } else {
         let plan = storage::plan_records(&lowered, target, 4 * 1024 * 1024 * 1024)?;
@@ -1093,6 +1094,7 @@ fn write_package_in_place(
     target: TargetProfile,
     fingerprint: [u8; 32],
     request: &RecompileRequest,
+    optimizer: Option<&ParetoPlan>,
 ) -> Result<()> {
     if actions.len() != plan.records.len() {
         return Err(ColicError::Usage(
@@ -1227,7 +1229,14 @@ fn write_package_in_place(
         replace_manifest(&request.source, &manifest)?;
         crate::verify::verify_package(&request.output)?;
         crate::verify_target::verify_target_layouts(&request.output)?;
-        write_provenance(package, target, actions, request, &request.output)
+        write_provenance(
+            package,
+            target,
+            actions,
+            request,
+            optimizer,
+            &request.output,
+        )
     })();
     if let Err(error) = finalization {
         if let Err(recovery) = rollback_finalization(&request.source) {
@@ -1253,6 +1262,16 @@ fn request_signature(request: &RecompileRequest) -> String {
         "codec": request.codec.as_str(),
         "allow_requantize": request.allow_requantize,
         "repack": request.repack,
+        "optimize": request.optimize,
+        "plan_choice": request.plan_choice,
+        "context": request.context.map(|constraint| json!({
+            "kind": match constraint.kind {
+                logan_ir::ContextConstraintKind::Maximum => "maximum",
+                logan_ir::ContextConstraintKind::Required => "required",
+            },
+            "tokens": constraint.tokens,
+        })),
+        "calibration": request.calibration.as_ref().map(|path| path.to_string_lossy()),
     }))
     .expect("recompile request signature is always JSON-serializable")
 }
