@@ -336,6 +336,21 @@ fn run() -> logan_compiler::Result<()> {
             }
             Ok(())
         }
+        Command::AttachMtp { package, drafter } => {
+            eprintln!("logan: attaching Qwen4Exp MTP drafter...");
+            let summary = logan_compiler::mtp_attach::attach_qwen4_mtp(&package, &drafter)?;
+            println!("package={}", summary.package.display());
+            println!("drafter={}", summary.drafter.display());
+            println!("stages={}", summary.stages);
+            println!("experts={}", summary.experts);
+            println!("static_tensors={}", summary.static_tensors);
+            println!("virtual_layer_base={}", summary.virtual_layer_base);
+            println!("new_records={}", summary.new_records);
+            println!("new_shards={}", summary.new_shards);
+            println!("added_stored_bytes={}", summary.added_stored_bytes);
+            println!("backup_manifest={}", summary.backup_manifest.display());
+            Ok(())
+        }
         Command::Verify { package } => {
             eprintln!("logan: verification...");
             let mut progress = ConsoleProgress::new();

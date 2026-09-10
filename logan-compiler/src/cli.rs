@@ -21,6 +21,10 @@ pub enum Command {
     Verify {
         package: PathBuf,
     },
+    AttachMtp {
+        package: PathBuf,
+        drafter: PathBuf,
+    },
     Compile(CompileRequest),
     Recompile(RecompileRequest),
     Run {
@@ -31,7 +35,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan run MODEL_OR_PACKAGE [--prompt \"TOKEN_IDS\"] [--max-new N]\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan attach-mtp PACKAGE_DIR DRAFTER_DIR\n  logan run MODEL_OR_PACKAGE [--prompt \"TOKEN_IDS\"] [--max-new N]\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -58,6 +62,23 @@ where
         }
         "compile" => parse_compile(args),
         "recompile" => parse_recompile(args),
+        "attach-mtp" => {
+            let package = args.next().ok_or_else(|| {
+                ColicError::Usage("attach-mtp requires PACKAGE_DIR DRAFTER_DIR".into())
+            })?;
+            let drafter = args.next().ok_or_else(|| {
+                ColicError::Usage("attach-mtp requires PACKAGE_DIR DRAFTER_DIR".into())
+            })?;
+            if args.next().is_some() {
+                return Err(ColicError::Usage(
+                    "attach-mtp accepts exactly PACKAGE_DIR DRAFTER_DIR".into(),
+                ));
+            }
+            Ok(Command::AttachMtp {
+                package: PathBuf::from(package),
+                drafter: PathBuf::from(drafter),
+            })
+        }
         "run" => {
             let package = std::path::PathBuf::from(
                 args.next()
@@ -588,6 +609,17 @@ mod tests {
                 package: PathBuf::from("spark.coli"),
                 prompt: "1 2 3 4 5".to_owned(),
                 max_new: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_attach_mtp_command() {
+        assert_eq!(
+            parse(["attach-mtp", "target.coli", "drafter"].map(str::to_owned)).unwrap(),
+            Command::AttachMtp {
+                package: PathBuf::from("target.coli"),
+                drafter: PathBuf::from("drafter"),
             }
         );
     }

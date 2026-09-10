@@ -14,6 +14,7 @@ pub mod format;
 pub mod generated;
 pub mod ir;
 pub mod model;
+pub mod mtp_attach;
 pub mod optimize;
 pub mod passes;
 pub mod pipeline;
