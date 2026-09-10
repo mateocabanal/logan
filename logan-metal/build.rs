@@ -10,6 +10,12 @@
 // MetalIO + direct paths compile to the same sources as c/ (byte-identical
 // copies, verified by md5 in the port session).
 fn main() {
+    // The native backend is Apple-only. Non-macOS targets use the Rust CPU stubs
+    // in `src/lib.rs`, so do not try to compile Objective-C++ or link frameworks.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+
     let out = std::env::var("OUT_DIR").unwrap();
     let metal_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("metal");
     let src = metal_dir.join("backend_metal.mm");
