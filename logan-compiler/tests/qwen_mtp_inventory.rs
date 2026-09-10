@@ -149,8 +149,13 @@ fn classifies_native_mtp_and_keeps_experts_pageable() {
 
     let stage = &mtp.stages[0];
     assert_eq!(stage.stage, 0);
-    assert_eq!(stage.expert_gate_up.shape, vec![2, 6, 4]);
-    assert_eq!(stage.expert_down.shape, vec![2, 4, 3]);
+    match &stage.expert_bank {
+        qwen_mtp::QwenMtpExpertBank::FusedGateUp { gate_up, down } => {
+            assert_eq!(gate_up.shape, vec![2, 6, 4]);
+            assert_eq!(down.shape, vec![2, 4, 3]);
+        }
+        other => panic!("legacy fixture classified with wrong MTP expert bank: {other:?}"),
+    }
     assert!(stage.static_tensors.contains_key("self_attn.q_proj.weight"));
     assert!(
         stage
