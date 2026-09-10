@@ -43,6 +43,10 @@ name = "parallel_dense"
 path = "examples/parallel_dense.rs"
 
 [[example]]
+name = "qwen4_mtp_input"
+path = "examples/qwen4_mtp_input.rs"
+
+[[example]]
 name = "cache_probe"
 path = "examples/cache_probe.rs"
 

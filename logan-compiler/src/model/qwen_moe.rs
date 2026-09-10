@@ -206,11 +206,19 @@ impl QwenMoeFrontend {
             for (stage, st) in mtp.stages.iter().enumerate() {
                 let layer = geometry.layers + stage as u32;
                 for expert in 0..mtp.experts {
-                    let gate =
-                        slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, 0, inter)?;
-                    let up =
-                        slice_fused(&st.expert_gate_up, expert, 2 * inter, hidden, inter, inter)?;
-                    let down = slice_fused(&st.expert_down, expert, hidden, inter, 0, hidden)?;
+                    use crate::model::qwen_mtp::QwenMtpExpertBank;
+                    let (gate, up, down) = match &st.expert_bank {
+                        QwenMtpExpertBank::FusedGateUp { gate_up, down } => (
+                            slice_fused(gate_up, expert, 2 * inter, hidden, 0, inter)?,
+                            slice_fused(gate_up, expert, 2 * inter, hidden, inter, inter)?,
+                            slice_fused(down, expert, hidden, inter, 0, hidden)?,
+                        ),
+                        QwenMtpExpertBank::SplitGateUp { gate, up, down } => (
+                            slice_fused(gate, expert, inter, hidden, 0, inter)?,
+                            slice_fused(up, expert, inter, hidden, 0, inter)?,
+                            slice_fused(down, expert, hidden, inter, 0, hidden)?,
+                        ),
+                    };
                     routed_experts.insert(
                         (layer, expert),
                         RoutedExpert {

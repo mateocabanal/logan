@@ -207,6 +207,73 @@ pub fn parallel_dense_fp16_f32_io(
         .with_weight(WeightBlob::new(WEIGHT_PATH, blob.into_bytes()).descriptor_offset(0)))
 }
 
+/// Build Qwen4Exp MTP's fixed dense input projections as one ANE island.
+///
+/// This intentionally begins *after* the two MTP RMSNorms. Qwen4Exp's MTP
+/// front-end applies `fc_embedding` once to the normalized new-token embedding
+/// and applies one shared `fc_hidden` matrix independently to every gated-
+/// residual (HC) hidden branch. The outputs remain separate: the projected
+/// embedding becomes `prev_block_output`, while the projected HC branches form
+/// the draft layer's multi-stream hidden state.
+///
+/// The private ANE compiler is most reliable with one activation input, so the
+/// caller packs both normalized values into one fp32 IOSurface:
+/// `packed = embedding[S] | hidden[hc_count*S]`, shape
+/// `[1, H, 1, (hc_count+1)*S]`. Both HxH projections currently evaluate over
+/// that whole packed surface and return the same packed shape; callers consume
+/// only the `fc_embedding` result from the first `S` lanes and the `fc_hidden`
+/// result from the remaining HC lanes. This intentionally trades about 2x the
+/// ideal arithmetic for a single hardware-qualified ANE dispatch.
+///
+/// Note that Qwen4Exp's hidden RMSNorm is over the concatenated `hc_count*H`
+/// vector *before* this packing; it is not a per-branch normalization.
+pub fn qwen4_mtp_input_projections_fp16_f32_io(
+    hidden_size: usize,
+    token_spatial: usize,
+    hc_count: usize,
+    fc_embedding: DenseProjection,
+    fc_hidden: DenseProjection,
+) -> Result<MilProgram> {
+    if hidden_size == 0 || hc_count == 0 {
+        return Err(AneError::InvalidArgument(
+            "Qwen4 MTP input projections require non-zero hidden size and HC count".into(),
+        ));
+    }
+    if token_spatial < 16 || token_spatial % 16 != 0 {
+        return Err(AneError::InvalidArgument(format!(
+            "Qwen4 MTP token spatial dimension {token_spatial} must be >= 16 and a multiple of 16"
+        )));
+    }
+    let hidden_spatial = token_spatial
+        .checked_mul(hc_count)
+        .ok_or_else(|| AneError::InvalidArgument("Qwen4 MTP hidden spatial overflow".into()))?;
+    let packed_spatial = token_spatial
+        .checked_add(hidden_spatial)
+        .ok_or_else(|| AneError::InvalidArgument("Qwen4 MTP packed spatial overflow".into()))?;
+
+    for (role, projection) in [("fc_embedding", &fc_embedding), ("fc_hidden", &fc_hidden)] {
+        if projection.out_features != hidden_size {
+            return Err(AneError::InvalidArgument(format!(
+                "Qwen4 MTP {role} has {} output features, expected hidden size {hidden_size}",
+                projection.out_features
+            )));
+        }
+    }
+
+    // Keep the first production probe on the already hardware-qualified ANE
+    // primitive: both HxH projections evaluate over the whole packed spatial
+    // surface and therefore return the same shape. The caller consumes only
+    // fc_embedding[:, 0..S] and fc_hidden[:, S..packed_spatial]. This spends
+    // roughly 2x the ideal projection arithmetic, but avoids unsupported MIL
+    // slicing and gives us one dispatch with stable compiled weights.
+    parallel_dense_fp16_f32_io(
+        hidden_size,
+        packed_spatial,
+        &[fc_embedding, fc_hidden],
+    )
+
+}
+
 /// Build the decode front-half of a GDN block as one ANE program.
 ///
 /// Inputs:
@@ -910,6 +977,52 @@ mod tests {
     fn parallel_dense_rejects_wrong_weight_shape() {
         let bad = DenseProjection::new("bad", 16, vec![0; 15]);
         assert!(parallel_dense_fp16_f32_io(16, 16, &[bad]).is_err());
+    }
+
+    #[test]
+    fn qwen4_mtp_input_projections_preserve_hc_stream_geometry() {
+        let identity = (0..16 * 16)
+            .map(|i| if i / 16 == i % 16 { 0x3c00 } else { 0 })
+            .collect::<Vec<_>>();
+        let half = (0..16 * 16)
+            .map(|i| if i / 16 == i % 16 { 0x3800 } else { 0 })
+            .collect::<Vec<_>>();
+        let p = qwen4_mtp_input_projections_fp16_f32_io(
+            16,
+            16,
+            4,
+            DenseProjection::new("fc_embedding", 16, identity),
+            DenseProjection::new("fc_hidden", 16, half),
+        )
+        .unwrap();
+
+        assert_eq!(p.weights().len(), 1);
+        assert!(p.text().contains("tensor<fp32, [1, 16, 1, 80]> x"));
+        assert!(p.text().contains("tensor<fp32, [1, 16, 1, 80]> y0"));
+        assert!(p.text().contains("tensor<fp32, [1, 16, 1, 80]> y1"));
+        assert!(p.text().contains("y0, y1"));
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn qwen4_mtp_input_projections_reject_bad_geometry() {
+        let good = vec![0x3c00; 16 * 16];
+        assert!(qwen4_mtp_input_projections_fp16_f32_io(
+            16,
+            15,
+            4,
+            DenseProjection::new("fc_embedding", 16, good.clone()),
+            DenseProjection::new("fc_hidden", 16, good.clone()),
+        )
+        .is_err());
+        assert!(qwen4_mtp_input_projections_fp16_f32_io(
+            16,
+            16,
+            0,
+            DenseProjection::new("fc_embedding", 16, good.clone()),
+            DenseProjection::new("fc_hidden", 16, good),
+        )
+        .is_err());
     }
 
     #[test]
