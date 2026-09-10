@@ -1784,6 +1784,7 @@ pub use imp::*;
 /// BF16 GEMV on the direct path (generic; wired for the attention
 /// projections). w = BF16 bytes, O x I row-major; x = S x I f32; y = S x O.
 /// rc > 0 done; rc == 0 declined pre-submit (CPU fallback); rc < 0 fatal.
+#[cfg(target_os = "macos")]
 pub fn bf16_matmul(w: &[u8], x: &[f32], y: &mut [f32], s: usize, o: usize, i: usize) -> i32 {
     if !direct_available() || !metal_available() {
         return 0;
@@ -1798,4 +1799,9 @@ pub fn bf16_matmul(w: &[u8], x: &[f32], y: &mut [f32], s: usize, o: usize, i: us
             i as i32,
         )
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn bf16_matmul(_w: &[u8], _x: &[f32], _y: &mut [f32], _s: usize, _o: usize, _i: usize) -> i32 {
+    0
 }
