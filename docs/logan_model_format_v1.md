@@ -507,6 +507,12 @@ optional to implement.*
 This is what makes R5 real: a 400 MB sparse shard becomes 400 MB / `block_bytes` independently verifiable
 blocks, and a 256 B row read becomes a legal, checksummed operation rather than an unwritten convention.
 
+Deliberately **not** included in v1: per-block min/max statistics, bloom filters and other query-skipping
+metadata. Both target workloads are *direct-addressed* — an n-gram hash computes the row, and a router
+computes the expert — so nothing is ever searched for and skipping metadata would be dead weight on every
+read. It becomes justified the moment a model carries a dictionary-style sparse structure that must be
+*queried* rather than indexed; that is a compatible addition, not a redesign.
+
 ### 7.6 Backing (per segment)
 
 Exactly #93's `BackingPlan`, kept:
@@ -621,6 +627,13 @@ Trailer (16 bytes):  u8[8] magic "LOGANEND" ‖ u32 trailer_crc32c ‖ u32 reser
 ```
 
 `artifact_id` is stored as a 32-byte field inside the `IDENTITY` section, zeroed while hashing.
+
+**Single-file packing detail.** The header sits at a fixed offset 0 and has a fixed size, but the section
+table, file table and `IDENTITY` are only fully known once payload emission finishes. Single-file packing
+therefore finalizes them with one small patched write at offset 0 after the payload, rather than by
+appending a footer. The header is *not* streamed-and-frozen, which is one more reason the sharded
+directory packing is the default for artifacts that are large or produced incrementally. A reader never
+seeks to the end of the file to open an artifact — opening costs one header read in every packing.
 
 ### 8.2 Section kinds
 
@@ -815,6 +828,9 @@ pre-load. The `artifact_id` binds them transitively.
   referenced twice, not by overlapping ranges — this removes an entire class of adversarial metadata.
 - Sparse allocation (holes) is allowed but must be declared (`flags.bit4`); a hole reads as zero and is not an
   error.
+- The alignment rule is also what keeps a future `AccessKind::Mapped` **legal**: a segment offset that is a
+  multiple of a page-sized alignment satisfies the ELF-style `p_offset ≡ p_vaddr (mod page_size)` congruence
+  that a loader needs. The design does not use mapping by default (§17.5), but it does not foreclose it.
 
 ### 8.10 The state store (runtime-created, format specified in v1)
 
@@ -863,6 +879,11 @@ compliant strategies:
 
 Submission of `.logan` v1 only requires strategy 1 plus the *declared* existence and format of the journal so
 strategy 2 is implementable without a format change. This is exactly the "no v2 escape hatch" requirement.
+
+If Windows `ReplaceFile` semantics turn out to be unreliable for the commit step (§18.1), the LMDB
+double-meta-page pattern is a drop-in alternative: two header slots, commit = write the inactive one and
+fsync, recovery = take the valid one with the higher generation. It needs no new field, because `generation`
+already exists and the second slot can live in a reserved section.
 
 ### 8.12 Parser and fuzz surface
 
@@ -1058,6 +1079,20 @@ Additions:
   (e.g. do not let a bulk `Stream` fill evict a latency-critical `Gather` working set).
 - `PoolStats` extends to per-class: resident/target/bytes-per-class, queue depths, exposed wait per class.
 
+**Admission is a separate decision from eviction.** LRU alone guarantees that a one-shot expert stream can
+evict a hot lookup-table working set, and §17 measures exactly that interference. The plan therefore
+declares `target_resident_bytes` and `eviction_priority` per resource, and the runtime owns *admission*:
+whether an arriving region may enter a pool at all, or must stream through without displacing residents.
+Frequency-based admission (W-TinyLFU-style) is one sound implementation; the format deliberately does not
+pick one — it only guarantees that a region is distinguishable by class and priority so an admission policy
+has something to reason about.
+
+**Block tables with refcounts and copy-on-write are runtime state, not artifact content.** vLLM's paged
+attention multiplexes many sequences over one physical pool with sharing and COW, which is the right design
+for a scheduler and the wrong thing to freeze into an immutable model artifact. The state store fixes only
+the backing *format*; a runtime is free to build a block table, refcount blocks and implement COW above it
+without a format change.
+
 Nothing else in `residency.rs` changes: the generation/lease discipline, the typed completions, the
 `Started/Joined/AlreadyResident` dispositions and the debug invariants are correct and hard-won.
 
@@ -1141,6 +1176,25 @@ There is deliberately **no** "model + context does not fit in RAM" entry.
 Authoritative sources used: the official technical report (`DeepSeek_V41_Tech_Report.pdf`, in
 `~/Downloads`) and the official `config.json` for `deepseek-ai/DeepSeek-V4.1-Flash`. Both were read directly
 for this design; nothing below is inferred from aggregator coverage.
+
+**Provenance caveat, stated plainly.** The public record as of 2026-09-09 is that DeepSeek-V4.1-Flash is an
+API-only intermediate build in a short beta window (`deepseek-v4.1-flash-expires-on-0910`) with no released
+weights, model card or paper; the *open* members of the family are DeepSeek-V4-Pro and V4-Flash
+(arXiv:2606.19348, MIT weights). The two documents used here were downloaded to this Mac by Mateo on
+2026-09-09 and are internally consistent to three significant figures — the declared 196B Engram parameters
+resolve exactly as 2 modules × 384,006,168 entries × 256 dimensions at FP8, and the per-head counts are
+consistent with the report's "24 prime-sized tables of ~16M entries". Treat them as **beta-channel
+primary documents**, not as public confirmation.
+
+This does not put the design at risk, because nothing in `.logan` depends on V4.1's specific numbers. The
+format maps *shapes* — a bulk-streamed expert set, two enormous sparsely-addressed lookup tables with
+deterministic prefetchable addresses, FP4/FP8 mixed weight precision with block scales, multi-tier KV with
+cross-layer sharing, and a separate draft model with its own experts. Every one of those shapes is
+independently confirmed by the open V4-Flash checkpoint (284B/13B, 43 layers, 256 routed experts top-6,
+expert intermediate 2048, FP4+FP8, 1M context, per the official report and model cards), by
+`docs/DEEPSEEK_V4_APPLE_SILICON_PLAN.md` in this repository, and by Qwen3.8-Flash-Next's PLE table. The
+design would survive V4.1 shipping with different geometry; it would not survive a claim that no such
+lookup-table or streaming-expert workload exists, and no source makes that claim.
 
 ### 12.1 What the model actually is
 
@@ -1598,6 +1652,27 @@ overlapped I/O) is the default for every large class; `Mapped` is available and 
 This is a design judgement, stated as one, not a measurement.
 
 ---
+
+### 17.6 External corroboration and two deliberate divergences
+
+A survey of 13 external systems (safetensors, GGUF/ggml, MLX, llama.cpp, ORC/Parquet, Arrow IPC, ELF/PE/Mach-O,
+OCI/npm CAS, RocksDB, LMDB, Caffeine/TinyLFU, Zstd/UE .pak, vLLM and SGLang state) was run in parallel with this
+design. Three findings are worth recording:
+
+- **Independent corroboration of block-chunked staging.** vLLM's KV-offload connector arrives at
+  GPU↔CPU↔secondary tiering with a configurable `blocks_per_chunk`, explicitly to "coalesce tiny scattered
+  reads into NVMe-sized I/Os". That is §17.3's finding and §7.5's block geometry, reached from a different
+  direction. It is the strongest external signal that the `Gather` + `block_bytes` design is right.
+- **Independent corroboration of splitting the load view from the plan view.** ELF separates a minimal runtime
+  map view from richer metadata, and `p_filesz` vs `p_memsz` is exactly this design's `stored_bytes` vs
+  `logical_bytes` with the sparse/hole flag. §6.1 and §8.3 are that split, and the correspondence is not a
+  coincidence — both solve "the loader needs less than the reader".
+- **One deliberate divergence: no footer.** ORC and Parquet put a postscript and footer at EOF so a
+  stream-written file can be opened by reading the last few kilobytes. `.logan` puts its header at offset 0
+  instead, because the artifact is produced by a planner that knows the plan before it writes the bytes, so
+  there is nothing to discover at the end. Opening is a header read in both packings, and no reader is ever
+  forced to seek to EOF (§8.1). For an artifact whose whole purpose is bounded open cost on a 500 GB file, the
+  header is strictly better than a footer.
 
 ## 18. Risks and unresolved questions
 
