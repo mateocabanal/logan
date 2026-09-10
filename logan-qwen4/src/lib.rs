@@ -11,6 +11,9 @@ use std::path::Path;
 
 pub mod coliload;
 pub mod colisource;
+pub mod ggufsource;
+mod ggufload;
+pub use ggufload::load_cfg_gguf;
 pub mod ffi;
 mod gdn_ane;
 pub mod plan;
@@ -423,6 +426,12 @@ pub enum WtBytes {
         residuals: usize,
         metal_tensor: std::sync::Mutex<usize>,
     },
+    /// Byte-exact native GGUF/GGML row blocks. These bytes are never
+    /// requantized; CPU and CUDA kernels consume the source representation.
+    Gguf {
+        weights: Vec<u8>,
+        dtype: ggufsource::GgmlType,
+    },
 }
 
 impl Clone for WtBytes {
@@ -448,6 +457,10 @@ impl Clone for WtBytes {
                 residuals: *residuals,
                 metal_tensor: std::sync::Mutex::new(0),
             },
+            Self::Gguf { weights, dtype } => Self::Gguf {
+                weights: weights.clone(),
+                dtype: *dtype,
+            },
         }
     }
 }
@@ -457,16 +470,19 @@ impl Drop for WtBytes {
         let metal_tensor = match self {
             Self::Bf16 { metal_tensor, .. }
             | Self::Mxfp4 { metal_tensor, .. }
-            | Self::Q8Block { metal_tensor, .. } => metal_tensor,
+            | Self::Q8Block { metal_tensor, .. } => Some(metal_tensor),
+            Self::Gguf { .. } => None,
         };
-        let raw = std::mem::take(
-            metal_tensor
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        if raw != 0 {
-            unsafe {
-                logan_metal::coli_metal_tensor_free(raw as *mut logan_metal::ColiMetalTensor);
+        if let Some(metal_tensor) = metal_tensor {
+            let raw = std::mem::take(
+                metal_tensor
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            if raw != 0 {
+                unsafe {
+                    logan_metal::coli_metal_tensor_free(raw as *mut logan_metal::ColiMetalTensor);
+                }
             }
         }
     }
@@ -486,7 +502,7 @@ impl Wt {
     fn bf16_bytes(&self) -> Option<&[u8]> {
         match self.bytes.as_ref()? {
             WtBytes::Bf16 { weights, .. } => Some(weights),
-            WtBytes::Mxfp4 { .. } | WtBytes::Q8Block { .. } => None,
+            WtBytes::Mxfp4 { .. } | WtBytes::Q8Block { .. } | WtBytes::Gguf { .. } => None,
         }
     }
 
@@ -573,6 +589,14 @@ impl Wt {
                         value
                     })
                     .collect()
+            }
+            WtBytes::Gguf { weights, dtype } => {
+                let row_bytes = dtype
+                    .stored_bytes(self.i as u64)
+                    .expect("validated GGUF row geometry") as usize;
+                let start = row * row_bytes;
+                ggufsource::decode_row(*dtype, &weights[start..start + row_bytes], self.i)
+                    .expect("validated GGUF row")
             }
         }
     }
@@ -781,6 +805,16 @@ pub struct Model {
     /// mode). ponytail: no cache yet — each fetch re-reads the record; add a
     /// per-layer FIFO when disk shows in profiles.
     coli: Option<colisource::ColiSource>,
+    /// Native GGUF source. Dense quantized weights are resident as their
+    /// original GGML blocks; routed experts and PLE rows remain file-backed.
+    gguf: Option<ggufsource::GgufSource>,
+    /// GGUF Qwen4Exp reorders GDN V heads from HF grouped order to tiled
+    /// broadcast order. Keeping that layout at runtime avoids rewriting any
+    /// quantized matrix bytes; K-head selection becomes h % kheads.
+    gdn_v_tiled: bool,
+    /// Qwen4Exp GGUF keeps the checkpoint's interleaved rotary pairing.
+    /// Existing COLI packages retain their historical physical convention.
+    rope_interleaved: bool,
     embed: Wt,
     lm_head: Wt,
     /// Optional single-copy 16 KiB-aligned BF16 LM head storage. The generic
@@ -1754,6 +1788,42 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                 drop(handle);
                 matmul_q8_block_bytes(y, x, weights, scales, o, i, *block, *residuals);
             }
+            WtBytes::Gguf { weights, dtype } => {
+                let row_bytes = dtype
+                    .stored_bytes(i as u64)
+                    .expect("validated GGUF row geometry") as usize;
+                debug_assert_eq!(weights.len(), row_bytes * o);
+                let parallel = o * i >= 1_000_000
+                    && std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        > 1;
+                if parallel {
+                    let workers = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    let chunk = o.div_ceil(workers);
+                    std::thread::scope(|scope| {
+                        for (chunk_idx, ys) in y.chunks_mut(chunk).enumerate() {
+                            let first_row = chunk_idx * chunk;
+                            scope.spawn(move || {
+                                for (local_row, dst) in ys.iter_mut().enumerate() {
+                                    let row = first_row + local_row;
+                                    let raw = &weights[row * row_bytes..(row + 1) * row_bytes];
+                                    *dst = ggufsource::dot_row(*dtype, raw, x)
+                                        .expect("validated GGUF quantized row");
+                                }
+                            });
+                        }
+                    });
+                } else {
+                    for (row, dst) in y.iter_mut().enumerate() {
+                        let raw = &weights[row * row_bytes..(row + 1) * row_bytes];
+                        *dst = ggufsource::dot_row(*dtype, raw, x)
+                            .expect("validated GGUF quantized row");
+                    }
+                }
+            }
         }
         return;
     }
@@ -2077,19 +2147,29 @@ fn rope_angles(pos: usize, cfg: &Cfg) -> Vec<(f32, f32)> {
         .collect()
 }
 
-fn rope_partial_with_angles(v: &mut [f32], angles: &[(f32, f32)], rd: usize) {
+fn rope_partial_with_angles(
+    v: &mut [f32],
+    angles: &[(f32, f32)],
+    rd: usize,
+    interleaved: bool,
+) {
     for (j, &(cs, sn)) in angles.iter().enumerate() {
-        let a = v[j];
-        let b = v[j + rd / 2];
-        v[j] = a * cs - b * sn;
-        v[j + rd / 2] = b * cs + a * sn;
+        let (ia, ib) = if interleaved {
+            (2 * j, 2 * j + 1)
+        } else {
+            (j, j + rd / 2)
+        };
+        let a = v[ia];
+        let b = v[ib];
+        v[ia] = a * cs - b * sn;
+        v[ib] = b * cs + a * sn;
     }
 }
 
-fn rope_partial(v: &mut [f32], pos: usize, cfg: &Cfg) {
+fn rope_partial(v: &mut [f32], pos: usize, cfg: &Cfg, interleaved: bool) {
     let rd = cfg.rotary_dim;
     let angles = rope_angles(pos, cfg);
-    rope_partial_with_angles(v, &angles, rd);
+    rope_partial_with_angles(v, &angles, rd, interleaved);
 }
 
 // qwen4 PLE helpers (C-identical)
@@ -2818,7 +2898,7 @@ impl Model {
             let mut kh = vec![0.0_f32; vheads * kd];
             let mut vh = vec![0.0_f32; vheads * vd];
             for h in 0..vheads {
-                let khd = h / rep;
+                let khd = if self.gdn_v_tiled { h % kheads } else { h / rep };
                 for dd in 0..kd {
                     qh[h * kd + dd] = q_[khd * kd + dd];
                     kh[h * kd + dd] = k_[khd * kd + dd];
@@ -3299,7 +3379,7 @@ impl Model {
         let mut kh = vec![0.0; vheads * kd];
         let mut vh = vec![0.0; vheads * vd];
         for h in 0..vheads {
-            let khd = h / rep;
+            let khd = if self.gdn_v_tiled { h % kheads } else { h / rep };
             for d in 0..kd {
                 qh[h * kd + d] = q_[khd * kd + d];
                 kh[h * kd + d] = k_[khd * kd + d];
@@ -3670,10 +3750,16 @@ impl Model {
                 &mut qg[hh * 2 * hd..hh * 2 * hd + 2 * hd],
                 rope,
                 c.rotary_dim,
+                self.rope_interleaved,
             );
         }
         for g in 0..kv {
-            rope_partial_with_angles(&mut k[g * hd..g * hd + hd], rope, c.rotary_dim);
+            rope_partial_with_angles(
+                &mut k[g * hd..g * hd + hd],
+                rope,
+                c.rotary_dim,
+                self.rope_interleaved,
+            );
         }
         debug_assert_eq!(self.kv_k[li].len(), kv * c.max_t * hd);
         debug_assert_eq!(self.kv_v[li].len(), kv * c.max_t * hd);
@@ -3799,7 +3885,12 @@ impl Model {
             );
         }
         for hh in 0..in_ {
-            rope_partial_with_angles(&mut q[hh * ih..hh * ih + ih], rope, c.rotary_dim);
+            rope_partial_with_angles(
+                &mut q[hh * ih..hh * ih + ih],
+                rope,
+                c.rotary_dim,
+                self.rope_interleaved,
+            );
         }
         // store raw indexer k for this position
         let cached = &mut self.idx_cache[li];
@@ -3833,7 +3924,7 @@ impl Model {
             let pool2 = pool.clone();
             for b in 0..nblk {
                 let mut row = pool2[b * ih..b * ih + ih].to_vec();
-                rope_partial(&mut row, starts[b], &c);
+                rope_partial(&mut row, starts[b], &c, self.rope_interleaved);
                 pool[b * ih..b * ih + ih].copy_from_slice(&row);
             }
             let mut topk = budget / ratio;
@@ -6098,6 +6189,9 @@ impl Model {
         Ok(Model {
             cfg: cfg.clone(),
             coli: None,
+            gguf: None,
+            gdn_v_tiled: false,
+            rope_interleaved: false,
             embed: load_wt(st, "model.embed_tokens.weight", cfg.vocab, cfg.hidden)?,
             lm_head: load_wt(st, "lm_head.weight", cfg.vocab, cfg.hidden)?,
             lm_head_aligned: None,

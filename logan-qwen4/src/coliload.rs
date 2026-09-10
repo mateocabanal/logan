@@ -493,6 +493,9 @@ impl Model {
         let mut model = Model {
             cfg: cfg.clone(),
             coli: Some(src.clone()),
+            gguf: None,
+            gdn_v_tiled: false,
+            rope_interleaved: false,
             embed: load_wt(src, "embed.weight", cfg.vocab, cfg.hidden)?,
             lm_head: load_wt(src, "head.weight", cfg.vocab, cfg.hidden)?,
             lm_head_aligned: None,
