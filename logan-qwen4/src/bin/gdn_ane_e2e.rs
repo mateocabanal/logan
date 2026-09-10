@@ -43,12 +43,12 @@ fn peak_rss_mib() -> f64 {
 
 fn write_logits(path: &str, values: &[f32]) -> Result<(), String> {
     use std::io::Write as _;
-    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
     for &value in values {
         file.write_all(&value.to_le_bytes())
             .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    file.flush().map_err(|e| e.to_string())
 }
 
 fn main() -> Result<(), String> {
@@ -127,6 +127,9 @@ fn main() -> Result<(), String> {
             delta.moe_metal_calls,
             argmax(&logits),
         );
+        if let Ok(prefix) = std::env::var("LOGAN_LOGITS_EACH") {
+            write_logits(&format!("{prefix}.{pos}.f32"), &logits)?;
+        }
         final_logits = logits;
     }
     model.profile_summary(forwards, inference_t0.elapsed().as_secs_f64() * 1e3);

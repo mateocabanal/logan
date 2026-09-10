@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurface.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <objc/message.h>
 
 #include "apple8_metalio_direct.h"
 #include "apple8_contract.h"
@@ -8,6 +11,7 @@
 #include <chrono>
 #include <limits.h>
 #include <mutex>
+#include <memory>
 #include <new>
 #include <stdint.h>
 #include <stdio.h>
@@ -646,6 +650,31 @@ kernel void qwen_gdn_input_bf16(
     if (row < total && lane == 0) dst[o] = acc;
 }
 
+// ANE f32 outputs are channel-major [1, rows, 1, spatial]. Gather
+// column zero on-device so the proven recurrence keeps its contiguous ABI.
+kernel void qwen_gdn_gather_ane(
+    device const float *sqkv [[buffer(0)]],
+    device const float *sz [[buffer(1)]],
+    device const float *sa [[buffer(2)]],
+    device const float *sb [[buffer(3)]],
+    device float *qkv [[buffer(4)]],
+    device float *z [[buffer(5)]],
+    device float *a [[buffer(6)]],
+    device float *b [[buffer(7)]],
+    constant int &C [[buffer(8)]],
+    constant int &vdim [[buffer(9)]],
+    constant int &vheads [[buffer(10)]],
+    constant int &spatial [[buffer(11)]],
+    uint row [[thread_position_in_grid]])
+{
+    if (row < (uint)C) qkv[row] = sqkv[(long)row * spatial];
+    if (row < (uint)vdim) z[row] = sz[(long)row * spatial];
+    if (row < (uint)vheads) {
+        a[row] = sa[(long)row * spatial];
+        b[row] = sb[(long)row * spatial];
+    }
+}
+
 inline float qwen_gdn_conv_one(
     device const float *qkv,
     device const float *weights,
@@ -817,6 +846,7 @@ kernel void qwen_gdn_output_bf16(
 )METAL";
 
 static id<MTLComputePipelineState> g_gdn_input_pipeline = nil;
+static id<MTLComputePipelineState> g_gdn_gather_pipeline = nil;
 static id<MTLComputePipelineState> g_gdn_recur_pipeline = nil;
 static id<MTLComputePipelineState> g_gdn_output_pipeline = nil;
 
@@ -832,7 +862,9 @@ struct QwenGdnMetalLayer {
     id<MTLBuffer> xb = nil, outb = nil;
     id<MTLBuffer> qkv = nil, z = nil, a = nil, b = nil, normed = nil;
     int D = 0, kheads = 0, kd = 0, vheads = 0, vd = 0, kk = 0;
+    bool ane_input = false;
     bool in_use = false;
+    id<MTLCommandBuffer> active_command = nil;
 };
 
 /* Split-phase GDN handle. begin() owns one layer scratch lease until finish()
@@ -840,15 +872,21 @@ struct QwenGdnMetalLayer {
  * command buffer/output alive while the CPU performs independent MetalIO. */
 struct Apple8GdnPending {
     id<MTLCommandBuffer> cb = nil;
+    id<MTLSharedEvent> wait_event = nil;
     id<MTLBuffer> outb = nil;
-    QwenGdnMetalLayer *ctx = nullptr;
+    std::shared_ptr<QwenGdnMetalLayer> ctx;
+    IOSurfaceRef surfaces[4] = {};
+    id<MTLBuffer> surface_buffers[4] = {};
+    ~Apple8GdnPending() {
+        for (IOSurfaceRef surface : surfaces) if (surface) CFRelease(surface);
+    }
     size_t out_bytes = 0;
     int layer = -1;
     NSUInteger input_rows = 0;
     uint64_t encode_ns = 0;
     uint64_t submit_ns = 0;
 };
-static std::vector<QwenGdnMetalLayer *> g_gdn_layers;
+static std::vector<std::shared_ptr<QwenGdnMetalLayer>> g_gdn_layers;
 
 static size_t qwen_gdn_round_page(size_t bytes) {
     if (!bytes || bytes > SIZE_MAX - 16383u) return 0;
@@ -870,7 +908,7 @@ static id<MTLBuffer> qwen_gdn_wrap_nocopy_locked(const void *ptr, size_t bytes,
 }
 
 static int qwen_gdn_init_locked(void) {
-    if (g_gdn_input_pipeline && g_gdn_recur_pipeline && g_gdn_output_pipeline)
+    if (g_gdn_input_pipeline && g_gdn_gather_pipeline && g_gdn_recur_pipeline && g_gdn_output_pipeline)
         return 1;
     if (!g_device || !g_queue) return 0;
     NSError *error = nil;
@@ -882,12 +920,14 @@ static int qwen_gdn_init_locked(void) {
         return 0;
     }
     g_gdn_input_pipeline = make_pipeline(library, @"qwen_gdn_input_bf16", &error);
+    g_gdn_gather_pipeline = make_pipeline(library, @"qwen_gdn_gather_ane", &error);
     g_gdn_recur_pipeline = make_pipeline(library, @"qwen_gdn_conv_recur_norm", &error);
     g_gdn_output_pipeline = make_pipeline(library, @"qwen_gdn_output_bf16", &error);
-    if (!g_gdn_input_pipeline || !g_gdn_recur_pipeline || !g_gdn_output_pipeline) {
+    if (!g_gdn_input_pipeline || !g_gdn_gather_pipeline || !g_gdn_recur_pipeline || !g_gdn_output_pipeline) {
         fprintf(stderr, "[qwen-gdn-metal] pipeline creation failed: %s\n",
                 error ? error.localizedDescription.UTF8String : "missing function");
         g_gdn_input_pipeline = nil;
+        g_gdn_gather_pipeline = nil;
         g_gdn_recur_pipeline = nil;
         g_gdn_output_pipeline = nil;
         return 0;
@@ -896,8 +936,10 @@ static int qwen_gdn_init_locked(void) {
 }
 
 static void qwen_gdn_clear_locked(void) {
-    for (QwenGdnMetalLayer *ctx : g_gdn_layers) delete ctx;
+    for (const auto &ctx : g_gdn_layers)
+        if (ctx->active_command) [ctx->active_command waitUntilCompleted];
     g_gdn_layers.clear();
+    g_gdn_gather_pipeline = nil;
     g_gdn_input_pipeline = nil;
     g_gdn_recur_pipeline = nil;
     g_gdn_output_pipeline = nil;
@@ -911,19 +953,19 @@ static int qwen_gdn_mul3_size(size_t a, size_t b, size_t c, size_t *out) {
     return 1;
 }
 
-static QwenGdnMetalLayer *qwen_gdn_layer_locked(
+static std::shared_ptr<QwenGdnMetalLayer> qwen_gdn_layer_locked(
     uint64_t model_id, int layer,
     const uint16_t *wqkv, const uint16_t *wz,
     const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
     const float *A_log, const float *dt_bias,
     const float *conv_w, const float *norm_w,
     float *state, float *conv_state,
-    int D, int kheads, int kd, int vheads, int vd, int kk)
+    int D, int kheads, int kd, int vheads, int vd, int kk, bool ane_input)
 {
     if (model_id == 0 || layer < 0 || D <= 0 || kheads <= 0 || kd <= 0 || vheads <= 0 || vd <= 0 ||
-        kk <= 0 || vheads < kheads || vheads % kheads ||
-        !wqkv || !wz || !wa || !wb || !wout || !A_log || !dt_bias ||
-        !conv_w || !norm_w || !state || (kk > 1 && !conv_state))
+        kk <= 0 || vheads < kheads || vheads % kheads || !wout || !A_log || !dt_bias ||
+        !conv_w || !norm_w || !state || (kk > 1 && !conv_state) ||
+        (!ane_input && (!wqkv || !wz || !wa || !wb)))
         return nullptr;
     if (!qwen_gdn_init_locked()) return nullptr;
 
@@ -931,7 +973,7 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
     const size_t recur_threads = (size_t)rep * (size_t)vd;
     const size_t scratch_floats = 2u * (size_t)kd + recur_threads +
                                   3u * (size_t)rep + 3u;
-    if (g_gdn_input_pipeline.maxTotalThreadsPerThreadgroup < 256 ||
+    if ((!ane_input && g_gdn_input_pipeline.maxTotalThreadsPerThreadgroup < 256) ||
         g_gdn_output_pipeline.maxTotalThreadsPerThreadgroup < 256 ||
         recur_threads > (size_t)g_gdn_recur_pipeline.maxTotalThreadsPerThreadgroup ||
         scratch_floats > SIZE_MAX / sizeof(float) ||
@@ -944,13 +986,14 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
     // would otherwise retain dangling host pointers. Reuse only the exact
     // model+layer context and fail closed if that model tries to present a
     // different allocation/geometry for the same layer.
-    for (QwenGdnMetalLayer *ctx : g_gdn_layers) {
-        if (!ctx || ctx->model_id != model_id || ctx->layer != layer) continue;
+    for (const auto &ctx : g_gdn_layers) {
+        if (!ctx || ctx->model_id != model_id || ctx->layer != layer || ctx->ane_input != ane_input) continue;
         if (ctx->D != D || ctx->kheads != kheads || ctx->kd != kd ||
             ctx->vheads != vheads || ctx->vd != vd || ctx->kk != kk ||
-            ctx->host_wqkv != wqkv || ctx->host_wz != wz || ctx->host_wa != wa ||
-            ctx->host_wb != wb || ctx->host_wout != wout ||
-            ctx->host_state != state || ctx->host_conv_state != conv_state)
+            ctx->host_wout != wout || ctx->host_state != state ||
+            ctx->host_conv_state != conv_state ||
+            (!ane_input && (ctx->host_wqkv != wqkv || ctx->host_wz != wz ||
+                            ctx->host_wa != wa || ctx->host_wb != wb)))
             return nullptr;
         return ctx;
     }
@@ -964,29 +1007,36 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
 
     size_t wqkv_b = 0, wz_b = 0, wa_b = 0, wb_b = 0, wout_b = 0;
     size_t state_b = 0, conv_state_b = 0, conv_w_b = 0;
-    if (!qwen_gdn_mul3_size(C, (size_t)D, sizeof(uint16_t), &wqkv_b) ||
-        !qwen_gdn_mul3_size(vdim, (size_t)D, sizeof(uint16_t), &wz_b) ||
-        !qwen_gdn_mul3_size((size_t)vheads, (size_t)D, sizeof(uint16_t), &wa_b) ||
-        !qwen_gdn_mul3_size((size_t)vheads, (size_t)D, sizeof(uint16_t), &wb_b) ||
+    if ((!ane_input &&
+         (!qwen_gdn_mul3_size(C, (size_t)D, sizeof(uint16_t), &wqkv_b) ||
+          !qwen_gdn_mul3_size(vdim, (size_t)D, sizeof(uint16_t), &wz_b) ||
+          !qwen_gdn_mul3_size((size_t)vheads, (size_t)D, sizeof(uint16_t), &wa_b) ||
+          !qwen_gdn_mul3_size((size_t)vheads, (size_t)D, sizeof(uint16_t), &wb_b))) ||
         !qwen_gdn_mul3_size((size_t)D, vdim, sizeof(uint16_t), &wout_b) ||
         !qwen_gdn_mul3_size((size_t)vheads * (size_t)kd, (size_t)vd, sizeof(float), &state_b) ||
         !qwen_gdn_mul3_size(C, (size_t)(kk > 1 ? kk - 1 : 1), sizeof(float), &conv_state_b) ||
         !qwen_gdn_mul3_size(C, (size_t)kk, sizeof(float), &conv_w_b))
         return nullptr;
 
-    QwenGdnMetalLayer *ctx = new (std::nothrow) QwenGdnMetalLayer();
+    auto ctx = std::shared_ptr<QwenGdnMetalLayer>(new (std::nothrow) QwenGdnMetalLayer());
     if (!ctx) return nullptr;
     ctx->model_id = model_id;
     ctx->layer = layer;
-    ctx->host_wqkv = wqkv; ctx->host_wz = wz; ctx->host_wa = wa;
-    ctx->host_wb = wb; ctx->host_wout = wout;
+    ctx->ane_input = ane_input;
+    ctx->host_wqkv = ane_input ? nullptr : wqkv;
+    ctx->host_wz = ane_input ? nullptr : wz;
+    ctx->host_wa = ane_input ? nullptr : wa;
+    ctx->host_wb = ane_input ? nullptr : wb;
+    ctx->host_wout = wout;
     ctx->host_state = state; ctx->host_conv_state = conv_state;
     ctx->D = D; ctx->kheads = kheads; ctx->kd = kd;
     ctx->vheads = vheads; ctx->vd = vd; ctx->kk = kk;
-    ctx->wqkv = qwen_gdn_wrap_nocopy_locked(wqkv, wqkv_b, true);
-    ctx->wz = qwen_gdn_wrap_nocopy_locked(wz, wz_b, true);
-    ctx->wa = qwen_gdn_wrap_nocopy_locked(wa, wa_b, true);
-    ctx->wb = qwen_gdn_wrap_nocopy_locked(wb, wb_b, true);
+    if (!ane_input) {
+        ctx->wqkv = qwen_gdn_wrap_nocopy_locked(wqkv, wqkv_b, true);
+        ctx->wz = qwen_gdn_wrap_nocopy_locked(wz, wz_b, true);
+        ctx->wa = qwen_gdn_wrap_nocopy_locked(wa, wa_b, true);
+        ctx->wb = qwen_gdn_wrap_nocopy_locked(wb, wb_b, true);
+    }
     ctx->wout = qwen_gdn_wrap_nocopy_locked(wout, wout_b, true);
     ctx->state = qwen_gdn_wrap_nocopy_locked(state, state_b, false);
     if (kk > 1) ctx->conv_state = qwen_gdn_wrap_nocopy_locked(conv_state, conv_state_b, false);
@@ -1003,8 +1053,9 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
     ctx->norm_w = [g_device newBufferWithBytes:norm_w
                                          length:(size_t)vd * sizeof(float)
                                         options:MTLResourceStorageModeShared];
-    ctx->xb = [g_device newBufferWithLength:(size_t)D * sizeof(float)
-                                     options:MTLResourceStorageModeShared];
+    if (!ane_input)
+        ctx->xb = [g_device newBufferWithLength:(size_t)D * sizeof(float)
+                                         options:MTLResourceStorageModeShared];
     ctx->outb = [g_device newBufferWithLength:(size_t)D * sizeof(float)
                                        options:MTLResourceStorageModeShared];
     ctx->qkv = [g_device newBufferWithLength:C * sizeof(float)
@@ -1017,28 +1068,75 @@ static QwenGdnMetalLayer *qwen_gdn_layer_locked(
                                     options:MTLResourceStorageModePrivate];
     ctx->normed = [g_device newBufferWithLength:vdim * sizeof(float)
                                          options:MTLResourceStorageModePrivate];
-    if (!ctx->wqkv || !ctx->wz || !ctx->wa || !ctx->wb || !ctx->wout ||
-        !ctx->A_log || !ctx->dt_bias || !ctx->conv_w || !ctx->norm_w ||
-        !ctx->state || !ctx->conv_state || !ctx->xb || !ctx->outb ||
+    if ((!ane_input && (!ctx->wqkv || !ctx->wz || !ctx->wa || !ctx->wb || !ctx->xb)) ||
+        !ctx->wout || !ctx->A_log || !ctx->dt_bias || !ctx->conv_w || !ctx->norm_w ||
+        !ctx->state || !ctx->conv_state || !ctx->outb ||
         !ctx->qkv || !ctx->z || !ctx->a || !ctx->b || !ctx->normed) {
-        delete ctx;
         return nullptr;
     }
     g_gdn_layers.push_back(ctx);
     return ctx;
 }
 
+// Device-to-device ANE -> Metal dependency. Metal owns the MTLSharedEvent;
+// ANE receives only the private IOSurfaceSharedEvent backing and signals
+// `value`. The GPU command can therefore be committed before ANE completes.
+struct Apple8AneFence {
+    id<MTLSharedEvent> event = nil;
+    id shared_backing = nil;
+    uint64_t value = 0;
+};
+
+extern "C" void *coli_apple8_metalio_ane_fence_create(uint64_t value,
+                                                       void **shared_backing_out) {
+    if (shared_backing_out) *shared_backing_out = nullptr;
+    if (!shared_backing_out || value == 0) return nullptr;
+    id<MTLDevice> device = g_device ? g_device : MTLCreateSystemDefaultDevice();
+    if (!device) return nullptr;
+    id<MTLSharedEvent> event = [device newSharedEvent];
+    if (!event) return nullptr;
+    SEL getter = sel_registerName("IOSurfaceSharedEvent");
+    if (![event respondsToSelector:getter]) return nullptr;
+    using Msg0Id = id (*)(id, SEL);
+    id shared = ((Msg0Id)objc_msgSend)(event, getter);
+    if (!shared) return nullptr;
+    auto *fence = new (std::nothrow) Apple8AneFence();
+    if (!fence) return nullptr;
+    fence->event = event;
+    fence->shared_backing = shared;
+    fence->value = value;
+    *shared_backing_out = (__bridge void *)shared;
+    return fence;
+}
+
+extern "C" void *coli_apple8_metalio_ane_fence_metal_event(void *opaque) {
+    auto *fence = static_cast<Apple8AneFence *>(opaque);
+    return (fence && fence->event) ? (__bridge void *)fence->event : nullptr;
+}
+
+extern "C" int coli_apple8_metalio_ane_fence_set_value(void *opaque, uint64_t value) {
+    auto *fence = static_cast<Apple8AneFence *>(opaque);
+    if (!fence || !fence->event || value == 0) return 0;
+    // Shared-event values are monotonically increasing for one reusable fence.
+    if (value <= fence->value) return 0;
+    fence->value = value;
+    return 1;
+}
+
+extern "C" void coli_apple8_metalio_ane_fence_free(void *opaque) {
+    delete static_cast<Apple8AneFence *>(opaque);
+}
+
 // Release every cached GDN wrapper for one model while its Rust-owned backing
-// allocations are still alive. The token entry point holds the same mutex and
-// waits synchronously for its command buffer, so acquiring this lock also
-// establishes that no GDN command for this model is still using those buffers.
+// allocations are still alive. Drain any split-phase command before releasing
+// host backing storage; a pending ticket also pins the context until retirement.
 extern "C" void coli_apple8_metalio_gdn_drop_model(uint64_t model_id) {
     if (model_id == 0) return;
     std::lock_guard<std::mutex> guard(g_lock);
     for (auto it = g_gdn_layers.begin(); it != g_gdn_layers.end();) {
-        QwenGdnMetalLayer *ctx = *it;
+        auto ctx = *it;
         if (ctx && ctx->model_id == model_id) {
-            delete ctx;
+            if (ctx->active_command) [ctx->active_command waitUntilCompleted];
             it = g_gdn_layers.erase(it);
         } else {
             ++it;
@@ -1046,7 +1144,7 @@ extern "C" void coli_apple8_metalio_gdn_drop_model(uint64_t model_id) {
     }
 }
 
-extern "C" int coli_apple8_metalio_gdn_begin(
+static int qwen_gdn_begin_impl(
     uint64_t model_id, int layer, const float *x,
     const uint16_t *wqkv, const uint16_t *wz,
     const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
@@ -1054,16 +1152,18 @@ extern "C" int coli_apple8_metalio_gdn_begin(
     const float *conv_w, const float *norm_w,
     float *state, float *conv_state,
     int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps,
-    void **pending_out)
+    void **pending_out,
+    void *const *raw_surfaces, const size_t *surface_bytes, int spatial,
+    Apple8AneFence *wait_fence)
 {
     if (!pending_out) return 0;
     *pending_out = nullptr;
-    if (!x || !(eps > 0.0f)) return 0;
+    if ((!x && !raw_surfaces) || !(eps > 0.0f)) return 0;
 
     std::lock_guard<std::mutex> guard(g_lock);
-    QwenGdnMetalLayer *ctx = qwen_gdn_layer_locked(
+    auto ctx = qwen_gdn_layer_locked(
         model_id, layer, wqkv, wz, wa, wb, wout, A_log, dt_bias, conv_w, norm_w,
-        state, conv_state, D, kheads, kd, vheads, vd, kk);
+        state, conv_state, D, kheads, kd, vheads, vd, kk, raw_surfaces != nullptr);
     if (!ctx || !g_queue || !g_device || ctx->in_use) return 0;
 
     const int kdim = kheads * kd;
@@ -1073,17 +1173,57 @@ extern "C" int coli_apple8_metalio_gdn_begin(
     const NSUInteger recur_threads = (NSUInteger)rep * (NSUInteger)vd;
     const NSUInteger scratch_floats = 2u * (NSUInteger)kd + recur_threads +
                                       3u * (NSUInteger)rep + 3u;
-    memcpy(ctx->xb.contents, x, (size_t)D * sizeof(float));
+    if (!raw_surfaces) memcpy(ctx->xb.contents, x, (size_t)D * sizeof(float));
 
     Apple8GdnPending *pending = new (std::nothrow) Apple8GdnPending();
     if (!pending) return 0;
+    if (raw_surfaces) {
+        const size_t rows[4] = {(size_t)C, (size_t)vdim, (size_t)vheads, (size_t)vheads};
+        if (!surface_bytes || spatial <= 0) { delete pending; return 0; }
+        for (int i = 0; i < 4; ++i) {
+            size_t required = 0;
+            if (!raw_surfaces[i] ||
+                !qwen_gdn_mul3_size(rows[i], (size_t)spatial, sizeof(float), &required) ||
+                surface_bytes[i] < required) { delete pending; return 0; }
+            IOSurfaceRef surface = (IOSurfaceRef)raw_surfaces[i];
+            const size_t allocation = IOSurfaceGetAllocSize(surface);
+            void *base = IOSurfaceGetBaseAddress(surface);
+            if (!base || surface_bytes[i] > allocation) { delete pending; return 0; }
+            pending->surfaces[i] = (IOSurfaceRef)CFRetain(surface);
+            pending->surface_buffers[i] = [g_device newBufferWithBytesNoCopy:base
+                length:allocation options:MTLResourceStorageModeShared deallocator:nil];
+            if (!pending->surface_buffers[i]) { delete pending; return 0; }
+        }
+    }
     uint64_t encode_begin = direct_now_ns();
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     if (!cb) { delete pending; return 0; }
+    if (wait_fence) {
+        if (!wait_fence->event || wait_fence->value == 0) { delete pending; return 0; }
+        [cb encodeWaitForEvent:wait_fence->event value:wait_fence->value];
+        pending->wait_event = wait_fence->event;
+    }
 
     const NSUInteger input_rows = (NSUInteger)C + (NSUInteger)vdim +
                                   2u * (NSUInteger)vheads;
     auto encode_input = [&](id<MTLComputeCommandEncoder> e) {
+        if (raw_surfaces) {
+            [e setComputePipelineState:g_gdn_gather_pipeline];
+            for (int i = 0; i < 4; ++i)
+                [e setBuffer:pending->surface_buffers[i] offset:0 atIndex:i];
+            [e setBuffer:ctx->qkv offset:0 atIndex:4];
+            [e setBuffer:ctx->z offset:0 atIndex:5];
+            [e setBuffer:ctx->a offset:0 atIndex:6];
+            [e setBuffer:ctx->b offset:0 atIndex:7];
+            [e setBytes:&C length:sizeof(C) atIndex:8];
+            [e setBytes:&vdim length:sizeof(vdim) atIndex:9];
+            [e setBytes:&vheads length:sizeof(vheads) atIndex:10];
+            [e setBytes:&spatial length:sizeof(spatial) atIndex:11];
+            NSUInteger tg = MIN((NSUInteger)256, g_gdn_gather_pipeline.maxTotalThreadsPerThreadgroup);
+            [e dispatchThreads:MTLSizeMake((NSUInteger)C, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            return;
+        }
         [e setComputePipelineState:g_gdn_input_pipeline];
         [e setBuffer:ctx->wqkv offset:0 atIndex:0];
         [e setBuffer:ctx->wz offset:0 atIndex:1];
@@ -1170,6 +1310,7 @@ extern "C" int coli_apple8_metalio_gdn_begin(
     const uint64_t encode_ns = direct_now_ns() - encode_begin;
     const uint64_t submit_begin = direct_now_ns();
     ctx->in_use = true;
+    ctx->active_command = cb;
     [cb commit];
     const uint64_t submit_ns = direct_now_ns() - submit_begin;
 
@@ -1185,6 +1326,47 @@ extern "C" int coli_apple8_metalio_gdn_begin(
     return 1;
 }
 
+// Legacy BF16 input projection entry point.
+extern "C" int coli_apple8_metalio_gdn_begin(
+    uint64_t model_id, int layer, const float *x,
+    const uint16_t *wqkv, const uint16_t *wz,
+    const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
+    const float *A_log, const float *dt_bias,
+    const float *conv_w, const float *norm_w,
+    float *state, float *conv_state,
+    int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps,
+    void **pending_out)
+{
+    return qwen_gdn_begin_impl(model_id, layer, x, wqkv, wz, wa, wb, wout,
+        A_log, dt_bias, conv_w, norm_w, state, conv_state,
+        D, kheads, kd, vheads, vd, kk, output_gate, eps, pending_out,
+        nullptr, nullptr, 0, nullptr);
+}
+
+// ANE must have completed writing all four FP32 surfaces before this call.
+// Success retains each IOSurface until finish/discard; callers must not write
+// those surfaces or mutate/free model weights/state while the ticket is live.
+// 0 declines before submission (state untouched); failure after commit is fatal.
+extern "C" int coli_apple8_metalio_gdn_ane_begin(
+    uint64_t model_id, int layer,
+    void *qkv_surface, size_t qkv_bytes, void *z_surface, size_t z_bytes,
+    void *a_surface, size_t a_bytes, void *b_surface, size_t b_bytes, int spatial,
+    const uint16_t *wqkv, const uint16_t *wz,
+    const uint16_t *wa, const uint16_t *wb, const uint16_t *wout,
+    const float *A_log, const float *dt_bias,
+    const float *conv_w, const float *norm_w,
+    float *state, float *conv_state,
+    int D, int kheads, int kd, int vheads, int vd, int kk, int output_gate, float eps,
+    void *ane_fence, void **pending_out)
+{
+    void *surfaces[4] = {qkv_surface, z_surface, a_surface, b_surface};
+    const size_t bytes[4] = {qkv_bytes, z_bytes, a_bytes, b_bytes};
+    return qwen_gdn_begin_impl(model_id, layer, nullptr, wqkv, wz, wa, wb, wout,
+        A_log, dt_bias, conv_w, norm_w, state, conv_state,
+        D, kheads, kd, vheads, vd, kk, output_gate, eps, pending_out,
+        surfaces, bytes, spatial, static_cast<Apple8AneFence *>(ane_fence));
+}
+
 static int apple8_gdn_pending_retire(Apple8GdnPending *pending, float *out) {
     if (!pending) return 0;
     const uint64_t wait_begin = direct_now_ns();
@@ -1198,7 +1380,10 @@ static int apple8_gdn_pending_retire(Apple8GdnPending *pending, float *out) {
         if (ok)
             profile_completed_locked(pending->cb, pending->encode_ns,
                                      pending->submit_ns, wait_ns, 0, DIRECT_PROFILE_GDN);
-        if (pending->ctx) pending->ctx->in_use = false;
+        if (pending->ctx) {
+            pending->ctx->in_use = false;
+            pending->ctx->active_command = nil;
+        }
     }
     if (!ok) {
         fprintf(stderr, "[qwen-gdn-metal] command failed after submission: %s\n",

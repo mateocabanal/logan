@@ -631,6 +631,8 @@ impl Model {
             gdn_ane: (0..cfg.layers)
                 .map(|_| crate::gdn_ane::GdnAneState::default())
                 .collect(),
+            gdn_ane_dynamic: None,
+            gdn_ane_dynamic_failed: false,
             attn_metal: (0..cfg.layers).map(|_| None).collect(),
             sched_mode: false,
             sched_blocked: None,

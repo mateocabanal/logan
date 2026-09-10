@@ -206,10 +206,10 @@ fn main() -> Result<(), String> {
         HIDDEN,
         SPATIAL,
         &[
-            DenseProjection::new("qkv", QKV, qkv16),
-            DenseProjection::new("z", Z, z16),
-            DenseProjection::new("a", A, a16),
-            DenseProjection::new("b", B, b16),
+            DenseProjection::new("qkv", QKV, qkv16.clone()),
+            DenseProjection::new("z", Z, z16.clone()),
+            DenseProjection::new("a", A, a16.clone()),
+            DenseProjection::new("b", B, b16.clone()),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -228,6 +228,16 @@ fn main() -> Result<(), String> {
     model.load().map_err(|e| e.to_string())?;
     let ane_load_ms = load_t0.elapsed().as_secs_f64() * 1e3;
     println!("ANE compile={compile_ms:.1} ms load={ane_load_ms:.1} ms");
+    if std::env::var("LOGAN_ANE_RESIDENCY_HINT").map(|v| v != "0").unwrap_or(false) {
+        let client = runtime.shared_client().map_err(|e| e.to_string())?;
+        let mut hint_ms = Vec::new();
+        for _ in 0..8 {
+            let t = Instant::now();
+            client.residency_hint(&model, logan_ane::AneQos::DEFAULT).map_err(|e| e.to_string())?;
+            hint_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("residency_hint ms={hint_ms:?} median={:.3}", median_ms(hint_ms.clone()));
+    }
 
     // Deterministic activation with a distribution similar to normalized LLM hidden states.
     let x: Vec<f32> = (0..HIDDEN)
@@ -286,6 +296,80 @@ fn main() -> Result<(), String> {
         ane_samples.push(t.elapsed().as_secs_f64() * 1e3);
     }
     drop(request);
+
+    // Reusable async-channel cost on the same real Qwen GDN layer. This keeps
+    // surface wrappers/request/shared-events/completion block alive and only
+    // updates the shared-event value before each submit.
+    let direct = std::env::var("LOGAN_ANE_ASYNC_DIRECT")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")).unwrap_or(false);
+    let realtime = std::env::var("LOGAN_ANE_ASYNC_REALTIME")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")).unwrap_or(false);
+    let mode = if realtime { 2 } else if direct { 1 } else { 0 };
+    let premap = std::env::var("LOGAN_ANE_ASYNC_PREMAP")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")).unwrap_or(false);
+    let mut fence = logan_metal::MetalAneFence::new(1)
+        .ok_or_else(|| "Metal shared event unavailable".to_string())?;
+    let mut channel = unsafe {
+        model.async_channel(
+            &[&input], &[&out_qkv, &out_z, &out_a, &out_b], 0,
+            fence.ane_shared_event(), mode, premap,
+        )
+    }.map_err(|e| e.to_string())?;
+    let mut event_value = fence.value();
+    for warm in 0..5 {
+        if warm > 0 { event_value = fence.advance().ok_or_else(|| "fence advance failed".to_string())?; }
+        channel.submit(event_value).map_err(|e| e.to_string())?.finish(2_000).map_err(|e| e.to_string())?;
+    }
+    let mut async_submit_samples = Vec::new();
+    let mut async_total_samples = Vec::new();
+    for _ in 0..30 {
+        event_value = fence.advance().ok_or_else(|| "fence advance failed".to_string())?;
+        let total_t0 = Instant::now();
+        let submit_t0 = Instant::now();
+        let pending = channel.submit(event_value).map_err(|e| e.to_string())?;
+        async_submit_samples.push(submit_t0.elapsed().as_secs_f64() * 1e3);
+        pending.finish(2_000).map_err(|e| e.to_string())?;
+        async_total_samples.push(total_t0.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "ANE reusable async mode={mode} premap={premap} submit_median={:.3} ms total_median={:.3} ms",
+        median_ms(async_submit_samples.clone()), median_ms(async_total_samples.clone())
+    );
+
+    if std::env::var("LOGAN_ANE_PACKED_PROJ").map(|v| v != "0").unwrap_or(false) {
+        let packed_rows = QKV + Z + A + B;
+        let mut packed_weights = Vec::with_capacity(packed_rows * HIDDEN);
+        packed_weights.extend_from_slice(&qkv16);
+        packed_weights.extend_from_slice(&z16);
+        packed_weights.extend_from_slice(&a16);
+        packed_weights.extend_from_slice(&b16);
+        let packed_program = logan_ane::mil::parallel_dense_fp16_f32_io(
+            HIDDEN, SPATIAL,
+            &[DenseProjection::new("packed", packed_rows, packed_weights)],
+        ).map_err(|e| e.to_string())?;
+        let t0 = Instant::now();
+        let mut packed_model = runtime.compile(&packed_program, CompileOptions::default())
+            .map_err(|e| e.to_string())?;
+        let packed_compile_ms = t0.elapsed().as_secs_f64() * 1e3;
+        packed_model.load().map_err(|e| e.to_string())?;
+        let packed_out = AneSurface::new(packed_rows * SPATIAL * 4).map_err(|e| e.to_string())?;
+        let packed_req = AneRequest::new(&[&input], &[&packed_out], 0).map_err(|e| e.to_string())?;
+        for _ in 0..5 { packed_model.evaluate(&packed_req).map_err(|e| e.to_string())?; }
+        let mut samples = Vec::new();
+        for _ in 0..30 {
+            let t = Instant::now();
+            packed_model.evaluate(&packed_req).map_err(|e| e.to_string())?;
+            samples.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let po = packed_out.read_f32().map_err(|e| e.to_string())?;
+        let mut row = 0usize;
+        let pq = quality(&ref_qkv, &po[row*SPATIAL..(row+QKV)*SPATIAL], SPATIAL); row += QKV;
+        let pz = quality(&ref_z, &po[row*SPATIAL..(row+Z)*SPATIAL], SPATIAL); row += Z;
+        let pa = quality(&ref_a, &po[row*SPATIAL..(row+A)*SPATIAL], SPATIAL); row += A;
+        let pb = quality(&ref_b, &po[row*SPATIAL..(row+B)*SPATIAL], SPATIAL);
+        println!("ANE packed projection compile={packed_compile_ms:.1} ms median={:.3} ms qkv_cos={:.9} z_cos={:.9} a_cos={:.9} b_cos={:.9}",
+            median_ms(samples), pq.cosine, pz.cosine, pa.cosine, pb.cosine);
+    }
 
     // Production-shaped cost: write one repeated token, build a request,
     // evaluate it, then read lane 0 from all four outputs. This captures the

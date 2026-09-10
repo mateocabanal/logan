@@ -28,8 +28,8 @@ mod surface;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use model::{
-    AneClient, AneDeviceInfo, AneModel, AneQos, AneRequest, AneRuntime, CompileOptions, ModelState,
-    MutableWeightMapping, RuntimeCapabilities,
+    AneAsyncChannel, AneChannelPending, AneClient, AneDeviceInfo, AneModel, AnePending, AneQos,
+    AneRequest, AneRuntime, CompileOptions, ModelState, MutableWeightMapping, RuntimeCapabilities,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use surface::{AneSurface, SurfaceRead, SurfaceWrite};

@@ -9,9 +9,12 @@ mod imp {
     use std::{path::PathBuf, time::Instant};
 
     use logan_ane::{
-        AneModel, AneRequest, AneRuntime, AneSurface, CompileOptions, mil::DenseProjection,
+        AneAsyncChannel, AneChannelPending, AneModel, AneRequest, AneRuntime, AneSurface, CompileOptions, mil::DenseProjection,
     };
-    use logan_metal::{MetalGdnConvSilu, MetalSharedSurface};
+    use logan_metal::{
+        MetalAneDynamicPack, MetalAneDynamicPackPending, MetalAneFence, MetalGdnConvSilu,
+        MetalSharedSurface,
+    };
 
     const SPATIAL: usize = 16;
 
@@ -41,6 +44,362 @@ mod imp {
         z_rows: usize,
         ab_rows: usize,
         conv_kernel: usize,
+        gpu_tail: bool,
+        async_fence: Option<MetalAneFence>,
+        async_channel: Option<AneAsyncChannel>,
+        async_slow_score: u32,
+        async_samples: u32,
+    }
+
+    /// Shared two-program dynamic-weight ANE engine. Unlike the original
+    /// constant-weight path this is model-global: every GDN layer reuses the
+    /// same qkv program and the same z+a+b program, avoiding the M2 firmware's
+    /// severe 36-program residency/switching cliff.
+    pub struct GdnAneDynamicEngine {
+        qkv_model: AneModel,
+        aux_model: AneModel,
+        qkv_input: AneSurface,
+        aux_input: AneSurface,
+        qkv: AneSurface,
+        z: AneSurface,
+        a: AneSurface,
+        b: AneSurface,
+        hidden: usize,
+        qkv_rows: usize,
+        z_rows: usize,
+        ab_rows: usize,
+        qkv_spatial: usize,
+        aux_spatial: usize,
+        qkv_weight_offset: usize,
+        aux_weight_offsets: [usize; 3],
+        metal_packers: Vec<Option<MetalAneDynamicPack>>,
+        async_fence: Option<MetalAneFence>,
+        qkv_channel: Option<AneAsyncChannel>,
+        aux_channel: Option<AneAsyncChannel>,
+        async_started: bool,
+    }
+
+    pub fn dynamic_enabled() -> bool {
+        switch_enabled("QWEN_GDN_ANE_DYNAMIC")
+    }
+
+    pub fn dynamic_async_enabled() -> bool {
+        switch_enabled("QWEN_GDN_ANE_DYNAMIC_ASYNC")
+    }
+
+    /// Owns one fully device-chained dynamic GDN front half:
+    /// Metal pack -> ANE qkv -> ANE z/a/b. The same monotonic shared event
+    /// orders every edge; callers can submit the GPU tail against `gpu_fence()`
+    /// before any of these stages complete on the host.
+    pub struct GdnAneDynamicPending {
+        pack: MetalAneDynamicPackPending,
+        qkv: AneChannelPending,
+        aux: AneChannelPending,
+        submit_ms: f64,
+    }
+
+    impl GdnAneDynamicPending {
+        pub fn submit_ms(&self) -> f64 { self.submit_ms }
+
+        pub fn finish(self, timeout_ms: u64) -> Result<f64, String> {
+            let pack_gpu_ms = self.pack.finish()
+                .ok_or_else(|| "dynamic ANE Metal pack failed after submission".to_string())?;
+            self.qkv.finish(timeout_ms).map_err(|e| e.to_string())?;
+            self.aux.finish(timeout_ms).map_err(|e| e.to_string())?;
+            Ok(pack_gpu_ms)
+        }
+    }
+
+    impl GdnAneDynamicEngine {
+        pub fn build(
+            hidden: usize,
+            qkv_rows: usize,
+            z_rows: usize,
+            ab_rows: usize,
+        ) -> Result<Self, String> {
+            let (qkv_program, qkv_layout) =
+                logan_ane::mil::parallel_dense_packed_dynamic_f32_io(hidden, SPATIAL, &[qkv_rows])
+                    .map_err(|e| e.to_string())?;
+            let (aux_program, aux_layout) =
+                logan_ane::mil::parallel_dense_packed_dynamic_f32_io(
+                    hidden, SPATIAL, &[z_rows, ab_rows, ab_rows],
+                ).map_err(|e| e.to_string())?;
+            // The ANE compiler currently rejects a packed tensor dimension
+            // beyond 16384. Keep the production path fail-closed if a future
+            // model geometry exceeds the hardware-qualified envelope.
+            if qkv_layout.total_spatial > 16_384 || aux_layout.total_spatial > 16_384 {
+                return Err(format!(
+                    "dynamic ANE packed spatial exceeds 16384 (qkv={} aux={})",
+                    qkv_layout.total_spatial, aux_layout.total_spatial,
+                ));
+            }
+            let runtime = AneRuntime::load().map_err(|e| e.to_string())?;
+            let mut options = CompileOptions::default();
+            options.cache_directory = ane_cache_dir();
+            let t0 = Instant::now();
+            let mut qkv_model = runtime.compile(&qkv_program, options.clone()).map_err(|e| e.to_string())?;
+            let qkv_compile_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let t0 = Instant::now();
+            let mut aux_model = runtime.compile(&aux_program, options).map_err(|e| e.to_string())?;
+            let aux_compile_ms = t0.elapsed().as_secs_f64() * 1e3;
+            qkv_model.load().map_err(|e| e.to_string())?;
+            aux_model.load().map_err(|e| e.to_string())?;
+
+            let qkv_input = AneSurface::new(hidden * qkv_layout.total_spatial * 4)
+                .map_err(|e| e.to_string())?;
+            let aux_input = AneSurface::new(hidden * aux_layout.total_spatial * 4)
+                .map_err(|e| e.to_string())?;
+            let qkv = AneSurface::new(qkv_rows * SPATIAL * 4).map_err(|e| e.to_string())?;
+            let z = AneSurface::new(z_rows * SPATIAL * 4).map_err(|e| e.to_string())?;
+            let a = AneSurface::new(ab_rows * SPATIAL * 4).map_err(|e| e.to_string())?;
+            let b = AneSurface::new(ab_rows * SPATIAL * 4).map_err(|e| e.to_string())?;
+            eprintln!(
+                "qwen4-rs: dynamic ANE GDN engine ready (2 programs; qkv_spatial={} aux_spatial={} input_mib={:.1}; compile={:.1}+{:.1}ms)",
+                qkv_layout.total_spatial, aux_layout.total_spatial,
+                (hidden * (qkv_layout.total_spatial + aux_layout.total_spatial) * 4) as f64 / 1048576.0,
+                qkv_compile_ms, aux_compile_ms,
+            );
+            Ok(Self {
+                qkv_model, aux_model, qkv_input, aux_input, qkv, z, a, b,
+                hidden, qkv_rows, z_rows, ab_rows,
+                qkv_spatial: qkv_layout.total_spatial,
+                aux_spatial: aux_layout.total_spatial,
+                qkv_weight_offset: qkv_layout.weight_offsets[0],
+                aux_weight_offsets: [
+                    aux_layout.weight_offsets[0], aux_layout.weight_offsets[1], aux_layout.weight_offsets[2],
+                ],
+                metal_packers: Vec::new(),
+                async_fence: None,
+                qkv_channel: None,
+                aux_channel: None,
+                async_started: false,
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn ensure_metal_packer(
+            &mut self,
+            layer: usize,
+            wqkv: &[u8],
+            wz: &[u8],
+            wa: &[u8],
+            wb: &[u8],
+        ) -> Result<(), String> {
+            if self.metal_packers.len() <= layer {
+                self.metal_packers.resize_with(layer + 1, || None);
+            }
+            if self.metal_packers[layer].is_some() {
+                return Ok(());
+            }
+            let qkv_dst = unsafe {
+                MetalSharedSurface::from_iosurface(self.qkv_input.as_raw_iosurface(), self.qkv_input.len())
+            }.ok_or_else(|| "dynamic ANE qkv Metal surface import failed".to_string())?;
+            let aux_dst = unsafe {
+                MetalSharedSurface::from_iosurface(self.aux_input.as_raw_iosurface(), self.aux_input.len())
+            }.ok_or_else(|| "dynamic ANE aux Metal surface import failed".to_string())?;
+            self.metal_packers[layer] = Some(MetalAneDynamicPack::new(
+                &qkv_dst, &aux_dst, wqkv, wz, wa, wb,
+                self.hidden, SPATIAL, self.qkv_rows, self.z_rows, self.ab_rows,
+                self.qkv_spatial, self.aux_spatial, self.qkv_weight_offset,
+                self.aux_weight_offsets[0], self.aux_weight_offsets[1],
+                self.aux_weight_offsets[2],
+            ).ok_or_else(|| "dynamic ANE Metal packer creation failed".to_string())?);
+            Ok(())
+        }
+
+        fn ensure_async_channels(&mut self) -> Result<(), String> {
+            if self.async_fence.is_none() {
+                self.async_fence = MetalAneFence::new(1);
+            }
+            let fence = self.async_fence.as_ref()
+                .ok_or_else(|| "dynamic ANE Metal shared event unavailable".to_string())?;
+            let shared_event = fence.ane_shared_event();
+            let submit_mode = if switch_enabled("QWEN_GDN_ANE_ASYNC_REALTIME") { 2 }
+                else if switch_enabled("QWEN_GDN_ANE_ASYNC_DIRECT") { 1 } else { 0 };
+            // Dynamic requests are large (~161 MiB across qkv+aux on
+            // Qwen3.8-Flash-Next). Pre-mapping avoids repeated private-runtime
+            // IOSurface mapping; hardware A/B on M2 cut warm GDN wait by ~25%.
+            // Keep an explicit 0/false escape hatch for qualification.
+            let premap = std::env::var("QWEN_GDN_ANE_ASYNC_PREMAP")
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            if self.qkv_channel.is_none() {
+                self.qkv_channel = Some(unsafe {
+                    self.qkv_model.async_channel_wait_signal(
+                        &[&self.qkv_input], &[&self.qkv], 0,
+                        shared_event, shared_event, submit_mode, premap,
+                    )
+                }.map_err(|e| e.to_string())?);
+            }
+            if self.aux_channel.is_none() {
+                self.aux_channel = Some(unsafe {
+                    self.aux_model.async_channel_wait_signal(
+                        &[&self.aux_input], &[&self.z, &self.a, &self.b], 0,
+                        shared_event, shared_event, submit_mode, premap,
+                    )
+                }.map_err(|e| e.to_string())?);
+            }
+            Ok(())
+        }
+
+        /// Submit Metal pack -> qkv ANE -> aux ANE without a host wait between
+        /// stages. The caller should immediately submit the GPU tail against
+        /// `gpu_fence()`, then finish this owner after that tail retires.
+        #[allow(clippy::too_many_arguments)]
+        pub fn evaluate_layer_async(
+            &mut self,
+            layer: usize,
+            x: &[f32],
+            wqkv: &[u8],
+            wz: &[u8],
+            wa: &[u8],
+            wb: &[u8],
+        ) -> Result<GdnAneDynamicPending, String> {
+            if x.len() != self.hidden {
+                return Err("dynamic ANE hidden vector size mismatch".into());
+            }
+            self.ensure_metal_packer(layer, wqkv, wz, wa, wb)?;
+            self.ensure_async_channels()?;
+
+            let submit_t0 = Instant::now();
+            let pack_value = {
+                let fence = self.async_fence.as_mut().unwrap();
+                if self.async_started {
+                    fence.advance().ok_or_else(|| "dynamic ANE pack fence advance failed".to_string())?
+                } else {
+                    fence.value()
+                }
+            };
+            let pack = {
+                let fence = self.async_fence.as_ref().unwrap();
+                self.metal_packers[layer].as_mut().unwrap().begin(x, fence)
+                    .ok_or_else(|| "dynamic ANE Metal pack submit declined".to_string())?
+            };
+            self.async_started = true;
+
+            let qkv_signal = self.async_fence.as_mut().unwrap().advance()
+                .ok_or_else(|| "dynamic ANE qkv fence advance failed".to_string())?;
+            let qkv = self.qkv_channel.as_mut().unwrap()
+                .submit_after(pack_value, qkv_signal).map_err(|e| e.to_string())?;
+            let aux_signal = self.async_fence.as_mut().unwrap().advance()
+                .ok_or_else(|| "dynamic ANE aux fence advance failed".to_string())?;
+            let aux = self.aux_channel.as_mut().unwrap()
+                .submit_after(qkv_signal, aux_signal).map_err(|e| e.to_string())?;
+            let submit_ms = submit_t0.elapsed().as_secs_f64() * 1e3;
+
+            if switch_enabled("QWEN_GDN_ANE_TRACE") {
+                eprintln!(
+                    "qwen4-rs: dynamic ANE async layer={layer} pack_wait={pack_value} qkv_signal={qkv_signal} aux_signal={aux_signal} host_waits=0 submit_ms={submit_ms:.3}"
+                );
+            }
+            Ok(GdnAneDynamicPending { pack, qkv, aux, submit_ms })
+        }
+
+        pub fn gpu_fence(&self) -> Option<&MetalAneFence> {
+            self.async_fence.as_ref()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn evaluate_layer(
+            &mut self,
+            layer: usize,
+            x: &[f32],
+            wqkv: &[u8],
+            wz: &[u8],
+            wa: &[u8],
+            wb: &[u8],
+        ) -> Result<(), String> {
+            if x.len() != self.hidden {
+                return Err("dynamic ANE hidden vector size mismatch".into());
+            }
+            let gpu_pack_enabled = std::env::var("QWEN_GDN_ANE_DYNAMIC_GPU_PACK")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let pack_t0 = Instant::now();
+            let mut pack_gpu_ms = None;
+            if gpu_pack_enabled {
+                if self.metal_packers.len() <= layer {
+                    self.metal_packers.resize_with(layer + 1, || None);
+                }
+                if self.metal_packers[layer].is_none() {
+                    let qkv_dst = unsafe {
+                        MetalSharedSurface::from_iosurface(self.qkv_input.as_raw_iosurface(), self.qkv_input.len())
+                    };
+                    let aux_dst = unsafe {
+                        MetalSharedSurface::from_iosurface(self.aux_input.as_raw_iosurface(), self.aux_input.len())
+                    };
+                    if let (Some(qkv_dst), Some(aux_dst)) = (qkv_dst.as_ref(), aux_dst.as_ref()) {
+                        self.metal_packers[layer] = MetalAneDynamicPack::new(
+                            qkv_dst, aux_dst, wqkv, wz, wa, wb,
+                            self.hidden, SPATIAL, self.qkv_rows, self.z_rows, self.ab_rows,
+                            self.qkv_spatial, self.aux_spatial, self.qkv_weight_offset,
+                            self.aux_weight_offsets[0], self.aux_weight_offsets[1],
+                            self.aux_weight_offsets[2],
+                        );
+                    }
+                }
+                if let Some(packer) = self.metal_packers[layer].as_mut() {
+                    pack_gpu_ms = packer.run(x);
+                }
+            }
+            let activation_ms = if pack_gpu_ms.is_some() {
+                0.0
+            } else {
+                self.qkv_input.pack_bf16_transposed_f32(
+                    self.qkv_spatial, self.qkv_weight_offset, wqkv, self.hidden, self.qkv_rows,
+                ).map_err(|e| e.to_string())?;
+                self.aux_input.pack_bf16_transposed_f32(
+                    self.aux_spatial, self.aux_weight_offsets[0], wz, self.hidden, self.z_rows,
+                ).map_err(|e| e.to_string())?;
+                self.aux_input.pack_bf16_transposed_f32(
+                    self.aux_spatial, self.aux_weight_offsets[1], wa, self.hidden, self.ab_rows,
+                ).map_err(|e| e.to_string())?;
+                self.aux_input.pack_bf16_transposed_f32(
+                    self.aux_spatial, self.aux_weight_offsets[2], wb, self.hidden, self.ab_rows,
+                ).map_err(|e| e.to_string())?;
+                let activation_t0 = Instant::now();
+                self.qkv_input.write_repeated_f32(self.qkv_spatial, SPATIAL, x).map_err(|e| e.to_string())?;
+                self.aux_input.write_repeated_f32(self.aux_spatial, SPATIAL, x).map_err(|e| e.to_string())?;
+                activation_t0.elapsed().as_secs_f64() * 1e3
+            };
+            let pack_ms = pack_t0.elapsed().as_secs_f64() * 1e3;
+
+            let qkv_req = AneRequest::new(&[&self.qkv_input], &[&self.qkv], 0).map_err(|e| e.to_string())?;
+            let aux_req = AneRequest::new(&[&self.aux_input], &[&self.z, &self.a, &self.b], 0).map_err(|e| e.to_string())?;
+            let eval_t0 = Instant::now();
+            self.qkv_model.evaluate(&qkv_req).map_err(|e| e.to_string())?;
+            let qkv_ms = eval_t0.elapsed().as_secs_f64() * 1e3;
+            let aux_t0 = Instant::now();
+            self.aux_model.evaluate(&aux_req).map_err(|e| e.to_string())?;
+            let aux_ms = aux_t0.elapsed().as_secs_f64() * 1e3;
+            if switch_enabled("QWEN_GDN_ANE_TRACE") {
+                eprintln!(
+                    "qwen4-rs: dynamic ANE GDN layer={layer} pack_ms={pack_ms:.3} pack_gpu_ms={:.3} activation_ms={activation_ms:.3} qkv_ms={qkv_ms:.3} aux_ms={aux_ms:.3}",
+                    pack_gpu_ms.unwrap_or(0.0)
+                );
+            }
+            Ok(())
+        }
+
+        pub fn gpu_surfaces(&self) -> [(*mut std::ffi::c_void, usize); 4] {
+            unsafe {
+                [
+                    (self.qkv.as_raw_iosurface(), self.qkv.len()),
+                    (self.z.as_raw_iosurface(), self.z.len()),
+                    (self.a.as_raw_iosurface(), self.a.len()),
+                    (self.b.as_raw_iosurface(), self.b.len()),
+                ]
+            }
+        }
+
+        pub fn materialize(
+            &self, qkv: &mut [f32], z: &mut [f32], a: &mut [f32], b: &mut [f32],
+        ) -> Result<(), String> {
+            GdnAneLayer::read_column(&self.qkv, self.qkv_rows, qkv)?;
+            GdnAneLayer::read_column(&self.z, self.z_rows, z)?;
+            GdnAneLayer::read_column(&self.a, self.ab_rows, a)?;
+            GdnAneLayer::read_column(&self.b, self.ab_rows, b)
+        }
     }
 
     fn switch_enabled(name: &str) -> bool {
@@ -53,6 +412,10 @@ mod imp {
         std::env::var("QWEN_GDN_ANE_FUSED")
             .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true)
+    }
+
+    fn ephemeral_enabled() -> bool {
+        switch_enabled("QWEN_GDN_ANE_EPHEMERAL")
     }
 
     fn ane_cache_dir() -> Option<PathBuf> {
@@ -256,8 +619,17 @@ mod imp {
                 (None, None)
             };
             let fused = metal_conv.is_some();
+            let native_cache_hit = model.native_cache_hit();
+            let ephemeral = ephemeral_enabled();
+            if ephemeral {
+                let unload_t0 = Instant::now();
+                model.unload().map_err(|e| e.to_string())?;
+                if switch_enabled("QWEN_GDN_ANE_TRACE") {
+                    eprintln!("qwen4-rs: ANE GDN layer {layer} initial unload_ms={:.3}", unload_t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
             eprintln!(
-                "qwen4-rs: ANE GDN layer {layer} ready (bf16->fp16={convert_ms:.1}ms compile={compile_ms:.1}ms load={load_ms:.1}ms fused_conv={fused})"
+                "qwen4-rs: ANE GDN layer {layer} ready (bf16->fp16={convert_ms:.1}ms compile={compile_ms:.1}ms load={load_ms:.1}ms fused_conv={fused} native_cache_hit={native_cache_hit} ephemeral={ephemeral})"
             );
             Ok(Self {
                 model,
@@ -273,6 +645,11 @@ mod imp {
                 z_rows,
                 ab_rows,
                 conv_kernel,
+                gpu_tail: switch_enabled("QWEN_GDN_ANE_GPU_TAIL"),
+                async_fence: None,
+                async_channel: None,
+                async_slow_score: 0,
+                async_samples: 0,
             })
         }
 
@@ -308,6 +685,50 @@ mod imp {
             Ok(())
         }
 
+        fn evaluate_async_signal(&mut self, x: &[f32]) -> Result<AneChannelPending, String> {
+            if !self.gpu_tail {
+                return Err("ANE async GDN requires GPU tail".into());
+            }
+            if !self.model.is_loaded() {
+                let load_t0 = Instant::now();
+                self.model.load().map_err(|e| e.to_string())?;
+                if switch_enabled("QWEN_GDN_ANE_TRACE") {
+                    eprintln!("qwen4-rs: ANE GDN ephemeral reload_ms={:.3}", load_t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            self.write_input(x)?;
+            let signal_value = if let Some(fence) = self.async_fence.as_mut() {
+                fence.advance().ok_or_else(|| "ANE/Metal shared-event value advance failed".to_string())?
+            } else {
+                self.async_fence = MetalAneFence::new(1);
+                if self.async_fence.is_none() {
+                    return Err("Metal shared event unavailable".into());
+                }
+                1
+            };
+            if self.async_channel.is_none() {
+                let fence = self.async_fence.as_ref().unwrap();
+                let submit_mode = if switch_enabled("QWEN_GDN_ANE_ASYNC_REALTIME") { 2 }
+                    else if switch_enabled("QWEN_GDN_ANE_ASYNC_DIRECT") { 1 } else { 0 };
+                let premap = switch_enabled("QWEN_GDN_ANE_ASYNC_PREMAP");
+                self.async_channel = Some(unsafe {
+                    self.model.async_channel(
+                        &[&self.input],
+                        &[&self.qkv, &self.z, &self.a, &self.b],
+                        0,
+                        fence.ane_shared_event(),
+                        submit_mode,
+                        premap,
+                    )
+                }.map_err(|e| e.to_string())?);
+            }
+            self.async_channel
+                .as_mut()
+                .unwrap()
+                .submit(signal_value)
+                .map_err(|e| e.to_string())
+        }
+
         fn evaluate(
             &mut self,
             x: &[f32],
@@ -320,12 +741,23 @@ mod imp {
             let request =
                 AneRequest::new(&[&self.input], &[&self.qkv, &self.z, &self.a, &self.b], 0)
                     .map_err(|e| e.to_string())?;
+            let eval_t0 = Instant::now();
             self.model.evaluate(&request).map_err(|e| e.to_string())?;
+            if switch_enabled("QWEN_GDN_ANE_TRACE") {
+                eprintln!("qwen4-rs: ANE eval sync submissions=1 host_waits=1 evaluate_ms={:.6}", eval_t0.elapsed().as_secs_f64() * 1e3);
+            }
+            if self.gpu_tail {
+                return Ok(());
+            }
             Self::read_column(&self.qkv, self.qkv_rows, qkv)?;
+            self.read_aux(z, a, b)?;
+            Ok(())
+        }
+
+        fn read_aux(&self, z: &mut [f32], a: &mut [f32], b: &mut [f32]) -> Result<(), String> {
             Self::read_column(&self.z, self.z_rows, z)?;
             Self::read_column(&self.a, self.ab_rows, a)?;
-            Self::read_column(&self.b, self.ab_rows, b)?;
-            Ok(())
+            Self::read_column(&self.b, self.ab_rows, b)
         }
 
         fn conv_silu(
@@ -435,6 +867,134 @@ mod imp {
         matches!(state, GdnAneState::Ready(_))
     }
 
+    pub struct GdnAnePending {
+        inner: AneChannelPending,
+        submit_ms: f64,
+    }
+
+    impl GdnAnePending {
+        pub fn submit_ms(&self) -> f64 { self.submit_ms }
+        pub fn finish(self, timeout_ms: u64) -> Result<(), String> {
+            self.inner.finish(timeout_ms).map_err(|e| e.to_string())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_input_async(
+        state: &mut GdnAneState,
+        layer: usize,
+        hidden: usize,
+        qkv_rows: usize,
+        z_rows: usize,
+        ab_rows: usize,
+        wqkv: &[u8],
+        wz: &[u8],
+        wa: &[u8],
+        wb: &[u8],
+        conv_weights: &[f32],
+        conv_kernel: usize,
+        x: &[f32],
+    ) -> Option<GdnAnePending> {
+        if !requested(layer) || matches!(state, GdnAneState::Disabled) {
+            return None;
+        }
+        if !warm(
+            state, layer, hidden, qkv_rows, z_rows, ab_rows,
+            wqkv, wz, wa, wb, conv_weights, conv_kernel,
+        ) {
+            return None;
+        }
+        let GdnAneState::Ready(ready) = state else { return None; };
+        if !ready.gpu_tail { return None; }
+        let trace = switch_enabled("QWEN_GDN_ANE_TRACE");
+        let t0 = Instant::now();
+        match ready.evaluate_async_signal(x) {
+            Ok(inner) => {
+                let submit_ms = t0.elapsed().as_secs_f64() * 1e3;
+                if trace {
+                    eprintln!(
+                        "qwen4-rs: ANE GDN async layer={layer} submissions=1 host_waits=0 submit_ms={submit_ms:.3}"
+                    );
+                }
+                Some(GdnAnePending { inner, submit_ms })
+            }
+            Err(error) => {
+                eprintln!("qwen4-rs: ANE GDN layer {layer} async submit declined: {error}");
+                None
+            }
+        }
+    }
+
+    fn adaptive_enabled() -> bool {
+        std::env::var("QWEN_GDN_ANE_ADAPTIVE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    }
+
+    fn env_ms(name: &str, default: f64) -> f64 {
+        std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(default)
+    }
+
+    /// Feed one completed async ANE->Metal sample into the opt-in path's
+    /// residency circuit breaker. ANE program switches on the M2 can jump from
+    /// ~1-5 ms to 75-150 ms when firmware residency thrashes. Rather than keep
+    /// paying that cost forever, slowly accumulate a penalty and retire only
+    /// persistently slow layers back to the validated Metal path.
+    pub fn report_async_sample(
+        state: &mut GdnAneState,
+        layer: usize,
+        submit_ms: f64,
+        exposed_wait_ms: f64,
+    ) -> bool {
+        if ephemeral_enabled() {
+            if let GdnAneState::Ready(ready) = state {
+                // The pending request and Metal tail have both completed before
+                // this hook. Drop the pre-mapped request object before unload;
+                // the shared-event fence itself can be reused after reload.
+                ready.async_channel = None;
+                let unload_t0 = Instant::now();
+                if let Err(error) = ready.model.unload() {
+                    eprintln!("qwen4-rs: ANE GDN layer {layer} ephemeral unload failed: {error}");
+                    *state = GdnAneState::Disabled;
+                    return true;
+                }
+                if switch_enabled("QWEN_GDN_ANE_TRACE") {
+                    eprintln!("qwen4-rs: ANE GDN layer {layer} ephemeral unload_ms={:.3}", unload_t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            return false;
+        }
+        if !adaptive_enabled() { return false; }
+        let submit_limit = env_ms("QWEN_GDN_ANE_SLOW_SUBMIT_MS", 25.0);
+        let wait_limit = env_ms("QWEN_GDN_ANE_SLOW_WAIT_MS", 25.0);
+        let retire_score = std::env::var("QWEN_GDN_ANE_SLOW_SCORE")
+            .ok().and_then(|v| v.parse::<u32>().ok()).filter(|&v| v > 0).unwrap_or(4);
+        let mut retire = false;
+        let mut score = 0u32;
+        if let GdnAneState::Ready(ready) = state {
+            ready.async_samples = ready.async_samples.saturating_add(1);
+            let slow = submit_ms > submit_limit || exposed_wait_ms > wait_limit;
+            if slow {
+                ready.async_slow_score = ready.async_slow_score.saturating_add(2);
+            } else {
+                ready.async_slow_score = ready.async_slow_score.saturating_sub(1);
+            }
+            score = ready.async_slow_score;
+            retire = ready.async_samples >= 2 && score >= retire_score;
+        }
+        if retire {
+            eprintln!(
+                "qwen4-rs: ANE GDN layer {layer} adaptively retired to Metal \
+                 (submit_ms={submit_ms:.3} exposed_wait_ms={exposed_wait_ms:.3} score={score})"
+            );
+            *state = GdnAneState::Disabled;
+            true
+        } else {
+            false
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn try_input(
         state: &mut GdnAneState,
@@ -486,11 +1046,34 @@ mod imp {
         }
         if let Some(t0) = t0 {
             eprintln!(
-                "qwen4-rs: ANE GDN trace layer={layer} input_ms={:.3}",
-                t0.elapsed().as_secs_f64() * 1e3
+                "qwen4-rs: ANE GDN trace layer={layer} input_ms={:.3} cpu_surface_maps={} cpu_output_bytes={} input_write_bytes={}",
+                t0.elapsed().as_secs_f64() * 1e3,
+                if ready.gpu_tail { 1 } else { 5 },
+                if ready.gpu_tail { 0 } else { (ready.qkv_rows + ready.z_rows + 2 * ready.ab_rows) * 4 },
+                ready.hidden * SPATIAL * 4
             );
         }
         true
+    }
+
+    /// Borrowed raw views; the caller must finish Metal use before mutating or
+    /// dropping this ANE state. No CPU maps are opened here.
+    pub fn gpu_surfaces(state: &GdnAneState) -> Option<[(*mut std::ffi::c_void, usize); 4]> {
+        let GdnAneState::Ready(ready) = state else { return None };
+        if !ready.gpu_tail { return None; }
+        Some([&ready.qkv, &ready.z, &ready.a, &ready.b].map(|s| (unsafe { s.as_raw_iosurface() }, s.len())))
+    }
+
+    pub fn gpu_fence(state: &GdnAneState) -> Option<&MetalAneFence> {
+        let GdnAneState::Ready(ready) = state else { return None };
+        ready.async_fence.as_ref()
+    }
+
+    pub fn materialize(state: &GdnAneState, qkv: &mut [f32], z: &mut [f32], a: &mut [f32], b: &mut [f32]) {
+        let GdnAneState::Ready(ready) = state else { return };
+        GdnAneLayer::read_column(&ready.qkv, ready.qkv_rows, qkv)
+            .and_then(|_| ready.read_aux(z, a, b))
+            .expect("ANE output mapping failed; cannot safely continue inference");
     }
 
     pub fn try_conv_silu(
@@ -516,8 +1099,11 @@ mod imp {
         }
         if let Some(t0) = t0 {
             eprintln!(
-                "qwen4-rs: ANE GDN trace layer={layer} conv_ms={:.3}",
-                t0.elapsed().as_secs_f64() * 1e3
+                "qwen4-rs: ANE GDN trace layer={layer} conv_ms={:.3} cpu_surface_maps={} cpu_output_bytes={} history_write_bytes={}",
+                t0.elapsed().as_secs_f64() * 1e3,
+                1 + usize::from(ready.conv_kernel > 1),
+                ready.qkv_rows * 4,
+                ready.qkv_rows * ready.conv_kernel.saturating_sub(1) * 4
             );
         }
         true
@@ -563,6 +1149,22 @@ mod imp {
         false
     }
 
+    pub struct GdnAnePending;
+    impl GdnAnePending {
+        pub fn submit_ms(&self) -> f64 { 0.0 }
+        pub fn finish(self, _timeout_ms: u64) -> Result<(), String> { Err("ANE unavailable".into()) }
+    }
+    pub fn report_async_sample(
+        _state: &mut GdnAneState, _layer: usize, _submit_ms: f64, _exposed_wait_ms: f64,
+    ) -> bool { false }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_input_async(
+        _state: &mut GdnAneState, _layer: usize, _hidden: usize, _qkv_rows: usize,
+        _z_rows: usize, _ab_rows: usize, _wqkv: &[u8], _wz: &[u8], _wa: &[u8],
+        _wb: &[u8], _conv_weights: &[f32], _conv_kernel: usize, _x: &[f32],
+    ) -> Option<GdnAnePending> { None }
+
     #[allow(clippy::too_many_arguments)]
     pub fn try_input(
         _state: &mut GdnAneState,
@@ -585,6 +1187,9 @@ mod imp {
     ) -> bool {
         false
     }
+
+    pub fn gpu_surfaces(_state: &GdnAneState) -> Option<[(*mut std::ffi::c_void, usize); 4]> { None }
+    pub fn materialize(_state: &GdnAneState, _qkv: &mut [f32], _z: &mut [f32], _a: &mut [f32], _b: &mut [f32]) {}
 
     pub fn try_conv_silu(
         _state: &mut GdnAneState,

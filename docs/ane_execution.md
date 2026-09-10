@@ -62,6 +62,15 @@ Hardware validation on the M2 passed both directions with zero error:
 1. Metal mutates an IOSurface -> ANE consumes the same bytes.
 2. ANE writes an IOSurface -> Metal mutates the same bytes -> CPU observes it.
 
+## GPU-resident ANE continuation experiment
+
+`QWEN_GDN_ANE_GPU_TAIL=1` keeps completed ANE projections on shared surfaces,
+then runs GPU gather, Conv1D, recurrence, gated RMSNorm and BF16 output projection
+in one Metal command buffer. It remains opt-in along with ANE. See
+[the implementation and validation results](ane_async_20260908.md) for numerical
+differences, measured CPU map reduction, cache repair, and the bounded private
+shared-event hardware probe. End-to-end acceleration is not yet established.
+
 ## Synchronization contract
 
 Zero-copy is not synchronization.

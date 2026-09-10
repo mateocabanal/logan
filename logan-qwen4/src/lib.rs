@@ -889,6 +889,10 @@ pub struct Model {
     /// Experimental constant-weight ANE input-projection islands. Each entry
     /// stays uninitialized unless explicitly selected by QWEN_GDN_ANE.
     gdn_ane: Vec<gdn_ane::GdnAneState>,
+    /// Experimental model-global dynamic-weight ANE engine. Two compiled
+    /// programs are shared by every GDN layer when QWEN_GDN_ANE_DYNAMIC=1.
+    gdn_ane_dynamic: Option<gdn_ane::GdnAneDynamicEngine>,
+    gdn_ane_dynamic_failed: bool,
     /// Per-attention-layer Metal BF16 projection buffers (lazy build,
     /// mirror of gdn_metal). QWEN_ATTN_METAL=0 opts out.
     attn_metal: Vec<Option<AttnMetalLayer>>,
@@ -2536,6 +2540,14 @@ impl Model {
         {
             return;
         }
+        // Dynamic-weight ANE uses two model-global programs for every GDN
+        // layer. Warming the old per-layer constant programs here defeats the
+        // entire residency experiment and can consume several GiB / trigger
+        // firmware model-switch thrash before decode even starts.
+        if gdn_ane::dynamic_enabled() {
+            eprintln!("qwen4-rs: dynamic ANE GDN selected; skipping per-layer ANE warmup");
+            return;
+        }
 
         let cfg = self.cfg.clone();
         let kd = cfg.lin_k_dim;
@@ -3019,7 +3031,11 @@ impl Model {
             || std::env::var("QWEN_PROFILE_GDN_PARTS")
                 .map(|v| v != "0")
                 .unwrap_or(false);
-        let ane_requested = gdn_ane::requested(li);
+        let ane_requested_any = gdn_ane::requested(li);
+        let dynamic_ane_requested = ane_requested_any && gdn_ane::dynamic_enabled();
+        // Existing per-layer constant-weight ANE path stays independently
+        // selectable; dynamic mode must not compile 36 constant programs too.
+        let ane_requested = ane_requested_any && !dynamic_ane_requested;
 
         // One-time aligned re-home (C calloc_checked/coli_wt intercept): move
         // the five BF16 GDN matrices into 16 KiB-aligned buffers so Metal can
@@ -3045,6 +3061,133 @@ impl Model {
             }
             self.gdn_metal[li] = built;
         }
+        // Model-global dynamic-weight ANE path. Two compiled programs are
+        // shared by every GDN layer: qkv and z+a+b. BF16 checkpoint weights are
+        // transposed/expanded into two reusable fp32 IOSurfaces immediately
+        // before evaluation. This deliberately runs before the pure-Metal
+        // branch so a clean pre-submit failure can fall back without state loss.
+        if dynamic_ane_requested && !self.gdn_ane_dynamic_failed {
+            if self.gdn_ane_dynamic.is_none() {
+                match gdn_ane::GdnAneDynamicEngine::build(c.hidden, cdim, vdim, vheads) {
+                    Ok(engine) => self.gdn_ane_dynamic = Some(engine),
+                    Err(error) => {
+                        eprintln!("qwen4-rs: dynamic ANE GDN disabled: {error}");
+                        self.gdn_ane_dynamic_failed = true;
+                    }
+                }
+            }
+            if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
+                let wqkv = unsafe { std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2) };
+                let wz = unsafe { std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2) };
+                let wa = unsafe { std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2) };
+                let wb = unsafe { std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2) };
+                let input_t0 = std::time::Instant::now();
+                if gdn_ane::dynamic_async_enabled() {
+                    let submitted = self.gdn_ane_dynamic.as_mut().map(|engine|
+                        engine.evaluate_layer_async(li, x, wqkv, wz, wa, wb)
+                    );
+                    match submitted {
+                        Some(Ok(dynamic_pending)) => {
+                            let input_ms = input_t0.elapsed().as_secs_f64() * 1e3;
+                            let dynamic_submit_ms = dynamic_pending.submit_ms();
+                            let engine = self.gdn_ane_dynamic.as_ref().unwrap();
+                            let surfaces = engine.gpu_surfaces();
+                            let fence = engine.gpu_fence()
+                                .expect("dynamic ANE async submission lost its shared fence");
+                            let metal_pending = unsafe {
+                                crate::ffi::gdn_ane_token_begin(
+                                    self.metal_model_id, li, surfaces, 16, Some(fence),
+                                    wqkv, wz, wa, wb,
+                                    std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                                    &layer.gdn_a_log, &layer.gdn_dt_bias,
+                                    &layer.gdn_conv1d, &layer.gdn_norm,
+                                    std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
+                                    std::slice::from_raw_parts_mut(
+                                        gm.conv_state, cdim * kk.saturating_sub(1),
+                                    ),
+                                    c.hidden, kheads, kd, vheads, vd, kk,
+                                    c.output_gate.gdn_metal_code(), c.eps,
+                                )
+                            };
+                            if let Some(metal_pending) = metal_pending {
+                                self.prefetch_previous_route_now(li);
+                                let wait_t0 = std::time::Instant::now();
+                                let rc = crate::ffi::gdn_token_finish(metal_pending, out);
+                                let exposed_wait_ms = wait_t0.elapsed().as_secs_f64() * 1e3;
+                                let pack_gpu_ms = dynamic_pending.finish(2_000)
+                                    .unwrap_or_else(|error| panic!(
+                                        "dynamic async ANE GDN failed after submission at layer {li}: {error}"
+                                    ));
+                                if std::env::var("QWEN_GDN_ANE_TRACE")
+                                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                                    .unwrap_or(false)
+                                {
+                                    eprintln!(
+                                        "qwen4-rs: dynamic ANE chain layer={li} submit_ms={dynamic_submit_ms:.3} pack_gpu_ms={pack_gpu_ms:.3} exposed_wait_ms={exposed_wait_ms:.3} host_interdevice_waits=0"
+                                    );
+                                }
+                                if rc > 0 {
+                                    self.spans.gdn_metal_ok += 1;
+                                    if profile_gdn_parts { self.spans.gdn_in_proj_ms += input_ms; }
+                                    return;
+                                }
+                                panic!("dynamic async ANE GPU GDN tail failed after submission at layer {li}");
+                            }
+                            // The GPU tail declined before recurrent state was
+                            // submitted. Drain the ANE chain, then retry through
+                            // the established synchronous dynamic path below.
+                            if let Err(error) = dynamic_pending.finish(2_000) {
+                                eprintln!("qwen4-rs: dynamic async ANE layer {li} pre-tail failure: {error}; retrying synchronous path");
+                            }
+                        }
+                        Some(Err(error)) => {
+                            eprintln!("qwen4-rs: dynamic async ANE layer {li} declined: {error}; retrying synchronous path");
+                        }
+                        None => {}
+                    }
+                }
+
+                let evaluated = self.gdn_ane_dynamic.as_mut().map(|engine|
+                    engine.evaluate_layer(li, x, wqkv, wz, wa, wb)
+                );
+                match evaluated {
+                    Some(Ok(())) => {
+                        let input_ms = input_t0.elapsed().as_secs_f64() * 1e3;
+                        let surfaces = self.gdn_ane_dynamic.as_ref().unwrap().gpu_surfaces();
+                        let rc = unsafe {
+                            crate::ffi::gdn_ane_token(
+                                self.metal_model_id, li, surfaces, 16, out,
+                                wqkv, wz, wa, wb,
+                                std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                                &layer.gdn_a_log, &layer.gdn_dt_bias,
+                                &layer.gdn_conv1d, &layer.gdn_norm,
+                                std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
+                                std::slice::from_raw_parts_mut(
+                                    gm.conv_state, cdim * kk.saturating_sub(1),
+                                ),
+                                c.hidden, kheads, kd, vheads, vd, kk,
+                                c.output_gate.gdn_metal_code(), c.eps,
+                            )
+                        };
+                        if rc > 0 {
+                            self.spans.gdn_metal_ok += 1;
+                            if profile_gdn_parts { self.spans.gdn_in_proj_ms += input_ms; }
+                            return;
+                        }
+                        if rc < 0 {
+                            panic!("dynamic ANE GPU GDN tail failed after submission at layer {li}");
+                        }
+                        // Native tail declined before mutating recurrent state;
+                        // pure Metal/CPU paths below may safely recompute.
+                    }
+                    Some(Err(error)) => {
+                        eprintln!("qwen4-rs: dynamic ANE GDN layer {li} declined: {error}");
+                    }
+                    None => {}
+                }
+            }
+        }
+
         // Metal direct path (C QWEN_GDN_METAL default ON): the coalesced
         // kernels consume the page-aligned re-home above; rc semantics per
         // C contract (0=decline pre-submit, <0 = fatal post-submit). The
@@ -3175,7 +3318,100 @@ impl Model {
         let mut z = vec![0.0; vdim];
         let gdn_in_t0 = profile_gdn_parts.then(std::time::Instant::now);
 
-        let ane_ok = if ane_requested {
+        // True device-to-device ANE -> Metal path. The CPU submits ANE with a
+        // Metal-owned shared event, then commits the GPU tail with an encoded
+        // wait on that event. No host completion occurs between accelerators.
+        // Keep it independently opt-in until end-to-end performance is stable.
+        let ane_async_enabled = std::env::var("QWEN_GDN_ANE_ASYNC")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        let mut ane_async_materialized = false;
+        if ane_requested && ane_async_enabled {
+            if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
+                let ane_pending = unsafe {
+                    gdn_ane::try_input_async(
+                        &mut self.gdn_ane[li],
+                        li,
+                        c.hidden,
+                        cdim,
+                        vdim,
+                        vheads,
+                        std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                        std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                        &layer.gdn_conv1d,
+                        kk,
+                        x,
+                    )
+                };
+                if let Some(ane_pending) = ane_pending {
+                    if let (Some(surfaces), Some(fence)) = (
+                        gdn_ane::gpu_surfaces(&self.gdn_ane[li]),
+                        gdn_ane::gpu_fence(&self.gdn_ane[li]),
+                    ) {
+                        let metal_pending = unsafe {
+                            crate::ffi::gdn_ane_token_begin(
+                                self.metal_model_id, li, surfaces, 16, Some(fence),
+                                    std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                                    std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                                    std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                                    std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                                    std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                                    &layer.gdn_a_log, &layer.gdn_dt_bias,
+                                    &layer.gdn_conv1d, &layer.gdn_norm,
+                                    std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
+                                    std::slice::from_raw_parts_mut(gm.conv_state, cdim * kk.saturating_sub(1)),
+                                    c.hidden, kheads, kd, vheads, vd, kk,
+                                    c.output_gate.gdn_metal_code(), c.eps,
+                                )
+                            };
+                            if let Some(metal_pending) = metal_pending {
+                                // This host work is independent of the current
+                                // GDN result and now overlaps the ANE->GPU chain.
+                                self.prefetch_previous_route_now(li);
+                                let ane_submit_ms = ane_pending.submit_ms();
+                                let wait_t0 = std::time::Instant::now();
+                                let rc = crate::ffi::gdn_token_finish(metal_pending, out);
+                                let exposed_wait_ms = wait_t0.elapsed().as_secs_f64() * 1e3;
+                                let ane_done = ane_pending.finish(2_000);
+                                if let Err(error) = ane_done {
+                                    panic!("async ANE GDN failed after submission at layer {li}: {error}");
+                                }
+                                gdn_ane::report_async_sample(
+                                    &mut self.gdn_ane[li], li, ane_submit_ms, exposed_wait_ms,
+                                );
+                                if rc > 0 {
+                                    self.spans.gdn_metal_ok += 1;
+                                    return;
+                                }
+                                if rc < 0 {
+                                    panic!("async ANE->Metal GDN tail failed after submission at layer {li}");
+                                }
+                            } else {
+                                // Metal declined before submission. ANE may
+                                // still be running, so retire it and materialize
+                                // its valid outputs before using the scalar tail.
+                                match ane_pending.finish(2_000) {
+                                    Ok(()) => {
+                                        gdn_ane::materialize(
+                                            &self.gdn_ane[li], &mut qkv, &mut z, &mut a, &mut b,
+                                        );
+                                        ane_async_materialized = true;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("qwen4-rs: async ANE pre-tail failure at layer {li}: {error}; retrying synchronous path");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        let ane_ok = if ane_async_materialized {
+            true
+        } else if ane_requested {
             if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
                 // SAFETY: GdnMetalLayer owns these exact-length model-lifetime
                 // BF16 buffers. ANE compilation consumes them as immutable
@@ -3207,6 +3443,44 @@ impl Model {
         } else {
             false
         };
+
+        if ane_ok {
+            if let Some(surfaces) = gdn_ane::gpu_surfaces(&self.gdn_ane[li]) {
+                let input_ms = gdn_in_t0.map(|t| t.elapsed().as_secs_f64() * 1e3);
+                let rc = if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
+                    // ANE evaluation has completed. Native code retains these
+                    // surfaces until its GPU gather/recur/output command retires.
+                    // Both ANE and model-owned aligned state remain alive and
+                    // untouched throughout this synchronous tail call.
+                    unsafe {
+                        crate::ffi::gdn_ane_token(
+                            self.metal_model_id, li, surfaces, 16, out,
+                            std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                            std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                            &layer.gdn_a_log, &layer.gdn_dt_bias,
+                            &layer.gdn_conv1d, &layer.gdn_norm,
+                            std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
+                            std::slice::from_raw_parts_mut(gm.conv_state, cdim * kk.saturating_sub(1)),
+                            c.hidden, kheads, kd, vheads, vd, kk,
+                            c.output_gate.gdn_metal_code(), c.eps,
+                        )
+                    }
+                } else { 0 };
+                if rc > 0 {
+                    self.spans.gdn_metal_ok += 1;
+                    if let Some(ms) = input_ms { self.spans.gdn_in_proj_ms += ms; }
+                    return;
+                }
+                if rc < 0 {
+                    panic!("ANE GPU GDN tail failed after submission at layer {li}; recurrent state may have advanced");
+                }
+                // A pre-submit decline has not changed recurrent/conv state.
+                gdn_ane::materialize(&self.gdn_ane[li], &mut qkv, &mut z, &mut a, &mut b);
+            }
+        }
 
         if !ane_ok {
             if let Some(gm) = self.gdn_metal[li].as_mut().filter(|gm| gm.bf16_weights) {
@@ -6337,6 +6611,8 @@ impl Model {
             gdn_ane: (0..cfg.layers)
                 .map(|_| gdn_ane::GdnAneState::default())
                 .collect(),
+            gdn_ane_dynamic: None,
+            gdn_ane_dynamic_failed: false,
             attn_metal: (0..cfg.layers).map(|_| None).collect(),
             sched_mode: false,
             sched_blocked: None,

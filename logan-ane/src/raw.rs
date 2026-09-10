@@ -387,6 +387,20 @@ pub(crate) unsafe fn msg_unload(receiver: Id, sel: Sel, qos: u32, error: *mut Id
     unsafe { f(receiver, sel, qos, error) != 0 }
 }
 
+#[inline]
+pub(crate) unsafe fn msg_client_load(
+    receiver: Id,
+    sel: Sel,
+    model: Id,
+    options: Id,
+    qos: u32,
+    error: *mut Id,
+) -> bool {
+    let f: unsafe extern "C" fn(Id, Sel, Id, Id, u32, *mut Id) -> u8 =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(receiver, sel, model, options, qos, error) != 0 }
+}
+
 pub(crate) unsafe fn msg_client_evaluate(
     receiver: Id,
     sel: Sel,

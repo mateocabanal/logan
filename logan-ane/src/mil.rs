@@ -660,6 +660,99 @@ pub fn parallel_dense_packed_dynamic_fp16_f32_io(
     ))
 }
 
+/// Build the hardware-qualified packed dynamic dense contract used by current
+/// ANE reverse-engineering kernels: one **fp32** IOSurface contains both the
+/// activation tile and transposed fp32 weights. The graph casts the entire
+/// packed tensor to fp16 internally, performs the matmul(s), and casts outputs
+/// back to fp32. On the validated M2 this boundary contract is materially
+/// different from an fp16 IOSurface input: the latter is rejected at evaluate
+/// time with ANE status 0x1d.
+///
+/// Packed memory for input channel `i` is:
+/// `x[i, 0..S], W0^T[i, 0..O0], W1^T[i, 0..O1], ...`.
+pub fn parallel_dense_packed_dynamic_f32_io(
+    in_features: usize,
+    token_spatial: usize,
+    out_features: &[usize],
+) -> Result<(MilProgram, PackedDenseLayout)> {
+    if in_features == 0 || token_spatial == 0 || out_features.is_empty() {
+        return Err(AneError::InvalidArgument(
+            "packed dynamic f32 dense requires non-zero input/spatial dimensions and projections"
+                .into(),
+        ));
+    }
+    if out_features.iter().any(|&out| out == 0) {
+        return Err(AneError::InvalidArgument(
+            "packed dynamic f32 projection output sizes must be non-zero".into(),
+        ));
+    }
+
+    let mut weight_offsets = Vec::with_capacity(out_features.len());
+    let mut total_spatial = token_spatial;
+    for &out in out_features {
+        weight_offsets.push(total_spatial);
+        total_spatial = total_spatial
+            .checked_add(out)
+            .ok_or_else(|| AneError::InvalidArgument("packed dynamic f32 spatial overflow".into()))?;
+    }
+
+    let mut body = String::from(
+        "program(1.3)\n\
+[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]\n\
+{\n",
+    );
+    body.push_str(&format!(
+        " func main<ios18>(tensor<fp32, [1, {in_features}, 1, {total_spatial}]> x) {{\n"
+    ));
+    // Match the upstream hardware-qualified contract: cast the complete packed
+    // IOSurface once, then slice activation/weight regions from the fp16 tensor.
+    body.push_str(&format!(
+        "  string to16 = const()[name = string(\"to16\"), val = string(\"fp16\")];\n\
+  tensor<fp16, [1, {in_features}, 1, {total_spatial}]> xh = cast(dtype = to16, x = x)[name = string(\"cin\")];\n\
+  tensor<int32, [4]> ba = const()[name = string(\"ba\"), val = tensor<int32, [4]>([0,0,0,0])];\n\
+  tensor<int32, [4]> sa = const()[name = string(\"sa\"), val = tensor<int32, [4]>([1,{in_features},1,{token_spatial}])];\n\
+  tensor<fp16, [1,{in_features},1,{token_spatial}]> act = slice_by_size(x=xh,begin=ba,size=sa)[name=string(\"act\")];\n\
+  tensor<int32, [4]> ra = const()[name = string(\"ra\"), val = tensor<int32, [4]>([1,1,{in_features},{token_spatial}])];\n\
+  tensor<fp16, [1,1,{in_features},{token_spatial}]> a2 = reshape(shape=ra,x=act)[name=string(\"a2\")];\n\
+  tensor<int32, [4]> pm = const()[name = string(\"pm\"), val = tensor<int32, [4]>([0,1,3,2])];\n\
+  tensor<fp16, [1,1,{token_spatial},{in_features}]> a3 = transpose(perm=pm,x=a2)[name=string(\"a3\")];\n"
+    ));
+
+    for (idx, (&out, &offset)) in out_features.iter().zip(&weight_offsets).enumerate() {
+        body.push_str(&format!(
+            "  tensor<int32, [4]> bw{idx} = const()[name = string(\"bw{idx}\"), val = tensor<int32, [4]>([0,0,0,{offset}])];\n\
+  tensor<int32, [4]> sw{idx} = const()[name = string(\"sw{idx}\"), val = tensor<int32, [4]>([1,{in_features},1,{out}])];\n\
+  tensor<fp16, [1,{in_features},1,{out}]> wt{idx} = slice_by_size(x=xh,begin=bw{idx},size=sw{idx})[name=string(\"wt{idx}\")];\n\
+  tensor<int32, [4]> rw{idx} = const()[name = string(\"rw{idx}\"), val = tensor<int32, [4]>([1,1,{in_features},{out}])];\n\
+  tensor<fp16, [1,1,{in_features},{out}]> W{idx} = reshape(shape=rw{idx},x=wt{idx})[name=string(\"W{idx}\")];\n\
+  bool bF{idx} = const()[name = string(\"bF{idx}\"), val = bool(false)];\n\
+  tensor<fp16, [1,1,{token_spatial},{out}]> yh{idx} = matmul(transpose_x=bF{idx},transpose_y=bF{idx},x=a3,y=W{idx})[name=string(\"mm{idx}\")];\n\
+  tensor<fp16, [1,1,{out},{token_spatial}]> yt{idx} = transpose(perm=pm,x=yh{idx})[name=string(\"yt{idx}\")];\n\
+  tensor<int32, [4]> ro{idx} = const()[name = string(\"ro{idx}\"), val = tensor<int32, [4]>([1,{out},1,{token_spatial}])];\n\
+  tensor<fp16, [1,{out},1,{token_spatial}]> yr{idx} = reshape(shape=ro{idx},x=yt{idx})[name=string(\"yr{idx}\")];\n\
+  string to32_{idx} = const()[name = string(\"to32_{idx}\"), val = string(\"fp32\")];\n\
+  tensor<fp32, [1,{out},1,{token_spatial}]> y{idx} = cast(dtype=to32_{idx},x=yr{idx})[name=string(\"cout{idx}\")];\n"
+        ));
+    }
+
+    let outputs = (0..out_features.len())
+        .map(|idx| format!("y{idx}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    body.push_str(&format!(" }} -> ({outputs});\n}}\n"));
+
+    Ok((
+        MilProgram::new(body),
+        PackedDenseLayout {
+            in_features,
+            token_spatial,
+            total_spatial,
+            weight_offsets,
+            out_features: out_features.to_vec(),
+        },
+    ))
+}
+
 /// Build a reusable single-input dynamic dense island.
 ///
 /// The fp16 input is `[1, I, 1, S + sum(O_n)]`. For every input channel, the

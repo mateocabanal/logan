@@ -8,6 +8,19 @@ use crate::{AneError, Result};
 use logan_core::shared::{
     DeviceVisibility, SharedAllocationDesc, SharedAllocationId, SharedMemoryKind,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "logan_ane_async", kind = "static")]
+unsafe extern "C" {
+    fn logan_ane_surface_pack_bf16_transposed_f32(
+        raw_surface: *mut c_void, total_spatial: usize, weight_offset: usize,
+        src: *const u16, in_features: usize, out_features: usize,
+    ) -> i32;
+    fn logan_ane_surface_write_repeated_f32(
+        raw_surface: *mut c_void, total_spatial: usize, token_spatial: usize,
+        x: *const f32, in_features: usize,
+    ) -> i32;
+}
+
 
 /// IOSurface-backed memory that can be shared with ANE without an extra copy.
 pub struct AneSurface {
@@ -121,6 +134,33 @@ impl AneSurface {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect())
+    }
+
+    /// Blocked NEON BF16 [O,I] -> fp32 W^T [I,O] pack into a dynamic-weight region.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn pack_bf16_transposed_f32(
+        &mut self, total_spatial: usize, weight_offset: usize,
+        weights_bf16: &[u8], in_features: usize, out_features: usize,
+    ) -> Result<()> {
+        let want = in_features.checked_mul(out_features).and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| AneError::InvalidArgument("BF16 pack shape overflow".into()))?;
+        if weights_bf16.len() != want || weights_bf16.as_ptr() as usize % 2 != 0 {
+            return Err(AneError::InvalidArgument("BF16 pack byte size/alignment mismatch".into()));
+        }
+        let ok = unsafe { logan_ane_surface_pack_bf16_transposed_f32(
+            self.raw.cast(), total_spatial, weight_offset, weights_bf16.as_ptr().cast(),
+            in_features, out_features) };
+        if ok == 1 { Ok(()) } else { Err(AneError::Surface { operation: "pack BF16 transpose", code: ok }) }
+    }
+
+    /// Update only the repeated decode-token tile in a packed dynamic surface.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn write_repeated_f32(
+        &mut self, total_spatial: usize, token_spatial: usize, x: &[f32],
+    ) -> Result<()> {
+        let ok = unsafe { logan_ane_surface_write_repeated_f32(
+            self.raw.cast(), total_spatial, token_spatial, x.as_ptr(), x.len()) };
+        if ok == 1 { Ok(()) } else { Err(AneError::Surface { operation: "write repeated f32", code: ok }) }
     }
 
     /// Borrow the underlying `IOSurfaceRef` for interoperability with Metal,

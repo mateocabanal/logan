@@ -42,6 +42,74 @@ mod imp {
         _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
     }
 
+    /// One device-visible event shared by ANE and Metal. Metal owns the
+    /// `MTLSharedEvent`; `ane_shared_event` is its private IOSurfaceSharedEvent
+    /// backing, borrowed by the ANE request while this handle lives.
+    pub struct MetalAneFence {
+        handle: *mut c_void,
+        ane_shared_event: *mut c_void,
+        value: u64,
+        _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    /// Reusable Metal packer for the model-global dynamic-weight ANE GDN path.
+    /// It zero-copy wraps one layer's aligned BF16 qkv/z/a/b matrices and
+    /// writes the transposed fp32 packed layout directly into ANE IOSurfaces.
+    pub struct MetalAneDynamicPack {
+        handle: *mut c_void,
+        hidden: usize,
+        _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    pub struct MetalAneDynamicPackPending {
+        raw: Option<std::ptr::NonNull<c_void>>,
+        _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl MetalAneFence {
+        pub fn new(value: u64) -> Option<Self> {
+            if value == 0 { return None; }
+            let mut shared = std::ptr::null_mut();
+            let handle = unsafe { coli_apple8_metalio_ane_fence_create(value, &mut shared) };
+            if handle.is_null() || shared.is_null() {
+                if !handle.is_null() { unsafe { coli_apple8_metalio_ane_fence_free(handle) }; }
+                return None;
+            }
+            Some(Self {
+                handle,
+                ane_shared_event: shared,
+                value,
+                _not_send_sync: std::marker::PhantomData,
+            })
+        }
+
+        pub fn ane_shared_event(&self) -> *mut c_void { self.ane_shared_event }
+        /// Borrow the underlying MTLSharedEvent for Metal command encoding.
+        /// Lifetime is tied to this fence; native pending objects retain it.
+        pub fn metal_shared_event(&self) -> *mut c_void {
+            unsafe { coli_apple8_metalio_ane_fence_metal_event(self.handle) }
+        }
+        pub fn value(&self) -> u64 { self.value }
+        pub fn advance(&mut self) -> Option<u64> {
+            let next = self.value.checked_add(1)?;
+            if unsafe { coli_apple8_metalio_ane_fence_set_value(self.handle, next) } != 1 {
+                return None;
+            }
+            self.value = next;
+            Some(next)
+        }
+        fn raw_handle(&self) -> *mut c_void { self.handle }
+    }
+
+    impl Drop for MetalAneFence {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { coli_apple8_metalio_ane_fence_free(self.handle) };
+                self.handle = std::ptr::null_mut();
+            }
+        }
+    }
+
     #[repr(C)]
     struct ColiMetalMatmulDescRaw {
         tensor: *mut ColiMetalTensor,
@@ -82,6 +150,36 @@ mod imp {
         fn logan_metal_shared_surface_contents(handle: *mut c_void) -> *mut c_void;
         fn logan_metal_shared_surface_length(handle: *mut c_void) -> usize;
         fn logan_metal_shared_surface_allocation_length(handle: *mut c_void) -> usize;
+        fn logan_metal_ane_dynamic_pack_create(
+            qkv_surface: *mut c_void,
+            aux_surface: *mut c_void,
+            wqkv: *const u16,
+            wz: *const u16,
+            wa: *const u16,
+            wb: *const u16,
+            hidden: u32,
+            spatial: u32,
+            qkv_rows: u32,
+            z_rows: u32,
+            ab_rows: u32,
+            qkv_stride: u32,
+            aux_stride: u32,
+            qkv_offset: u32,
+            z_offset: u32,
+            a_offset: u32,
+            b_offset: u32,
+        ) -> *mut c_void;
+        fn logan_metal_ane_dynamic_pack_run(
+            handle: *mut c_void,
+            x: *const f32,
+            gpu_ms: *mut f64,
+        ) -> i32;
+        fn logan_metal_ane_dynamic_pack_begin(
+            handle: *mut c_void, x: *const f32, signal_event: *mut c_void, signal_value: u64,
+        ) -> *mut c_void;
+        fn logan_metal_ane_dynamic_pack_finish(pending: *mut c_void, gpu_ms: *mut f64) -> i32;
+        fn logan_metal_ane_dynamic_pack_discard(pending: *mut c_void);
+        fn logan_metal_ane_dynamic_pack_free(handle: *mut c_void);
         fn logan_metal_gdn_conv_silu_create(
             input_handle: *mut c_void,
             output_handle: *mut c_void,
@@ -91,6 +189,8 @@ mod imp {
             kernel: usize,
         ) -> *mut c_void;
         fn logan_metal_gdn_conv_silu_run(handle: *mut c_void) -> i32;
+        fn logan_metal_gdn_conv_silu_begin(handle: *mut c_void) -> *mut c_void;
+        fn logan_metal_gdn_conv_silu_finish(handle: *mut c_void, gpu_ms: *mut f64) -> i32;
         fn logan_metal_gdn_conv_silu_free(handle: *mut c_void);
 
         pub fn coli_metal_init() -> i32;
@@ -339,6 +439,117 @@ mod imp {
         }
     }
 
+
+    impl MetalAneDynamicPack {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            qkv_dst: &MetalSharedSurface,
+            aux_dst: &MetalSharedSurface,
+            wqkv: &[u8],
+            wz: &[u8],
+            wa: &[u8],
+            wb: &[u8],
+            hidden: usize,
+            spatial: usize,
+            qkv_rows: usize,
+            z_rows: usize,
+            ab_rows: usize,
+            qkv_stride: usize,
+            aux_stride: usize,
+            qkv_offset: usize,
+            z_offset: usize,
+            a_offset: usize,
+            b_offset: usize,
+        ) -> Option<Self> {
+            if hidden == 0 || spatial == 0 || qkv_rows == 0 || z_rows == 0 || ab_rows == 0 ||
+                wqkv.len() != qkv_rows.checked_mul(hidden)?.checked_mul(2)? ||
+                wz.len() != z_rows.checked_mul(hidden)?.checked_mul(2)? ||
+                wa.len() != ab_rows.checked_mul(hidden)?.checked_mul(2)? ||
+                wb.len() != ab_rows.checked_mul(hidden)?.checked_mul(2)? {
+                return None;
+            }
+            let cv = |v: usize| u32::try_from(v).ok();
+            let handle = unsafe {
+                logan_metal_ane_dynamic_pack_create(
+                    qkv_dst.handle, aux_dst.handle,
+                    wqkv.as_ptr().cast(), wz.as_ptr().cast(), wa.as_ptr().cast(), wb.as_ptr().cast(),
+                    cv(hidden)?, cv(spatial)?, cv(qkv_rows)?, cv(z_rows)?, cv(ab_rows)?,
+                    cv(qkv_stride)?, cv(aux_stride)?, cv(qkv_offset)?, cv(z_offset)?,
+                    cv(a_offset)?, cv(b_offset)?,
+                )
+            };
+            if handle.is_null() { return None; }
+            Some(Self { handle, hidden, _not_send_sync: std::marker::PhantomData })
+        }
+
+        /// Commit the pack and signal the shared event when both ANE input surfaces are complete.
+        pub fn begin(&mut self, x: &[f32], fence: &MetalAneFence) -> Option<MetalAneDynamicPackPending> {
+            if x.len() != self.hidden || fence.value() == 0 { return None; }
+            let event = fence.metal_shared_event();
+            if event.is_null() { return None; }
+            let raw = unsafe { logan_metal_ane_dynamic_pack_begin(self.handle, x.as_ptr(), event, fence.value()) };
+            Some(MetalAneDynamicPackPending {
+                raw: Some(std::ptr::NonNull::new(raw)?),
+                _not_send_sync: std::marker::PhantomData,
+            })
+        }
+
+        /// Fill both dynamic-ANE packed IOSurfaces and wait for Metal completion.
+        /// Returns actual GPU execution milliseconds; callers can separately
+        /// measure exposed host wall time to diagnose queue/residency stalls.
+        pub fn run(&mut self, x: &[f32]) -> Option<f64> {
+            if x.len() != self.hidden { return None; }
+            let mut gpu_ms = 0.0;
+            let rc = unsafe { logan_metal_ane_dynamic_pack_run(self.handle, x.as_ptr(), &mut gpu_ms) };
+            (rc > 0).then_some(gpu_ms)
+        }
+    }
+
+    impl MetalAneDynamicPackPending {
+        pub fn finish(mut self) -> Option<f64> {
+            let raw = self.raw.take()?; let mut gpu_ms=0.0;
+            let rc=unsafe { logan_metal_ane_dynamic_pack_finish(raw.as_ptr(), &mut gpu_ms) };
+            (rc > 0).then_some(gpu_ms)
+        }
+    }
+    impl Drop for MetalAneDynamicPackPending {
+        fn drop(&mut self) { if let Some(raw)=self.raw.take() { unsafe { logan_metal_ane_dynamic_pack_discard(raw.as_ptr()) } } }
+    }
+
+    impl Drop for MetalAneDynamicPack {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { logan_metal_ane_dynamic_pack_free(self.handle) };
+                self.handle = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Owns a committed command and borrows its continuation exclusively.
+    /// Drop drains execution; native ownership also retains both IOSurfaces.
+    #[must_use]
+    pub struct MetalGdnConvPending<'a> {
+        handle: *mut c_void,
+        _owner: std::marker::PhantomData<&'a mut MetalGdnConvSilu>,
+    }
+
+    impl MetalGdnConvPending<'_> {
+        pub fn finish(mut self) -> (bool, f64) {
+            let mut gpu_ms = 0.0;
+            let ok = unsafe { logan_metal_gdn_conv_silu_finish(self.handle, &mut gpu_ms) == 1 };
+            self.handle = std::ptr::null_mut();
+            (ok, gpu_ms)
+        }
+    }
+
+    impl Drop for MetalGdnConvPending<'_> {
+        fn drop(&mut self) {
+            if !self.handle.is_null() {
+                unsafe { logan_metal_gdn_conv_silu_finish(self.handle, std::ptr::null_mut()); }
+            }
+        }
+    }
+
     impl MetalGdnConvSilu {
         pub fn new(
             input: &MetalSharedSurface,
@@ -376,6 +587,17 @@ mod imp {
                     _not_send_sync: std::marker::PhantomData,
                 })
             }
+        }
+
+        /// # Safety
+        /// External owners must not map or mutate the imported input/output
+        /// surfaces until the returned ticket finishes or is dropped.
+        pub unsafe fn begin(&mut self) -> Option<MetalGdnConvPending<'_>> {
+            let handle = unsafe { logan_metal_gdn_conv_silu_begin(self.handle) };
+            (!handle.is_null()).then_some(MetalGdnConvPending {
+                handle,
+                _owner: std::marker::PhantomData,
+            })
         }
 
         pub fn run(&mut self) -> bool {
@@ -1615,6 +1837,13 @@ mod imp {
         ) -> i32;
         // GDN (coalesced Metal kernels, qwen_moe.c seam contract)
         pub fn coli_apple8_metalio_gdn_drop_model(model_id: u64);
+        pub fn coli_apple8_metalio_ane_fence_create(
+            value: u64,
+            shared_backing_out: *mut *mut c_void,
+        ) -> *mut c_void;
+        pub fn coli_apple8_metalio_ane_fence_set_value(handle: *mut c_void, value: u64) -> i32;
+        pub fn coli_apple8_metalio_ane_fence_metal_event(handle: *mut c_void) -> *mut c_void;
+        pub fn coli_apple8_metalio_ane_fence_free(handle: *mut c_void);
         pub fn coli_apple8_metalio_gdn_begin(
             model_id: u64,
             layer: i32,
@@ -1638,6 +1867,36 @@ mod imp {
             kk: i32,
             output_gate: i32,
             eps: f32,
+            pending_out: *mut *mut c_void,
+        ) -> i32;
+        pub fn coli_apple8_metalio_gdn_ane_begin(
+            model_id: u64,
+            layer: i32,
+            qkv_surface: *mut c_void, qkv_bytes: usize,
+            z_surface: *mut c_void, z_bytes: usize,
+            a_surface: *mut c_void, a_bytes: usize,
+            b_surface: *mut c_void, b_bytes: usize,
+            spatial: i32,
+            wqkv: *const u16,
+            wz: *const u16,
+            wa: *const u16,
+            wb: *const u16,
+            wout: *const u16,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            conv_w: *const f32,
+            norm_w: *const f32,
+            state: *mut f32,
+            conv_state: *mut f32,
+            d: i32,
+            kheads: i32,
+            kd: i32,
+            vheads: i32,
+            vd: i32,
+            kk: i32,
+            output_gate: i32,
+            eps: f32,
+            ane_fence: *mut c_void,
             pending_out: *mut *mut c_void,
         ) -> i32;
         pub fn coli_apple8_metalio_gdn_finish(pending: *mut c_void, out: *mut f32) -> i32;
@@ -2075,6 +2334,131 @@ mod imp {
             )
         }
     }
+    /// Submit the Metal half of an ANE->Metal GDN island. When `fence` is
+    /// supplied the command buffer is committed immediately but cannot execute
+    /// its gather until ANE signals the shared event. This is the critical
+    /// device-to-device dependency: the CPU does not wait between devices.
+    ///
+    /// # Safety
+    /// Each raw pointer must denote a live IOSurface of the specified size.
+    /// The surfaces and aligned model/state backing must remain valid until the
+    /// returned `GdnPending` is finished or dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gdn_ane_token_begin(
+        model_id: u64,
+        layer: usize,
+        surfaces: [(*mut c_void, usize); 4],
+        spatial: usize,
+        fence: Option<&MetalAneFence>,
+        wqkv: &[u8],
+        wz: &[u8],
+        wa: &[u8],
+        wb: &[u8],
+        wout: &[u8],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        conv_w: &[f32],
+        norm_w: &[f32],
+        state: &mut [f32],
+        conv_state: &mut [f32],
+        d: usize,
+        kheads: usize,
+        kd: usize,
+        vheads: usize,
+        vd: usize,
+        kk: usize,
+        output_gate: i32,
+        eps: f32,
+    ) -> Option<GdnPending> {
+        if [layer,d,kheads,kd,vheads,vd,kk,spatial].iter().any(|&n| n > i32::MAX as usize)
+            || d == 0 || kd == 0 || vd == 0 || kheads == 0 || vheads == 0 || kk == 0 || spatial == 0
+            || vheads % kheads != 0 { return None; }
+        let Some(kdim) = kheads.checked_mul(kd) else { return None; };
+        let Some(vdim) = vheads.checked_mul(vd) else { return None; };
+        let Some(cdim) = kdim.checked_mul(2).and_then(|n| n.checked_add(vdim)) else { return None; };
+        let fits = |actual: usize, rows: usize, cols: usize, bytes: usize| {
+            rows.checked_mul(cols).and_then(|n| n.checked_mul(bytes)).is_some_and(|n| actual >= n)
+        };
+        if !fits(wqkv.len(), cdim, d, 2) || !fits(wz.len(), vdim, d, 2)
+            || !fits(wa.len(), vheads, d, 2) || !fits(wb.len(), vheads, d, 2)
+            || !fits(wout.len(), d, vdim, 2) || a_log.len() < vheads || dt_bias.len() < vheads
+            || !fits(conv_w.len(), cdim, kk, 1) || norm_w.len() < vd
+            || !fits(state.len(), vdim, kd, 1) || !fits(conv_state.len(), cdim, kk-1, 1) { return None; }
+        if !direct_available() { return None; }
+        let mut pending = std::ptr::null_mut();
+        let rc = unsafe {
+            coli_apple8_metalio_gdn_ane_begin(
+                model_id,
+                layer as i32,
+                surfaces[0].0, surfaces[0].1,
+                surfaces[1].0, surfaces[1].1,
+                surfaces[2].0, surfaces[2].1,
+                surfaces[3].0, surfaces[3].1, spatial as i32,
+                wqkv.as_ptr() as *const u16,
+                wz.as_ptr() as *const u16,
+                wa.as_ptr() as *const u16,
+                wb.as_ptr() as *const u16,
+                wout.as_ptr() as *const u16,
+                a_log.as_ptr(),
+                dt_bias.as_ptr(),
+                conv_w.as_ptr(),
+                norm_w.as_ptr(),
+                state.as_mut_ptr(),
+                conv_state.as_mut_ptr(),
+                d as i32,
+                kheads as i32,
+                kd as i32,
+                vheads as i32,
+                vd as i32,
+                kk as i32,
+                output_gate,
+                eps,
+                fence.map_or(std::ptr::null_mut(), MetalAneFence::raw_handle),
+                &mut pending,
+            )
+        };
+        if rc != 1 { return None; }
+        let raw = std::ptr::NonNull::new(pending)?;
+        Some(GdnPending { raw: Some(raw), hidden: d })
+    }
+
+    /// Synchronous compatibility wrapper used by the existing GPU-tail A/B.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gdn_ane_token(
+        model_id: u64,
+        layer: usize,
+        surfaces: [(*mut c_void, usize); 4],
+        spatial: usize,
+        out: &mut [f32],
+        wqkv: &[u8],
+        wz: &[u8],
+        wa: &[u8],
+        wb: &[u8],
+        wout: &[u8],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        conv_w: &[f32],
+        norm_w: &[f32],
+        state: &mut [f32],
+        conv_state: &mut [f32],
+        d: usize,
+        kheads: usize,
+        kd: usize,
+        vheads: usize,
+        vd: usize,
+        kk: usize,
+        output_gate: i32,
+        eps: f32,
+    ) -> i32 {
+        let pending = unsafe { gdn_ane_token_begin(
+            model_id, layer, surfaces, spatial, None,
+            wqkv, wz, wa, wb, wout, a_log, dt_bias, conv_w, norm_w,
+            state, conv_state, d, kheads, kd, vheads, vd, kk, output_gate, eps,
+        ) };
+        let Some(pending) = pending else { return 0; };
+        gdn_token_finish(pending, out)
+    }
+
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2090,6 +2474,7 @@ mod imp {
     pub unsafe fn coli_metal_tensor_free(_tensor: *mut ColiMetalTensor) {}
 
     pub struct MetalSharedSurface;
+    pub struct MetalAneDynamicPack;
     pub struct MetalGdnConvSilu;
 
     impl MetalGdnConvSilu {
@@ -2127,6 +2512,19 @@ mod imp {
         pub unsafe fn contents_ptr(&self) -> *mut u8 {
             std::ptr::null_mut()
         }
+    }
+
+
+    impl MetalAneDynamicPack {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            _qkv_dst: &MetalSharedSurface, _aux_dst: &MetalSharedSurface,
+            _wqkv: &[u8], _wz: &[u8], _wa: &[u8], _wb: &[u8],
+            _hidden: usize, _spatial: usize, _qkv_rows: usize, _z_rows: usize,
+            _ab_rows: usize, _qkv_stride: usize, _aux_stride: usize,
+            _qkv_offset: usize, _z_offset: usize, _a_offset: usize, _b_offset: usize,
+        ) -> Option<Self> { None }
+        pub fn run(&mut self, _x: &[f32]) -> Option<f64> { None }
     }
 
     pub struct MetalMatmulDesc<'a> {
@@ -2504,9 +2902,20 @@ mod imp {
 
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_token_begin(
+        _model_id: u64, _layer: usize, _x: &[f32], _wqkv: &[u8], _wz: &[u8],
+        _wa: &[u8], _wb: &[u8], _wout: &[u8], _a_log: &[f32], _dt_bias: &[f32],
+        _conv_w: &[f32], _norm_w: &[f32], _state: &mut [f32], _conv_state: &mut [f32],
+        _d: usize, _kheads: usize, _kd: usize, _vheads: usize, _vd: usize, _kk: usize,
+        _output_gate: i32, _eps: f32,
+    ) -> Option<GdnPending> { None }
+
+    pub fn gdn_token_finish(_pending: GdnPending, _out: &mut [f32]) -> i32 { 0 }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_token(
         _model_id: u64,
         _layer: usize,
         _x: &[f32],
+        _out: &mut [f32],
         _wqkv: &[u8],
         _wz: &[u8],
         _wa: &[u8],
@@ -2526,19 +2935,15 @@ mod imp {
         _kk: usize,
         _output_gate: i32,
         _eps: f32,
-    ) -> Option<GdnPending> {
-        None
-    }
-
-    pub fn gdn_token_finish(_pending: GdnPending, _out: &mut [f32]) -> i32 {
+    ) -> i32 {
         0
     }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn gdn_token(
+    pub unsafe fn gdn_ane_token(
         _model_id: u64,
         _layer: usize,
-        _x: &[f32],
+        _surfaces: [(*mut std::ffi::c_void, usize); 4],
+        _spatial: usize,
         _out: &mut [f32],
         _wqkv: &[u8],
         _wz: &[u8],

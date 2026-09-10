@@ -89,6 +89,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut kernel = MetalGdnConvSilu::new(&qkv_metal, &out_metal, &taps, C, S, K)
         .ok_or("failed to create Metal Conv1D+SiLU continuation")?;
 
+    // The continuation must retain IOSurfaces, not just no-copy MTLBuffers.
+    drop(qkv_metal);
+    drop(out_metal);
+    drop(qkv);
+    // Dropping an in-flight ticket must drain before the output is mapped.
+    drop(unsafe { kernel.begin() }.ok_or("begin declined")?);
+    let after_drop = out.read_f32()?;
+    assert!(quality(&reference, &after_drop).1 < 1e-6);
+    let (ok, gpu_ms) = unsafe { kernel.begin() }.ok_or("begin declined")?.finish();
+    assert!(ok && gpu_ms >= 0.0);
+    assert!(quality(&reference, &out.read_f32()?).1 < 1e-6);
+    println!("pending_drop_and_surface_retention=passed gpu_ms={gpu_ms:.6}");
+
     for _ in 0..4 {
         assert!(kernel.run());
     }
@@ -101,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let got = out.read_f32()?;
     let (rmse, mx, cos) = quality(&reference, &got);
+    assert!(mx < 1e-6 && cos > 0.999999);
     println!(
         "median_ms={:.4} p10_ms={:.4} p90_ms={:.4} rmse={rmse:.9} max={mx:.9} cosine={cos:.12}",
         times[times.len() / 2],
