@@ -228,6 +228,15 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
         for path in temp_shards.iter().chain(&final_shards) {
             let _ = fs::remove_file(path);
         }
+        let _ = fs::remove_file(package_root.join(MTP_METADATA_FILE));
+        let _ = fs::remove_file(package_root.join(format!(
+            "{MTP_METADATA_FILE}.mtp-next-{}",
+            std::process::id()
+        )));
+        let _ = fs::remove_file(package_root.join(format!(
+            "manifest.coli.mtp-next-{}",
+            std::process::id()
+        )));
     }
     result
 }
