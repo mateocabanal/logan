@@ -17,6 +17,7 @@ pub use ggufload::load_cfg_gguf;
 pub mod ffi;
 mod gdn_ane;
 pub mod plan;
+pub mod mtp;
 pub mod scheduled;
 
 use logan_core::expert::Slot as _; // for SlotExpert::release
