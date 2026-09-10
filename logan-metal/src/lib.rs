@@ -1477,6 +1477,8 @@ mod imp {
         _private: [u8; 0],
     }
 
+    pub unsafe fn coli_metal_tensor_free(_tensor: *mut ColiMetalTensor) {}
+
     pub struct MetalSharedSurface;
     pub struct MetalGdnConvSilu;
 
@@ -1709,6 +1711,9 @@ mod imp {
     pub fn metal_profile() -> (u64, u64, u64, u64, u64, u64) {
         (0, 0, 0, 0, 0, 0)
     }
+    pub fn metal_profile_detail() -> (u64, u64, u64, u64, u64, u64) {
+        (0, 0, 0, 0, 0, 0)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_mxfp4(
         _model_id: u64,
@@ -1749,6 +1754,41 @@ mod imp {
     pub fn gdn_mxfp4_drop_model(_model_id: u64) {}
 
     pub fn gdn_drop_model(_model_id: u64) {}
+
+    pub struct GdnPending;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_token_begin(
+        _model_id: u64,
+        _layer: usize,
+        _x: &[f32],
+        _wqkv: &[u8],
+        _wz: &[u8],
+        _wa: &[u8],
+        _wb: &[u8],
+        _wout: &[u8],
+        _a_log: &[f32],
+        _dt_bias: &[f32],
+        _conv_w: &[f32],
+        _norm_w: &[f32],
+        _state: &mut [f32],
+        _conv_state: &mut [f32],
+        _d: usize,
+        _kheads: usize,
+        _kd: usize,
+        _vheads: usize,
+        _vd: usize,
+        _kk: usize,
+        _output_gate: i32,
+        _eps: f32,
+    ) -> Option<GdnPending> {
+        None
+    }
+
+    pub fn gdn_token_finish(_pending: GdnPending, _out: &mut [f32]) -> i32 {
+        0
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_token(
         _model_id: u64,

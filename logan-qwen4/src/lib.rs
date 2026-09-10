@@ -947,18 +947,30 @@ impl AlignedBuf {
             return None;
         }
         let rounded = (len + 16383) & !16383usize;
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let rc = unsafe {
-            libc::posix_memalign(
-                &mut ptr as *mut *mut u8 as *mut *mut libc::c_void,
-                16384,
-                rounded,
-            )
-        };
-        if rc != 0 || ptr.is_null() {
-            return None;
+        #[cfg(unix)]
+        {
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::posix_memalign(
+                    &mut ptr as *mut *mut u8 as *mut *mut libc::c_void,
+                    16384,
+                    rounded,
+                )
+            };
+            if rc != 0 || ptr.is_null() {
+                return None;
+            }
+            Some(AlignedBuf { ptr, len: rounded })
         }
-        Some(AlignedBuf { ptr, len: rounded })
+        #[cfg(not(unix))]
+        {
+            let layout = std::alloc::Layout::from_size_align(rounded, 16384).ok()?;
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                return None;
+            }
+            Some(AlignedBuf { ptr, len: rounded })
+        }
     }
 
     fn zeroed(len: usize) -> Option<AlignedBuf> {
@@ -976,7 +988,14 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        unsafe { libc::free(self.ptr as *mut libc::c_void) };
+        #[cfg(unix)]
+        unsafe {
+            libc::free(self.ptr as *mut libc::c_void);
+        }
+        #[cfg(not(unix))]
+        if let Ok(layout) = std::alloc::Layout::from_size_align(self.len, 16384) {
+            unsafe { std::alloc::dealloc(self.ptr, layout) };
+        }
     }
 }
 
