@@ -67,6 +67,13 @@ pub(crate) fn crc32c_impl(bytes: &[u8]) -> u32 {
     // ~95 MB/s (the 113 s load on the M2 was CRC-bound, not disk-bound).
     crc32c::crc32c(bytes)
 }
+
+pub(crate) fn crc32c_update_impl(state: u32, bytes: &[u8]) -> u32 {
+    // Logan's streaming callers keep the conventional pre-final-XOR state.
+    // crc32c_append accepts/returns finalized CRC values, so complement at
+    // the API boundary while retaining hardware acceleration.
+    !crc32c::crc32c_append(!state, bytes)
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationSummary {
     pub shards: u32,
@@ -465,12 +472,7 @@ fn crc32c_file_range(path: &Path, offset: u64, length: u64) -> Result<u32> {
                 path: path.to_owned(),
                 source,
             })?;
-        for byte in &buffer[..count] {
-            state ^= *byte as u32;
-            for _ in 0..8 {
-                state = (state >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(state & 1)));
-            }
-        }
+        state = crc32c_update_impl(state, &buffer[..count]);
         remaining -= count as u64;
     }
     Ok(!state)
@@ -551,6 +553,18 @@ pub(crate) mod tests {
         // different input gives a different output.
         assert_eq!(crc32c(b"123456789"), crc32c(b"123456789"));
         assert_ne!(crc32c(b"123456789"), crc32c(b"123456790"));
+    }
+
+    #[test]
+    fn crc32c_incremental_matches_contiguous() {
+        let bytes = b"streamed crc32c must match one-shot crc32c across arbitrary chunking";
+        for chunk_size in [1, 2, 3, 7, 16, 31, 64] {
+            let mut state = !0_u32;
+            for chunk in bytes.chunks(chunk_size) {
+                state = crc32c_update_impl(state, chunk);
+            }
+            assert_eq!(!state, crc32c_impl(bytes), "chunk_size={chunk_size}");
+        }
     }
 
     #[test]

@@ -27,3 +27,10 @@ pub fn align_up(value: u64, alignment: u64) -> crate::verify::Result<u64> {
 pub fn crc32c(bytes: &[u8]) -> u32 {
     crate::verify::crc32c_impl(bytes)
 }
+
+/// Advances Logan's internal CRC-32C running state over `bytes`. The running
+/// state starts at `!0`; complement it once at the end to obtain the standard
+/// CRC value. This uses the same hardware-accelerated backend as `crc32c`.
+pub fn crc32c_update(state: u32, bytes: &[u8]) -> u32 {
+    crate::verify::crc32c_update_impl(state, bytes)
+}

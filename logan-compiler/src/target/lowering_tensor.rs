@@ -80,14 +80,8 @@ pub fn stream_exact_tensor<W: Write + Seek>(
     Ok((logical_crc32c, crc32c_combine(crc32c(&header), !payload_state, tensor.len)))
 }
 
-fn crc32c_state(mut crc: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    crc
+fn crc32c_state(state: u32, bytes: &[u8]) -> u32 {
+    logan_format::crc32c_update(state, bytes)
 }
 
 fn write_padding<W: Write>(
