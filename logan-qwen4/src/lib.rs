@@ -11,13 +11,13 @@ use std::path::Path;
 
 pub mod coliload;
 pub mod colisource;
-pub mod ggufsource;
 mod ggufload;
+pub mod ggufsource;
 pub use ggufload::load_cfg_gguf;
 pub mod ffi;
 mod gdn_ane;
-pub mod plan;
 pub mod mtp;
+pub mod plan;
 pub mod pool;
 pub mod scheduled;
 
@@ -248,7 +248,11 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
     if let Some(tc) = v.get("text_config").and_then(|x| x.as_object()) {
         v = serde_json::Value::Object(tc.clone());
     }
-    let model_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+    let model_type = v
+        .get("model_type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_owned();
     let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
     let output_gate = OutputGate::from_config(&v)?;
@@ -279,29 +283,30 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
         .unwrap_or(1.0);
     let head_dim = get("head_dim").max(get("hidden_size") / get("num_attention_heads").max(1));
     let layers = get("num_hidden_layers");
-    let layer_types: Vec<String> = if let Some(values) = v.get("layer_types").and_then(|x| x.as_array()) {
-        values
-            .iter()
-            .map(|value| value.as_str().unwrap_or("").to_owned())
-            .collect()
-    } else if let Some(interval) = v
-        .get("full_attention_interval")
-        .and_then(|x| x.as_u64())
-        .and_then(|v| usize::try_from(v).ok())
-        .filter(|v| *v > 0)
-    {
-        (0..layers)
-            .map(|layer| {
-                if (layer + 1) % interval == 0 {
-                    "full_attention".to_owned()
-                } else {
-                    "linear_attention".to_owned()
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let layer_types: Vec<String> =
+        if let Some(values) = v.get("layer_types").and_then(|x| x.as_array()) {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or("").to_owned())
+                .collect()
+        } else if let Some(interval) = v
+            .get("full_attention_interval")
+            .and_then(|x| x.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|v| *v > 0)
+        {
+            (0..layers)
+                .map(|layer| {
+                    if (layer + 1) % interval == 0 {
+                        "full_attention".to_owned()
+                    } else {
+                        "linear_attention".to_owned()
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let gdn_layers: Vec<bool> = layer_types
         .iter()
         .map(|t| t == "linear_attention")
@@ -479,7 +484,13 @@ impl Clone for WtBytes {
                 // Clones must create their own handle lazily.
                 metal_tensor: std::sync::Mutex::new(0),
             },
-            Self::Q8Block { weights, scales, block, residuals, .. } => Self::Q8Block {
+            Self::Q8Block {
+                weights,
+                scales,
+                block,
+                residuals,
+                ..
+            } => Self::Q8Block {
                 weights: weights.clone(),
                 scales: scales.clone(),
                 block: *block,
@@ -584,7 +595,8 @@ impl Wt {
                             value += MX4[c2 as usize] * s2;
                         }
                         if weights.len() >= full_wb * 3 && scales.len() >= full_sb * 3 {
-                            let wr3 = &weights[2 * full_wb + row * rb..2 * full_wb + (row + 1) * rb];
+                            let wr3 =
+                                &weights[2 * full_wb + row * rb..2 * full_wb + (row + 1) * rb];
                             let sr3 = &scales[2 * full_sb + row * ng..2 * full_sb + (row + 1) * ng];
                             let p3 = wr3[col / 2];
                             let c3 = if col & 1 == 0 { p3 & 0x0f } else { p3 >> 4 };
@@ -594,8 +606,14 @@ impl Wt {
                         value
                     })
                     .collect()
-            },
-            WtBytes::Q8Block { weights, scales, block, residuals, .. } => {
+            }
+            WtBytes::Q8Block {
+                weights,
+                scales,
+                block,
+                residuals,
+                ..
+            } => {
                 let ng = self.i.div_ceil(*block);
                 (0..self.i)
                     .map(|col| {
@@ -1327,20 +1345,45 @@ fn mxfp4_storage_fmt(weights: &[u8], scales: &[u8], o: usize, i: usize) -> i32 {
     }
 }
 
-fn matmul_mxfp4_storage(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize) {
+fn matmul_mxfp4_storage(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    scales: &[u8],
+    o: usize,
+    i: usize,
+) {
     let wb = o * i.div_ceil(2);
     let sb = o * i.div_ceil(32);
     matmul_mxfp4_bytes(y, x, &weights[..wb], &scales[..sb], o, i);
     let fmt = mxfp4_storage_fmt(weights, scales, o, i);
     if fmt >= 9 {
         let mut residual = vec![0.0f32; o];
-        matmul_mxfp4_bytes(&mut residual, x, &weights[wb..wb*2], &scales[sb..sb*2], o, i);
-        for (dst, corr) in y.iter_mut().zip(residual.iter()) { *dst += *corr; }
+        matmul_mxfp4_bytes(
+            &mut residual,
+            x,
+            &weights[wb..wb * 2],
+            &scales[sb..sb * 2],
+            o,
+            i,
+        );
+        for (dst, corr) in y.iter_mut().zip(residual.iter()) {
+            *dst += *corr;
+        }
     }
     if fmt == 10 {
         let mut residual = vec![0.0f32; o];
-        matmul_mxfp4_bytes(&mut residual, x, &weights[wb*2..wb*3], &scales[sb*2..sb*3], o, i);
-        for (dst, corr) in y.iter_mut().zip(residual.iter()) { *dst += *corr; }
+        matmul_mxfp4_bytes(
+            &mut residual,
+            x,
+            &weights[wb * 2..wb * 3],
+            &scales[sb * 2..sb * 3],
+            o,
+            i,
+        );
+        for (dst, corr) in y.iter_mut().zip(residual.iter()) {
+            *dst += *corr;
+        }
     }
 }
 
@@ -1390,13 +1433,21 @@ fn mxfp4_quantize_value(value: f32, scale: f32) -> u8 {
             best_code = code as u8;
         }
     }
-    if value.is_sign_negative() { best_code | 0x8 } else { best_code }
+    if value.is_sign_negative() {
+        best_code | 0x8
+    } else {
+        best_code
+    }
 }
 
 #[inline]
 fn mxfp4_decode_value(code: u8, scale: f32) -> f32 {
     let magnitude = MXFP4_E2M1_MAGNITUDES[(code & 0x7) as usize];
-    let signed = if code & 0x8 != 0 { -magnitude } else { magnitude };
+    let signed = if code & 0x8 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    };
     signed * scale
 }
 
@@ -1424,7 +1475,10 @@ fn quantize_bf16_to_mxfp4(weights: &[u8], rows: usize, cols: usize) -> Option<(V
     let scale_row_bytes = cols.div_ceil(MXFP4_GROUP_SIZE);
     let mut packed = vec![0u8; rows.checked_mul(packed_row_bytes)?];
     let mut scales = vec![0u8; rows.checked_mul(scale_row_bytes)?];
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows);
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(rows);
     let rows_per = rows.div_ceil(nthreads);
 
     std::thread::scope(|scope| {
@@ -1507,7 +1561,9 @@ fn quantize_bf16_to_mxfp4(weights: &[u8], rows: usize, cols: usize) -> Option<(V
                                 let b1 = u16::from_le_bytes([src[off1], src[off1 + 1]]);
                                 let v1 = f32::from_bits(u32::from(b1) << 16);
                                 (mxfp4_quantize_value(v1, scale) & 0x0f) << 4
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             dst[col / 2] = low | high;
                             col += 2;
                         }
@@ -1519,7 +1575,11 @@ fn quantize_bf16_to_mxfp4(weights: &[u8], rows: usize, cols: usize) -> Option<(V
     Some((packed, scales))
 }
 
-fn quantize_bf16_to_mxfp4x2(weights: &[u8], rows: usize, cols: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+fn quantize_bf16_to_mxfp4x2(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let (base_w, base_s) = quantize_bf16_to_mxfp4(weights, rows, cols)?;
     let rb = cols.div_ceil(2);
     let ng = cols.div_ceil(32);
@@ -1532,7 +1592,11 @@ fn quantize_bf16_to_mxfp4x2(weights: &[u8], rows: usize, cols: usize) -> Option<
             let bits = u16::from_le_bytes([weights[src_off], weights[src_off + 1]]);
             let value = f32::from_bits(u32::from(bits) << 16);
             let packed = wr[col / 2];
-            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let code = if col & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
             let scale = mxfp4_runtime_scale(sr[col / 32]);
             let residual = value - mxfp4_decode_value(code, scale);
             let rb16 = crate::colisource::f32_to_bf16(residual).to_le_bytes();
@@ -1550,11 +1614,21 @@ fn quantize_bf16_to_mxfp4x2(weights: &[u8], rows: usize, cols: usize) -> Option<
     Some((all_w, all_s))
 }
 
-fn mxfp4_residual_bf16(source: &[u8], qweights: &[u8], qscales: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
-    if source.len() != rows.checked_mul(cols)?.checked_mul(2)? { return None; }
+fn mxfp4_residual_bf16(
+    source: &[u8],
+    qweights: &[u8],
+    qscales: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Option<Vec<u8>> {
+    if source.len() != rows.checked_mul(cols)?.checked_mul(2)? {
+        return None;
+    }
     let rb = cols.div_ceil(2);
     let ng = cols.div_ceil(32);
-    if qweights.len() < rows * rb || qscales.len() < rows * ng { return None; }
+    if qweights.len() < rows * rb || qscales.len() < rows * ng {
+        return None;
+    }
     let mut residual = vec![0u8; source.len()];
     for row in 0..rows {
         let wr = &qweights[row * rb..(row + 1) * rb];
@@ -1564,39 +1638,62 @@ fn mxfp4_residual_bf16(source: &[u8], qweights: &[u8], qscales: &[u8], rows: usi
             let bits = u16::from_le_bytes([source[off], source[off + 1]]);
             let value = f32::from_bits(u32::from(bits) << 16);
             let packed = wr[col / 2];
-            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let code = if col & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
             let scale = mxfp4_runtime_scale(sr[col / 32]);
             let delta = value - mxfp4_decode_value(code, scale);
             let out = crate::colisource::f32_to_bf16(delta).to_le_bytes();
-            residual[off] = out[0]; residual[off + 1] = out[1];
+            residual[off] = out[0];
+            residual[off + 1] = out[1];
         }
     }
     Some(residual)
 }
 
-fn quantize_bf16_to_mxfp4x3(weights: &[u8], rows: usize, cols: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+fn quantize_bf16_to_mxfp4x3(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let (w0, s0) = quantize_bf16_to_mxfp4(weights, rows, cols)?;
     let r1 = mxfp4_residual_bf16(weights, &w0, &s0, rows, cols)?;
     let (w1, s1) = quantize_bf16_to_mxfp4(&r1, rows, cols)?;
     let r2 = mxfp4_residual_bf16(&r1, &w1, &s1, rows, cols)?;
     let (w2, s2) = quantize_bf16_to_mxfp4(&r2, rows, cols)?;
     let mut all_w = Vec::with_capacity(w0.len() + w1.len() + w2.len());
-    all_w.extend_from_slice(&w0); all_w.extend_from_slice(&w1); all_w.extend_from_slice(&w2);
+    all_w.extend_from_slice(&w0);
+    all_w.extend_from_slice(&w1);
+    all_w.extend_from_slice(&w2);
     let mut all_s = Vec::with_capacity(s0.len() + s1.len() + s2.len());
-    all_s.extend_from_slice(&s0); all_s.extend_from_slice(&s1); all_s.extend_from_slice(&s2);
+    all_s.extend_from_slice(&s0);
+    all_s.extend_from_slice(&s1);
+    all_s.extend_from_slice(&s2);
     Some((all_w, all_s))
 }
 
-fn quantize_bf16_to_q8_block(weights: &[u8], rows: usize, cols: usize, block: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+fn quantize_bf16_to_q8_block(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    block: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     if rows == 0 || cols == 0 || weights.len() != rows.checked_mul(cols)?.checked_mul(2)? {
         return None;
     }
-    if !matches!(block, 8 | 16 | 32) { return None; }
+    if !matches!(block, 8 | 16 | 32) {
+        return None;
+    }
     let ng = cols.div_ceil(block);
     let mut q = vec![0u8; rows.checked_mul(cols)?];
     let mut scales = vec![0u8; rows.checked_mul(ng)?.checked_mul(4)?];
     let row_bytes = cols * 2;
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows);
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(rows);
     let rows_per = rows.div_ceil(nthreads);
     std::thread::scope(|scope| {
         for ((src_rows, q_rows), scale_rows) in weights
@@ -1618,7 +1715,9 @@ fn quantize_bf16_to_q8_block(weights: &[u8], rows: usize, cols: usize, block: us
                             let off = col * 2;
                             let bits = u16::from_le_bytes([src[off], src[off + 1]]);
                             let value = f32::from_bits(u32::from(bits) << 16);
-                            if value.is_finite() { max_abs = max_abs.max(value.abs()); }
+                            if value.is_finite() {
+                                max_abs = max_abs.max(value.abs());
+                            }
                         }
                         let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
                         let sb = scale.to_le_bytes();
@@ -1629,7 +1728,9 @@ fn quantize_bf16_to_q8_block(weights: &[u8], rows: usize, cols: usize, block: us
                             let value = f32::from_bits(u32::from(bits) << 16);
                             let qi = if value.is_finite() {
                                 (value / scale).round().clamp(-127.0, 127.0) as i8
-                            } else { 0 };
+                            } else {
+                                0
+                            };
                             dst[col] = qi as u8;
                         }
                     }
@@ -1640,7 +1741,16 @@ fn quantize_bf16_to_q8_block(weights: &[u8], rows: usize, cols: usize, block: us
     Some((q, scales))
 }
 
-fn matmul_q8_block_bytes(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize, block: usize, residuals: usize) {
+fn matmul_q8_block_bytes(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    scales: &[u8],
+    o: usize,
+    i: usize,
+    block: usize,
+    residuals: usize,
+) {
     let ng = i.div_ceil(block);
     debug_assert!(weights.len() >= o * i);
     debug_assert!(scales.len() >= o * ng * 4);
@@ -1675,10 +1785,19 @@ fn matmul_q8_block_bytes(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8]
     }
 }
 
-fn q8_append_residual1(source: &[u8], mut q: Vec<u8>, scales: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
+fn q8_append_residual1(
+    source: &[u8],
+    mut q: Vec<u8>,
+    scales: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Option<Vec<u8>> {
     let block = 32usize;
     let ng = cols.div_ceil(block);
-    if source.len() != rows.checked_mul(cols)?.checked_mul(2)? || q.len() != rows * cols || scales.len() < rows * ng * 4 {
+    if source.len() != rows.checked_mul(cols)?.checked_mul(2)?
+        || q.len() != rows * cols
+        || scales.len() < rows * ng * 4
+    {
         return None;
     }
     let mut residual_values = vec![0u8; rows * ng * 2];
@@ -1704,7 +1823,8 @@ fn q8_append_residual1(source: &[u8], mut q: Vec<u8>, scales: &[u8], rows: usize
             }
             let rb = crate::colisource::f32_to_bf16(best_residual).to_le_bytes();
             let ro = (row * ng + group) * 2;
-            residual_values[ro] = rb[0]; residual_values[ro + 1] = rb[1];
+            residual_values[ro] = rb[0];
+            residual_values[ro + 1] = rb[1];
             residual_indices[row * ng + group] = best_idx as u8;
         }
     }
@@ -1717,10 +1837,16 @@ fn quantize_wt_bf16_to_q8_block(w: &mut Wt, block: usize, residuals: usize) -> b
     let Some(source) = w.bf16_bytes() else {
         return matches!(w.bytes, Some(WtBytes::Q8Block { block: b, residuals: r, .. }) if b == block && r == residuals);
     };
-    let Some((base_weights, scales)) = quantize_bf16_to_q8_block(source, w.o, w.i, block) else { return false; };
+    let Some((base_weights, scales)) = quantize_bf16_to_q8_block(source, w.o, w.i, block) else {
+        return false;
+    };
     let weights = if residuals == 1 {
-        if block != 32 { return false; }
-        let Some(v) = q8_append_residual1(source, base_weights, &scales, w.o, w.i) else { return false; };
+        if block != 32 {
+            return false;
+        }
+        let Some(v) = q8_append_residual1(source, base_weights, &scales, w.o, w.i) else {
+            return false;
+        };
         v
     } else {
         base_weights
@@ -1736,7 +1862,9 @@ fn quantize_wt_bf16_to_q8_block(w: &mut Wt, block: usize, residuals: usize) -> b
 }
 
 fn quantize_wt_bf16_to_mxfp4(w: &mut Wt) -> bool {
-    let Some(source) = w.bf16_bytes() else { return matches!(w.bytes, Some(WtBytes::Mxfp4 { .. })); };
+    let Some(source) = w.bf16_bytes() else {
+        return matches!(w.bytes, Some(WtBytes::Mxfp4 { .. }));
+    };
     let residual3 = std::env::var("QWEN_GDN_RUNTIME_MXFP4_RESIDUAL3")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
@@ -1750,7 +1878,9 @@ fn quantize_wt_bf16_to_mxfp4(w: &mut Wt) -> bool {
     } else {
         quantize_bf16_to_mxfp4(source, w.o, w.i)
     };
-    let Some((weights, scales)) = packed else { return false; };
+    let Some((weights, scales)) = packed else {
+        return false;
+    };
     w.bytes = Some(WtBytes::Mxfp4 {
         weights,
         scales,
@@ -1818,8 +1948,19 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let mut tensor = *handle as *mut logan_metal::ColiMetalTensor;
-                let fmt = if *block == 32 && *residuals == 1 { 14 } else { match *block { 32 => 11, 16 => 12, 8 => 13, _ => 0 } };
-                if fmt != 0 && logan_metal::metal_matmul(&mut tensor, y, x, weights, scales, fmt, i, o) {
+                let fmt = if *block == 32 && *residuals == 1 {
+                    14
+                } else {
+                    match *block {
+                        32 => 11,
+                        16 => 12,
+                        8 => 13,
+                        _ => 0,
+                    }
+                };
+                if fmt != 0
+                    && logan_metal::metal_matmul(&mut tensor, y, x, weights, scales, fmt, i, o)
+                {
                     *handle = tensor as usize;
                     return;
                 }
@@ -1988,27 +2129,44 @@ fn gdn_mxfp4_full_token(
     ];
     let mut parts = Vec::with_capacity(ws.len());
     for &w in &ws {
-        let (weights, scales, metal_tensor, fmt): (&[u8], &[u8], &std::sync::Mutex<usize>, i32) = match w.bytes.as_ref() {
-            Some(WtBytes::Bf16 { weights, metal_tensor }) => {
-                (weights.as_slice(), &[], metal_tensor, 5)
-            }
-            Some(WtBytes::Mxfp4 { weights, scales, metal_tensor }) => {
-                (weights.as_slice(), scales.as_slice(), metal_tensor, mxfp4_storage_fmt(weights, scales, w.o, w.i))
-            }
-            Some(WtBytes::Q8Block { weights, scales, block, residuals, metal_tensor }) => {
-                let fmt = if *block == 32 && *residuals == 1 { 14 } else { match *block { 32 => 11, 16 => 12, 8 => 13, _ => return 0 } };
-                (weights.as_slice(), scales.as_slice(), metal_tensor, fmt)
-            }
-            _ => return 0,
-        };
-        parts.push((
-            weights,
-            scales,
-            metal_tensor,
-            w.i,
-            w.o,
-            fmt,
-        ));
+        let (weights, scales, metal_tensor, fmt): (&[u8], &[u8], &std::sync::Mutex<usize>, i32) =
+            match w.bytes.as_ref() {
+                Some(WtBytes::Bf16 {
+                    weights,
+                    metal_tensor,
+                }) => (weights.as_slice(), &[], metal_tensor, 5),
+                Some(WtBytes::Mxfp4 {
+                    weights,
+                    scales,
+                    metal_tensor,
+                }) => (
+                    weights.as_slice(),
+                    scales.as_slice(),
+                    metal_tensor,
+                    mxfp4_storage_fmt(weights, scales, w.o, w.i),
+                ),
+                Some(WtBytes::Q8Block {
+                    weights,
+                    scales,
+                    block,
+                    residuals,
+                    metal_tensor,
+                }) => {
+                    let fmt = if *block == 32 && *residuals == 1 {
+                        14
+                    } else {
+                        match *block {
+                            32 => 11,
+                            16 => 12,
+                            8 => 13,
+                            _ => return 0,
+                        }
+                    };
+                    (weights.as_slice(), scales.as_slice(), metal_tensor, fmt)
+                }
+                _ => return 0,
+            };
+        parts.push((weights, scales, metal_tensor, w.i, w.o, fmt));
     }
     let mut guards = Vec::with_capacity(parts.len());
     for (_, _, metal_tensor, _, _, _) in &parts {
@@ -2186,12 +2344,7 @@ fn rope_angles(pos: usize, cfg: &Cfg) -> Vec<(f32, f32)> {
         .collect()
 }
 
-fn rope_partial_with_angles(
-    v: &mut [f32],
-    angles: &[(f32, f32)],
-    rd: usize,
-    interleaved: bool,
-) {
+fn rope_partial_with_angles(v: &mut [f32], angles: &[(f32, f32)], rd: usize, interleaved: bool) {
     for (j, &(cs, sn)) in angles.iter().enumerate() {
         let (ia, ib) = if interleaved {
             (2 * j, 2 * j + 1)
@@ -2302,27 +2455,41 @@ impl Model {
         let enabled = std::env::var("QWEN_GDN_RUNTIME_Q8")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        if !enabled { return false; }
+        if !enabled {
+            return false;
+        }
         let scope = std::env::var("QWEN_GDN_RUNTIME_Q8_SCOPE").unwrap_or_else(|_| "all".into());
-        let layer_spec = std::env::var("QWEN_GDN_RUNTIME_Q8_LAYERS").unwrap_or_else(|_| "all".into());
+        let layer_spec =
+            std::env::var("QWEN_GDN_RUNTIME_Q8_LAYERS").unwrap_or_else(|_| "all".into());
         let block = std::env::var("QWEN_GDN_RUNTIME_Q8_BLOCK")
-            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32);
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
         if !matches!(block, 8 | 16 | 32) {
             eprintln!("qwen4-rs: unsupported Q8 GDN block size {block}; use 8, 16, or 32");
             return false;
         }
         let residuals = std::env::var("QWEN_GDN_RUNTIME_Q8_RESIDUALS")
-            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
         if residuals > 1 || (residuals == 1 && block != 32) {
-            eprintln!("qwen4-rs: Q8 GDN residuals currently supports only residuals=1 with block=32");
+            eprintln!(
+                "qwen4-rs: Q8 GDN residuals currently supports only residuals=1 with block=32"
+            );
             return false;
         }
-        let selected = |name: &str| scope == "all" || scope.split(',').any(|part| part.trim() == name);
+        let selected =
+            |name: &str| scope == "all" || scope.split(',').any(|part| part.trim() == name);
         let selected_layer = |layer: usize| {
-            if layer_spec.trim().eq_ignore_ascii_case("all") { return true; }
+            if layer_spec.trim().eq_ignore_ascii_case("all") {
+                return true;
+            }
             layer_spec.split(',').any(|piece| {
                 let piece = piece.trim();
-                if piece.is_empty() { return false; }
+                if piece.is_empty() {
+                    return false;
+                }
                 if let Some((lo, hi)) = piece.split_once('-') {
                     match (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
                         (Ok(lo), Ok(hi)) => lo <= layer && layer <= hi,
@@ -2338,7 +2505,9 @@ impl Model {
         let mut before = 0usize;
         let mut after = 0usize;
         for (li, layer) in self.layers.iter_mut().enumerate() {
-            if !layer.is_gdn || !selected_layer(li) { continue; }
+            if !layer.is_gdn || !selected_layer(li) {
+                continue;
+            }
             let matrices = [
                 ("qkv", &mut layer.gdn_in_qkv),
                 ("z", &mut layer.gdn_in_z),
@@ -2347,18 +2516,26 @@ impl Model {
                 ("out", &mut layer.gdn_out),
             ];
             for (name, w) in matrices {
-                if !selected(name) { continue; }
+                if !selected(name) {
+                    continue;
+                }
                 if let Some(bytes) = w.bf16_bytes() {
                     before += bytes.len();
                     if !quantize_wt_bf16_to_q8_block(w, block, residuals) {
                         eprintln!("qwen4-rs: runtime Q8 GDN quantization failed at layer {li} matrix {name}");
                         return false;
                     }
-                    if let Some(WtBytes::Q8Block { weights, scales, .. }) = w.bytes.as_ref() {
+                    if let Some(WtBytes::Q8Block {
+                        weights, scales, ..
+                    }) = w.bytes.as_ref()
+                    {
                         after += weights.len() + scales.len();
                     }
                     converted += 1;
-                } else if let Some(WtBytes::Q8Block { weights, scales, .. }) = w.bytes.as_ref() {
+                } else if let Some(WtBytes::Q8Block {
+                    weights, scales, ..
+                }) = w.bytes.as_ref()
+                {
                     after += weights.len() + scales.len();
                 } else {
                     eprintln!("qwen4-rs: runtime Q8 GDN encountered unsupported weight at layer {li} matrix {name}");
@@ -2384,17 +2561,23 @@ impl Model {
         let enabled = std::env::var("QWEN_GDN_RUNTIME_MXFP4")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        if !enabled { return false; }
+        if !enabled {
+            return false;
+        }
         let scope = std::env::var("QWEN_GDN_RUNTIME_MXFP4_SCOPE").unwrap_or_else(|_| "all".into());
-        let layer_spec = std::env::var("QWEN_GDN_RUNTIME_MXFP4_LAYERS").unwrap_or_else(|_| "all".into());
-        let selected = |name: &str| {
-            scope == "all" || scope.split(',').any(|part| part.trim() == name)
-        };
+        let layer_spec =
+            std::env::var("QWEN_GDN_RUNTIME_MXFP4_LAYERS").unwrap_or_else(|_| "all".into());
+        let selected =
+            |name: &str| scope == "all" || scope.split(',').any(|part| part.trim() == name);
         let selected_layer = |layer: usize| {
-            if layer_spec.trim().eq_ignore_ascii_case("all") { return true; }
+            if layer_spec.trim().eq_ignore_ascii_case("all") {
+                return true;
+            }
             layer_spec.split(',').any(|piece| {
                 let piece = piece.trim();
-                if piece.is_empty() { return false; }
+                if piece.is_empty() {
+                    return false;
+                }
                 if let Some((lo, hi)) = piece.split_once('-') {
                     match (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
                         (Ok(lo), Ok(hi)) => lo <= layer && layer <= hi,
@@ -2410,7 +2593,9 @@ impl Model {
         let mut before = 0usize;
         let mut after = 0usize;
         for (li, layer) in self.layers.iter_mut().enumerate() {
-            if !layer.is_gdn || !selected_layer(li) { continue; }
+            if !layer.is_gdn || !selected_layer(li) {
+                continue;
+            }
             let matrices = [
                 ("qkv", &mut layer.gdn_in_qkv),
                 ("z", &mut layer.gdn_in_z),
@@ -2419,18 +2604,26 @@ impl Model {
                 ("out", &mut layer.gdn_out),
             ];
             for (name, w) in matrices {
-                if !selected(name) { continue; }
+                if !selected(name) {
+                    continue;
+                }
                 if let Some(bytes) = w.bf16_bytes() {
                     before += bytes.len();
                     if !quantize_wt_bf16_to_mxfp4(w) {
                         eprintln!("qwen4-rs: runtime MXFP4 GDN quantization failed at layer {li} matrix {name}");
                         return false;
                     }
-                    if let Some(WtBytes::Mxfp4 { weights, scales, .. }) = w.bytes.as_ref() {
+                    if let Some(WtBytes::Mxfp4 {
+                        weights, scales, ..
+                    }) = w.bytes.as_ref()
+                    {
                         after += weights.len() + scales.len();
                     }
                     converted += 1;
-                } else if let Some(WtBytes::Mxfp4 { weights, scales, .. }) = w.bytes.as_ref() {
+                } else if let Some(WtBytes::Mxfp4 {
+                    weights, scales, ..
+                }) = w.bytes.as_ref()
+                {
                     after += weights.len() + scales.len();
                 } else {
                     eprintln!("qwen4-rs: runtime MXFP4 GDN encountered unsupported weight at layer {li} matrix {name}");
@@ -2452,7 +2645,8 @@ impl Model {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false)
         {
-            let radius = std::env::var("QWEN_GDN_RUNTIME_MXFP4_MSE_RADIUS").unwrap_or_else(|_| "3".into());
+            let radius =
+                std::env::var("QWEN_GDN_RUNTIME_MXFP4_MSE_RADIUS").unwrap_or_else(|_| "3".into());
             format!("mse:r{radius}")
         } else {
             std::env::var("QWEN_GDN_RUNTIME_MXFP4_CLIP_RMS")
@@ -2702,8 +2896,7 @@ impl Model {
         };
         let need = self.cfg.vocab * self.cfg.hidden * 2;
         let bytes = unsafe { std::slice::from_raw_parts(aligned.ptr, need) };
-        let backend = std::env::var("QWEN_LM_HEAD_BACKEND")
-            .unwrap_or_else(|_| "cpu".to_string());
+        let backend = std::env::var("QWEN_LM_HEAD_BACKEND").unwrap_or_else(|_| "cpu".to_string());
         if backend.eq_ignore_ascii_case("metal") {
             let mut tensor = self.lm_head_metal_tensor as *mut logan_metal::ColiMetalTensor;
             let ok = logan_metal::metal_matmul(
@@ -2721,13 +2914,7 @@ impl Model {
                 return;
             }
         } else if backend.eq_ignore_ascii_case("bnns")
-            && logan_metal::bnns_bf16_matmul(
-                bytes,
-                x,
-                y,
-                self.cfg.vocab,
-                self.cfg.hidden,
-            )
+            && logan_metal::bnns_bf16_matmul(bytes, x, y, self.cfg.vocab, self.cfg.hidden)
         {
             return;
         }
@@ -2901,12 +3088,16 @@ impl Model {
         let conv_len = cdim * (kk - 1);
         let speculative_states = mtp_boundaries.is_some();
         let mut spec_state_rows = if speculative_states {
-            (0..rows).map(|_| vec![0.0_f32; state_len]).collect::<Vec<_>>()
+            (0..rows)
+                .map(|_| vec![0.0_f32; state_len])
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         let mut spec_conv_rows = if speculative_states {
-            (0..rows).map(|_| vec![0.0_f32; conv_len]).collect::<Vec<_>>()
+            (0..rows)
+                .map(|_| vec![0.0_f32; conv_len])
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -2984,7 +3175,11 @@ impl Model {
             let mut kh = vec![0.0_f32; vheads * kd];
             let mut vh = vec![0.0_f32; vheads * vd];
             for h in 0..vheads {
-                let khd = if self.gdn_v_tiled { h % kheads } else { h / rep };
+                let khd = if self.gdn_v_tiled {
+                    h % kheads
+                } else {
+                    h / rep
+                };
                 for dd in 0..kd {
                     qh[h * kd + dd] = q_[khd * kd + dd];
                     kh[h * kd + dd] = k_[khd * kd + dd];
@@ -3014,8 +3209,8 @@ impl Model {
                     &before[row - 1]
                 };
                 for h in 0..vheads {
-                    let ga =
-                        -layer.gdn_a_log[h].exp() * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
+                    let ga = -layer.gdn_a_log[h].exp()
+                        * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
                     let gt = ga.exp();
                     let bt = 1.0 / (1.0 + (-b[h]).exp());
                     let prev_sh = &prev_state[h * kd * vd..(h + 1) * kd * vd];
@@ -3048,8 +3243,8 @@ impl Model {
             } else {
                 let state = unsafe { std::slice::from_raw_parts_mut(state_ptr, state_len) };
                 for h in 0..vheads {
-                    let ga =
-                        -layer.gdn_a_log[h].exp() * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
+                    let ga = -layer.gdn_a_log[h].exp()
+                        * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
                     let gt = ga.exp();
                     let bt = 1.0 / (1.0 + (-b[h]).exp());
                     let sh = &mut state[h * kd * vd..(h + 1) * kd * vd];
@@ -3210,30 +3405,48 @@ impl Model {
                 let wb = unsafe { std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2) };
                 let input_t0 = std::time::Instant::now();
                 if gdn_ane::dynamic_async_enabled() {
-                    let submitted = self.gdn_ane_dynamic.as_mut().map(|engine|
-                        engine.evaluate_layer_async(li, x, wqkv, wz, wa, wb)
-                    );
+                    let submitted = self
+                        .gdn_ane_dynamic
+                        .as_mut()
+                        .map(|engine| engine.evaluate_layer_async(li, x, wqkv, wz, wa, wb));
                     match submitted {
                         Some(Ok(dynamic_pending)) => {
                             let input_ms = input_t0.elapsed().as_secs_f64() * 1e3;
                             let dynamic_submit_ms = dynamic_pending.submit_ms();
                             let engine = self.gdn_ane_dynamic.as_ref().unwrap();
                             let surfaces = engine.gpu_surfaces();
-                            let fence = engine.gpu_fence()
+                            let fence = engine
+                                .gpu_fence()
                                 .expect("dynamic ANE async submission lost its shared fence");
                             let metal_pending = unsafe {
                                 crate::ffi::gdn_ane_token_begin(
-                                    self.metal_model_id, li, surfaces, 16, Some(fence),
-                                    wqkv, wz, wa, wb,
+                                    self.metal_model_id,
+                                    li,
+                                    surfaces,
+                                    16,
+                                    Some(fence),
+                                    wqkv,
+                                    wz,
+                                    wa,
+                                    wb,
                                     std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
-                                    &layer.gdn_a_log, &layer.gdn_dt_bias,
-                                    &layer.gdn_conv1d, &layer.gdn_norm,
+                                    &layer.gdn_a_log,
+                                    &layer.gdn_dt_bias,
+                                    &layer.gdn_conv1d,
+                                    &layer.gdn_norm,
                                     std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
                                     std::slice::from_raw_parts_mut(
-                                        gm.conv_state, cdim * kk.saturating_sub(1),
+                                        gm.conv_state,
+                                        cdim * kk.saturating_sub(1),
                                     ),
-                                    c.hidden, kheads, kd, vheads, vd, kk,
-                                    c.output_gate.gdn_metal_code(), c.eps,
+                                    c.hidden,
+                                    kheads,
+                                    kd,
+                                    vheads,
+                                    vd,
+                                    kk,
+                                    c.output_gate.gdn_metal_code(),
+                                    c.eps,
                                 )
                             };
                             if let Some(metal_pending) = metal_pending {
@@ -3255,7 +3468,9 @@ impl Model {
                                 }
                                 if rc > 0 {
                                     self.spans.gdn_metal_ok += 1;
-                                    if profile_gdn_parts { self.spans.gdn_in_proj_ms += input_ms; }
+                                    if profile_gdn_parts {
+                                        self.spans.gdn_in_proj_ms += input_ms;
+                                    }
                                     return;
                                 }
                                 panic!("dynamic async ANE GPU GDN tail failed after submission at layer {li}");
@@ -3274,35 +3489,56 @@ impl Model {
                     }
                 }
 
-                let evaluated = self.gdn_ane_dynamic.as_mut().map(|engine|
-                    engine.evaluate_layer(li, x, wqkv, wz, wa, wb)
-                );
+                let evaluated = self
+                    .gdn_ane_dynamic
+                    .as_mut()
+                    .map(|engine| engine.evaluate_layer(li, x, wqkv, wz, wa, wb));
                 match evaluated {
                     Some(Ok(())) => {
                         let input_ms = input_t0.elapsed().as_secs_f64() * 1e3;
                         let surfaces = self.gdn_ane_dynamic.as_ref().unwrap().gpu_surfaces();
                         let rc = unsafe {
                             crate::ffi::gdn_ane_token(
-                                self.metal_model_id, li, surfaces, 16, out,
-                                wqkv, wz, wa, wb,
+                                self.metal_model_id,
+                                li,
+                                surfaces,
+                                16,
+                                out,
+                                wqkv,
+                                wz,
+                                wa,
+                                wb,
                                 std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
-                                &layer.gdn_a_log, &layer.gdn_dt_bias,
-                                &layer.gdn_conv1d, &layer.gdn_norm,
+                                &layer.gdn_a_log,
+                                &layer.gdn_dt_bias,
+                                &layer.gdn_conv1d,
+                                &layer.gdn_norm,
                                 std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
                                 std::slice::from_raw_parts_mut(
-                                    gm.conv_state, cdim * kk.saturating_sub(1),
+                                    gm.conv_state,
+                                    cdim * kk.saturating_sub(1),
                                 ),
-                                c.hidden, kheads, kd, vheads, vd, kk,
-                                c.output_gate.gdn_metal_code(), c.eps,
+                                c.hidden,
+                                kheads,
+                                kd,
+                                vheads,
+                                vd,
+                                kk,
+                                c.output_gate.gdn_metal_code(),
+                                c.eps,
                             )
                         };
                         if rc > 0 {
                             self.spans.gdn_metal_ok += 1;
-                            if profile_gdn_parts { self.spans.gdn_in_proj_ms += input_ms; }
+                            if profile_gdn_parts {
+                                self.spans.gdn_in_proj_ms += input_ms;
+                            }
                             return;
                         }
                         if rc < 0 {
-                            panic!("dynamic ANE GPU GDN tail failed after submission at layer {li}");
+                            panic!(
+                                "dynamic ANE GPU GDN tail failed after submission at layer {li}"
+                            );
                         }
                         // Native tail declined before mutating recurrent state;
                         // pure Metal/CPU paths below may safely recompute.
@@ -3393,7 +3629,9 @@ impl Model {
                             return;
                         }
                         if rc < 0 {
-                            eprintln!("qwen4-rs: async Metal GDN failed after submission (layer {li})");
+                            eprintln!(
+                                "qwen4-rs: async Metal GDN failed after submission (layer {li})"
+                            );
                             std::process::exit(1);
                         }
                     }
@@ -3479,62 +3717,86 @@ impl Model {
                     ) {
                         let metal_pending = unsafe {
                             crate::ffi::gdn_ane_token_begin(
-                                self.metal_model_id, li, surfaces, 16, Some(fence),
-                                    std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
-                                    std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
-                                    std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
-                                    std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
-                                    std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
-                                    &layer.gdn_a_log, &layer.gdn_dt_bias,
-                                    &layer.gdn_conv1d, &layer.gdn_norm,
-                                    std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
-                                    std::slice::from_raw_parts_mut(gm.conv_state, cdim * kk.saturating_sub(1)),
-                                    c.hidden, kheads, kd, vheads, vd, kk,
-                                    c.output_gate.gdn_metal_code(), c.eps,
-                                )
-                            };
-                            if let Some(metal_pending) = metal_pending {
-                                // This host work is independent of the current
-                                // GDN result and now overlaps the ANE->GPU chain.
-                                self.prefetch_previous_route_now(li);
-                                let ane_submit_ms = ane_pending.submit_ms();
-                                let wait_t0 = std::time::Instant::now();
-                                let rc = crate::ffi::gdn_token_finish(metal_pending, out);
-                                let exposed_wait_ms = wait_t0.elapsed().as_secs_f64() * 1e3;
-                                let ane_done = ane_pending.finish(2_000);
-                                if let Err(error) = ane_done {
-                                    panic!("async ANE GDN failed after submission at layer {li}: {error}");
-                                }
-                                gdn_ane::report_async_sample(
-                                    &mut self.gdn_ane[li], li, ane_submit_ms, exposed_wait_ms,
+                                self.metal_model_id,
+                                li,
+                                surfaces,
+                                16,
+                                Some(fence),
+                                std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
+                                std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
+                                std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
+                                std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
+                                std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
+                                &layer.gdn_a_log,
+                                &layer.gdn_dt_bias,
+                                &layer.gdn_conv1d,
+                                &layer.gdn_norm,
+                                std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
+                                std::slice::from_raw_parts_mut(
+                                    gm.conv_state,
+                                    cdim * kk.saturating_sub(1),
+                                ),
+                                c.hidden,
+                                kheads,
+                                kd,
+                                vheads,
+                                vd,
+                                kk,
+                                c.output_gate.gdn_metal_code(),
+                                c.eps,
+                            )
+                        };
+                        if let Some(metal_pending) = metal_pending {
+                            // This host work is independent of the current
+                            // GDN result and now overlaps the ANE->GPU chain.
+                            self.prefetch_previous_route_now(li);
+                            let ane_submit_ms = ane_pending.submit_ms();
+                            let wait_t0 = std::time::Instant::now();
+                            let rc = crate::ffi::gdn_token_finish(metal_pending, out);
+                            let exposed_wait_ms = wait_t0.elapsed().as_secs_f64() * 1e3;
+                            let ane_done = ane_pending.finish(2_000);
+                            if let Err(error) = ane_done {
+                                panic!(
+                                    "async ANE GDN failed after submission at layer {li}: {error}"
                                 );
-                                if rc > 0 {
-                                    self.spans.gdn_metal_ok += 1;
-                                    return;
+                            }
+                            gdn_ane::report_async_sample(
+                                &mut self.gdn_ane[li],
+                                li,
+                                ane_submit_ms,
+                                exposed_wait_ms,
+                            );
+                            if rc > 0 {
+                                self.spans.gdn_metal_ok += 1;
+                                return;
+                            }
+                            if rc < 0 {
+                                panic!("async ANE->Metal GDN tail failed after submission at layer {li}");
+                            }
+                        } else {
+                            // Metal declined before submission. ANE may
+                            // still be running, so retire it and materialize
+                            // its valid outputs before using the scalar tail.
+                            match ane_pending.finish(2_000) {
+                                Ok(()) => {
+                                    gdn_ane::materialize(
+                                        &self.gdn_ane[li],
+                                        &mut qkv,
+                                        &mut z,
+                                        &mut a,
+                                        &mut b,
+                                    );
+                                    ane_async_materialized = true;
                                 }
-                                if rc < 0 {
-                                    panic!("async ANE->Metal GDN tail failed after submission at layer {li}");
-                                }
-                            } else {
-                                // Metal declined before submission. ANE may
-                                // still be running, so retire it and materialize
-                                // its valid outputs before using the scalar tail.
-                                match ane_pending.finish(2_000) {
-                                    Ok(()) => {
-                                        gdn_ane::materialize(
-                                            &self.gdn_ane[li], &mut qkv, &mut z, &mut a, &mut b,
-                                        );
-                                        ane_async_materialized = true;
-                                    }
-                                    Err(error) => {
-                                        eprintln!("qwen4-rs: async ANE pre-tail failure at layer {li}: {error}; retrying synchronous path");
-                                    }
+                                Err(error) => {
+                                    eprintln!("qwen4-rs: async ANE pre-tail failure at layer {li}: {error}; retrying synchronous path");
                                 }
                             }
                         }
                     }
                 }
             }
+        }
 
         let ane_ok = if ane_async_materialized {
             true
@@ -3574,31 +3836,51 @@ impl Model {
         if ane_ok {
             if let Some(surfaces) = gdn_ane::gpu_surfaces(&self.gdn_ane[li]) {
                 let input_ms = gdn_in_t0.map(|t| t.elapsed().as_secs_f64() * 1e3);
-                let rc = if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights) {
+                let rc = if let Some(gm) = self.gdn_metal[li].as_ref().filter(|gm| gm.bf16_weights)
+                {
                     // ANE evaluation has completed. Native code retains these
                     // surfaces until its GPU gather/recur/output command retires.
                     // Both ANE and model-owned aligned state remain alive and
                     // untouched throughout this synchronous tail call.
                     unsafe {
                         crate::ffi::gdn_ane_token(
-                            self.metal_model_id, li, surfaces, 16, out,
+                            self.metal_model_id,
+                            li,
+                            surfaces,
+                            16,
+                            out,
                             std::slice::from_raw_parts(gm.wqkv, cdim * c.hidden * 2),
                             std::slice::from_raw_parts(gm.wz, vdim * c.hidden * 2),
                             std::slice::from_raw_parts(gm.wa, vheads * c.hidden * 2),
                             std::slice::from_raw_parts(gm.wb, vheads * c.hidden * 2),
                             std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2),
-                            &layer.gdn_a_log, &layer.gdn_dt_bias,
-                            &layer.gdn_conv1d, &layer.gdn_norm,
+                            &layer.gdn_a_log,
+                            &layer.gdn_dt_bias,
+                            &layer.gdn_conv1d,
+                            &layer.gdn_norm,
                             std::slice::from_raw_parts_mut(gm.state, vheads * kd * vd),
-                            std::slice::from_raw_parts_mut(gm.conv_state, cdim * kk.saturating_sub(1)),
-                            c.hidden, kheads, kd, vheads, vd, kk,
-                            c.output_gate.gdn_metal_code(), c.eps,
+                            std::slice::from_raw_parts_mut(
+                                gm.conv_state,
+                                cdim * kk.saturating_sub(1),
+                            ),
+                            c.hidden,
+                            kheads,
+                            kd,
+                            vheads,
+                            vd,
+                            kk,
+                            c.output_gate.gdn_metal_code(),
+                            c.eps,
                         )
                     }
-                } else { 0 };
+                } else {
+                    0
+                };
                 if rc > 0 {
                     self.spans.gdn_metal_ok += 1;
-                    if let Some(ms) = input_ms { self.spans.gdn_in_proj_ms += ms; }
+                    if let Some(ms) = input_ms {
+                        self.spans.gdn_in_proj_ms += ms;
+                    }
                     return;
                 }
                 if rc < 0 {
@@ -3628,13 +3910,50 @@ impl Model {
                         )
                     };
                     let mut descs = [
-                        logan_metal::MetalMatmulDesc { tensor: gm.tqkv, y: &mut qkv, weights: wqkv, scales: &[], fmt: 5, i: c.hidden, o: cdim },
-                        logan_metal::MetalMatmulDesc { tensor: gm.tz, y: &mut z, weights: wz, scales: &[], fmt: 5, i: c.hidden, o: vdim },
-                        logan_metal::MetalMatmulDesc { tensor: gm.ta, y: &mut a, weights: wa, scales: &[], fmt: 5, i: c.hidden, o: vheads },
-                        logan_metal::MetalMatmulDesc { tensor: gm.tb, y: &mut b, weights: wb, scales: &[], fmt: 5, i: c.hidden, o: vheads },
+                        logan_metal::MetalMatmulDesc {
+                            tensor: gm.tqkv,
+                            y: &mut qkv,
+                            weights: wqkv,
+                            scales: &[],
+                            fmt: 5,
+                            i: c.hidden,
+                            o: cdim,
+                        },
+                        logan_metal::MetalMatmulDesc {
+                            tensor: gm.tz,
+                            y: &mut z,
+                            weights: wz,
+                            scales: &[],
+                            fmt: 5,
+                            i: c.hidden,
+                            o: vdim,
+                        },
+                        logan_metal::MetalMatmulDesc {
+                            tensor: gm.ta,
+                            y: &mut a,
+                            weights: wa,
+                            scales: &[],
+                            fmt: 5,
+                            i: c.hidden,
+                            o: vheads,
+                        },
+                        logan_metal::MetalMatmulDesc {
+                            tensor: gm.tb,
+                            y: &mut b,
+                            weights: wb,
+                            scales: &[],
+                            fmt: 5,
+                            i: c.hidden,
+                            o: vheads,
+                        },
                     ];
                     let ok = logan_metal::metal_matmul_multi(x, &mut descs);
-                    let handles = [descs[0].tensor, descs[1].tensor, descs[2].tensor, descs[3].tensor];
+                    let handles = [
+                        descs[0].tensor,
+                        descs[1].tensor,
+                        descs[2].tensor,
+                        descs[3].tensor,
+                    ];
                     drop(descs);
                     gm.tqkv = handles[0];
                     gm.tz = handles[1];
@@ -3780,7 +4099,11 @@ impl Model {
         let mut kh = vec![0.0; vheads * kd];
         let mut vh = vec![0.0; vheads * vd];
         for h in 0..vheads {
-            let khd = if self.gdn_v_tiled { h % kheads } else { h / rep };
+            let khd = if self.gdn_v_tiled {
+                h % kheads
+            } else {
+                h / rep
+            };
             for d in 0..kd {
                 qh[h * kd + d] = q_[khd * kd + d];
                 kh[h * kd + d] = k_[khd * kd + d];
@@ -3873,9 +4196,7 @@ impl Model {
             let metal_bf16 = std::env::var("QWEN_GDN_BF16_METAL")
                 .map(|v| v != "0")
                 .unwrap_or(false);
-            let wout = unsafe {
-                std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2)
-            };
+            let wout = unsafe { std::slice::from_raw_parts(gm.wout, c.hidden * vdim * 2) };
             let mut tensor = gm.tout;
             let metal_ok = metal_bf16
                 && logan_metal::metal_matmul(
@@ -4071,15 +4392,19 @@ impl Model {
                 .unwrap_or(true);
             // Qwen4's QSA index projection consumes the same activation.
             // Qualify this four-projection variant separately from Qwen3.6.
-            let fused_index = index_rows > 0 && std::env::var("QWEN_QSA_FUSED_INPUT")
-                .map(|v| v != "0").unwrap_or(false);
+            let fused_index = index_rows > 0
+                && std::env::var("QWEN_QSA_FUSED_INPUT")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
             let mut fused_ok = false;
             if fused_input && fused_index {
                 let mut qk = vec![0.0; index_rows];
                 let mut ys: [&mut [f32]; 4] = [&mut qg, &mut k, &mut v, &mut qk];
                 let ws = [&layer.attn_q, &layer.attn_k, &layer.attn_v, &layer.index_qk];
                 fused_ok = matmul_mxfp4_multi(&mut ys, x, &ws);
-                if fused_ok { index_qk = Some(qk); }
+                if fused_ok {
+                    index_qk = Some(qk);
+                }
             }
             if fused_input && !fused_ok {
                 let mut ys: [&mut [f32]; 3] = [&mut qg, &mut k, &mut v];
@@ -4546,11 +4871,7 @@ impl Model {
     /// Temporary slots live only until the current layer's grouped MoE kernel
     /// completes, so peak residency grows with one verification layer rather
     /// than with all model layers.
-    fn uncached_expert_issue(
-        &self,
-        li: i32,
-        ei: i32,
-    ) -> Option<crate::colisource::SlotExpert> {
+    fn uncached_expert_issue(&self, li: i32, ei: i32) -> Option<crate::colisource::SlotExpert> {
         let coli = self.coli.as_ref()?;
         let planned = self
             .expert_plan
@@ -5329,7 +5650,9 @@ impl Model {
         let mut emb = vec![0.0_f32; c.ple_embed_dim.max(256)];
         // One immutable scalar is shared by every head. Keep row payloads
         // range-read from NVMe; do not cache the embedding table here.
-        let ngram_scale = self.coli.as_ref()
+        let ngram_scale = self
+            .coli
+            .as_ref()
             .map(|coli| coli.ple_ngram_scale(c.ple_layer as i32).unwrap_or(1.0));
         for h in 0..heads {
             let r = rows[h] as usize;
@@ -5353,9 +5676,11 @@ impl Model {
         let mut key = vec![0.0; hcd];
         let mut value = vec![0.0; d];
         let fused = std::env::var("QWEN_PLE_FUSED_INPUT")
-            .map(|v| v != "0").unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(false)
             && matmul_mxfp4_multi(
-                &mut [&mut key, &mut value], &emb,
+                &mut [&mut key, &mut value],
+                &emb,
                 &[&self.ple_key_proj, &self.ple_value_proj],
             );
         if !fused {
@@ -5507,11 +5832,7 @@ impl Model {
             self.gdn_conv[li].copy_from_slice(&boundary.gdn_conv[li]);
             if let Some(gm) = self.gdn_metal[li].as_ref() {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        boundary.gdn_s[li].as_ptr(),
-                        gm.state,
-                        state_len,
-                    );
+                    std::ptr::copy_nonoverlapping(boundary.gdn_s[li].as_ptr(), gm.state, state_len);
                     std::ptr::copy_nonoverlapping(
                         boundary.gdn_conv[li].as_ptr(),
                         gm.conv_state,
@@ -5527,13 +5848,15 @@ impl Model {
                 return Err("incomplete MTP PLE boundary".into());
             }
             self.ple_ring.copy_from_slice(&boundary.ple_ring);
-            self.ple_conv_state.copy_from_slice(&boundary.ple_conv_state);
+            self.ple_conv_state
+                .copy_from_slice(&boundary.ple_conv_state);
         }
         if boundary.hidden_hc.len() != self.cfg.hc_count * self.cfg.hidden {
             return Err("incomplete MTP HC boundary".into());
         }
         self.last_hidden_nextn.clear();
-        self.last_hidden_nextn.extend_from_slice(&boundary.hidden_hc);
+        self.last_hidden_nextn
+            .extend_from_slice(&boundary.hidden_hc);
         self.sched_blocked = None;
         Ok(())
     }
@@ -5613,11 +5936,7 @@ impl Model {
         let mut res_hc = vec![0.0_f32; hcd];
         for g in 0..hc {
             let mut h_proj = vec![0.0_f32; d];
-            matmul(
-                &mut h_proj,
-                &h_norm[g * d..(g + 1) * d],
-                &mtp.fc_hidden,
-            );
+            matmul(&mut h_proj, &h_norm[g * d..(g + 1) * d], &mtp.fc_hidden);
             for dd in 0..d {
                 res_hc[g * d + dd] = e_proj[dd] + h_proj[dd];
             }
@@ -6121,7 +6440,10 @@ impl Model {
         start_pos: usize,
     ) -> Result<crate::mtp::MtpVerifyBatch, String> {
         if tokens.is_empty() {
-            return Ok(crate::mtp::MtpVerifyBatch { logits: Vec::new(), boundaries: Vec::new() });
+            return Ok(crate::mtp::MtpVerifyBatch {
+                logits: Vec::new(),
+                boundaries: Vec::new(),
+            });
         }
         if self.sched_mode {
             return Err("layer-major prefill is not yet supported in scheduler mode".into());
@@ -6170,7 +6492,9 @@ impl Model {
                     self.push_ple_ring(token);
                     self.ple_forward(stream);
                     boundaries[row].ple_ring.clone_from(&self.ple_ring);
-                    boundaries[row].ple_conv_state.clone_from(&self.ple_conv_state);
+                    boundaries[row]
+                        .ple_conv_state
+                        .clone_from(&self.ple_conv_state);
                 }
                 let mut mixed = vec![0.0; d];
                 let mut inj = vec![0.0; hc];
@@ -6326,8 +6650,7 @@ impl Model {
                 let mut descriptors = Vec::with_capacity(unique.len());
                 let mut row_offsets = Vec::with_capacity(unique.len() + 1);
                 let mut grouped_x = Vec::with_capacity(tokens.len() * c.topk * c.hidden);
-                let mut scatter: Vec<(usize, usize)> =
-                    Vec::with_capacity(tokens.len() * c.topk);
+                let mut scatter: Vec<(usize, usize)> = Vec::with_capacity(tokens.len() * c.topk);
                 row_offsets.push(0_i32);
 
                 let mut bind_ok = true;
@@ -6406,8 +6729,8 @@ impl Model {
                     if gpu_ok {
                         let mut contrib = vec![0.0_f32; tokens.len() * c.topk * c.hidden];
                         for (grouped_row, &(row, rank)) in scatter.iter().enumerate() {
-                            let src = &grouped_y
-                                [grouped_row * c.hidden..(grouped_row + 1) * c.hidden];
+                            let src =
+                                &grouped_y[grouped_row * c.hidden..(grouped_row + 1) * c.hidden];
                             let off = (row * c.topk + rank) * c.hidden;
                             contrib[off..off + c.hidden].copy_from_slice(src);
                         }
@@ -6429,8 +6752,7 @@ impl Model {
                             }
                             for g in 0..c.hc_count {
                                 for dd in 0..c.hidden {
-                                    streams[row][g * c.hidden + dd] +=
-                                        injectors[row][g] * moe[dd];
+                                    streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
                                 }
                             }
                         }
@@ -7723,32 +8045,53 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn qsa_four_mxfp4_projections_match_scalar_and_mixed_format_declines() {
-        use super::{Wt, WtBytes, matmul_mxfp4_multi, matmul_mxfp4_bytes};
+        use super::{matmul_mxfp4_bytes, matmul_mxfp4_multi, Wt, WtBytes};
         crate::ffi::metal_init();
         let x: Vec<f32> = (0..64).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
         let weights: Vec<Wt> = [(64, 0x22), (32, 0x44), (32, 0xaa), (16, 0xcc)]
-            .into_iter().map(|(o, code)| Wt {
-                f: vec![], o, i: 64,
+            .into_iter()
+            .map(|(o, code)| Wt {
+                f: vec![],
+                o,
+                i: 64,
                 bytes: Some(WtBytes::Mxfp4 {
-                    weights: vec![code; o * 32], scales: vec![127; o * 2],
+                    weights: vec![code; o * 32],
+                    scales: vec![127; o * 2],
                     metal_tensor: std::sync::Mutex::new(0),
                 }),
-            }).collect();
+            })
+            .collect();
         let mut actual: Vec<Vec<f32>> = weights.iter().map(|w| vec![0.0; w.o]).collect();
         let refs: Vec<&Wt> = weights.iter().collect();
         assert!(matmul_mxfp4_multi(
-            &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(), &x, &refs,
+            &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+            &x,
+            &refs,
         ));
         for (w, got) in weights.iter().zip(&actual) {
-            let WtBytes::Mxfp4 { weights, scales, .. } = w.bytes.as_ref().unwrap() else { unreachable!() };
+            let WtBytes::Mxfp4 {
+                weights, scales, ..
+            } = w.bytes.as_ref().unwrap()
+            else {
+                unreachable!()
+            };
             let mut expected = vec![0.0; w.o];
             matmul_mxfp4_bytes(&mut expected, &x, weights, scales, w.o, w.i);
             assert_eq!(*got, expected);
         }
-        let bf16 = Wt { f: vec![], bytes: Some(WtBytes::Bf16 { weights: vec![0; 16 * 64 * 2], metal_tensor: std::sync::Mutex::new(0) }), o: 16, i: 64 };
+        let bf16 = Wt {
+            f: vec![],
+            bytes: Some(WtBytes::Bf16 {
+                weights: vec![0; 16 * 64 * 2],
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
+            o: 16,
+            i: 64,
+        };
         let before = actual.clone();
         assert!(!matmul_mxfp4_multi(
-            &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(), &x,
+            &mut actual.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+            &x,
             &[&weights[0], &weights[1], &weights[2], &bf16],
         ));
         assert_eq!(actual, before);
@@ -7775,14 +8118,19 @@ mod tests {
     #[test]
     fn runtime_mxfp4_quantizer_matches_canonical_nibble_order() {
         let values = [
-            0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+            0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0,
+            -6.0,
         ];
         let mut bf16 = Vec::with_capacity(values.len() * 2);
-        for value in values { bf16.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes()); }
+        for value in values {
+            bf16.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+        }
         let (weights, scales) = quantize_bf16_to_mxfp4(&bf16, 1, values.len()).unwrap();
         assert_eq!(scales, vec![127]);
-        assert_eq!(weights, vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]);
+        assert_eq!(
+            weights,
+            vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe]
+        );
     }
 
     #[test]
@@ -7800,4 +8148,3 @@ mod tests {
         assert_eq!(raw_out, mlx_out);
     }
 }
-

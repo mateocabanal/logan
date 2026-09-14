@@ -223,7 +223,10 @@ mod json {
         for ch in s.chars() {
             if ch == ',' || ch.is_whitespace() {
                 if !num.is_empty() {
-                    out.push(num.parse::<f32>().map_err(|e| format!("bad float {num}: {e}"))?);
+                    out.push(
+                        num.parse::<f32>()
+                            .map_err(|e| format!("bad float {num}: {e}"))?,
+                    );
                     num.clear();
                 }
             } else {
@@ -231,7 +234,10 @@ mod json {
             }
         }
         if !num.is_empty() {
-            out.push(num.parse::<f32>().map_err(|e| format!("bad float {num}: {e}"))?);
+            out.push(
+                num.parse::<f32>()
+                    .map_err(|e| format!("bad float {num}: {e}"))?,
+            );
         }
         Ok(out)
     }
@@ -250,7 +256,10 @@ mod json {
                     // what truncated vectors to their first value.
                     if !num.is_empty() {
                         if let Some(v) = cur.as_mut() {
-                            v.push(num.parse::<f32>().map_err(|e| format!("bad float {num}: {e}"))?);
+                            v.push(
+                                num.parse::<f32>()
+                                    .map_err(|e| format!("bad float {num}: {e}"))?,
+                            );
                         }
                         num.clear();
                     }
@@ -393,8 +402,16 @@ mod tests {
     #[test]
     fn encodes_a_batch_request_the_pool_accepts() {
         let calls = vec![
-            ExpertCall { layer: 3, expert: 17, input: vec![0.5, -1.25] },
-            ExpertCall { layer: 3, expert: 200, input: vec![2.0, 0.0] },
+            ExpertCall {
+                layer: 3,
+                expert: 17,
+                input: vec![0.5, -1.25],
+            },
+            ExpertCall {
+                layer: 3,
+                expert: 200,
+                input: vec![2.0, 0.0],
+            },
         ];
         let body = encode_batch_request(&calls, "qwen36", Some("abc123"), 2, 4, "silu");
         assert!(body.contains("\"family\":\"qwen36\""));

@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use logan_qwen4::pool::{self, ExpertCall, PoolConfig};
 
 fn main() -> Result<(), String> {
-    let mut coordinator = std::env::var("LOGAN_POOL_COORDINATOR")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let mut coordinator =
+        std::env::var("LOGAN_POOL_COORDINATOR").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let mut model = PathBuf::from(
         std::env::var("LOGAN_POOL_MODEL")
             .unwrap_or_else(|_| "~/models/Qwen3.6-35B-A3B-mxfp4".into()),
@@ -66,8 +66,7 @@ fn main() -> Result<(), String> {
         .map(|j| (((j * 37) % 101) as f32 - 50.0) / 500.0)
         .collect();
 
-    let cfg = PoolConfig::new(coordinator.clone())
-        .with_family(family.clone());
+    let cfg = PoolConfig::new(coordinator.clone()).with_family(family.clone());
     println!("coordinator {coordinator}  family {family}");
     println!("layer {layer} expert {expert}  d_model {d_model}");
 
@@ -94,15 +93,27 @@ fn main() -> Result<(), String> {
             remote.len()
         ));
     }
+    // Compare RELATIVE to the vector's own magnitude. An absolute epsilon is
+    // the wrong test here: expert outputs are ~1e-4, so a 1e-3 threshold would
+    // wave through a 10x error. (It did -- this check reported PASS on a
+    // result that was wrong by 4x.)
+    let scale = local
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-30);
     let diff = local
         .iter()
         .zip(remote.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
+    let rel = diff / scale;
     println!("pool   rms {:.6}", rms(remote));
-    println!("max|local - pool| = {diff:.3e}");
-    if diff > 1e-3 {
-        return Err(format!("pool disagrees with local decode by {diff:.3e}"));
+    println!("max|local - pool| = {diff:.3e}  (relative {rel:.3e})");
+    if rel > 1e-5 {
+        return Err(format!(
+            "pool disagrees with local decode by {rel:.3e} relative"
+        ));
     }
     println!("OK: pool client returns the same expert the checkpoint holds");
     Ok(())
@@ -184,31 +195,41 @@ fn local_expert(
             let rows = wshape[1] as usize;
             let cols = wshape[2] as usize; // u32 words
             let per_w = rows * cols * 4;
-            let sgroups = (sshape[2] as usize) * (sshape[1] as usize) / (sshape[0] as usize).max(1);
-            let per_s = sgroups;
+            // Scale bytes for ONE expert: every dim except the leading expert
+            // axis. Dividing by the expert count (sshape[0]) is wrong -- that
+            // axis is already excluded by slicing, and the quotient came out
+            // 256x too small, which read the wrong scales entirely.
+            let per_s: usize = sshape[1..].iter().map(|&d| d as usize).product();
 
             let woff = w["data_offsets"].as_array().unwrap()[0].as_u64().unwrap();
             let soff = s["data_offsets"].as_array().unwrap()[0].as_u64().unwrap();
-            f.seek(SeekFrom::Start(data_start + woff + expert as u64 * per_w as u64))
-                .map_err(|e| format!("{e}"))?;
+            f.seek(SeekFrom::Start(
+                data_start + woff + expert as u64 * per_w as u64,
+            ))
+            .map_err(|e| format!("{e}"))?;
             let mut wbuf = vec![0u8; per_w];
             f.read_exact(&mut wbuf).map_err(|e| format!("{e}"))?;
-            f.seek(SeekFrom::Start(data_start + soff + expert as u64 * per_s as u64))
-                .map_err(|e| format!("{e}"))?;
+            f.seek(SeekFrom::Start(
+                data_start + soff + expert as u64 * per_s as u64,
+            ))
+            .map_err(|e| format!("{e}"))?;
             let mut sbuf = vec![0u8; per_s];
             f.read_exact(&mut sbuf).map_err(|e| format!("{e}"))?;
 
-            // MXFP4: E2M1 nibbles, low nibble first, one E8M0 scale per 32 cols.
+            // MXFP4: row-major E2M1 nibbles (low nibble = even column) with
+            // one E8M0 scale byte per 32 COLUMNS. The scale index therefore
+            // advances every 32 outputs, not every packed byte -- indexing by
+            // the byte inflated values by ~2^5 and made this probe disagree
+            // with the pool for reasons that had nothing to do with the pool.
             const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-            let mut out = vec![0.0f32; rows * (cols * 8)];
+            let cols_f32 = cols * 8;
+            let mut out = vec![0.0f32; rows * cols_f32];
             let mut col = 0usize;
-            'outer: for (bi, b) in wbuf.iter().enumerate() {
+            'outer: for b in wbuf.iter() {
                 for nib in [b & 0x0F, (b >> 4) & 0x0F] {
                     if col >= out.len() {
                         break 'outer;
                     }
-                    // One scale byte per 32 OUTPUT columns. Indexing by the
-                    // packed byte index instead inflates values by ~2^5.
                     let scale_idx = col / 32;
                     let scale = sbuf
                         .get(scale_idx)
