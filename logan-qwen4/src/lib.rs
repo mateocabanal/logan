@@ -18,6 +18,7 @@ pub mod ffi;
 mod gdn_ane;
 pub mod plan;
 pub mod mtp;
+pub mod pool;
 pub mod scheduled;
 
 use logan_core::expert::Slot as _; // for SlotExpert::release
@@ -212,6 +213,10 @@ pub struct Cfg {
     pub vocab: usize,
     pub eps: f32,
     pub output_gate: OutputGate,
+    /// True when checkpoint RMSNorm weights are zero-centered deltas and
+    /// runtime must apply `(1 + weight)`. Native Qwen3-Next/HF uses this;
+    /// legacy MLX Qwen3.5/3.6 packages already fold the +1 into stored weights.
+    pub zero_centered_norm: bool,
     gdn_layers: Vec<bool>,
     qsa_layers: Vec<bool>,
     // qwen4 hyper connections
@@ -243,6 +248,7 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
     if let Some(tc) = v.get("text_config").and_then(|x| x.as_object()) {
         v = serde_json::Value::Object(tc.clone());
     }
+    let model_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("").to_owned();
     let get = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
     let output_gate = OutputGate::from_config(&v)?;
@@ -262,22 +268,43 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
     let theta = rope
         .and_then(|r| r.get("rope_theta"))
         .and_then(|x| x.as_f64())
+        .or_else(|| v.get("rope_theta").and_then(|x| x.as_f64()))
         .map(|x| x as f32)
-        .unwrap_or_else(|| num("rope_theta").max(10000000.0));
+        .unwrap_or(10_000_000.0);
     let prf = rope
         .and_then(|r| r.get("partial_rotary_factor"))
         .and_then(|x| x.as_f64())
+        .or_else(|| v.get("partial_rotary_factor").and_then(|x| x.as_f64()))
         .map(|x| x as f32)
         .unwrap_or(1.0);
     let head_dim = get("head_dim").max(get("hidden_size") / get("num_attention_heads").max(1));
-    let layer_types = v
-        .get("layer_types")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let layers = get("num_hidden_layers");
+    let layer_types: Vec<String> = if let Some(values) = v.get("layer_types").and_then(|x| x.as_array()) {
+        values
+            .iter()
+            .map(|value| value.as_str().unwrap_or("").to_owned())
+            .collect()
+    } else if let Some(interval) = v
+        .get("full_attention_interval")
+        .and_then(|x| x.as_u64())
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+    {
+        (0..layers)
+            .map(|layer| {
+                if (layer + 1) % interval == 0 {
+                    "full_attention".to_owned()
+                } else {
+                    "linear_attention".to_owned()
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let gdn_layers: Vec<bool> = layer_types
         .iter()
-        .map(|t| t.as_str() == Some("linear_attention"))
+        .map(|t| t == "linear_attention")
         .collect();
 
     // qwen4 keys are TOP-LEVEL in config.json (C engine reads from root)
@@ -289,7 +316,7 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
     // QSA layers = full_attention layers when the indexer is configured
     let qsa_layers: Vec<bool> = layer_types
         .iter()
-        .map(|t| t.as_str() == Some("full_attention") && idx_n_heads > 0)
+        .map(|t| t == "full_attention" && idx_n_heads > 0)
         .collect();
 
     let hc_count = get("hc_count");
@@ -340,6 +367,7 @@ pub fn load_cfg(path: &Path) -> Result<Cfg, String> {
         vocab: get("vocab_size"),
         eps: num("rms_norm_eps").max(1e-6),
         output_gate,
+        zero_centered_norm: model_type == "qwen3_next",
         gdn_layers,
         qsa_layers,
         hc_count,
@@ -829,6 +857,12 @@ pub struct Model {
     layers: Vec<Layer>,
     experts: Vec<Vec<[Wt; 3]>>,
     hc_global: HcGlobal,
+    /// Embedded Qwen4Exp MTP drafter. Its transformer block is appended to
+    /// `layers` outside `cfg.layers`, so normal target forward never executes it.
+    mtp: Option<mtp::MtpRuntime>,
+    /// Wide [hc*hidden] residual exported by the most recent completed target
+    /// token. This is the `h_nextn` input consumed one position later by MTP.
+    last_hidden_nextn: Vec<f32>,
     // PLE (present when cfg.ple_layer >= 0)
     ple_ngram: Wt,
     ple_key_proj: Wt,
@@ -2751,6 +2785,7 @@ impl Model {
         li: usize,
         xs: &[Vec<f32>],
         outs: &mut [Vec<f32>],
+        mut mtp_boundaries: Option<&mut [crate::mtp::MtpVerifyBoundary]>,
     ) -> bool {
         let rows = xs.len();
         if rows <= 1 || outs.len() != rows || !layer.is_gdn {
@@ -2864,8 +2899,17 @@ impl Model {
         assert!(rep >= 1 && vheads % kheads == 0);
         let state_len = vheads * kd * vd;
         let conv_len = cdim * (kk - 1);
-        let conv_st = unsafe { std::slice::from_raw_parts_mut(conv_ptr, conv_len) };
-        let state = unsafe { std::slice::from_raw_parts_mut(state_ptr, state_len) };
+        let speculative_states = mtp_boundaries.is_some();
+        let mut spec_state_rows = if speculative_states {
+            (0..rows).map(|_| vec![0.0_f32; state_len]).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut spec_conv_rows = if speculative_states {
+            (0..rows).map(|_| vec![0.0_f32; conv_len]).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         for row in 0..rows {
             let qkv = &qkv_all[row * cdim..(row + 1) * cdim];
@@ -2876,23 +2920,52 @@ impl Model {
             let conv_t0 = std::time::Instant::now();
             let mut y = vec![0.0_f32; cdim];
             if kk > 1 {
-                for ch in 0..cdim {
-                    let mut acc = 0.0_f32;
-                    for j in 0..kk {
-                        let vv = if j == kk - 1 {
-                            qkv[ch]
-                        } else {
-                            conv_st[ch * (kk - 1) + j]
-                        };
-                        acc += layer.gdn_conv1d[ch * kk + j] * vv;
+                if speculative_states {
+                    let (before, tail) = spec_conv_rows.split_at_mut(row);
+                    let next = &mut tail[0];
+                    let prev: &[f32] = if row == 0 {
+                        unsafe { std::slice::from_raw_parts(conv_ptr, conv_len) }
+                    } else {
+                        &before[row - 1]
+                    };
+                    for ch in 0..cdim {
+                        let mut acc = 0.0_f32;
+                        for j in 0..kk {
+                            let vv = if j == kk - 1 {
+                                qkv[ch]
+                            } else {
+                                prev[ch * (kk - 1) + j]
+                            };
+                            acc += layer.gdn_conv1d[ch * kk + j] * vv;
+                        }
+                        y[ch] = silu(acc);
                     }
-                    y[ch] = silu(acc);
-                }
-                for ch in 0..cdim {
-                    for s in 0..kk - 2 {
-                        conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
+                    for ch in 0..cdim {
+                        for s in 0..kk - 2 {
+                            next[ch * (kk - 1) + s] = prev[ch * (kk - 1) + s + 1];
+                        }
+                        next[ch * (kk - 1) + (kk - 2)] = qkv[ch];
                     }
-                    conv_st[ch * (kk - 1) + (kk - 2)] = qkv[ch];
+                } else {
+                    let conv_st = unsafe { std::slice::from_raw_parts_mut(conv_ptr, conv_len) };
+                    for ch in 0..cdim {
+                        let mut acc = 0.0_f32;
+                        for j in 0..kk {
+                            let vv = if j == kk - 1 {
+                                qkv[ch]
+                            } else {
+                                conv_st[ch * (kk - 1) + j]
+                            };
+                            acc += layer.gdn_conv1d[ch * kk + j] * vv;
+                        }
+                        y[ch] = silu(acc);
+                    }
+                    for ch in 0..cdim {
+                        for s in 0..kk - 2 {
+                            conv_st[ch * (kk - 1) + s] = conv_st[ch * (kk - 1) + s + 1];
+                        }
+                        conv_st[ch * (kk - 1) + (kk - 2)] = qkv[ch];
+                    }
                 }
             } else {
                 for ch in 0..cdim {
@@ -2932,36 +3005,79 @@ impl Model {
 
             let recur_t0 = std::time::Instant::now();
             let mut kv_mem = vec![0.0_f32; vd];
-            for h in 0..vheads {
-                let ga =
-                    -layer.gdn_a_log[h].exp() * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
-                let gt = ga.exp();
-                let bt = 1.0 / (1.0 + (-b[h]).exp());
-                let sh = &mut state[h * kd * vd..(h + 1) * kd * vd];
-                let qhh = &qh[h * kd..(h + 1) * kd];
-                let khh = &kh[h * kd..(h + 1) * kd];
-                let vhh = &vh[h * vd..(h + 1) * vd];
-                kv_mem.fill(0.0);
-                for kk2 in 0..kd {
-                    for dd in 0..vd {
-                        let si = kk2 * vd + dd;
-                        let sv = sh[si] * gt;
-                        sh[si] = sv;
-                        kv_mem[dd] += sv * khh[kk2];
-                    }
-                }
-                for dd in 0..vd {
-                    let delta = (vhh[dd] - kv_mem[dd]) * bt;
-                    let mut acc = 0.0_f32;
+            if speculative_states {
+                let (before, tail) = spec_state_rows.split_at_mut(row);
+                let next_state = &mut tail[0];
+                let prev_state: &[f32] = if row == 0 {
+                    unsafe { std::slice::from_raw_parts(state_ptr, state_len) }
+                } else {
+                    &before[row - 1]
+                };
+                for h in 0..vheads {
+                    let ga =
+                        -layer.gdn_a_log[h].exp() * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
+                    let gt = ga.exp();
+                    let bt = 1.0 / (1.0 + (-b[h]).exp());
+                    let prev_sh = &prev_state[h * kd * vd..(h + 1) * kd * vd];
+                    let next_sh = &mut next_state[h * kd * vd..(h + 1) * kd * vd];
+                    let qhh = &qh[h * kd..(h + 1) * kd];
+                    let khh = &kh[h * kd..(h + 1) * kd];
+                    let vhh = &vh[h * vd..(h + 1) * vd];
+                    kv_mem.fill(0.0);
                     for kk2 in 0..kd {
-                        let si = kk2 * vd + dd;
-                        let next_s = sh[si] + khh[kk2] * delta;
-                        sh[si] = next_s;
-                        acc += next_s * qhh[kk2];
+                        for dd in 0..vd {
+                            let si = kk2 * vd + dd;
+                            let sv = prev_sh[si] * gt;
+                            next_sh[si] = sv;
+                            kv_mem[dd] += sv * khh[kk2];
+                        }
                     }
-                    kv_mem[dd] = acc;
+                    for dd in 0..vd {
+                        let delta = (vhh[dd] - kv_mem[dd]) * bt;
+                        let mut acc = 0.0_f32;
+                        for kk2 in 0..kd {
+                            let si = kk2 * vd + dd;
+                            let next_s = next_sh[si] + khh[kk2] * delta;
+                            next_sh[si] = next_s;
+                            acc += next_s * qhh[kk2];
+                        }
+                        kv_mem[dd] = acc;
+                    }
+                    vh[h * vd..(h + 1) * vd].copy_from_slice(&kv_mem);
                 }
-                vh[h * vd..(h + 1) * vd].copy_from_slice(&kv_mem);
+            } else {
+                let state = unsafe { std::slice::from_raw_parts_mut(state_ptr, state_len) };
+                for h in 0..vheads {
+                    let ga =
+                        -layer.gdn_a_log[h].exp() * (1.0 + (a[h] + layer.gdn_dt_bias[h]).exp()).ln();
+                    let gt = ga.exp();
+                    let bt = 1.0 / (1.0 + (-b[h]).exp());
+                    let sh = &mut state[h * kd * vd..(h + 1) * kd * vd];
+                    let qhh = &qh[h * kd..(h + 1) * kd];
+                    let khh = &kh[h * kd..(h + 1) * kd];
+                    let vhh = &vh[h * vd..(h + 1) * vd];
+                    kv_mem.fill(0.0);
+                    for kk2 in 0..kd {
+                        for dd in 0..vd {
+                            let si = kk2 * vd + dd;
+                            let sv = sh[si] * gt;
+                            sh[si] = sv;
+                            kv_mem[dd] += sv * khh[kk2];
+                        }
+                    }
+                    for dd in 0..vd {
+                        let delta = (vhh[dd] - kv_mem[dd]) * bt;
+                        let mut acc = 0.0_f32;
+                        for kk2 in 0..kd {
+                            let si = kk2 * vd + dd;
+                            let next_s = sh[si] + khh[kk2] * delta;
+                            sh[si] = next_s;
+                            acc += next_s * qhh[kk2];
+                        }
+                        kv_mem[dd] = acc;
+                    }
+                    vh[h * vd..(h + 1) * vd].copy_from_slice(&kv_mem);
+                }
             }
             if logan_core::telemetry::enabled() {
                 self.spans.gdn_recur_ms += recur_t0.elapsed().as_secs_f64() * 1e3;
@@ -2981,6 +3097,16 @@ impl Model {
             }
             if logan_core::telemetry::enabled() {
                 self.spans.gdn_gate_ms += gate_t0.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+
+        if let Some(boundaries) = mtp_boundaries.as_deref_mut() {
+            if boundaries.len() != rows {
+                return false;
+            }
+            for row in 0..rows {
+                boundaries[row].gdn_s[li] = std::mem::take(&mut spec_state_rows[row]);
+                boundaries[row].gdn_conv[li] = std::mem::take(&mut spec_conv_rows[row]);
             }
         }
 
@@ -4012,22 +4138,20 @@ impl Model {
         for hh in 0..h {
             let out = &mut qg[hh * 2 * hd..hh * 2 * hd + hd];
             let input = &qg_snap[hh * 2 * hd..hh * 2 * hd + hd];
-            if c.hc_count == 0 {
-                // MLX Qwen3.5/3.6 converted checkpoints already have the
-                // Transformers `+1` folded into q_norm/k_norm weights.
-                rmsnorm_row_shifted(out, input, &layer.attn_qn, c.eps);
-            } else {
+            if c.zero_centered_norm || c.hc_count > 0 {
                 rmsnorm_row(out, input, &layer.attn_qn, c.eps);
+            } else {
+                rmsnorm_row_shifted(out, input, &layer.attn_qn, c.eps);
             }
         }
         let k_snap = k.clone();
         for g in 0..kv {
             let out = &mut k[g * hd..g * hd + hd];
             let input = &k_snap[g * hd..g * hd + hd];
-            if c.hc_count == 0 {
-                rmsnorm_row_shifted(out, input, &layer.attn_kn, c.eps);
-            } else {
+            if c.zero_centered_norm || c.hc_count > 0 {
                 rmsnorm_row(out, input, &layer.attn_kn, c.eps);
+            } else {
+                rmsnorm_row_shifted(out, input, &layer.attn_kn, c.eps);
             }
         }
         for hh in 0..h {
@@ -4128,6 +4252,43 @@ impl Model {
         out: &mut [f32],
     ) {
         self.attention_common(layer, li, x, pos, rope, None, None, out);
+    }
+
+    /// Populate one dense-attention K/V row without evaluating attention or
+    /// the output projection. Qwen4Exp's one-layer MTP catch-up only needs its
+    /// prompt KV: each draft-position input is independently conditioned on a
+    /// target hidden row, so no MTP block output is carried between prompt
+    /// positions. The stored K/V bytes are identical to `attention_common`.
+    fn attention_cache_row(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+        pos: usize,
+        rope: &[(f32, f32)],
+    ) {
+        let c = self.cfg.clone();
+        let hd = c.head_dim;
+        let kv = c.kv_heads;
+        let AttnProjection { mut k, v, .. } = self.project_attention(layer, li, x, false);
+        let k_snap = k.clone();
+        for g in 0..kv {
+            rmsnorm_row(
+                &mut k[g * hd..g * hd + hd],
+                &k_snap[g * hd..g * hd + hd],
+                &layer.attn_kn,
+                c.eps,
+            );
+            rope_partial_with_angles(
+                &mut k[g * hd..g * hd + hd],
+                rope,
+                c.rotary_dim,
+                self.rope_interleaved,
+            );
+            let base = g * c.max_t * hd + pos * hd;
+            self.kv_k[li][base..base + hd].copy_from_slice(&k[g * hd..g * hd + hd]);
+            self.kv_v[li][base..base + hd].copy_from_slice(&v[g * hd..g * hd + hd]);
+        }
     }
 
     fn qsa_select(
@@ -4376,6 +4537,72 @@ impl Model {
             e.release();
         }
         Some(std::rc::Rc::new(v.ref_view()))
+    }
+
+    /// Issue an expert into a request-scoped MetalIO slot without inserting
+    /// it into the persistent LRU. Speculative verification can need the union
+    /// of several routes at one layer (up to block_len * topk); forcing that
+    /// union through a topk-sized per-layer LRU causes immediate self-eviction.
+    /// Temporary slots live only until the current layer's grouped MoE kernel
+    /// completes, so peak residency grows with one verification layer rather
+    /// than with all model layers.
+    fn uncached_expert_issue(
+        &self,
+        li: i32,
+        ei: i32,
+    ) -> Option<crate::colisource::SlotExpert> {
+        let coli = self.coli.as_ref()?;
+        let planned = self
+            .expert_plan
+            .as_ref()
+            .and_then(|plan| plan.layers.get(li as usize))
+            .and_then(|layer| layer.get(ei as usize))
+            .cloned();
+        let (shard_id, regions, dims) = if let Some(planned) = planned.as_ref() {
+            (
+                planned.shard_id,
+                [planned.regions[0], planned.regions[1], planned.regions[2]],
+                [planned.dims[0], planned.dims[1], planned.dims[2]],
+            )
+        } else {
+            let recs = coli.pkg_ref().expert_records(li, ei);
+            let rec = recs.first()?;
+            let (regions, dims) = coli.pkg_ref().expert_matrix_regions(rec)?;
+            if regions.len() < 3 || dims.len() < 3 {
+                return None;
+            }
+            (
+                rec.shard_id,
+                [regions[0], regions[1], regions[2]],
+                [dims[0], dims[1], dims[2]],
+            )
+        };
+        let shard = coli.pkg_ref().shard_path(shard_id)?;
+        let fid = crate::ffi::mio_file(&shard)?;
+        let (slot, ev) = crate::ffi::mio_load_expert(fid, &regions)?;
+        let ptr = unsafe { crate::ffi::metalio_slot_ptr(slot) } as *mut u8;
+        if ptr.is_null() {
+            unsafe { crate::ffi::metalio_slot_free(slot) };
+            return None;
+        }
+        let gb = regions[0].1;
+        let ub = regions[1].1;
+        let db = regions[2].1;
+        let up_off = (gb + 15) & !15usize;
+        let down_off = (up_off + ub + 15) & !15usize;
+        Some(crate::colisource::SlotExpert {
+            slot,
+            gate_bytes: gb,
+            up_offset: up_off,
+            up_bytes: ub,
+            down_offset: down_off,
+            down_bytes: db,
+            ptr,
+            pending: std::cell::Cell::new(ev),
+            bf16_cache: std::cell::RefCell::new(None),
+            rows: [dims[0].0, dims[1].0, dims[2].0],
+            cols: [dims[0].1, dims[1].1, dims[2].1],
+        })
     }
 
     /// Issue the previous token's route early while the temporal block runs.
@@ -4671,20 +4898,25 @@ impl Model {
         (sy, gs)
     }
 
-    fn route_topk(&mut self, layer: &Layer, x: &[f32]) -> (Vec<usize>, Vec<f32>, f32) {
-        let c = self.cfg.clone();
-        let e = c.experts;
-        let k = c.topk;
+    fn route_topk_n(
+        &mut self,
+        layer: &Layer,
+        x: &[f32],
+        experts: usize,
+        topk: usize,
+    ) -> (Vec<usize>, Vec<f32>, f32) {
+        debug_assert_eq!(layer.router.o, experts);
+        let k = topk.min(experts);
         let mut _route_t = logan_core::telemetry::Span::begin("route");
-        let mut logits = vec![0.0; e];
+        let mut logits = vec![0.0; experts];
         matmul(&mut logits, x, &layer.router);
         softmax_row(&mut logits);
 
-        let mut idx: Vec<usize> = (0..e).collect();
+        let mut idx: Vec<usize> = (0..experts).collect();
         let mut val = logits;
         for i in 0..k {
             let mut best = i;
-            for j in i + 1..e {
+            for j in i + 1..experts {
                 if val[j] > val[best] || (val[j] == val[best] && idx[j] < idx[best]) {
                     best = j;
                 }
@@ -4695,6 +4927,10 @@ impl Model {
         let wsum: f32 = val[..k].iter().sum();
         self.spans.route_ms += _route_t.end();
         (idx, val, wsum)
+    }
+
+    fn route_topk(&mut self, layer: &Layer, x: &[f32]) -> (Vec<usize>, Vec<f32>, f32) {
+        self.route_topk_n(layer, x, self.cfg.experts, self.cfg.topk)
     }
 
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
@@ -5163,6 +5399,328 @@ impl Model {
         }
     }
 
+    pub(crate) fn mtp_enabled(&self) -> bool {
+        self.mtp.is_some()
+            && std::env::var("QWEN_MTP")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true)
+    }
+
+    pub(crate) fn last_hidden_nextn(&self) -> &[f32] {
+        &self.last_hidden_nextn
+    }
+
+    pub(crate) fn mtp_record_verification(&mut self, accepted: bool) {
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.drafted += 1;
+            mtp.accepted += u64::from(accepted);
+            mtp.attempted_by_pos[0] += 1;
+            mtp.accepted_by_pos[0] += u64::from(accepted);
+        }
+    }
+
+    pub(crate) fn mtp_record_block(
+        &mut self,
+        draft_len: usize,
+        accepted_prefix: usize,
+        draft_ms: f64,
+        verify_ms: f64,
+        draft_mio_bytes: u64,
+        verify_mio_bytes: u64,
+    ) {
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.blocks += 1;
+            mtp.drafted += draft_len as u64;
+            mtp.accepted += accepted_prefix as u64;
+            mtp.draft_ms += draft_ms;
+            mtp.verify_ms += verify_ms;
+            mtp.draft_mio_bytes = mtp.draft_mio_bytes.saturating_add(draft_mio_bytes);
+            mtp.verify_mio_bytes = mtp.verify_mio_bytes.saturating_add(verify_mio_bytes);
+            // Positions after the first mismatch are not valid acceptance
+            // observations because target logits there were conditioned on a
+            // rejected prefix. Count only the accepted prefix plus the first
+            // mismatch (or all positions when the block fully accepts).
+            let observed = if accepted_prefix < draft_len {
+                accepted_prefix + 1
+            } else {
+                draft_len
+            };
+            for i in 0..observed.min(4) {
+                mtp.attempted_by_pos[i] += 1;
+                if i < accepted_prefix {
+                    mtp.accepted_by_pos[i] += 1;
+                }
+            }
+        }
+    }
+
+    fn capture_mtp_gdn_boundary(
+        &self,
+        li: usize,
+        boundary: &mut crate::mtp::MtpVerifyBoundary,
+    ) -> Result<(), String> {
+        let state_len = self.cfg.lin_v_heads * self.cfg.lin_k_dim * self.cfg.lin_v_dim;
+        let cdim = self.cfg.lin_k_dim * self.cfg.lin_k_heads * 2
+            + self.cfg.lin_v_dim * self.cfg.lin_v_heads;
+        let conv_len = cdim * self.cfg.conv_kernel.saturating_sub(1);
+        if boundary.gdn_s.len() != self.cfg.layers || boundary.gdn_conv.len() != self.cfg.layers {
+            return Err("malformed MTP recurrent boundary storage".into());
+        }
+        if let Some(gm) = self.gdn_metal[li].as_ref() {
+            unsafe {
+                boundary.gdn_s[li] = std::slice::from_raw_parts(gm.state, state_len).to_vec();
+                boundary.gdn_conv[li] =
+                    std::slice::from_raw_parts(gm.conv_state, conv_len).to_vec();
+            }
+        } else {
+            boundary.gdn_s[li] = self.gdn_s[li].clone();
+            boundary.gdn_conv[li] = self.gdn_conv[li].clone();
+        }
+        Ok(())
+    }
+
+    /// Commit the target causal state at one already-evaluated speculative row.
+    /// Attention KV/QSA rows beyond this boundary are deliberately left in
+    /// place: subsequent causal reads cannot observe future positions, and the
+    /// first resumed token overwrites the stale row before it becomes visible.
+    /// Only genuinely recurrent state (GDN + PLE) and the HC handoff need to be
+    /// restored to the accepted boundary.
+    pub(crate) fn mtp_commit_verified_boundary(
+        &mut self,
+        boundary: &crate::mtp::MtpVerifyBoundary,
+    ) -> Result<(), String> {
+        if boundary.gdn_s.len() != self.cfg.layers || boundary.gdn_conv.len() != self.cfg.layers {
+            return Err("MTP boundary layer count does not match target".into());
+        }
+        let state_len = self.cfg.lin_v_heads * self.cfg.lin_k_dim * self.cfg.lin_v_dim;
+        let cdim = self.cfg.lin_k_dim * self.cfg.lin_k_heads * 2
+            + self.cfg.lin_v_dim * self.cfg.lin_v_heads;
+        let conv_len = cdim * self.cfg.conv_kernel.saturating_sub(1);
+        for li in 0..self.cfg.layers {
+            if !self.cfg.gdn_layers[li] {
+                continue;
+            }
+            if boundary.gdn_s[li].len() != state_len || boundary.gdn_conv[li].len() != conv_len {
+                return Err(format!("layer {li}: incomplete MTP GDN boundary"));
+            }
+            self.gdn_s[li].copy_from_slice(&boundary.gdn_s[li]);
+            self.gdn_conv[li].copy_from_slice(&boundary.gdn_conv[li]);
+            if let Some(gm) = self.gdn_metal[li].as_ref() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        boundary.gdn_s[li].as_ptr(),
+                        gm.state,
+                        state_len,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        boundary.gdn_conv[li].as_ptr(),
+                        gm.conv_state,
+                        conv_len,
+                    );
+                }
+            }
+        }
+        if self.cfg.ple_layer >= 0 {
+            if boundary.ple_ring.len() != self.ple_ring.len()
+                || boundary.ple_conv_state.len() != self.ple_conv_state.len()
+            {
+                return Err("incomplete MTP PLE boundary".into());
+            }
+            self.ple_ring.copy_from_slice(&boundary.ple_ring);
+            self.ple_conv_state.copy_from_slice(&boundary.ple_conv_state);
+        }
+        if boundary.hidden_hc.len() != self.cfg.hc_count * self.cfg.hidden {
+            return Err("incomplete MTP HC boundary".into());
+        }
+        self.last_hidden_nextn.clear();
+        self.last_hidden_nextn.extend_from_slice(&boundary.hidden_hc);
+        self.sched_blocked = None;
+        Ok(())
+    }
+
+    pub(crate) fn mtp_stats(&self) -> Option<crate::mtp::MtpStats> {
+        self.mtp.as_ref().map(|mtp| crate::mtp::MtpStats {
+            catchup_rows: mtp.catchup_rows,
+            drafted: mtp.drafted,
+            accepted: mtp.accepted,
+            blocks: mtp.blocks,
+            attempted_by_pos: mtp.attempted_by_pos,
+            accepted_by_pos: mtp.accepted_by_pos,
+            draft_ms: mtp.draft_ms,
+            verify_ms: mtp.verify_ms,
+            draft_mio_bytes: mtp.draft_mio_bytes,
+            verify_mio_bytes: mtp.verify_mio_bytes,
+        })
+    }
+
+    /// Run the embedded one-layer Qwen4Exp MTP head for a single position.
+    /// `target_hidden` is the target model's wide HC residual from the
+    /// *previous* position; `token` is the token at this position. This is the
+    /// exact shift used by the upstream MTP driver: (h[p-1], x[p]) -> draft
+    /// logits for x[p+1]. The draft layer owns an independent dense KV cache
+    /// at `layer_index`, so rejected drafts never mutate target causal state.
+    fn mtp_forward_inner(
+        &mut self,
+        token: usize,
+        target_hidden: &[f32],
+        pos: usize,
+        catchup: bool,
+    ) -> Result<crate::mtp::MtpDraft, String> {
+        if self.sched_mode {
+            return Err("MTP is not yet supported in scheduler-driven forward mode".into());
+        }
+        let c = self.cfg.clone();
+        let hcd = c.hc_count * c.hidden;
+        if c.hc_count == 0 {
+            return Err("Qwen4Exp MTP requires hyper-connection state".into());
+        }
+        if target_hidden.len() != hcd {
+            return Err(format!(
+                "MTP target hidden width {} != expected {hcd}",
+                target_hidden.len()
+            ));
+        }
+        if pos >= c.max_t {
+            return Err(format!("MTP position {pos} exceeds context {}", c.max_t));
+        }
+        let Some(mut mtp) = self.mtp.take() else {
+            return Err("package has no embedded MTP drafter".into());
+        };
+        let li = mtp.layer_index;
+        if li >= self.layers.len()
+            || li >= self.kv_k.len()
+            || li >= self.kv_v.len()
+            || li >= self.attn_metal.len()
+        {
+            self.mtp = Some(mtp);
+            return Err("MTP runtime state is not fully initialized".into());
+        }
+
+        let mut layer = std::mem::replace(&mut self.layers[li], Layer::empty());
+        let d = c.hidden;
+        let hc = c.hc_count;
+
+        // Split checkpoint form of upstream eh_proj:
+        //   W_e @ rmsnorm(embed(x[p])) + W_h @ grouped_rmsnorm(h[p-1])
+        // with the embedding term broadcast to all HC streams.
+        let emb = self.embed.row_f32(token);
+        let mut e_norm = vec![0.0_f32; d];
+        rmsnorm_row(&mut e_norm, &emb, &mtp.enorm, c.eps);
+        let mut h_norm = vec![0.0_f32; hcd];
+        rmsnorm_grouped(&mut h_norm, target_hidden, &mtp.hnorm, hc, d, c.eps);
+        let mut e_proj = vec![0.0_f32; d];
+        matmul(&mut e_proj, &e_norm, &mtp.fc_embedding);
+        let mut res_hc = vec![0.0_f32; hcd];
+        for g in 0..hc {
+            let mut h_proj = vec![0.0_f32; d];
+            matmul(
+                &mut h_proj,
+                &h_norm[g * d..(g + 1) * d],
+                &mtp.fc_hidden,
+            );
+            for dd in 0..d {
+                res_hc[g * d + dd] = e_proj[dd] + h_proj[dd];
+            }
+        }
+
+        // MTP layer 0 is always a dense full-attention block. Although the
+        // detached checkpoint carries indexer tensors for architectural
+        // parity, upstream deliberately gives the drafter a plain attention
+        // cache, so no QSA selection/index cache is used here.
+        let rope = rope_angles(pos, &c);
+        let mut mixed = vec![0.0_f32; d];
+        let mut inject = vec![0.0_f32; hc];
+        self.hc_mix(
+            &layer.hc_norm,
+            &layer.hc_mix_down,
+            &layer.hc_mix_up,
+            Some(&layer.hc_inject),
+            &res_hc,
+            &mut mixed,
+            Some(&mut inject),
+        );
+        if catchup {
+            self.attention_cache_row(&layer, li, &mixed, pos, &rope);
+            mtp.catchup_rows += 1;
+            self.layers[li] = layer;
+            self.mtp = Some(mtp);
+            return Ok(crate::mtp::MtpDraft {
+                logits: Vec::new(),
+                next_hidden_hc: Vec::new(),
+            });
+        }
+
+        let mut attn = vec![0.0_f32; d];
+        self.attention_token(&layer, li, &mixed, pos, &rope, &mut attn);
+        for g in 0..hc {
+            for dd in 0..d {
+                res_hc[g * d + dd] += inject[g] * attn[dd];
+            }
+        }
+
+        let mut moe_in = vec![0.0_f32; d];
+        self.hc_mix(
+            &layer.hc_mlp_norm,
+            &layer.hc_mlp_mix_down,
+            &layer.hc_mlp_mix_up,
+            Some(&layer.hc_mlp_inject),
+            &res_hc,
+            &mut moe_in,
+            Some(&mut inject),
+        );
+        let (idx, val, wsum) = self.route_topk_n(&layer, &moe_in, mtp.experts, mtp.topk);
+        let mut moe = vec![0.0_f32; d];
+        self.moe_token_routed(&layer, li, &moe_in, &mut moe, &idx, &val, wsum);
+        for g in 0..hc {
+            for dd in 0..d {
+                res_hc[g * d + dd] += inject[g] * moe[dd];
+            }
+        }
+
+        // The detached drafter ships its own copy of the final HC mixer and
+        // shares the target LM head. There is no separate output RMSNorm.
+        let mut head = vec![0.0_f32; d];
+        self.hc_mix(
+            &mtp.head_norm,
+            &mtp.head_down,
+            &mtp.head_up,
+            None,
+            &res_hc,
+            &mut head,
+            None,
+        );
+        let mut logits = vec![0.0_f32; c.vocab];
+        self.lm_head_matmul(&mut logits, &head);
+
+        self.layers[li] = layer;
+        self.mtp = Some(mtp);
+        Ok(crate::mtp::MtpDraft {
+            logits,
+            next_hidden_hc: res_hc,
+        })
+    }
+
+    /// Seed/advance the MTP KV cache over an already verified target token.
+    pub(crate) fn mtp_catchup(
+        &mut self,
+        token: usize,
+        previous_target_hidden: &[f32],
+        pos: usize,
+    ) -> Result<(), String> {
+        self.mtp_forward_inner(token, previous_target_hidden, pos, true)
+            .map(|_| ())
+    }
+
+    /// Produce one draft distribution without touching target causal state.
+    pub(crate) fn mtp_draft(
+        &mut self,
+        token: usize,
+        previous_target_hidden: &[f32],
+        pos: usize,
+    ) -> Result<crate::mtp::MtpDraft, String> {
+        self.mtp_forward_inner(token, previous_target_hidden, pos, false)
+    }
+
     fn init_token_stream(&self, token: usize) -> Vec<f32> {
         let d = self.cfg.hidden;
         let hc = self.cfg.hc_count;
@@ -5204,6 +5762,13 @@ impl Model {
                 // must not consume these logits.
                 return Vec::new();
             }
+        }
+        // Qwen4Exp MTP consumes the target's *wide*, pre-head-collapse HC
+        // residual one position later. Preserve only the most recent row;
+        // prompt catch-up copies it into the drafter before the next target row.
+        if self.mtp.is_some() {
+            self.last_hidden_nextn.clear();
+            self.last_hidden_nextn.extend_from_slice(&stream);
         }
         if want_logits {
             self.forward_tail(&stream)
@@ -5319,7 +5884,7 @@ impl Model {
             let mut temporal_rows = vec![vec![0.0_f32; d]; tokens.len()];
             if layer.is_gdn {
                 let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
-                if !self.gdn_chunk_batched(&mut layer, l, &mixed_rows, &mut temporal_rows) {
+                if !self.gdn_chunk_batched(&mut layer, l, &mixed_rows, &mut temporal_rows, None) {
                     for row in 0..tokens.len() {
                         self.gdn_token(&mut layer, l, &mixed_rows[row], &mut temporal_rows[row]);
                     }
@@ -5537,11 +6102,374 @@ impl Model {
             self.layers[l] = layer;
         }
 
+        if self.mtp.is_some() {
+            if let Some(last) = streams.last() {
+                self.last_hidden_nextn.clear();
+                self.last_hidden_nextn.extend_from_slice(last);
+            }
+        }
         if want_logits_last {
             Ok(streams.last().map(|stream| self.forward_tail(stream)))
         } else {
             Ok(None)
         }
+    }
+
+    pub(crate) fn prefill_chunk_logits_all(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<crate::mtp::MtpVerifyBatch, String> {
+        if tokens.is_empty() {
+            return Ok(crate::mtp::MtpVerifyBatch { logits: Vec::new(), boundaries: Vec::new() });
+        }
+        if self.sched_mode {
+            return Err("layer-major prefill is not yet supported in scheduler mode".into());
+        }
+        let c = self.cfg.clone();
+        if c.hc_count == 0 {
+            return Err("MTP block verification requires Qwen4 hyper-connection state".into());
+        }
+        let mut boundaries = (0..tokens.len())
+            .map(|_| crate::mtp::MtpVerifyBoundary {
+                gdn_s: vec![Vec::new(); c.layers],
+                gdn_conv: vec![Vec::new(); c.layers],
+                ple_ring: self.ple_ring.clone(),
+                ple_conv_state: self.ple_conv_state.clone(),
+                hidden_hc: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut streams: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&token| self.init_token_stream(token as usize))
+            .collect();
+        let ropes: Vec<Vec<(f32, f32)>> = (0..tokens.len())
+            .map(|row| rope_angles(start_pos + row, &c))
+            .collect();
+
+        for l in 0..c.layers {
+            // Keep one layer borrowed for the entire chunk. Each row advances
+            // this layer's causal state in increasing position, then pauses at
+            // the routed-MoE seam so the chunk can acquire its expert union.
+            let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
+            let mut moe_inputs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+            let mut injectors: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+
+            let d = c.hidden;
+            let hc = c.hc_count;
+            let mut mixed_rows: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+            let mut temporal_injectors: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+
+            // First HC is row-independent. Stop all rows at the temporal seam
+            // so GDN can batch its dense projections while retaining ordered
+            // convolution/recurrent state updates inside gdn_chunk_batched().
+            for row in 0..tokens.len() {
+                let token = tokens[row] as usize;
+                let stream = &mut streams[row];
+                if c.ple_layer == l as i64 {
+                    self.push_ple_ring(token);
+                    self.ple_forward(stream);
+                    boundaries[row].ple_ring.clone_from(&self.ple_ring);
+                    boundaries[row].ple_conv_state.clone_from(&self.ple_conv_state);
+                }
+                let mut mixed = vec![0.0; d];
+                let mut inj = vec![0.0; hc];
+                let mut _hc_t = logan_core::telemetry::Span::begin("hc");
+                self.hc_mix(
+                    &layer.hc_norm,
+                    &layer.hc_mix_down,
+                    &layer.hc_mix_up,
+                    Some(&layer.hc_inject),
+                    stream,
+                    &mut mixed,
+                    Some(&mut inj),
+                );
+                self.spans.hc_ms += _hc_t.end();
+                mixed_rows.push(mixed);
+                temporal_injectors.push(inj);
+            }
+
+            let mut temporal_rows = vec![vec![0.0_f32; d]; tokens.len()];
+            if layer.is_gdn {
+                let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
+                if !self.gdn_chunk_batched(
+                    &mut layer,
+                    l,
+                    &mixed_rows,
+                    &mut temporal_rows,
+                    Some(&mut boundaries),
+                ) {
+                    for row in 0..tokens.len() {
+                        self.gdn_token(&mut layer, l, &mixed_rows[row], &mut temporal_rows[row]);
+                        self.capture_mtp_gdn_boundary(l, &mut boundaries[row])?;
+                    }
+                }
+                self.spans.gdn_ms += _gdn_t.end();
+            } else {
+                let mut projected = self
+                    .project_attention_chunk(&layer, &mixed_rows)
+                    .map(std::collections::VecDeque::from);
+                for row in 0..tokens.len() {
+                    let pos = start_pos + row;
+                    let mut _attn_t = logan_core::telemetry::Span::begin("attn");
+                    if let Some(projection) = projected.as_mut().and_then(|q| q.pop_front()) {
+                        if layer.is_qsa {
+                            let sel = self.qsa_select(
+                                &layer,
+                                l,
+                                &mixed_rows[row],
+                                pos,
+                                &ropes[row],
+                                projection.index_qk.as_deref(),
+                            );
+                            self.attention_common(
+                                &layer,
+                                l,
+                                &mixed_rows[row],
+                                pos,
+                                &ropes[row],
+                                Some(&sel),
+                                Some(projection),
+                                &mut temporal_rows[row],
+                            );
+                        } else {
+                            self.attention_common(
+                                &layer,
+                                l,
+                                &mixed_rows[row],
+                                pos,
+                                &ropes[row],
+                                None,
+                                Some(projection),
+                                &mut temporal_rows[row],
+                            );
+                        }
+                    } else if layer.is_qsa {
+                        self.sparse_attn_token(
+                            &layer,
+                            l,
+                            &mixed_rows[row],
+                            pos,
+                            &ropes[row],
+                            &mut temporal_rows[row],
+                        );
+                    } else {
+                        self.attention_token(
+                            &layer,
+                            l,
+                            &mixed_rows[row],
+                            pos,
+                            &ropes[row],
+                            &mut temporal_rows[row],
+                        );
+                    }
+                    self.spans.attn_ms += _attn_t.end();
+                }
+            }
+
+            for row in 0..tokens.len() {
+                let stream = &mut streams[row];
+                let mut inj = std::mem::take(&mut temporal_injectors[row]);
+                for g in 0..hc {
+                    for dd in 0..d {
+                        stream[g * d + dd] += inj[g] * temporal_rows[row][dd];
+                    }
+                }
+                let mut m2 = vec![0.0; d];
+                self.hc_mix(
+                    &layer.hc_mlp_norm,
+                    &layer.hc_mlp_mix_down,
+                    &layer.hc_mlp_mix_up,
+                    Some(&layer.hc_mlp_inject),
+                    stream,
+                    &mut m2,
+                    Some(&mut inj),
+                );
+                moe_inputs.push(m2);
+                injectors.push(inj);
+            }
+
+            // Route every row exactly once. Batched prefill groups route
+            // occurrences by expert for GPU execution, then scatters the raw
+            // expert outputs back to per-row/per-rank slots so floating-point
+            // reduction still follows each token's canonical top-k order.
+            let mut routes = Vec::with_capacity(tokens.len());
+            let mut seen = vec![false; c.experts];
+            let mut unique = Vec::new();
+            for x in &moe_inputs {
+                let route = self.route_topk(&layer, x);
+                for &ei in route.0.iter().take(c.topk) {
+                    if !seen[ei] {
+                        seen[ei] = true;
+                        unique.push(ei);
+                    }
+                }
+                routes.push(route);
+            }
+
+            // Speculative verification may need up to block_len * topk unique
+            // experts at one layer. Keep persistent hits borrowed from the LRU,
+            // but place misses in request-scoped temporary MetalIO slots. The
+            // temporary union is released at the end of this layer, avoiding
+            // both LRU self-eviction and multi-layer residency growth.
+            let batch_enabled = std::env::var("QWEN_MTP_VERIFY_MOE_BATCH")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let mut batch_done = false;
+            if batch_enabled
+                && self.metal_direct
+                && crate::ffi::direct_available()
+                && self.coli.is_some()
+            {
+                let mut refs: Vec<std::rc::Rc<crate::colisource::SlotRef>> = Vec::new();
+                let mut temps: Vec<crate::colisource::SlotExpert> = Vec::new();
+                let mut descriptors = Vec::with_capacity(unique.len());
+                let mut row_offsets = Vec::with_capacity(unique.len() + 1);
+                let mut grouped_x = Vec::with_capacity(tokens.len() * c.topk * c.hidden);
+                let mut scatter: Vec<(usize, usize)> =
+                    Vec::with_capacity(tokens.len() * c.topk);
+                row_offsets.push(0_i32);
+
+                let mut bind_ok = true;
+                let mut _io_t = logan_core::telemetry::Span::begin("io");
+                for &ei in &unique {
+                    // A prior async demand load may already own this slot. Drain
+                    // it before borrowing the resident view; misses are issued
+                    // below without touching the persistent cache.
+                    if !self.expert_wait(l as i32, ei as i32) {
+                        bind_ok = false;
+                        break;
+                    }
+                    if let Some(v) = self.expert_store.peek((l as u32, ei as u32)) {
+                        let r = std::rc::Rc::new(v.ref_view());
+                        descriptors.push(Self::slot_descriptor(&r));
+                        refs.push(r);
+                    } else if let Some(se) = self.uncached_expert_issue(l as i32, ei as i32) {
+                        let view = se.ref_view();
+                        descriptors.push(Self::slot_descriptor(&view));
+                        temps.push(se);
+                    } else {
+                        bind_ok = false;
+                        break;
+                    }
+
+                    for row in 0..tokens.len() {
+                        let (idx, _, _) = &routes[row];
+                        for rank in 0..c.topk {
+                            if idx[rank] == ei {
+                                grouped_x.extend_from_slice(&moe_inputs[row]);
+                                scatter.push((row, rank));
+                            }
+                        }
+                    }
+                    row_offsets.push(scatter.len() as i32);
+                }
+
+                // All temporary loads were issued before this one barrier, so
+                // SSD reads can overlap. Even on a binding failure, drain every
+                // issued temp before its owning slot is dropped/freed.
+                if !temps.is_empty() {
+                    let slots = temps.iter().map(|se| se.slot).collect::<Vec<_>>();
+                    let has_pending = temps.iter().any(|se| se.pending.get() != 0);
+                    if has_pending {
+                        let waited = if let Some(event) = crate::ffi::mio_batch_barrier() {
+                            crate::ffi::mio_batch_wait(event, &slots)
+                        } else {
+                            temps.iter().all(|se| {
+                                let ev = se.pending.get();
+                                ev == 0 || unsafe { crate::ffi::metalio_wait(ev) } == 0
+                            })
+                        };
+                        if !waited {
+                            bind_ok = false;
+                        } else {
+                            for se in &temps {
+                                se.pending.set(0);
+                            }
+                        }
+                    }
+                }
+                self.spans.io_ms += _io_t.end();
+
+                if bind_ok && scatter.len() == tokens.len() * c.topk {
+                    let mut grouped_y = vec![0.0_f32; scatter.len() * c.hidden];
+                    let mut _gpu_t = logan_core::telemetry::Span::begin("gpu");
+                    let gpu_ok = crate::ffi::moe_rows(
+                        &descriptors,
+                        &row_offsets,
+                        &grouped_x,
+                        &mut grouped_y,
+                        c.hidden,
+                        c.moe_inter,
+                    );
+                    self.spans.gpu_ms += _gpu_t.end();
+                    if gpu_ok {
+                        let mut contrib = vec![0.0_f32; tokens.len() * c.topk * c.hidden];
+                        for (grouped_row, &(row, rank)) in scatter.iter().enumerate() {
+                            let src = &grouped_y
+                                [grouped_row * c.hidden..(grouped_row + 1) * c.hidden];
+                            let off = (row * c.topk + rank) * c.hidden;
+                            contrib[off..off + c.hidden].copy_from_slice(src);
+                        }
+                        for row in 0..tokens.len() {
+                            let (_, val, wsum) = &routes[row];
+                            let mut moe = vec![0.0_f32; c.hidden];
+                            for rank in 0..c.topk {
+                                let w = val[rank] / *wsum;
+                                let off = (row * c.topk + rank) * c.hidden;
+                                for dd in 0..c.hidden {
+                                    moe[dd] += contrib[off + dd] * w;
+                                }
+                            }
+                            let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                            let (sy, gs) = self.shared_expert_value(&layer, l, &moe_inputs[row]);
+                            self.spans.shared_ms += _shared_t.end();
+                            for dd in 0..c.hidden {
+                                moe[dd] += sy[dd] * gs;
+                            }
+                            for g in 0..c.hc_count {
+                                for dd in 0..c.hidden {
+                                    streams[row][g * c.hidden + dd] +=
+                                        injectors[row][g] * moe[dd];
+                                }
+                            }
+                        }
+                        batch_done = true;
+                    }
+                }
+                // `refs` keeps persistent slots alive; `temps` frees the
+                // request-scoped union here, before advancing to the next layer.
+                drop(refs);
+                drop(temps);
+            }
+
+            if !batch_done {
+                for row in 0..tokens.len() {
+                    let mut moe = vec![0.0; c.hidden];
+                    let (idx, val, wsum) = &routes[row];
+                    self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
+                    for g in 0..c.hc_count {
+                        for dd in 0..c.hidden {
+                            streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                        }
+                    }
+                }
+            }
+            self.layers[l] = layer;
+        }
+
+        for (row, stream) in streams.iter().enumerate() {
+            boundaries[row].hidden_hc.clone_from(stream);
+        }
+        if let Some(last) = streams.last() {
+            self.last_hidden_nextn.clear();
+            self.last_hidden_nextn.extend_from_slice(last);
+        }
+        let mut logits = Vec::with_capacity(streams.len());
+        for stream in &streams {
+            logits.push(self.forward_tail(stream));
+        }
+        Ok(crate::mtp::MtpVerifyBatch { logits, boundaries })
     }
 
     /// One transformer layer of the token stream — the exact canonical per-layer
@@ -5576,7 +6504,11 @@ impl Model {
         // engine; only the residual plumbing and two RMSNorm sites differ.
         if hc == 0 {
             let mut mixed = vec![0.0; d];
-            rmsnorm_row_shifted(&mut mixed, stream, &layer.in_ln, c.eps);
+            if c.zero_centered_norm {
+                rmsnorm_row(&mut mixed, stream, &layer.in_ln, c.eps);
+            } else {
+                rmsnorm_row_shifted(&mut mixed, stream, &layer.in_ln, c.eps);
+            }
             let mut attn = vec![0.0; d];
             if layer.is_gdn {
                 let mut _gdn_t = logan_core::telemetry::Span::begin("gdn");
@@ -5592,7 +6524,11 @@ impl Model {
             }
 
             let mut m2 = vec![0.0; d];
-            rmsnorm_row_shifted(&mut m2, stream, &layer.hc_mlp_norm, c.eps);
+            if c.zero_centered_norm {
+                rmsnorm_row(&mut m2, stream, &layer.hc_mlp_norm, c.eps);
+            } else {
+                rmsnorm_row_shifted(&mut m2, stream, &layer.hc_mlp_norm, c.eps);
+            }
             let mut moe = vec![0.0; d];
             self.moe_token(&layer, l, &m2, &mut moe);
             if let Some(experts) = self.sched_blocked.take() {
@@ -5698,7 +6634,11 @@ impl Model {
             let mut normed = vec![0.0; d];
             // MLX Qwen3.5/3.6 sanitize() folds the raw HF `(1 + weight)`
             // RMSNorm convention into model.norm.weight before quantization.
-            rmsnorm_row_shifted(&mut normed, stream, &self.final_norm, c.eps);
+            if c.zero_centered_norm {
+                rmsnorm_row(&mut normed, stream, &self.final_norm, c.eps);
+            } else {
+                rmsnorm_row_shifted(&mut normed, stream, &self.final_norm, c.eps);
+            }
             let mut logits = vec![0.0; c.vocab];
             self.lm_head_matmul(&mut logits, &normed);
             self.spans.head_ms += _head_t.end();
@@ -6519,6 +7459,8 @@ impl Model {
                     cfg.hc_lowrank,
                 )?,
             },
+            mtp: None,
+            last_hidden_nextn: Vec::new(),
             ple_ngram: ple_embed,
             ple_key_proj,
             ple_value_proj,
@@ -6687,9 +7629,59 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        causal_conv1d_sample, default_cache_cap_for_ram, quantize_bf16_to_mxfp4, rmsnorm_row,
-        rmsnorm_row_shifted, StFile, MAX_RESIDENT_PLE_NGRAM_BYTES,
+        causal_conv1d_sample, default_cache_cap_for_ram, load_cfg, quantize_bf16_to_mxfp4,
+        rmsnorm_row, rmsnorm_row_shifted, OutputGate, StFile, MAX_RESIDENT_PLE_NGRAM_BYTES,
     };
+
+    #[test]
+    fn qwen3_next_config_derives_hybrid_schedule_and_raw_norm_semantics() {
+        let path = std::env::temp_dir().join(format!(
+            "logan-qwen3-next-config-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+              "model_type":"qwen3_next",
+              "hidden_size":2048,
+              "num_hidden_layers":48,
+              "num_attention_heads":16,
+              "num_key_value_heads":2,
+              "head_dim":256,
+              "partial_rotary_factor":0.25,
+              "rope_theta":5000000.0,
+              "max_position_embeddings":262144,
+              "num_experts":512,
+              "num_experts_per_tok":10,
+              "moe_intermediate_size":512,
+              "shared_expert_intermediate_size":512,
+              "linear_num_key_heads":16,
+              "linear_key_head_dim":128,
+              "linear_num_value_heads":32,
+              "linear_value_head_dim":128,
+              "linear_conv_kernel_dim":4,
+              "full_attention_interval":4,
+              "hidden_act":"silu",
+              "rms_norm_eps":1e-6,
+              "vocab_size":151936
+            }"#,
+        )
+        .unwrap();
+        let cfg = load_cfg(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(cfg.layers, 48);
+        assert_eq!(cfg.rotary_dim, 64);
+        assert_eq!(cfg.theta, 5_000_000.0);
+        assert_eq!(cfg.topk, 10);
+        assert!(cfg.zero_centered_norm);
+        assert_eq!(cfg.output_gate, OutputGate::Silu);
+        assert_eq!(cfg.gdn_layers.len(), 48);
+        for layer in 0..48 {
+            assert_eq!(cfg.gdn_layers[layer], (layer + 1) % 4 != 0, "layer {layer}");
+            assert!(!cfg.qsa_layers[layer]);
+        }
+    }
 
     #[test]
     fn giant_ple_ngram_safetensor_is_refused_without_reading_payload() {
