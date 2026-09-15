@@ -10,6 +10,7 @@ pub mod cli;
 pub mod codec;
 pub mod context_plan;
 pub mod error;
+pub mod export;
 pub mod format;
 pub mod generated;
 pub mod ir;

@@ -194,7 +194,7 @@ fn is_qwen4_model_type(model_type: Option<&str>) -> bool {
     matches!(model_type, Some("qwen4_exp" | "qwen4_exp_text"))
 }
 
-fn text_base(source: &SourceInventory) -> Result<String> {
+pub(crate) fn text_base(source: &SourceInventory) -> Result<String> {
     for base in ["model.language_model", "model"] {
         let prefix = format!("{base}.layers.0.");
         if source.tensors.keys().any(|name| name.starts_with(&prefix)) {
@@ -207,7 +207,7 @@ fn text_base(source: &SourceInventory) -> Result<String> {
     )
 }
 
-fn build_experts(
+pub(crate) fn build_experts(
     source: &SourceInventory,
     base: &str,
     geometry: &ModelGeometry,

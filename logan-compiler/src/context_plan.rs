@@ -245,7 +245,20 @@ pub fn geometry_from_config(path: &Path, requested_tokens: u64) -> Result<Contex
             }
             (full, gdn)
         }
-        None => (layers, 0),
+        None => {
+            // Qwen3-Next / Qwen3-Coder-Next does not serialize layer_types in
+            // the official config. Transformers derives the hybrid schedule
+            // from the 1-based full_attention_interval: every Nth layer is
+            // full attention, the rest are Gated DeltaNet. Mirror that here so
+            // context memory planning matches both the frontend and runtime.
+            let interval = get("full_attention_interval");
+            if interval == 0 {
+                (layers, 0)
+            } else {
+                let full = layers / interval;
+                (full, layers - full)
+            }
+        }
     };
 
     let heads = get("num_attention_heads");
@@ -637,6 +650,48 @@ mod tests {
         assert_eq!(geometry.qsa_layers, 2);
         let state = state_bytes(&geometry, 131_072).unwrap();
         assert_eq!(state.full_attention_kv, 2 * 2 * 2 * 131_072 * 128 * 4);
+    }
+
+    #[test]
+    fn qwen3_next_interval_derives_twelve_full_and_thirty_six_gdn_layers() {
+        let root = std::env::temp_dir().join(format!(
+            "logan-context-qwen3-next-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "model_type":"qwen3_next",
+                "hidden_size":2048,
+                "num_hidden_layers":48,
+                "full_attention_interval":4,
+                "max_position_embeddings":262144,
+                "num_attention_heads":16,
+                "num_key_value_heads":2,
+                "head_dim":256,
+                "linear_num_key_heads":16,
+                "linear_key_head_dim":128,
+                "linear_num_value_heads":32,
+                "linear_value_head_dim":128,
+                "linear_conv_kernel_dim":4
+            }"#,
+        )
+        .unwrap();
+        let geometry = geometry_from_config(&path, 65_536).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(geometry.full_attention_layers, 12);
+        assert_eq!(geometry.gdn_layers, 36);
+        assert_eq!(geometry.qsa_layers, 0);
+        let state = state_bytes(&geometry, 65_536).unwrap();
+        assert_eq!(state.full_attention_kv, 12 * 2 * 2 * 65_536 * 256 * 4);
+        assert!(state.gdn_recurrent > 0);
+        assert!(state.gdn_conv > 0);
     }
 
     #[test]

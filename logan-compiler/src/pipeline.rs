@@ -10,8 +10,9 @@ use crate::{
     error::{ColicError, Result},
     ir::{Architecture, SemanticModel},
     model::deepseek_v4::DeepSeekV4Frontend,
-    model::qwen4_exp::Qwen4ExpFrontend,
     model::qwen_moe::QwenMoeFrontend,
+    model::qwen3_next::Qwen3NextFrontend,
+    model::qwen4_exp::Qwen4ExpFrontend,
     model::spark::SparkFrontend,
     quant::mxfp4_record,
     source,
@@ -229,6 +230,8 @@ pub fn build_semantic_ir(inventory: &source::SourceInventory) -> Result<Option<S
         Ok(Some(DeepSeekV4Frontend::build(inventory)?))
     } else if Qwen4ExpFrontend::probe(inventory)? {
         Ok(Some(Qwen4ExpFrontend::build(inventory)?))
+    } else if Qwen3NextFrontend::probe(inventory)? {
+        Ok(Some(Qwen3NextFrontend::build(inventory)?))
     } else if QwenMoeFrontend::probe(inventory)? {
         Ok(Some(QwenMoeFrontend::build(inventory)?))
     } else {
@@ -264,7 +267,7 @@ fn resolve_expert_quantization(
         QuantRequest::Profile(profile) if profile == "mxfp4" => {
             if !matches!(
                 model.architecture,
-                Architecture::Qwen3_5MoeMoE | Architecture::Qwen4Exp
+                Architecture::Qwen3_5MoeMoE | Architecture::Qwen3Next | Architecture::Qwen4Exp
             ) {
                 return Err(ColicError::unsupported(
                     Stage::TargetPlanning.as_str(),
@@ -829,6 +832,11 @@ fn is_sensitive_dense(name: &str) -> bool {
 
 /// Stored representation kind for a dense tensor, from its source dtype.
 fn dense_quant_kind(dtype: &str) -> &'static str {
+    if dtype.starts_with(crate::model::qwen3_next::QKVZ_SPLIT_PREFIX)
+        || dtype.starts_with(crate::model::qwen3_next::BA_SPLIT_PREFIX)
+    {
+        return KIND_BF16;
+    }
     if dtype.starts_with(crate::model::qwen4_exp::PLE_BF16_TO_F8_PREFIX) {
         return "f8-e4m3";
     }

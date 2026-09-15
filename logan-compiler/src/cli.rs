@@ -25,6 +25,17 @@ pub enum Command {
         package: PathBuf,
         drafter: PathBuf,
     },
+    /// Quantize routed experts and emit portable safetensors, one file per
+    /// layer.
+    ExportExperts {
+        source: PathBuf,
+        /// Directory the per-layer files are written into.
+        output_dir: PathBuf,
+        /// Verify each emitted file by decoding it back after writing.
+        verify: bool,
+        /// Reuse layer files already complete in `output_dir`.
+        resume: bool,
+    },
     Compile(CompileRequest),
     Recompile(RecompileRequest),
     Run {
@@ -35,7 +46,7 @@ pub enum Command {
     Help,
 }
 
-pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan attach-mtp PACKAGE_DIR DRAFTER_DIR\n  logan run MODEL_OR_PACKAGE [--prompt \"TOKEN_IDS\"] [--max-new N]\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan attach-mtp PACKAGE_DIR DRAFTER_DIR\n  logan export-experts MODEL_DIR -o OUTPUT_DIR [--verify] [--resume]\n  logan run MODEL_OR_PACKAGE [--prompt \"TOKEN_IDS\"] [--max-new N]\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
 
 pub fn parse<I>(args: I) -> Result<Command>
 where
@@ -61,6 +72,7 @@ where
             })
         }
         "compile" => parse_compile(args),
+        "export-experts" => parse_export_experts(args),
         "recompile" => parse_recompile(args),
         "attach-mtp" => {
             let package = args.next().ok_or_else(|| {
@@ -125,6 +137,45 @@ where
         }
         other => Err(ColicError::Usage(format!("unknown command `{other}`"))),
     }
+}
+
+fn parse_export_experts<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let source = args
+        .next()
+        .ok_or_else(|| ColicError::Usage("export-experts requires MODEL_DIR".into()))?;
+    let mut output: Option<PathBuf> = None;
+    let mut verify = false;
+    let mut resume = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-o" | "--output" => {
+                output = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    ColicError::Usage("export-experts -o requires a path".into())
+                })?));
+            }
+            "--verify" => verify = true,
+            // Reuses layer files already complete in the output directory.
+            // Off by default so a re-run reproduces the whole output.
+            "--resume" => resume = true,
+            other => {
+                return Err(ColicError::Usage(format!(
+                    "export-experts does not accept `{other}`"
+                )));
+            }
+        }
+    }
+    let output =
+        output.ok_or_else(|| ColicError::Usage("export-experts requires -o OUTPUT_DIR".into()))?;
+    Ok(Command::ExportExperts {
+        source: PathBuf::from(source),
+        output_dir: output,
+        verify,
+        resume,
+    })
 }
 
 fn parse_compile<I>(args: I) -> Result<Command>

@@ -128,12 +128,14 @@ mod tests {
 
     #[test]
     fn preserve_mode_requires_identical_quant_semantics() {
-        assert!(validate_quant_transition(
-            QuantFormat::GgmlQ4K,
-            QuantFormat::GgmlQ4K,
-            QuantTransform::LosslessRepack,
-        )
-        .is_ok());
+        assert!(
+            validate_quant_transition(
+                QuantFormat::GgmlQ4K,
+                QuantFormat::GgmlQ4K,
+                QuantTransform::LosslessRepack,
+            )
+            .is_ok()
+        );
 
         // Equal or lower nominal precision is NOT enough to call a transform
         // lossless.  Changing quant families requires explicit requantization.
@@ -149,24 +151,30 @@ mod tests {
 
     #[test]
     fn explicit_requantization_may_only_hold_or_reduce_precision() {
-        assert!(validate_quant_transition(
-            QuantFormat::GgmlQ8_0,
-            QuantFormat::GgmlQ6K,
-            QuantTransform::ExplicitRequantize,
-        )
-        .is_ok());
-        assert!(validate_quant_transition(
-            QuantFormat::GgmlQ6K,
-            QuantFormat::GgmlQ4K,
-            QuantTransform::ExplicitRequantize,
-        )
-        .is_ok());
-        assert!(validate_quant_transition(
-            QuantFormat::GgmlQ4K,
-            QuantFormat::GgmlQ4K,
-            QuantTransform::ExplicitRequantize,
-        )
-        .is_ok());
+        assert!(
+            validate_quant_transition(
+                QuantFormat::GgmlQ8_0,
+                QuantFormat::GgmlQ6K,
+                QuantTransform::ExplicitRequantize,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_quant_transition(
+                QuantFormat::GgmlQ6K,
+                QuantFormat::GgmlQ4K,
+                QuantTransform::ExplicitRequantize,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_quant_transition(
+                QuantFormat::GgmlQ4K,
+                QuantFormat::GgmlQ4K,
+                QuantTransform::ExplicitRequantize,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

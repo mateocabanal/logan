@@ -8,6 +8,7 @@ use crate::source::TensorRef;
 pub enum Architecture {
     DeepSeekV4Flash,
     Qwen3_5MoeMoE,
+    Qwen3Next,
     Qwen4Exp,
     Spark2_5,
 }

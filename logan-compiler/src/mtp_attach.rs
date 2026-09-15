@@ -72,13 +72,17 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
         );
     }
     if package.alignment() != target::MACOS_ARM64_METAL_APPLE8_V1.record_alignment {
-        return unsupported(package_root, "package record alignment does not match Apple8 v1");
+        return unsupported(
+            package_root,
+            "package record alignment does not match Apple8 v1",
+        );
     }
-    if package
-        .records()
-        .iter()
-        .any(|record| record.name.as_deref().is_some_and(|name| name.starts_with("mtp.")))
-        || package_root.join(MTP_METADATA_FILE).exists()
+    if package.records().iter().any(|record| {
+        record
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("mtp."))
+    }) || package_root.join(MTP_METADATA_FILE).exists()
     {
         return Err(ColicError::Usage(format!(
             "package already contains an MTP attachment: {}",
@@ -126,12 +130,19 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
             );
         }
         QwenMtpFlavor::LegacyQwen3 => {
-            return unsupported(drafter_root, "attach-mtp currently supports Qwen4Exp MTP only");
+            return unsupported(
+                drafter_root,
+                "attach-mtp currently supports Qwen4Exp MTP only",
+            );
         }
     };
     for (label, base, draft) in [
         ("hidden_size", base_hidden, mtp.hidden_size),
-        ("moe_intermediate_size", base_inter, mtp.moe_intermediate_size),
+        (
+            "moe_intermediate_size",
+            base_inter,
+            mtp.moe_intermediate_size,
+        ),
         ("hc_count", base_hc, hc_count),
         ("hc_lowrank", base_hc_lowrank, hc_lowrank),
         (
@@ -150,7 +161,10 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
     if mtp.use_dedicated_embeddings {
         return unsupported(drafter_root, "dedicated MTP embeddings are not supported");
     }
-    if let Some(declared) = base_text.get("mtp_num_hidden_layers").and_then(Value::as_u64) {
+    if let Some(declared) = base_text
+        .get("mtp_num_hidden_layers")
+        .and_then(Value::as_u64)
+    {
         if declared != u64::from(mtp.hidden_layers) {
             return unsupported(
                 package_root,
@@ -174,11 +188,8 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
         .checked_add(1)
         .ok_or_else(|| ColicError::Usage("record ID overflows u64".into()))?;
     let lowered = lowered_records(&sources, first_new_id)?;
-    let local_plan = storage::plan_records(
-        &lowered,
-        target::MACOS_ARM64_METAL_APPLE8_V1,
-        SHARD_LIMIT,
-    )?;
+    let local_plan =
+        storage::plan_records(&lowered, target::MACOS_ARM64_METAL_APPLE8_V1, SHARD_LIMIT)?;
 
     let existing_shards = existing_shard_count(&package);
     validate_existing_shards(&package, existing_shards)?;
@@ -205,7 +216,11 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
         temp_shards.push(package_root.join(format!("data-{shard:05}.coli.mtp-next-{pid}")));
         final_shards.push(package_root.join(format!("data-{shard:05}.coli")));
     }
-    if temp_shards.iter().chain(&final_shards).any(|path| path.exists()) {
+    if temp_shards
+        .iter()
+        .chain(&final_shards)
+        .any(|path| path.exists())
+    {
         return Err(ColicError::Usage(
             "MTP append target/temp shard path already exists; refusing overwrite".into(),
         ));
@@ -233,10 +248,9 @@ pub fn attach_qwen4_mtp(package_root: &Path, drafter_root: &Path) -> Result<Atta
             "{MTP_METADATA_FILE}.mtp-next-{}",
             std::process::id()
         )));
-        let _ = fs::remove_file(package_root.join(format!(
-            "manifest.coli.mtp-next-{}",
-            std::process::id()
-        )));
+        let _ = fs::remove_file(
+            package_root.join(format!("manifest.coli.mtp-next-{}", std::process::id())),
+        );
     }
     result
 }
@@ -273,9 +287,9 @@ fn write_attachment(
     for (source, planned) in sources.iter().zip(shifted_new) {
         let writer_index = usize::try_from(planned.shard_id - existing_shards)
             .map_err(|_| ColicError::Usage("MTP writer index exceeds usize".into()))?;
-        let writer = writers
-            .get_mut(writer_index)
-            .ok_or_else(|| ColicError::Usage("MTP planned record references missing writer".into()))?;
+        let writer = writers.get_mut(writer_index).ok_or_else(|| {
+            ColicError::Usage("MTP planned record references missing writer".into())
+        })?;
         new_metadata.push(write_new_record(writer, planned, source)?);
     }
 
@@ -359,7 +373,10 @@ fn write_attachment(
         &shard_header_crcs,
     )?;
     let manifest_path = package_root.join("manifest.coli");
-    let backup_manifest = package_root.join(format!("manifest.coli.pre-mtp-{pid}", pid = std::process::id()));
+    let backup_manifest = package_root.join(format!(
+        "manifest.coli.pre-mtp-{pid}",
+        pid = std::process::id()
+    ));
     fs::copy(&manifest_path, &backup_manifest).map_err(|source| ColicError::Io {
         path: backup_manifest.clone(),
         source,
@@ -386,7 +403,10 @@ fn write_attachment(
     });
     let metadata_bytes = serde_json::to_vec_pretty(&metadata)
         .map_err(|error| ColicError::Usage(format!("failed to encode MTP metadata: {error}")))?;
-    let metadata_next = package_root.join(format!("{MTP_METADATA_FILE}.mtp-next-{}", std::process::id()));
+    let metadata_next = package_root.join(format!(
+        "{MTP_METADATA_FILE}.mtp-next-{}",
+        std::process::id()
+    ));
     fs::write(&metadata_next, &metadata_bytes).map_err(|source| ColicError::Io {
         path: metadata_next.clone(),
         source,
@@ -517,12 +537,16 @@ fn slice_bank_rows(
     rows: u32,
 ) -> Result<Matrix> {
     require_bf16(tensor, "MTP expert bank")?;
-    if tensor.shape != [
-        u64::from(experts),
-        u64::from(rows_per_expert),
-        u64::from(columns),
-    ] || expert >= experts
-        || first_row.checked_add(rows).is_none_or(|end| end > rows_per_expert)
+    if tensor.shape
+        != [
+            u64::from(experts),
+            u64::from(rows_per_expert),
+            u64::from(columns),
+        ]
+        || expert >= experts
+        || first_row
+            .checked_add(rows)
+            .is_none_or(|end| end > rows_per_expert)
     {
         return Err(ColicError::InvalidSource {
             path: tensor.source.clone(),
@@ -719,14 +743,20 @@ fn post_attach_verify(root: &Path, mtp: &QwenMtpInventory, virtual_layer_base: u
         "mtp.pre_fc_norm_embedding.weight",
         "mtp.pre_fc_norm_hidden.weight",
     ] {
-        let record = package.record_by_name(required).ok_or_else(|| ColicError::InvalidSource {
-            path: root.to_owned(),
-            detail: format!("attached package is missing `{required}`"),
-        })?;
-        let _ = package.read_tensor_payload(record).map_err(|error| ColicError::InvalidSource {
-            path: root.to_owned(),
-            detail: format!("attached MTP tensor `{required}` failed CRC/read validation: {error}"),
-        })?;
+        let record = package
+            .record_by_name(required)
+            .ok_or_else(|| ColicError::InvalidSource {
+                path: root.to_owned(),
+                detail: format!("attached package is missing `{required}`"),
+            })?;
+        let _ = package
+            .read_tensor_payload(record)
+            .map_err(|error| ColicError::InvalidSource {
+                path: root.to_owned(),
+                detail: format!(
+                    "attached MTP tensor `{required}` failed CRC/read validation: {error}"
+                ),
+            })?;
     }
     for stage in 0..mtp.hidden_layers {
         let layer = virtual_layer_base + stage;
@@ -734,14 +764,23 @@ fn post_attach_verify(root: &Path, mtp: &QwenMtpInventory, virtual_layer_base: u
         if records.len() != 1 {
             return Err(ColicError::InvalidSource {
                 path: root.to_owned(),
-                detail: format!("MTP virtual layer {layer} expert 0 has {} records, expected 1", records.len()),
+                detail: format!(
+                    "MTP virtual layer {layer} expert 0 has {} records, expected 1",
+                    records.len()
+                ),
             });
         }
-        let _ = package.read_record(records[0]).map_err(|error| ColicError::InvalidSource {
-            path: root.to_owned(),
-            detail: format!("MTP expert {layer}/0 failed CRC validation: {error}"),
-        })?;
-        if package.expert_records(layer as i32, (mtp.experts - 1) as i32).len() != 1 {
+        let _ = package
+            .read_record(records[0])
+            .map_err(|error| ColicError::InvalidSource {
+                path: root.to_owned(),
+                detail: format!("MTP expert {layer}/0 failed CRC validation: {error}"),
+            })?;
+        if package
+            .expert_records(layer as i32, (mtp.experts - 1) as i32)
+            .len()
+            != 1
+        {
             return Err(ColicError::InvalidSource {
                 path: root.to_owned(),
                 detail: format!("MTP virtual layer {layer} is missing its final expert"),
@@ -757,10 +796,11 @@ fn read_shard_header_crc(path: &Path) -> Result<u32> {
         source,
     })?;
     let mut header = [0_u8; 76];
-    file.read_exact(&mut header).map_err(|source| ColicError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
+    file.read_exact(&mut header)
+        .map_err(|source| ColicError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
     if &header[..8] != storage::DATA_MAGIC {
         return Err(ColicError::InvalidSource {
             path: path.to_owned(),

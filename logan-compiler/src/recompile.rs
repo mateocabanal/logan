@@ -2417,69 +2417,11 @@ fn append_aligned(output: &mut Vec<u8>, bytes: &[u8], alignment: u64) -> Result<
 }
 
 fn quantize_f32_row(values: &[f32], weights: &mut Vec<u8>, scales: &mut Vec<u8>) -> Result<()> {
-    let mut nibbles = Vec::with_capacity(values.len());
-    for (group_index, group) in values.chunks(mxfp4::GROUP_SIZE).enumerate() {
-        if group.iter().any(|value| !value.is_finite()) {
-            return Err(ColicError::Usage(format!(
-                "MXFP4 requantization refuses non-finite value in group {group_index}"
-            )));
-        }
-        let (scale_code, scale) = choose_scale(group);
-        scales.push(scale_code);
-        for value in group {
-            nibbles.push(quantize_value(*value, scale));
-        }
-    }
-    for pair in nibbles.chunks(2) {
-        let low = pair[0] & 0x0f;
-        let high = pair.get(1).copied().unwrap_or(0) & 0x0f;
-        weights.push(low | (high << 4));
-    }
-    Ok(())
-}
-
-fn choose_scale(values: &[f32]) -> (u8, f32) {
-    let max_abs = values
-        .iter()
-        .fold(0.0_f32, |acc, value| acc.max(value.abs()));
-    if max_abs == 0.0 {
-        return (127, 1.0);
-    }
-    let bits = max_abs.to_bits();
-    let biased = ((bits >> 23) & 0xff) as i32;
-    let max_exp = if biased == 0 {
-        let mantissa = bits & 0x007f_ffff;
-        (31 - mantissa.leading_zeros() as i32) - 149
-    } else {
-        biased - 127
-    };
-    let mut scale_exp = (max_exp - 2).clamp(-126, 127);
-    let mut scale_code = (scale_exp + 127) as u8;
-    let mut scale = mxfp4::runtime_e8m0_to_f32(scale_code);
-    if max_abs > mxfp4::MAX_E2M1 * scale && scale_exp < 127 {
-        scale_exp += 1;
-        scale_code = (scale_exp + 127) as u8;
-        scale = mxfp4::runtime_e8m0_to_f32(scale_code);
-    }
-    (scale_code, scale)
-}
-
-fn quantize_value(value: f32, scale: f32) -> u8 {
-    let magnitude = (value.abs() / scale).min(mxfp4::MAX_E2M1);
-    let mut best_code = 0_u8;
-    let mut best_error = f32::INFINITY;
-    for (code, candidate) in mxfp4::E2M1_MAGNITUDES.iter().copied().enumerate() {
-        let error = (magnitude - candidate).abs();
-        if error < best_error || (error == best_error && (code & 1) == 0 && (best_code & 1) != 0) {
-            best_error = error;
-            best_code = code as u8;
-        }
-    }
-    if value.is_sign_negative() {
-        best_code | 0x8
-    } else {
-        best_code
-    }
+    // Fresh compilation and recompile must use one numerical contract. Keeping
+    // a second copy of scale selection / tie-breaking here previously made it
+    // possible for the two paths to drift while both still produced valid-looking
+    // MXFP4 records.
+    mxfp4::quantize_f32_row(values, weights, scales)
 }
 
 fn copy_json_metadata(source: &Path, output: &Path) -> Result<()> {

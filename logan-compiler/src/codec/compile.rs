@@ -501,7 +501,7 @@ fn resolve_quantization(
         QuantRequest::Profile(profile) if profile == "mxfp4" => {
             if !matches!(
                 model.architecture,
-                Architecture::Qwen3_5MoeMoE | Architecture::Qwen4Exp
+                Architecture::Qwen3_5MoeMoE | Architecture::Qwen3Next | Architecture::Qwen4Exp
             ) {
                 return Err(ColicError::unsupported(
                     Stage::TargetPlanning.as_str(),

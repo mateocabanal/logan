@@ -291,11 +291,53 @@ fn choose_optimizer_plan(plans: &[logan_ir::ParetoPlan]) -> logan_compiler::Resu
         })
 }
 
+/// Stack for the thread that does the work.
+///
+/// The platform main thread gets 1 MiB on Windows and 8 MiB on macOS, and this
+/// binary overflows that: parsing a real checkpoint's safetensors header (152k
+/// tensors for Qwen3.8-Flash-Next) recurses through serde's JSON parser deep
+/// enough to blow it. The failure is a bare `thread 'main' has overflowed its
+/// stack` with no other diagnostic, which reads like a corrupt model rather
+/// than a stack limit.
+///
+/// 256 MiB is chosen to be obviously sufficient rather than tuned: it is
+/// virtual address space, committed only as touched, and the whole point is
+/// that this class of failure cannot come back by adding a larger model.
+const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
+
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("colic: {error}");
-        eprintln!("{USAGE}");
-        std::process::exit(2);
+    // Do the work on a thread with a large stack rather than raising the main
+    // thread's: `main`'s stack size is fixed by the platform at process start
+    // and cannot be changed from inside the process on Windows.
+    let worker = std::thread::Builder::new()
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(|| {
+            if let Err(error) = run() {
+                eprintln!("colic: {error}");
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+        });
+    match worker {
+        Ok(handle) => {
+            // A panic inside `run` is the thread's business; joining propagates
+            // it here so the process still exits non-zero.
+            if handle.join().is_err() {
+                std::process::exit(101);
+            }
+        }
+        Err(error) => {
+            // Could not even start a thread: fall back to running inline rather
+            // than refusing to work.
+            eprintln!(
+                "colic: could not start a worker thread ({error}); running on the main stack"
+            );
+            if let Err(error) = run() {
+                eprintln!("colic: {error}");
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+        }
     }
 }
 
@@ -349,6 +391,78 @@ fn run() -> logan_compiler::Result<()> {
             println!("new_shards={}", summary.new_shards);
             println!("added_stored_bytes={}", summary.added_stored_bytes);
             println!("backup_manifest={}", summary.backup_manifest.display());
+            Ok(())
+        }
+        Command::ExportExperts {
+            source,
+            output_dir,
+            verify,
+            resume,
+        } => {
+            eprintln!("logan: quantizing routed experts to MXFP4 (one file per layer)...");
+            let started = Instant::now();
+            let mut last_layer = u32::MAX;
+            let mut report = logan_compiler::export::export_experts(
+                &source,
+                &output_dir,
+                resume,
+                &mut |done, total, layer| {
+                    if layer != last_layer {
+                        last_layer = layer;
+                        eprintln!("  layer {layer}: {done}/{total} experts");
+                    }
+                },
+            )?;
+            println!("output_dir={}", report.output_dir.display());
+            println!("file_template={}", report.file_template);
+            println!("total_bytes={}", report.total_bytes);
+            println!("layers={}", report.layers);
+            println!("experts_per_layer={}", report.experts_per_layer);
+            println!("experts_exported={}", report.experts_exported);
+            if let Some(first) = report.layer_bytes.first() {
+                println!("bytes_per_layer={first}");
+            }
+            if !report.source_dtypes.is_empty() {
+                let dtypes = report
+                    .source_dtypes
+                    .iter()
+                    .map(|(d, n)| format!("{d}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!("source_expert_dtypes={dtypes}");
+            }
+            eprintln!(
+                "logan: exported {} experts in {} layer file(s), {:.1} GB, in {:.1}s",
+                report.experts_exported,
+                report.layers,
+                report.total_bytes as f64 / 1e9,
+                started.elapsed().as_secs_f64()
+            );
+
+            if verify {
+                // Read every emitted file back and prove the bytes decode.
+                // This catches what matters: a file that parses but whose
+                // offsets, shapes or nibble order are wrong.
+                //
+                // Every expert of every projection in every layer is checked: a
+                // per-layer file is small enough that sampling would only hide
+                // which layer is wrong. Layers are verified in parallel, and
+                // each tensor is read once rather than once per expert.
+                eprintln!("logan: verifying exported files...");
+                let started_verify = Instant::now();
+                let base = logan_compiler::export::qwen4_expert_base(&source)?;
+                let checked = logan_compiler::export::verify_exported_files(
+                    &report.output_dir,
+                    &report.file_template,
+                    report.layers,
+                    report.experts_per_layer,
+                    &base,
+                )?;
+                eprintln!(
+                    "logan: verified all {checked} expert projections read back intact in {:.1}s",
+                    started_verify.elapsed().as_secs_f64()
+                );
+            }
             Ok(())
         }
         Command::Verify { package } => {
@@ -414,6 +528,7 @@ fn run() -> logan_compiler::Result<()> {
                 })
                 .unwrap_or_else(|| "qwen4_exp_text".to_string());
             let out = match model_type.as_str() {
+                #[cfg(feature = "runtime")]
                 "spark2_5" => {
                     logan_spark::run_greedy(&package, &prompt_ids, max_new).map_err(|e| {
                         logan_compiler::ColicError::Unsupported {
@@ -422,6 +537,7 @@ fn run() -> logan_compiler::Result<()> {
                         }
                     })?
                 }
+                #[cfg(feature = "runtime")]
                 "qwen4_exp_text" | "qwen4_exp" => {
                     let cfg = logan_qwen4::load_cfg(&cfg_path).map_err(|e| {
                         logan_compiler::ColicError::Unsupported {
@@ -435,6 +551,7 @@ fn run() -> logan_compiler::Result<()> {
                             detail: e,
                         })?
                 }
+                #[cfg(feature = "runtime")]
                 _ => {
                     // Default to the Qwen3 MoE engine for other qwen model
                     // types; unknown architectures are reported honestly.
@@ -447,6 +564,18 @@ fn run() -> logan_compiler::Result<()> {
                             });
                         }
                     }
+                }
+                // Built without the runtime feature: say exactly that, rather
+                // than reporting every architecture as unsupported.
+                #[cfg(not(feature = "runtime"))]
+                _ => {
+                    return Err(logan_compiler::ColicError::Unsupported {
+                        stage: "run",
+                        detail: format!(
+                            "this build has no runtime backend (model_type={model_type}); \
+                             rebuild with the `runtime` feature to use `logan run`"
+                        ),
+                    });
                 }
             };
             println!("generated: {out:?}");
