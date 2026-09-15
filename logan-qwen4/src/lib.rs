@@ -1973,6 +1973,30 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                     .stored_bytes(i as u64)
                     .expect("validated GGUF row geometry") as usize;
                 debug_assert_eq!(weights.len(), row_bytes * o);
+                // Q4_K on a CUDA device, tried before the CPU path. The whole
+                // `[o, i]` GEMV is one launch with one thread per output row,
+                // and every element of `y` is written by the thread that owns
+                // that row and nothing else touches it -- the same shape as the
+                // per-row arms below, just executed on the device. So the result
+                // ordering is identical and the row loop can be skipped
+                // entirely rather than having each row try the device.
+                //
+                // Placed after the assertion above so BOTH paths are guarded by
+                // it: `debug_assert_eq!` has already run by the time this is
+                // reached, and the oracle keeps its own per-row checks below.
+                //
+                // `None` is a refusal, not an error. `q4k_dot_row` declines a
+                // ragged `i`, a buffer shorter than the row geometry, a busy or
+                // absent device, and anything else it cannot express; each falls
+                // through to the oracle exactly as if the backend were absent.
+                // The opt-in being unset makes it refuse unconditionally: the
+                // backend is measured slower than the CPU at these shapes, so
+                // the default is off (see `cuda_q4k`'s module header).
+                if *dtype == ggufsource::GgmlType::Q4K
+                    && ggufsource::cuda_q4k::q4k_dot_row(y, x, weights, o, i).is_some()
+                {
+                    return;
+                }
                 let parallel = o * i >= 1_000_000
                     && std::thread::available_parallelism()
                         .map(|n| n.get())
@@ -7957,11 +7981,7 @@ mod tests {
 
     #[test]
     fn qwen3_next_config_derives_hybrid_schedule_and_raw_norm_semantics() {
-        let path = std::env::temp_dir().join(format!(
-            "logan-qwen3-next-config-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let path = logan_format::test_temp_path("logan-qwen3-next-config", "json");
         std::fs::write(
             &path,
             r#"{
@@ -8020,11 +8040,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "logan-ngram-residency-{}-{}.safetensors",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let path = logan_format::test_temp_path("logan-ngram-residency", "safetensors");
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(&(header.len() as u64).to_le_bytes())
             .unwrap();
@@ -8146,5 +8162,486 @@ mod tests {
         rmsnorm_row(&mut raw_out, &x, &raw_hf_delta, 1e-6);
         rmsnorm_row_shifted(&mut mlx_out, &x, &mlx_stored, 1e-6);
         assert_eq!(raw_out, mlx_out);
+    }
+
+    /// Two Q4_K blocks with exact-in-f16 scales and a chosen quant nibble.
+    ///
+    /// Both the value and the byte layout matter here, so this mirrors the
+    /// packing the oracle expects rather than trusting round-tripping.
+    fn q4k_blocks(nibble: u8, blocks: usize) -> Vec<u8> {
+        // +1.0 and +0.0 in f16.
+        let d: u16 = 0x3C00;
+        let dmin: u16 = 0x0000;
+        let mut out = Vec::with_capacity(blocks * 144);
+        for _ in 0..blocks {
+            let mut blk = vec![0u8; 144];
+            blk[0..2].copy_from_slice(&d.to_le_bytes());
+            blk[2..4].copy_from_slice(&dmin.to_le_bytes());
+            // Six-bit scales all 1, minima all 0.
+            //   bytes 0..4  : scale_j        | (scale_{j+4} >> 4) << 6
+            //   bytes 4..8  : min_j          | (min_{j+4}   >> 4) << 6
+            //   bytes 8..12 : (scale_{j+4} & 0xf) | ((min_{j+4} & 0xf) << 4)
+            for j in 0..4 {
+                blk[4 + j] = 1;
+                blk[8 + j] = 1;
+            }
+            for b in blk[16..].iter_mut() {
+                *b = (nibble & 0x0f) | ((nibble & 0x0f) << 4);
+            }
+            out.extend_from_slice(&blk);
+        }
+        out
+    }
+
+    /// A `Wt` holding byte-exact Q4_K blocks, as `ggufload::load_expert` builds.
+    fn q4k_wt(o: usize, i: usize, nibble: u8) -> super::Wt {
+        assert_eq!(i % 256, 0, "Q4_K blocks are 256 values");
+        super::Wt {
+            f: Vec::new(),
+            bytes: Some(super::WtBytes::Gguf {
+                weights: q4k_blocks(nibble, o * (i / 256)),
+                dtype: super::ggufsource::GgmlType::Q4K,
+            }),
+            o,
+            i,
+        }
+    }
+
+    /// The oracle's answer for the same weight, computed row by row.
+    ///
+    /// This is what `matmul` must produce on the CPU path, so it is the
+    /// reference the wired path is compared against.
+    fn oracle_matmul(w: &super::Wt, x: &[f32]) -> Vec<f32> {
+        let Some(super::WtBytes::Gguf { weights, dtype }) = &w.bytes else {
+            panic!("expected a Gguf weight");
+        };
+        let row_bytes = dtype.stored_bytes(w.i as u64).unwrap() as usize;
+        (0..w.o)
+            .map(|row| {
+                super::ggufsource::dot_row(
+                    *dtype,
+                    &weights[row * row_bytes..(row + 1) * row_bytes],
+                    x,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The wiring test: `matmul` must actually REACH the CUDA kernel.
+    ///
+    /// This is the one that catches the kernel being dead code, which is the
+    /// failure mode this whole backend exists to avoid. It runs the real
+    /// `matmul` on a synthetic `WtBytes::Gguf` Q4_K weight and asserts the
+    /// launch counter moved. It is deliberately *not* a test of the kernel's
+    /// arithmetic -- `cuda_q4k::q4k_kernel_matches_dot_row` owns that; this owns
+    /// the connection between the engine and the kernel.
+    ///
+    /// Runs in a child process because the CUDA module state is a `LazyLock`:
+    /// an in-process opt-in change could be observed by the initialiser and
+    /// cache "unavailable" for the whole run, including for the sibling parity
+    /// test.
+    #[test]
+    fn matmul_reaches_the_cuda_kernel_for_gguf_q4k() {
+        const CHILD: &str = "LOGAN_WIRING_CHILD";
+        // o=640, i=2560 is a real Qwen expert shape and is Q4_K-legal: Q4_K
+        // needs `i` divisible by 256 (2560 = 10 blocks), not `o`.
+        let (o, i) = (640usize, 2560usize);
+
+        if std::env::var(CHILD).is_ok() {
+            // Which arm are we? The parent tells us, because after the flip to
+            // opt-in "enabled" and "variable set" are no longer the same thing.
+            let expect = std::env::var("LOGAN_EXPECT").expect("parent sets LOGAN_EXPECT");
+            let enabled = super::ggufsource::cuda_q4k::available();
+            let w = q4k_wt(o, i, 3);
+            let x: Vec<f32> = (0..i).map(|k| ((k % 31) as f32 - 15.0) / 8.0).collect();
+            let want = oracle_matmul(&w, &x);
+
+            let before = super::ggufsource::cuda_q4k::kernel_launches();
+            let mut got = vec![0.0f32; o];
+            super::matmul(&mut got, &x, &w);
+            let launches = super::ggufsource::cuda_q4k::kernel_launches() - before;
+
+            // Checked in EVERY arm, including the default-off one: whether or
+            // not the device answers, `matmul` must return the oracle's result.
+            // A divergence means the wiring broke the CPU path or the device
+            // path is wrong, and neither is acceptable on any machine.
+            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+            let max_rel = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs() / scale)
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_rel < 1e-5,
+                "matmul result diverges from the oracle: max_rel={max_rel:e}"
+            );
+            assert!(got.iter().all(|v| v.is_finite()));
+
+            // Always printed, so the parent can tell the child took an arm.
+            println!("arm: launched {launches}");
+
+            match expect.as_str() {
+                "default" => {
+                    // THE guard. Absent LOGAN_CUDA, the slow kernel must not run
+                    // -- on a machine that HAS a working device. This is the
+                    // assertion that stops a 2-3x regression being reintroduced
+                    // as a default by a later change.
+                    assert_eq!(
+                        launches, 0,
+                        "the default must not reach the kernel: it is 0.34-0.58x \
+                         the 12-thread CPU oracle at these shapes"
+                    );
+                    assert!(
+                        !enabled,
+                        "available() must be false by default even with a device present"
+                    );
+                    println!("default arm: launches=0 max_rel={max_rel:e} o={o} i={i}");
+                }
+                "enabled" if enabled => {
+                    // The whole point of this test: the kernel was REACHED, not
+                    // merely correct.
+                    assert!(
+                        launches > 0,
+                        "LOGAN_CUDA=1 but matmul did NOT reach the CUDA kernel -- \
+                         it is dead code"
+                    );
+                    assert_eq!(
+                        launches, 1,
+                        "an [o, i] GEMV should be exactly one launch, got {launches}"
+                    );
+                    println!(
+                        "cuda arm: device={:?} launches={launches} max_rel={max_rel:e} o={o} i={i}",
+                        super::ggufsource::cuda_q4k::device_name()
+                    );
+                }
+                "enabled" => {
+                    // Opted in, but no device (macOS). The oracle result above
+                    // was still verified, which is the portable half. Saying
+                    // "skipped" rather than passing quietly: a pass on a machine
+                    // that never ran the kernel would be a lie.
+                    println!(
+                        "SKIP cuda arm: opted in but no device ({:?}); oracle path \
+                         verified, reaching NOT verified",
+                        super::ggufsource::cuda_q4k::unavailable_reason()
+                    );
+                }
+                other => panic!("unknown LOGAN_EXPECT={other}"),
+            }
+            return;
+        }
+
+        for (label, value) in [("default", None), ("enabled", Some("1"))] {
+            let exe = std::env::current_exe().expect("test binary path");
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([
+                "--exact",
+                "tests::matmul_reaches_the_cuda_kernel_for_gguf_q4k",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("LOGAN_EXPECT", label);
+            match value {
+                // Genuinely absent, not present-and-empty.
+                None => {
+                    cmd.env_remove("LOGAN_CUDA");
+                }
+                Some(v) => {
+                    cmd.env("LOGAN_CUDA", v);
+                }
+            }
+            let out = cmd.output().expect("spawn child test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{label} child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                stdout.contains("arm:"),
+                "{label} child did not take its arm:\n{stdout}"
+            );
+            print!("[{label}] {stdout}");
+        }
+    }
+
+    /// A non-Q4_K Gguf weight must take the oracle path unchanged.
+    ///
+    /// `available_for` already asserts the dtype gate; this asserts that the
+    /// *engine* still computes those dtypes correctly through `matmul`, i.e.
+    /// the new early-return did not swallow them.
+    #[test]
+    fn matmul_still_handles_non_q4k_gguf_weights() {
+        // Q8_0: 32 values in 34 bytes, so i needs only to be a multiple of 32.
+        let (o, i) = (7usize, 64usize);
+        let mut weights = Vec::new();
+        for _ in 0..o * (i / 32) {
+            weights.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+            for k in 0..32u8 {
+                weights.push(k); // quant = k, signed i8
+            }
+        }
+        let w = super::Wt {
+            f: Vec::new(),
+            bytes: Some(super::WtBytes::Gguf {
+                weights,
+                dtype: super::ggufsource::GgmlType::Q8_0,
+            }),
+            o,
+            i,
+        };
+        let x: Vec<f32> = (0..i).map(|k| ((k % 7) as f32 - 3.0) / 2.0).collect();
+        let want = oracle_matmul(&w, &x);
+        let mut got = vec![0.0f32; o];
+        super::matmul(&mut got, &x, &w);
+        assert_eq!(got, want, "Q8_0 must be byte-identical to the oracle");
+    }
+
+    // -----------------------------------------------------------------
+    // Benchmark (manual, not run by default)
+    // -----------------------------------------------------------------
+
+    /// Weight bytes for an `[o, i]` Q4_K matrix: 144 bytes per 256 values.
+    fn q4k_weight_bytes(o: usize, i: usize) -> usize {
+        o * (i / 256) * 144
+    }
+
+    /// Shapes the benchmark reports. `i` must be a multiple of 256 (Q4_K block
+    /// size); `o` has no such constraint. 640x2560 is a real Qwen expert
+    /// gate/up shape; 2048x2560 is four times the work.
+    const BENCH_SHAPES: [(usize, usize); 2] = [(640, 2560), (2048, 2560)];
+
+    /// Mean milliseconds per `matmul` call, after warm-up.
+    ///
+    /// Aggregated over `iters` and divided, rather than timed per call: a single
+    /// call here is well under a millisecond and would be dominated by clock
+    /// resolution. Warm-up fills caches and, for CUDA, leaves the module loaded
+    /// and the buffers allocated, so the timed loop measures the steady state.
+    fn bench_matmul(w: &super::Wt, x: &[f32], y: &mut [f32], warm: usize, iters: usize) -> f64 {
+        for _ in 0..warm {
+            super::matmul(y, x, w);
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            super::matmul(y, x, w);
+        }
+        t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+    }
+
+    /// Sum of the output, printed so the two processes can be cross-checked.
+    ///
+    /// Keeps the benchmark self-validating: without it, the numbers below could
+    /// describe a fast but wrong kernel.
+    fn checksum(y: &[f32]) -> f64 {
+        y.iter().map(|v| *v as f64).sum()
+    }
+
+    /// Field `key=value` from a benchmark line.
+    fn field(line: &str, key: &str) -> String {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key}= in {line:?}"))
+            .to_string()
+    }
+
+    /// **Manual benchmark**: the wired CUDA path against the CPU oracle.
+    ///
+    /// `#[ignore]`d because it asserts no timing. The interesting quantities
+    /// here are machine- and shape-dependent — CUDA is *slower* at small shapes,
+    /// where launch latency exceeds the whole CPU computation — so a timing
+    /// assertion would be a flaky test rather than a guard against a real
+    /// regression. Correctness is owned by
+    /// [`Self::matmul_reaches_the_cuda_kernel_for_gguf_q4k`] and
+    /// `ggufsource::cuda_q4k::tests::q4k_kernel_matches_dot_row`; this test owns
+    /// only the numbers, and cross-checks the two arms against each other so it
+    /// cannot report timings for a broken kernel.
+    ///
+    /// Run with:
+    ///
+    /// ```text
+    /// cargo test --release -p logan-qwen4 --lib -- --ignored --nocapture q4k_bench
+    /// ```
+    ///
+    /// Three arms per shape, so the PCIe share is separable from the kernel:
+    ///
+    /// All CUDA arms require the opt-in (`LOGAN_CUDA=1`); the default is off
+    /// because the per-row kernel measured 0.34–0.58x of the CPU arm at these
+    /// shapes. The `cuda-*` arms therefore set it explicitly.
+    ///
+    /// - `cpu` — the oracle path (`LOGAN_CUDA` unset). Multi-threaded above 1M MACs;
+    ///   the thread count is printed.
+    /// - `cuda-alt` — alternates two *distinct* weight matrices, so the
+    ///   upload-fingerprint misses every call and every call pays the transfer.
+    /// - `cuda-warm` — one matrix repeated, so the fingerprint hits and only the
+    ///   first call transfers. The difference between the two CUDA arms is the
+    ///   transfer cost.
+    #[test]
+    #[ignore = "manual benchmark: prints timings, asserts none"]
+    fn q4k_bench_wired_vs_cpu() {
+        const ARM: &str = "LOGAN_BENCH_ARM";
+
+        if let Ok(arm) = std::env::var(ARM) {
+            let idx: usize = std::env::var("LOGAN_BENCH_SHAPE")
+                .expect("parent sets LOGAN_BENCH_SHAPE")
+                .parse()
+                .expect("shape index");
+            let (o, i) = BENCH_SHAPES[idx];
+            let x: Vec<f32> = (0..i).map(|k| ((k % 31) as f32 - 15.0) / 8.0).collect();
+            let mut y = vec![0.0f32; o];
+            // Shapes are large, so fewer iterations keep the run short while
+            // still aggregating past timer resolution.
+            let (warm, iters) = if o * i > 3_000_000 { (2, 5) } else { (3, 20) };
+
+            let (label, ms, extra) = match arm.as_str() {
+                "cpu" => {
+                    let w = q4k_wt(o, i, 3);
+                    let ms = bench_matmul(&w, &x, &mut y, warm, iters);
+                    let threads = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    (format!("cpu({threads}t)"), ms, format!("threads={threads}"))
+                }
+                "cuda-alt" | "cuda-warm" => {
+                    // Two matrices with different quants, so their bytes differ
+                    // and the upload fingerprint distinguishes them.
+                    let a = q4k_wt(o, i, 3);
+                    let b = q4k_wt(o, i, 11);
+                    let (ms, extra) = if arm == "cuda-alt" {
+                        // Alternating guarantees a fingerprint miss, so every
+                        // timed call uploads its weights.
+                        for _ in 0..warm {
+                            super::matmul(&mut y, &x, &a);
+                            super::matmul(&mut y, &x, &b);
+                        }
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            super::matmul(&mut y, &x, &a);
+                            super::matmul(&mut y, &x, &b);
+                        }
+                        (
+                            t0.elapsed().as_secs_f64() * 1e3 / (2 * iters) as f64,
+                            "upload=every-call".to_string(),
+                        )
+                    } else {
+                        let before = super::ggufsource::cuda_q4k::kernel_launches();
+                        let ms = bench_matmul(&a, &x, &mut y, warm, iters);
+                        let launches =
+                            super::ggufsource::cuda_q4k::kernel_launches() - before;
+                        // `warm + iters` calls, all with the same matrix, so all
+                        // but the first skipped the upload.
+                        (
+                            ms,
+                            format!("upload=skipped launches={launches}/{}", warm + iters),
+                        )
+                    };
+                    let dev = super::ggufsource::cuda_q4k::device_name().unwrap_or_default();
+                    (arm.clone(), ms, format!("device={dev:?} {extra}"))
+                }
+                other => panic!("unknown arm {other}"),
+            };
+
+            // Recompute `y` with a canonical nibble-3 weight in EVERY arm, so
+            // all three report the checksum of the same computation and the
+            // parent can cross-check them. Untimed: it is outside the measured
+            // region. Without this the alternating arm would leave `b`'s result
+            // in `y` and the cross-check would compare different matrices.
+            let canonical = q4k_wt(o, i, 3);
+            super::matmul(&mut y, &x, &canonical);
+
+            println!(
+                "BENCH arm={label} o={o} i={i} wbytes={} ms_per_op={ms:.6} sum={:.6} {extra}",
+                q4k_weight_bytes(o, i),
+                checksum(&y)
+            );
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut rows: Vec<(usize, usize, String, f64, String)> = Vec::new();
+        for (idx, (o, i)) in BENCH_SHAPES.iter().copied().enumerate() {
+            for (arm, cuda) in [("cpu", "0"), ("cuda-alt", "1"), ("cuda-warm", "1")] {
+                let out = std::process::Command::new(&exe)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "tests::q4k_bench_wired_vs_cpu",
+                        "--nocapture",
+                    ])
+                    .env(ARM, arm)
+                    .env("LOGAN_BENCH_SHAPE", idx.to_string())
+                    .env("LOGAN_CUDA", cuda)
+                    .output()
+                    .expect("spawn benchmark child");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let line = stdout
+                    .lines()
+                    .find(|l| l.starts_with("BENCH "))
+                    .unwrap_or_else(|| {
+                        panic!("arm={arm} o={o} i={i} produced no BENCH line:\n{stdout}")
+                    })
+                    .to_string();
+                rows.push((
+                    o,
+                    i,
+                    field(&line, "arm"),
+                    field(&line, "ms_per_op").parse().unwrap(),
+                    line.clone(),
+                ));
+                print!("{line}\n");
+            }
+        }
+
+        // The arms must agree on the answer, or the timings describe a fast but
+        // wrong kernel.
+        for (idx, (o, i)) in BENCH_SHAPES.iter().copied().enumerate() {
+            let sums: Vec<f64> = rows[idx * 3..idx * 3 + 3]
+                .iter()
+                .map(|r| field(&r.4, "sum").parse().unwrap())
+                .collect();
+            let scale = sums.iter().map(|v| v.abs()).fold(0.0f64, f64::max).max(1e-30);
+            for pair in sums.windows(2) {
+                let rel = (pair[0] - pair[1]).abs() / scale;
+                assert!(
+                    rel < 1e-5,
+                    "o={o} i={i}: arms disagree (sums {sums:?}), these timings are meaningless"
+                );
+            }
+        }
+
+        println!("\n=== summary ===");
+        println!(
+            "{:<7} {:<7} {:>11} {:>13} {:>14} {:>9} {:>14}",
+            "o", "i", "cpu ms", "cuda-alt ms", "cuda-warm ms", "xfer %", "xfer GB/s"
+        );
+        for (idx, (o, i)) in BENCH_SHAPES.iter().copied().enumerate() {
+            // rows are pushed cpu, cuda-alt, cuda-warm per shape, in that order.
+            let (cpu, alt, warm) = (
+                rows[idx * 3].3,
+                rows[idx * 3 + 1].3,
+                rows[idx * 3 + 2].3,
+            );
+            // gate+up+down at [o, i]: two of the three are `o` rows, so the
+            // per-call weight payload is `wbytes + i*4 + o*4` for ONE matrix.
+            let wbytes = q4k_weight_bytes(o, i);
+            let moved = wbytes + i * 4 + o * 4;
+            // The transfer is what the two CUDA arms differ by; attributing all
+            // of the alt-vs-warm gap to the transfer gives an effective rate for
+            // that payload.
+            let xfer_ms = (alt - warm).max(0.0);
+            println!(
+                "{o:<7} {i:<7} {cpu:>11.4} {alt:>13.4} {warm:>14.4} {:>8.0}% {:>14}",
+                100.0 * xfer_ms / alt.max(1e-9),
+                if xfer_ms > 1e-6 {
+                    format!("{:.2}", moved as f64 / 1e9 / (xfer_ms / 1e3))
+                } else {
+                    "<not separable>".to_string()
+                },
+            );
+            println!(
+                "        -> vs cpu: cuda-alt {:.2}x   cuda-warm {:.2}x   (wbytes={wbytes}, moved={moved})",
+                cpu / alt,
+                cpu / warm,
+            );
+        }
     }
 }

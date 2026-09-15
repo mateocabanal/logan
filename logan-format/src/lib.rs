@@ -5,8 +5,10 @@
 
 pub mod codecs;
 pub mod package;
+pub mod test_support;
 pub mod verify;
 
+pub use test_support::test_temp_path;
 pub use verify::{FormatError, Result};
 
 /// COLI data shard file magic.

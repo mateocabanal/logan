@@ -2967,6 +2967,48 @@ mod imp {
     ) -> i32 {
         0
     }
+
+    /// Non-macOS: Metal owns no shared event and there is no ANE to signal, so
+    /// no fence can ever exist. Uninhabited and never constructible (there is
+    /// no `new`), which keeps the Apple signatures identical — call sites that
+    /// thread `Option<&MetalAneFence>` through simply always see `None`.
+    pub struct MetalAneFence {
+        _private: [u8; 0],
+    }
+
+    /// Non-macOS twin of the Apple zero-copy ANE GDN launch. There are no ANE
+    /// IOSurfaces here, so this declines pre-submit exactly like
+    /// `gdn_ane_token` above, and the caller's `if let Some(pending)` takes the
+    /// CPU tail.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gdn_ane_token_begin(
+        _model_id: u64,
+        _layer: usize,
+        _surfaces: [(*mut std::ffi::c_void, usize); 4],
+        _spatial: usize,
+        _fence: Option<&MetalAneFence>,
+        _wqkv: &[u8],
+        _wz: &[u8],
+        _wa: &[u8],
+        _wb: &[u8],
+        _wout: &[u8],
+        _a_log: &[f32],
+        _dt_bias: &[f32],
+        _conv_w: &[f32],
+        _norm_w: &[f32],
+        _state: &mut [f32],
+        _conv_state: &mut [f32],
+        _d: usize,
+        _kheads: usize,
+        _kd: usize,
+        _vheads: usize,
+        _vd: usize,
+        _kk: usize,
+        _output_gate: i32,
+        _eps: f32,
+    ) -> Option<GdnPending> {
+        None
+    }
 }
 
 pub use imp::*;

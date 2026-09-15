@@ -660,13 +660,18 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 /// Dot one logical GGML row with an f32 activation without materializing a
-/// dequantized copy. This is the correctness oracle for the future CUDA path.
+/// dequantized copy. This is the correctness oracle for the CUDA path
+/// ([`cuda_q4k`]), which mirrors it — including its loop nesting, so the two
+/// accumulate in the same order and agree far more closely than a general f32
+/// reassociation would.
 pub fn dot_row(dtype: GgmlType, row: &[u8], x: &[f32]) -> Result<f32, String> {
     let expected = dtype.stored_bytes(x.len() as u64)? as usize;
     if row.len() != expected {
         return Err(format!(
             "{} row has {} bytes, expected {expected} for {} values",
-            dtype.name(), row.len(), x.len()
+            dtype.name(),
+            row.len(),
+            x.len()
         ));
     }
     let mut acc = 0.0_f32;
@@ -870,8 +875,14 @@ pub fn decode_row(dtype: GgmlType, row: &[u8], elements: usize) -> Result<Vec<f3
     Ok(out)
 }
 
+/// Six-bit scale/minimum unpacking for Q4_K groups.
+///
+/// `pub(crate)` rather than private: [`cuda_q4k`] both transliterates this into
+/// CUDA and checks its own block-packing helper against it, and duplicating the
+/// bit-twiddling in a third place is how the kernel and the oracle would drift
+/// apart without anyone noticing.
 #[inline]
-fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
     debug_assert!(j < 8 && q.len() >= 12);
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
@@ -908,3 +919,13 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     };
     f32::from_bits(out)
 }
+
+/// CUDA execution for Q4_K rows, next to the [`dot_row`] oracle it must agree
+/// with.
+///
+/// A submodule of this file rather than of the crate root: the layout constants
+/// (`q4k_scale_min`, the 144-byte block) are here, and the module is gated on
+/// `target_arch` only by what it can load at runtime, not by compilation — the
+/// loading path is `dlopen`/`LoadLibrary`, so this compiles everywhere and
+/// simply reports itself unavailable where there is no CUDA runtime.
+pub mod cuda_q4k;

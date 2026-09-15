@@ -14,6 +14,14 @@ fn argmax(values: &[f32]) -> Result<u32, String> {
         .ok_or_else(|| "logits contain no finite values".to_string())
 }
 
+/// Peak resident set size in MiB, or 0.0 when unavailable.
+///
+/// macOS `getrusage` reports `ru_maxrss` in bytes (Linux reports KiB), and this
+/// benchmark is Apple-Silicon-specific, so the native macOS value is exposed
+/// directly. Windows has no `getrusage`; the probe reports 0.0 there, the same
+/// "not measured" value the failure path already returns, so the CPU baseline
+/// still runs and only the RSS column is absent.
+#[cfg(target_os = "macos")]
 fn peak_rss_mib() -> f64 {
     let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -21,6 +29,11 @@ fn peak_rss_mib() -> f64 {
         return 0.0;
     }
     usage.ru_maxrss as f64 / (1024.0 * 1024.0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peak_rss_mib() -> f64 {
+    0.0
 }
 
 fn main() -> Result<(), String> {

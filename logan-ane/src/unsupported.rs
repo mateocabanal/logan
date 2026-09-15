@@ -63,3 +63,12 @@ pub struct AneClient;
 pub struct AneModel;
 pub struct AneRequest<'a>(PhantomData<&'a ()>);
 pub struct MutableWeightMapping<'a>(PhantomData<&'a ()>);
+
+impl AneModel {
+    /// Mirrors the Apple signature. There is no ANE outside Apple silicon, so
+    /// loading always fails with the platform error the rest of this module
+    /// already returns.
+    pub fn load(&mut self) -> Result<()> {
+        Err(AneError::UnsupportedPlatform)
+    }
+}

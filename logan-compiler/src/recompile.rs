@@ -1620,20 +1620,34 @@ fn replace_manifest(root: &Path, manifest: &[u8]) -> Result<()> {
         source,
     })?;
     #[cfg(windows)]
-    {
-        fs::copy(&next, &path).map_err(|source| ColicError::Io {
-            path: path.clone(),
+    commit_replaced_file(&next, &path)?;
+    Ok(())
+}
+
+/// Windows has no atomic replace for a file that may already exist, so the
+/// `.next` payload is copied over the destination and the copy is flushed
+/// before the original is discarded.
+///
+/// The flush MUST use a handle opened for writing: Windows implements
+/// `sync_all` as `FlushFileBuffers`, which requires GENERIC_WRITE. A handle
+/// from `File::open` is read-only and fails with ERROR_ACCESS_DENIED (os error
+/// 5), which is a permanent condition, not a transient one — that is what made
+/// the low-space in-place recompile tests fail on Windows only.
+#[cfg(windows)]
+fn commit_replaced_file(next: &Path, path: &Path) -> Result<()> {
+    fs::copy(next, path).map_err(|source| ColicError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ColicError::Io {
+            path: path.to_owned(),
             source,
         })?;
-        File::open(&path)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| ColicError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        remove_if_exists(&next)?;
-    }
-    Ok(())
+    remove_if_exists(next)
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1666,19 +1680,7 @@ fn write_json_synced(path: &Path, value: &serde_json::Value) -> Result<()> {
         source,
     })?;
     #[cfg(windows)]
-    {
-        fs::copy(&next, path).map_err(|source| ColicError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| ColicError::Io {
-                path: path.to_owned(),
-                source,
-            })?;
-        remove_if_exists(&next)?;
-    }
+    commit_replaced_file(&next, path)?;
     Ok(())
 }
 

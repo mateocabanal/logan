@@ -1,6 +1,6 @@
 use std::{path::Path, time::Instant};
 
-use logan_qwen4::{Model, colisource::ColiSource, load_cfg};
+use logan_qwen4::{colisource::ColiSource, load_cfg, Model};
 
 fn argmax(values: &[f32]) -> usize {
     let mut best_i = 0usize;
@@ -30,15 +30,26 @@ fn fingerprint(values: &[f32]) -> (f64, f64, f32, usize) {
     (sum, sumsq.sqrt(), max, maxi)
 }
 
+/// Peak resident set size in MiB, or 0.0 when unavailable.
+///
+/// macOS `getrusage` reports `ru_maxrss` in bytes (Linux reports KiB), and this
+/// benchmark is Apple-Silicon-specific, so the native macOS value is exposed
+/// directly. Windows has no `getrusage`; the probe reports 0.0 there, the same
+/// "not measured" value the failure path already returns, so the CPU baseline
+/// still runs and only the RSS column is absent.
+#[cfg(target_os = "macos")]
 fn peak_rss_mib() -> f64 {
     let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
     if rc != 0 {
         return 0.0;
     }
-    // macOS reports ru_maxrss in bytes (Linux reports KiB). This benchmark is
-    // Apple-Silicon-specific, so expose the native macOS value directly.
     usage.ru_maxrss as f64 / (1024.0 * 1024.0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peak_rss_mib() -> f64 {
+    0.0
 }
 
 fn write_logits(path: &str, values: &[f32]) -> Result<(), String> {

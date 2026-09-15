@@ -1123,6 +1123,102 @@ mod imp {
         false
     }
 
+    /// The dynamic-weight engine does not exist off Apple silicon.
+    ///
+    /// A unit type rather than a struct with fields: nothing can construct it
+    /// here, so there is no state to model, and `build` below always fails.
+    pub struct GdnAneDynamicEngine;
+
+    /// Off Apple silicon there is no ANE chain to be pending on. Only reachable
+    /// if a caller ignored the `Err` from `evaluate_layer_async`; it mirrors the
+    /// Apple type so that call site needs no cfg.
+    pub struct GdnAneDynamicPending;
+
+    impl GdnAneDynamicPending {
+        pub fn submit_ms(&self) -> f64 {
+            0.0
+        }
+        pub fn finish(self, _timeout_ms: u64) -> Result<f64, String> {
+            Err("dynamic ANE is only available on macOS aarch64".into())
+        }
+    }
+
+    impl GdnAneDynamicEngine {
+        pub fn build(
+            _hidden: usize,
+            _qkv_rows: usize,
+            _z_rows: usize,
+            _ab_rows: usize,
+        ) -> Result<Self, String> {
+            Err("dynamic ANE is only available on macOS aarch64".into())
+        }
+
+        /// Only reachable through `dynamic_async_enabled()`, which is false
+        /// here; returning `Err` matches the Apple type's shape without
+        /// pretending a submission happened.
+        #[allow(clippy::too_many_arguments)]
+        pub fn evaluate_layer_async(
+            &mut self,
+            _layer: usize,
+            _x: &[f32],
+            _wqkv: &[u8],
+            _wz: &[u8],
+            _wa: &[u8],
+            _wb: &[u8],
+        ) -> Result<GdnAneDynamicPending, String> {
+            Err("dynamic ANE is only available on macOS aarch64".into())
+        }
+
+        /// Apple returns the shared ANE/Metal fence it submits against. No ANE
+        /// exists here, so there is never a fence.
+        pub fn gpu_fence(&self) -> Option<&logan_metal::MetalAneFence> {
+            None
+        }
+
+        /// Apple only calls this after a successful `evaluate_layer`; here that
+        /// always fails, so this is unreachable in practice. Returning all-null
+        /// keeps the caller's `gdn_ane_token` fallback (which also returns 0)
+        /// rather than asserting.
+        #[allow(clippy::too_many_arguments)]
+        pub fn evaluate_layer(
+            &mut self,
+            _layer: usize,
+            _x: &[f32],
+            _wqkv: &[u8],
+            _wz: &[u8],
+            _wa: &[u8],
+            _wb: &[u8],
+        ) -> Result<(), String> {
+            Err("dynamic ANE is only available on macOS aarch64".into())
+        }
+
+        /// Apple hands the four ANE IOSurfaces to the Metal tail. None exist
+        /// off Apple silicon, so the caller's `gdn_ane_token` receives nulls
+        /// and declines, taking the CPU tail.
+        pub fn gpu_surfaces(&self) -> [(*mut std::ffi::c_void, usize); 4] {
+            [(std::ptr::null_mut(), 0); 4]
+        }
+    }
+
+    /// Always false: the switch exists on every platform so call sites do not
+    /// need cfg gates, but only Apple silicon can honour it.
+    pub fn dynamic_enabled() -> bool {
+        false
+    }
+
+    pub fn dynamic_async_enabled() -> bool {
+        false
+    }
+
+    /// No ANE surface exists to fence against, so there is never a fence.
+    ///
+    /// Returns the same `logan_metal::MetalAneFence` reference type the Apple
+    /// build does, so the caller's `if let (Some(surfaces), Some(fence))` keeps
+    /// compiling and simply takes the non-ANE branch.
+    pub fn gpu_fence(_state: &GdnAneState) -> Option<&logan_metal::MetalAneFence> {
+        None
+    }
+
     pub fn fused_active(_state: &GdnAneState) -> bool {
         false
     }

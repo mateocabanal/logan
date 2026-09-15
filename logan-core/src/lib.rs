@@ -5,6 +5,7 @@
 //! verbatim (C-identical numerics are the contract — the token-identity
 //! gates prove extraction is behavior-neutral).
 
+pub mod cuda;
 pub mod expert;
 pub mod math;
 pub mod sched;

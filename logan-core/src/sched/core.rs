@@ -468,7 +468,13 @@ impl SchedulerCore {
 
     /// Debug-only invariant checker used by deterministic tests and future
     /// simulator/replay code (#46).
-    #[cfg(debug_assertions)]
+    ///
+    /// `test` is in the gate as well as `debug_assertions`: the callers are all
+    /// `#[cfg(test)]` and `cargo test --release` compiles them with
+    /// `debug_assertions` OFF, which otherwise left the method absent and the
+    /// test target unbuildable. Production release builds still exclude it, so
+    /// real users pay nothing.
+    #[cfg(any(debug_assertions, test))]
     pub fn assert_invariants(&self) {
         let mut seen = HashSet::new();
         for &session in &self.ready {

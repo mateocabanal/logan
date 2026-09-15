@@ -494,11 +494,7 @@ mod tests {
 
     #[test]
     fn calibration_json_overrides_one_group_without_affecting_others() {
-        let root = std::env::temp_dir().join(format!(
-            "logan-calibration-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root = logan_format::test_temp_path("logan-calibration", "json");
         fs::write(
             &root,
             r#"{"scores":[{"group":"layer:7:routed-experts","candidate":"mxfp4","quality_loss_ppm":123}]}"#,

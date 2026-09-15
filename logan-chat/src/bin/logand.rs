@@ -1750,6 +1750,8 @@ fn peak_rss_bytes() -> u64 {
             return unsafe { usage.assume_init().ru_maxrss.max(0) as u64 };
         }
     }
+    // Windows has no `getrusage`: report "not measured" rather than failing.
+    // The daemon's status endpoint renders this as an absent RSS figure.
     0
 }
 
