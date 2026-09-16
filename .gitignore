@@ -116,6 +116,7 @@ c/tiny_inkling/
 .archcore/
 .hermes/
 c/*.o
+.qwen3-coder-next-scratch/
 c/metalio_test
 c/qwen_moe_medium/
 c/qwen_moe_tiny_i3/
