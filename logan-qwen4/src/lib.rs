@@ -2626,6 +2626,12 @@ fn matmul_f32_rows(y: &mut [f32], x: &[f32], w: &[f32], o: usize, i: usize) {
     }
 }
 
+/// Diagnostic counter: how many pool batches a run issued.
+///
+/// The call site is easy to get wrong in a way a profile hides: a per-token loop
+/// and a per-layer batch produce identical output and differ only in round trips.
+pub static POOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Threads to use for one parallel split.
 ///
 /// One definition so the several `thread::scope` sites in this file cannot
@@ -6289,6 +6295,10 @@ impl Model {
         // experts would be requested from the pool at an index it does not
         // have, and speculative decoding would fail on every draft step.
         let is_trunk_layer = (li as usize) < self.cfg.layers;
+        if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+            let n = POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            eprintln!("[pool-trace] layer {li} PER-TOKEN call #{n}");
+        }
         if let Some(pcfg) = self.pool.clone().filter(|_| is_trunk_layer) {
             let mut calls: Vec<crate::pool::ExpertCall> = Vec::with_capacity(k);
             for i in 0..k {
@@ -7309,13 +7319,99 @@ impl Model {
             }
 
             if !batch_done {
-                for row in 0..tokens.len() {
-                    let mut moe = vec![0.0; c.hidden];
-                    let (idx, val, wsum) = &routes[row];
-                    self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
-                    for g in 0..c.hc_count {
-                        for dd in 0..c.hidden {
-                            streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                // Pool mode: ONE call for the whole layer, carrying every token's
+                // routed experts.
+                //
+                // `moe_token_routed` is per-token, so calling it in this loop sent
+                // one network request per token per layer: a 5-token prompt cost
+                // 5 x 48 = 240 round trips of ~72 ms = 17 s, and every generated
+                // token added another 48. The coordinator's batch endpoint already
+                // takes a list of `(layer, expert, input)` and answers in the same
+                // order, so the tokens belong in the payload, not in separate
+                // requests.
+                //
+                // This mirrors what the Metal batch path below does with
+                // `scatter`: group the `(row, rank)` occurrences by expert, send
+                // them together, then scatter each answer back to its slot so the
+                // per-token weighted reduction still follows the canonical top-k
+                // order.
+                let mut pool_done = false;
+                if let Some(pcfg) = self.pool.clone().filter(|_| (l as usize) < self.cfg.layers) {
+                    let mut calls: Vec<crate::pool::ExpertCall> = Vec::new();
+                    let mut scatter: Vec<(usize, usize)> = Vec::new();
+                    for (row, (idx, _, _)) in routes.iter().enumerate() {
+                        for rank in 0..c.topk {
+                            calls.push(crate::pool::ExpertCall {
+                                layer: l as u32,
+                                expert: idx[rank] as u32,
+                                input: moe_inputs[row].clone(),
+                            });
+                            scatter.push((row, rank));
+                        }
+                    }
+                    let mut _fill_t = logan_core::telemetry::Span::begin("fill");
+                    match crate::pool::run_expert_batch(
+                        &pcfg,
+                        &calls,
+                        c.hidden,
+                        c.moe_inter,
+                        "silu",
+                    ) {
+                        Ok(outs) if outs.len() == calls.len() => {
+                            self.spans.fill_ms += _fill_t.end();
+                            // Accumulate each answer into its own token's output,
+                            // weighted exactly as the per-token path would have.
+                            let mut moe_rows = vec![vec![0.0f32; c.hidden]; tokens.len()];
+                            for ((row, rank), out) in scatter.iter().zip(outs.iter()) {
+                                let (_, val, wsum) = &routes[*row];
+                                let w = val[*rank] / wsum;
+                                for dd in 0..c.hidden.min(out.len()) {
+                                    moe_rows[*row][dd] += out[dd] * w;
+                                }
+                            }
+                            for row in 0..tokens.len() {
+                                let mut moe = vec![0.0; c.hidden];
+                                std::mem::swap(&mut moe, &mut moe_rows[row]);
+                                let sy_gs = self.shared_expert_value(&layer, l, &moe_inputs[row]);
+                                for dd in 0..c.hidden {
+                                    moe[dd] += sy_gs.0[dd] * sy_gs.1;
+                                }
+                                for g in 0..c.hc_count {
+                                    for dd in 0..c.hidden {
+                                        streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                                    }
+                                }
+                            }
+                            pool_done = true;
+                        }
+                        Ok(outs) => {
+                            self.spans.fill_ms += _fill_t.end();
+                            return Err(format!(
+                                "pool returned {} outputs for {} routed experts on layer {l}; \
+                                 refusing to compute a partial layer",
+                                outs.len(),
+                                calls.len()
+                            ));
+                        }
+                        Err(e) => {
+                            self.spans.fill_ms += _fill_t.end();
+                            return Err(format!(
+                                "pool expert batch failed on layer {l}: {e}. There is no local \
+                                 fallback: this mode exists because the expert weights do not fit \
+                                 on this host."
+                            ));
+                        }
+                    }
+                }
+                if !pool_done {
+                    for row in 0..tokens.len() {
+                        let mut moe = vec![0.0; c.hidden];
+                        let (idx, val, wsum) = &routes[row];
+                        self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
+                        for g in 0..c.hc_count {
+                            for dd in 0..c.hidden {
+                                streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                            }
                         }
                     }
                 }
@@ -7668,13 +7764,87 @@ impl Model {
             }
 
             if !batch_done {
-                for row in 0..tokens.len() {
-                    let mut moe = vec![0.0; c.hidden];
-                    let (idx, val, wsum) = &routes[row];
-                    self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
-                    for g in 0..c.hc_count {
-                        for dd in 0..c.hidden {
-                            streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                // Pool mode: ONE call for the layer, carrying every token's routed
+                // experts. `moe_token_routed` is per-token, so looping it here sent
+                // one request per token per layer: a 5-token prompt cost 5 x 48 =
+                // 240 round trips of ~72 ms = 17 s, plus 48 more for every token
+                // generated. The coordinator's batch endpoint takes a list of
+                // `(layer, expert, input)` and answers in the same order, so the
+                // tokens belong in the payload rather than in separate requests.
+                //
+                // Mirrors the Metal batch path's `scatter`: group the `(row, rank)`
+                // occurrences by expert, send together, scatter each answer back to
+                // its own slot so the weighted reduction still follows canonical
+                // top-k order.
+                let mut pool_done = false;
+                if let Some(pcfg) = self.pool.clone().filter(|_| (l as usize) < self.cfg.layers) {
+                    let mut calls: Vec<crate::pool::ExpertCall> = Vec::new();
+                    let mut scatter: Vec<(usize, usize)> = Vec::new();
+                    for (row, (idx, _, _)) in routes.iter().enumerate() {
+                        for rank in 0..c.topk {
+                            calls.push(crate::pool::ExpertCall {
+                                layer: l as u32,
+                                expert: idx[rank] as u32,
+                                input: moe_inputs[row].clone(),
+                            });
+                            scatter.push((row, rank));
+                        }
+                    }
+                    let mut _fill_t = logan_core::telemetry::Span::begin("fill");
+                    match crate::pool::run_expert_batch(&pcfg, &calls, c.hidden, c.moe_inter, "silu") {
+                        Ok(outs) if outs.len() == calls.len() => {
+                            self.spans.fill_ms += _fill_t.end();
+                            let mut moe_rows = vec![vec![0.0f32; c.hidden]; tokens.len()];
+                            for ((row, rank), out) in scatter.iter().zip(outs.iter()) {
+                                let (_, val, wsum) = &routes[*row];
+                                let w = val[*rank] / wsum;
+                                for dd in 0..c.hidden.min(out.len()) {
+                                    moe_rows[*row][dd] += out[dd] * w;
+                                }
+                            }
+                            for row in 0..tokens.len() {
+                                let mut moe = vec![0.0; c.hidden];
+                                std::mem::swap(&mut moe, &mut moe_rows[row]);
+                                let sy_gs = self.shared_expert_value(&layer, l, &moe_inputs[row]);
+                                for dd in 0..c.hidden {
+                                    moe[dd] += sy_gs.0[dd] * sy_gs.1;
+                                }
+                                for g in 0..c.hc_count {
+                                    for dd in 0..c.hidden {
+                                        streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                                    }
+                                }
+                            }
+                            pool_done = true;
+                        }
+                        Ok(outs) => {
+                            self.spans.fill_ms += _fill_t.end();
+                            return Err(format!(
+                                "pool returned {} outputs for {} routed experts on layer {l}; \
+                                 refusing to compute a partial layer",
+                                outs.len(),
+                                calls.len()
+                            ));
+                        }
+                        Err(e) => {
+                            self.spans.fill_ms += _fill_t.end();
+                            return Err(format!(
+                                "pool expert batch failed on layer {l}: {e}. There is no local \
+                                 fallback: this mode exists because the expert weights do not fit \
+                                 on this host."
+                            ));
+                        }
+                    }
+                }
+                if !pool_done {
+                    for row in 0..tokens.len() {
+                        let mut moe = vec![0.0; c.hidden];
+                        let (idx, val, wsum) = &routes[row];
+                        self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
+                        for g in 0..c.hc_count {
+                            for dd in 0..c.hidden {
+                                streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                            }
                         }
                     }
                 }
