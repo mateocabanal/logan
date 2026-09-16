@@ -2632,6 +2632,21 @@ fn matmul_f32_rows(y: &mut [f32], x: &[f32], w: &[f32], o: usize, i: usize) {
 /// and a per-layer batch produce identical output and differ only in round trips.
 pub static POOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Whether to trace pool calls, read once.
+///
+/// `env::var` takes a process-global lock and allocates a `String`, and this is
+/// consulted in the per-layer expert path. Caching it costs one `OnceLock` load
+/// per call instead of a lock and an allocation, and the flag cannot change
+/// mid-run in a way that matters.
+pub fn pool_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGAN_POOL_TRACE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// Threads to use for one parallel split.
 ///
 /// One definition so the several `thread::scope` sites in this file cannot
@@ -2643,17 +2658,25 @@ pub static POOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// serves HTTP and drives the pool client, and starving those adds latency that
 /// the extra worker does not repay.
 fn available_threads() -> usize {
-    if let Ok(v) = std::env::var("QWEN_THREADS") {
-        if let Ok(n) = v.parse::<usize>() {
-            if n > 0 {
-                return n;
+    // Resolved once. This is consulted by every matmul dispatch, and both halves
+    // are expensive relative to the call: `env::var` locks the process
+    // environment and allocates, and `available_parallelism` makes a syscall
+    // (~380 ns on this host). Neither can change in a way that matters mid-run,
+    // and the value decides only how work is split, not what is computed.
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Ok(v) = std::env::var("QWEN_THREADS") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 {
+                    return n;
+                }
             }
         }
-    }
-    let n = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    if n > 2 { n - 1 } else { n }
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if n > 2 { n - 1 } else { n }
+    })
 }
 
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
@@ -6295,7 +6318,7 @@ impl Model {
         // experts would be requested from the pool at an index it does not
         // have, and speculative decoding would fail on every draft step.
         let is_trunk_layer = (li as usize) < self.cfg.layers;
-        if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+        if pool_trace_enabled() {
             let n = POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             eprintln!("[pool-trace] layer {li} PER-TOKEN call #{n}");
         }
@@ -7336,7 +7359,7 @@ impl Model {
                 // per-token weighted reduction still follows the canonical top-k
                 // order.
                 let mut pool_done = false;
-                if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                if pool_trace_enabled() {
                     eprintln!(
                         "[pool-trace] layer {l} entering batched block (pool_is_some={} l<c.layers={})",
                         self.pool.is_some(),
@@ -7356,7 +7379,7 @@ impl Model {
                             scatter.push((row, rank));
                         }
                     }
-                    if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                    if pool_trace_enabled() {
                         eprintln!(
                             "[pool-trace] layer {l} BATCHED #{} items={} ({} tokens)",
                             POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
@@ -7792,7 +7815,7 @@ impl Model {
                 // its own slot so the weighted reduction still follows canonical
                 // top-k order.
                 let mut pool_done = false;
-                if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                if pool_trace_enabled() {
                     eprintln!(
                         "[pool-trace] layer {l} entering batched block (pool_is_some={} l<c.layers={})",
                         self.pool.is_some(),
@@ -7812,7 +7835,7 @@ impl Model {
                             scatter.push((row, rank));
                         }
                     }
-                    if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                    if pool_trace_enabled() {
                         eprintln!(
                             "[pool-trace] layer {l} BATCHED #{} items={} ({} tokens)",
                             POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
