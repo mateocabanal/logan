@@ -116,11 +116,19 @@ impl RuntimeStats {
             metal_submit_ns: self.metal_submit_ns.saturating_sub(before.metal_submit_ns),
             metal_wait_ns: self.metal_wait_ns.saturating_sub(before.metal_wait_ns),
             metal_kernel_ns: self.metal_kernel_ns.saturating_sub(before.metal_kernel_ns),
-            gdn_metal_wait_ns: self.gdn_metal_wait_ns.saturating_sub(before.gdn_metal_wait_ns),
-            gdn_metal_kernel_ns: self.gdn_metal_kernel_ns.saturating_sub(before.gdn_metal_kernel_ns),
+            gdn_metal_wait_ns: self
+                .gdn_metal_wait_ns
+                .saturating_sub(before.gdn_metal_wait_ns),
+            gdn_metal_kernel_ns: self
+                .gdn_metal_kernel_ns
+                .saturating_sub(before.gdn_metal_kernel_ns),
             gdn_metal_calls: self.gdn_metal_calls.saturating_sub(before.gdn_metal_calls),
-            moe_metal_wait_ns: self.moe_metal_wait_ns.saturating_sub(before.moe_metal_wait_ns),
-            moe_metal_kernel_ns: self.moe_metal_kernel_ns.saturating_sub(before.moe_metal_kernel_ns),
+            moe_metal_wait_ns: self
+                .moe_metal_wait_ns
+                .saturating_sub(before.moe_metal_wait_ns),
+            moe_metal_kernel_ns: self
+                .moe_metal_kernel_ns
+                .saturating_sub(before.moe_metal_kernel_ns),
             moe_metal_calls: self.moe_metal_calls.saturating_sub(before.moe_metal_calls),
             fused_calls: self.fused_calls.saturating_sub(before.fused_calls),
             fused_experts: self.fused_experts.saturating_sub(before.fused_experts),

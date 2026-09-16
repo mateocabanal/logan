@@ -1,4 +1,4 @@
-//! Qwen3.8 MTP-E speculative draft head — combiner + head mixer core.
+//! Qwen3.8 MTP-E speculative draft head — package/runtime state + numerical helpers.
 //!
 //! Exact algorithm from llama.cpp qwen4exp `graph_mtp` (PR #27836) and the
 //! checkpoint's `mtp.*` weights. The draft is:
@@ -19,8 +19,73 @@
 //! trunk layer (`forward_layer(48)` in Logan) and is NOT reproduced here.
 //! Self-contained + unit-tested so numerics are pinned before the lib.rs wiring.
 
-/// Row-major [o][i] f32 weights (the engine's `Wt.f` layout, no bytes path).
+use super::Wt;
+
+/// Row-major [o][i] f32 weights used only by the scalar helper tests below.
 type W = Vec<f32>;
+
+/// Loaded embedded MTP state. The actual transformer block lives at
+/// `layer_index` in `Model::layers`; keeping it there lets MTP reuse the
+/// production attention, HC, shared-expert, routed-expert and MetalIO paths
+/// without adding the draft layer to the target model's `cfg.layers`.
+pub(crate) struct MtpRuntime {
+    pub layer_index: usize,
+    pub experts: usize,
+    pub topk: usize,
+    pub fc_embedding: Wt,
+    pub fc_hidden: Wt,
+    pub enorm: Vec<f32>,
+    pub hnorm: Vec<f32>,
+    pub head_norm: Vec<f32>,
+    pub head_down: Wt,
+    pub head_up: Wt,
+    pub catchup_rows: u64,
+    pub drafted: u64,
+    pub accepted: u64,
+    pub blocks: u64,
+    pub attempted_by_pos: [u64; 4],
+    pub accepted_by_pos: [u64; 4],
+    pub draft_ms: f64,
+    pub verify_ms: f64,
+    pub draft_mio_bytes: u64,
+    pub verify_mio_bytes: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct MtpDraft {
+    pub logits: Vec<f32>,
+    /// Pre-final-mixer HC residual emitted by the MTP transformer block. This
+    /// is the hidden state consumed by the next recursive MTP step.
+    pub next_hidden_hc: Vec<f32>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct MtpVerifyBoundary {
+    pub gdn_s: Vec<Vec<f32>>,
+    pub gdn_conv: Vec<Vec<f32>>,
+    pub ple_ring: Vec<i64>,
+    pub ple_conv_state: Vec<f32>,
+    pub hidden_hc: Vec<f32>,
+}
+
+pub(crate) struct MtpVerifyBatch {
+    pub logits: Vec<Vec<f32>>,
+    pub boundaries: Vec<MtpVerifyBoundary>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MtpStats {
+    pub catchup_rows: u64,
+    pub drafted: u64,
+    pub accepted: u64,
+    pub blocks: u64,
+    pub attempted_by_pos: [u64; 4],
+    pub accepted_by_pos: [u64; 4],
+    pub draft_ms: f64,
+    pub verify_ms: f64,
+    pub draft_mio_bytes: u64,
+    pub verify_mio_bytes: u64,
+}
 
 /// The MTP combiner + head-mixer weights (block weights live in `Layer(48)`).
 #[derive(Clone)]
@@ -41,7 +106,7 @@ fn rmsnorm_row(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     }
     let inv = 1.0 / (sq / x.len() as f32 + eps).sqrt();
     for i in 0..x.len() {
-        out[i] = x[i] * inv * w[i];
+        out[i] = x[i] * inv * (1.0 + w[i]);
     }
 }
 
@@ -105,7 +170,7 @@ impl MtpHead {
         matmul(&mut lo, &normed, &self.hc_down, lr);
         for v in lo.iter_mut() {
             let s = *v / hc as f32;
-            *v = s / (1.0 + s.abs()); // hard silu
+            *v = s / (1.0 + (-s).exp());
         }
         let mut hi = vec![0.0; hcd];
         matmul(&mut hi, &lo, &self.hc_up, hcd);
@@ -152,7 +217,7 @@ mod tests {
         let norm = |x: &[f32], w: &[f32]| -> Vec<f32> {
             let sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
             let inv = 1.0 / (sq + eps).sqrt();
-            x.iter().zip(w).map(|(x, w)| x * inv * w).collect()
+            x.iter().zip(w).map(|(x, w)| x * inv * (1.0 + w)).collect()
         };
         let e = norm(&emb, &m.enorm);
         let h0 = norm(&res[0..3], &m.hnorm[0..3]);

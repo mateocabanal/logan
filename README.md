@@ -19,7 +19,7 @@ optimized for the current hardware.
 | `logan-format` | COLI CSF artifact framing: checksums, manifest/data-shard constants, package reader |
 | `logan-compiler` | The compiler (`logan` binary): machine probe, physical IR, memory planner, quant (exact / MXFP4-Apple8 / INT4-G32), rANS codec, package emission |
 | `logan-qwen` | Scalar Qwen MoE reference (C-identical numerics, token-identity gated) |
-| `logan-qwen4` | Qwen4 (Qwen3.8-Flash-Next / Qwen4Exp) runtime: hyper connections, QSA sparse attention, PLE n-gram layer, **Metal/MetalIO direct execution** (fused Apple8 experts + coalesced GDN kernels) |
+| `logan-qwen4` | Hybrid Qwen runtime: Qwen3-Next / **Qwen3-Coder-Next** plus Qwen4 (Qwen3.8-Flash-Next / Qwen4Exp), with Gated DeltaNet, sparse MoE and **Metal/MetalIO direct execution**; Qwen4 additionally enables hyper connections, QSA and PLE |
 
 ## The Metal/MetalIO path (macOS)
 
@@ -55,6 +55,11 @@ cargo run --release -p logan-qwen4 -- fixtures/qwen4_moe_tiny
 # compile a checkpoint into a COLI package:
 target/release/logan compile MODEL_DIR --target native --quant exact \
   --codec none --opt default -o OUT.coli --verify
+
+# Qwen3-Coder-Next BF16 -> streamed Apple8/MXFP4 experts on Apple silicon:
+target/release/logan compile ~/models/Qwen3-Coder-Next \
+  --target macos-arm64-metal-apple8-v1 --quant mxfp4 \
+  --codec none --opt default -o ~/models/Qwen3-Coder-Next.Apple8.coli --verify
 
 # decode a real package (macOS, Metal path):
 QWEN_PROMPT="1 2 3 4 5" QWEN_MAX_NEW=8 \

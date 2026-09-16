@@ -75,24 +75,87 @@ count** — *not* by raising thread count.
 
 ## 3. AVX2 status
 
-`logan-core/src/math_x86.rs` kernels are **correct and do engage**. Verified with
-temporary instrumented atomics on Zen 3 (counters since removed); measured against an
-independent scalar reference:
+`logan-core/src/math_x86.rs` kernels are **correct, do engage, and are now wired into
+production** (see reachability note below).
 
-| shape | path | scalar | AVX2 | speedup | max abs vs scalar ref |
-|---|---|---|---|---|---|
-| o=640 i=2560 | bf16 | 1.687 ms | 0.559 ms | **3.0×** | 7.82e-5 (1.71e-6 of result scale) |
-| o=640 i=2560 | f32 | 1.965 ms | 1.171 ms | **1.68×** | 9.16e-5 (2.00e-6 of result scale) |
+### 3.1 Speedup depends on weight residency — three regimes
 
-Differences match f32 reassociation exactly (predicted 1.7e-6, observed 1.71e-6);
-the scalar arm is bit-identical to the reference. Not a bug.
+The speedup is **not one number**: the scalar loop is a serial accumulator chain
+(`acc += x[ii] * w[ii]`), so it is latency-bound rather than throughput-bound — measured
+at ~1.1 GMAC/s at o=640/i=2560, i.e. a few cycles per MAC against FADD/FMA latency,
+versus ~0.25 cycles/MAC of AVX2 FMA throughput. Vectorising it removes that latency
+bottleneck, and the size of the win then depends on whether the weights are
+cache-resident.
 
-> **⚠ Open architectural issue (not fixed).**
-> `logan_core::math::matmul` has **zero production callers**. `logan-qwen4/src/lib.rs`
-> defines its **own private `matmul` with its own `WtBytes` enum**, and *that* is what
-> actually runs. The AVX2 kernels are therefore currently **unreachable from
-> production**, and there is a **duplicated matmul implementation** between
-> `logan-core` and `logan-qwen4` that will drift. This was left alone deliberately.
+| regime | shape | scalar | AVX2 | speedup |
+|---|---|---|---|---|
+| **L3-resident** (representative inference) | o=640 i=2560 bf16 | 1.441 ms | 0.086 ms | **~16.7×** |
+| L3-resident, transposed | o=2560 i=640 bf16 | 1.446 ms | 0.073 ms | ~19.8× |
+| **DRAM-resident** (134 MB, far exceeds 32 MB L3) | o=8192 i=8192 bf16 | 7.79 ms | 3.00 ms | **~2.6×** |
+
+All three rows are the **production** path (qwen4's private `matmul`, `WtBytes::Bf16`
+arm), which is what a real run executes. Measuring through `logan_core::math::matmul`
+instead gives ~12.6× at o=640/i=2560: its AVX2 time is identical (0.0856 ms) but its
+scalar loop runs 1.33× faster (1.082 vs 1.441 ms), reproducibly and in both loop orders
+when interleaved in one process. The two scalar loops are textually identical, so that
+1.33× is itself unexplained and is **not** part of the AVX2 win — quote 16.7× only for
+the production path, and do not compare a scalar reading from one engine with a SIMD
+reading from the other.
+
+Real inference runs in the **L3-resident** regime: `Wt` weights are stored in the
+`Layer` struct (`logan-qwen4/src/lib.rs`, `gdn_in_qkv`/`attn_q`/…) and borrowed by
+reference, never rebuilt per GEMV. So **~16.7×** is the representative figure for a real
+`logand` run on a BF16-resident `.coli` model.
+
+### 3.2 Superseded figures, and why
+
+An earlier version of this document reported **3.0× (bf16)** and **1.68× (f32)** at
+o=640/i=2560. Those measured the GEMV **plus a per-call weight-buffer materialisation
+inside the timed region**, which real inference does not pay. They are superseded; do
+not quote them.
+
+**Evidence.** A `cloneonly` control — building the weight payload and running *no GEMV
+at all* — measures the materialisation directly. It is **additive and arm-independent**
+(the same for AVX2 and scalar, so it is not a kernel effect), and it **scales with
+weight bytes**: the f32 added cost is **~1.94×** the bf16 added cost while f32 weights
+are **exactly 2× the bytes** (6.55 MB vs 3.28 MB). With that cost inside the region,
+`alloc ≈ clean + cloneonly` holds in all eight path/format/arm combinations, and
+`clean + cloneonly` reproduces the old 3.0×/1.68× figures to within 1–5%.
+
+| timed region | bf16 scalar / AVX2 | f32 scalar / AVX2 |
+|---|---|---|
+| weight payload built **outside** the loop (steady state) | 1.257 / 0.086 ms | 1.067 / 0.090 ms |
+| built **inside** the loop (materialisation billed) | 1.772 / 0.629 ms | 2.126 / 1.193 ms |
+| **construction only, no GEMV** (the control) | 0.539 ms | 1.054 ms |
+
+(The "outside the loop" row above was measured through `logan_core::math::matmul`, hence
+its scalar of 1.257 rather than §3.1's 1.441 — see §3.1 on why a scalar reading from one
+engine must not be paired with a SIMD reading from the other. The materialisation
+arithmetic, which is what this table is for, is unaffected: it is a difference of two
+readings taken on the same path.)
+
+**Data sensitivity was tested and ruled out.** All-zeros, all-ones and xorshift-random
+inputs give the same AVX2 time (0.0856 / 0.0864 / 0.0853 ms bf16). There is no early-out
+or sparse-data shortcut for a quantised or uniform activation.
+
+### 3.3 Correctness
+
+Differences from the scalar reference match f32 reassociation exactly (predicted 1.7e-6,
+observed max_rel ~1.1e-6 bf16 / 2.0e-6 f32); the scalar arm is bit-identical to the
+reference, and the `QWEN_NEON_BF16=0` opt-out reproduces it bit-for-bit. Not a bug.
+
+### 3.4 Reachability
+
+The kernels are reached in production on x86_64: qwen4's private `matmul` BF16 arm
+dispatches to `logan_core::math_x86::matmul_bf16_avx2` through the shared
+`matmul_bf16_simd` helper (row-chunking shared with the aarch64 NEON arm, so the two
+cannot drift), behind the same runtime `avx2`+`fma` probe, the same `o * i >= 1 << 18`
+size gate, and the same `QWEN_NEON_BF16` opt-out that `logan_core::math::matmul` uses.
+Reachability is asserted by execution counters (`logan_core::math_x86::bf16_calls` and
+qwen4's `BF16_NEON_CALLS`) in
+`tests::matmul_reaches_the_simd_bf16_kernel` and `math::tests::matmul_reaches_the_avx2_kernel`
+— correctness tests pass whether or not a kernel runs, so only a counter distinguishes
+"wired" from "advertised".
 
 ---
 
@@ -254,8 +317,12 @@ not done. It is recorded here **for the user to act on**.
    Re-evaluate whether CUDA is worth keeping at all: currently 0.32–0.58× of the
    12-thread CPU oracle, and default OFF.
 2. **Duplicated matmul:** reconcile `logan_core::math::matmul` with
-   `logan-qwen4`'s private `matmul`. Until then the AVX2 kernels (3.0× bf16) are dead
-   code in production.
+   `logan-qwen4`'s private `matmul`. The duplication is no longer causing the fast path
+   to be unreachable — the AVX2 kernels are wired into qwen4's BF16 arm and asserted
+   reached by execution-counter tests (§3.4) — but two implementations of one GEMV will
+   still drift, and `logan_core::math::matmul` remains callerless. Note also that the
+   two scalar loops currently differ in measured speed by 1.33× despite being textually
+   identical (§3.1), which is worth understanding before consolidating them.
 3. **Commit this session's work**, separated from the pre-existing in-flight changes,
    so the next session does not re-derive the above.
 4. **Unreproduced flake:** one run of `cargo test -p logan-core --lib` reported
@@ -308,5 +375,97 @@ plan for resident weights — otherwise it tunes something whose premise does no
 
 **Do not delete it.** Keep the code and the opt-in: it is bit-exact, the NVRTC/dlopen
 loading mechanism is reusable with no Cargo dependency and no toolkit, and it is worth
-keeping for a workload where experts **do** fit, or for a card with more VRAM. Do not
+keeping it for a workload where experts **do** fit, or for a card with more VRAM. Do not
 remove it.
+
+---
+
+## 9. Windows host environment notes
+
+**Status:** read-only observation, 2026-09-15. Nothing on the box was changed except one
+task disable (§9.1).
+
+### 9.1 Post-mortem: `ScheduledShutdown4AM` never fired
+
+A one-shot task registered 2026-09-15 01:58:34 to shut the host down at 04:00 local
+**never ran** — `LastTaskResult` **267011** (`0x41303` = `SCHED_S_TASK_HAS_NOT_RUN`).
+
+**Root cause: the principal was interactive-only.** The task XML carried:
+
+```xml
+<Principals>
+  <Principal id="Author">
+    <UserId>S-1-5-21-3397921002-1882174039-692983630-1001</UserId>
+    <LogonType>InteractiveToken</LogonType>   <!-- the bug -->
+  </Principal>
+</Principals>
+```
+
+`InteractiveToken` (`TASK_LOGON_INTERACTIVE_TOKEN`, 3) means *user must already be logged
+on; run only in an existing interactive session*. At 04:00 nobody was logged in —
+**zero Type-2 logons for `<user>`** in the Security log, `LogonUI.exe` running (1),
+`explorer.exe` absent (0). An interactive-token task is **refused, not queued**, when no
+session exists: the trigger fired and the launch was declined. The box was awake
+throughout (no sleep events; only S3 available, never entered) and no servicing window
+was in progress.
+
+**Why `StartWhenAvailable=true` did not rescue it.** Per the MS API reference it "applies
+only to time-based tasks with an end boundary or time-based tasks that are set to repeat
+infinitely". This trigger is a bare one-shot `TYPE=1` `<TimeTrigger>` with **neither** —
+`End`, `Repetition.Interval` and `Repetition.Duration` are all empty — so the setting is
+**inert** here. Four independent signals agree: `NextRunTime` FILETIME **0** (`schtasks`
+"N/A"), `NumberOfMissedRuns` **0**, and an **empty** `GetRunningTasks` collection
+(0 running, 0 queued). There is also no boot (`TYPE=8`) or logon (`TYPE=9`) trigger, so
+nothing could start it late.
+
+**Disposition.** `schtasks /change /tn ScheduledShutdown4AM /disable` — now
+`Status: Disabled`. The task is **preserved, not deleted**, so this forensics trail
+survives; it is reversible with `/enable`.
+
+### 9.2 Registering a shutdown task that fires with no session
+
+Use the **`-Principal` parameter set**: only it exposes `-LogonType`, and omitting both
+`-Principal` and `-LogonType` is exactly what silently produced `InteractiveToken` above.
+
+```powershell
+$action    = New-ScheduledTaskAction -Execute 'C:\Windows\System32\shutdown.exe' `
+             -Argument '/s /f /t 60 /c "Scheduled 4am shutdown"'
+$trigger   = New-ScheduledTaskTrigger -Once -At ([datetime]'2026-09-16T04:00:00')
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+Register-ScheduledTask -TaskName 'ScheduledShutdown4AM' -Action $action -Trigger $trigger `
+    -Principal $principal -Settings $settings -Force
+```
+
+| Question | Answer |
+|---|---|
+| `ServiceAccount` or `S4U`? | **`ServiceAccount` + `SYSTEM`** — no password, no session dependency, `SeShutdownPrivilege` inherent. `S4U` is the passwordless alternative but can fail with "the user account does not have the requested logon type" unless the account holds *Log on as a batch job*. |
+| Password stored? | `ServiceAccount` / `S4U`: **no**. `Password`: **yes**, via `-Password` at registration. `Interactive`: no password but requires a logged-on session. |
+| `-RunLevel Highest` needed for `shutdown.exe`? | **Not strictly** — `SeShutdownPrivilege` is granted to `Users` (`S-1-5-32-545`) as well, so even an unelevated `<user>` token can shut down. Pass it anyway as hygiene. |
+
+**Caveat.** `New-ScheduledTaskTrigger -Once -At '04:00'` with a bare time binds to
+**today**; registering after 04:00 puts `StartBoundary` in the past and it will not fire —
+pass an explicit future datetime. Do not test with `Start-ScheduledTask` (it would power
+the box off); test a benign action under the same principal instead.
+
+### 9.3 Windows host environment facts
+
+| Item | Value |
+|---|---|
+| OS | Windows 11 Home, 25H2 build 26200 |
+| CPU / GPU | Ryzen 5 5600X (12 threads) / GTX 1080 (Pascal, sm_61) |
+| Toolchain | `cargo` / `rustc` **1.98.1** |
+| Disk C: | ample free space for the FP8 checkpoint plus pool caches |
+| `C:\Users\<user>\models\qwen38-fp8-experts` | **48** `.safetensors` = **59.77 GB** |
+| `C:\Users\<user>\pool-cache2` | **97** files = **59.82 GB** |
+| Logan service | **RUNNING**, `AUTO_START`, LocalSystem, binary `C:\ProgramData\Logan\LoganService.exe` |
+| Logan API | `127.0.0.1:11435` **loopback only** (`logand.exe`); `/api/models` → `[]` |
+
+**Reboots are unattended.** The host rebooted at **03:15** via Windows Update
+(`MoUsoCoreWorker.exe` → `TrustedInstaller.exe` ×2), with KB5129195 landing later at
+06:02. A further restart can take the box down briefly **without warning**.
+
+### 9.4 Lesson
+
+> A scheduled task registered from a session defaults to **interactive-only**, so it
+> silently will not run on a headless box — set the principal explicitly.

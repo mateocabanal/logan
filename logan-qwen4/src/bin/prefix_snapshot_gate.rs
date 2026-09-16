@@ -77,12 +77,8 @@ fn main() -> Result<(), String> {
 
     prefill(&mut a, &suffix, prefix.len());
     let prompt_len = prefix.len() + suffix.len();
-    let (a_tokens, a_logits) = generate_trace(
-        &mut a,
-        *suffix.last().unwrap(),
-        prompt_len,
-        new_tokens,
-    );
+    let (a_tokens, a_logits) =
+        generate_trace(&mut a, *suffix.last().unwrap(), prompt_len, new_tokens);
     let a_final = a.snapshot_state(prompt_len + new_tokens)?;
     drop(a);
 
@@ -110,12 +106,8 @@ fn main() -> Result<(), String> {
     let restored_exact = b.snapshot_state(prefix.len())?.exact_eq(&prefix_snapshot);
 
     prefill(&mut b, &suffix, prefix.len());
-    let (b_tokens, b_logits) = generate_trace(
-        &mut b,
-        *suffix.last().unwrap(),
-        prompt_len,
-        new_tokens,
-    );
+    let (b_tokens, b_logits) =
+        generate_trace(&mut b, *suffix.last().unwrap(), prompt_len, new_tokens);
     let b_final = b.snapshot_state(prompt_len + new_tokens)?;
 
     let tokens_exact = a_tokens == b_tokens;

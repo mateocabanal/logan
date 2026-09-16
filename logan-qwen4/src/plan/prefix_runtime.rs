@@ -241,6 +241,205 @@ fn prefill_suffix(model: &mut Model, prompt: &[u32], start: usize) -> Option<Vec
     logits
 }
 
+fn prefill_with_mtp(model: &mut Model, prompt: &[u32]) -> Result<Vec<f32>, String> {
+    if prompt.is_empty() {
+        return Err("Qwen4 MTP requires a non-empty prompt".into());
+    }
+    let mut previous_hidden: Vec<f32> = Vec::new();
+    let mut logits = Vec::new();
+    for (pos, &token) in prompt.iter().enumerate() {
+        if pos + 1 == prompt.len() {
+            logits = model.forward_token(token as usize, pos);
+        } else {
+            model.prefill_token(token as usize, pos);
+        }
+        let current_hidden = model.last_hidden_nextn().to_vec();
+        if current_hidden.is_empty() {
+            return Err(format!(
+                "target did not export MTP hidden row at prompt position {pos}"
+            ));
+        }
+        if previous_hidden.is_empty() {
+            previous_hidden.resize(current_hidden.len(), 0.0);
+        }
+        model.mtp_catchup(token as usize, &previous_hidden, pos)?;
+        previous_hidden = current_hidden;
+    }
+    Ok(logits)
+}
+
+/// Correctness-first MTP qualification loop. The draft model is genuinely run
+/// on every next-token transition and its prediction is checked against the
+/// target, but target verification remains serial. Therefore output tokens are
+/// exactly the ordinary greedy target tokens even when a draft misses. Once
+/// acceptance is qualified, this same state split can be upgraded to batched
+/// target verification + rollback for actual speculative speedup.
+fn mtp_block_len() -> usize {
+    std::env::var("QWEN_MTP_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 4)
+}
+
+/// Multi-token Qwen4Exp MTP speculative decoding. The one-layer MTP block is
+/// recursively applied up to `QWEN_MTP_BLOCK` (default 4) times, carrying its
+/// post-block HC residual into the next draft step. The target verifies the
+/// whole candidate block with the existing layer-major batched path.
+///
+/// Correctness policy for this first batched implementation:
+/// - full-accept: keep the target state produced by the batched verifier;
+/// - rejection: restore the exact pre-block target snapshot and replay only
+///   the current token plus the accepted draft prefix. The correcting target
+///   token remains unconsumed, matching ordinary greedy decode semantics.
+///
+/// MTP owns a separate KV row at virtual layer 48. Rejected rows do not need
+/// zeroing: causal reads only observe <= current position and resumed drafting
+/// overwrites the first rejected row before it becomes visible.
+fn generate_from_logits_mtp_block(
+    model: &mut Model,
+    logits: Vec<f32>,
+    prompt_len: usize,
+    max_new: usize,
+) -> Result<Vec<u32>, String> {
+    if max_new == 0 {
+        return Ok(Vec::new());
+    }
+
+    let block_cap = mtp_block_len();
+    let mut out = Vec::with_capacity(max_new);
+    let mut current = argmax(&logits);
+    out.push(current);
+
+    while out.len() < max_new {
+        let pos = prompt_len + out.len() - 1;
+        let k = block_cap.min(max_new - out.len());
+        let mut hidden = model.last_hidden_nextn().to_vec();
+        if hidden.is_empty() {
+            return Err(format!(
+                "target did not export MTP hidden row before speculative block at position {pos}"
+            ));
+        }
+
+        // Draft k future tokens without touching target causal state.
+        let draft_before = model.runtime_stats();
+        let draft_t0 = Instant::now();
+        let mut drafts = Vec::with_capacity(k);
+        let mut draft_token = current;
+        for i in 0..k {
+            let draft = model.mtp_draft(draft_token as usize, &hidden, pos + i)?;
+            if draft.next_hidden_hc.is_empty() {
+                return Err(format!("MTP step {i} returned no recursive HC state"));
+            }
+            draft_token = argmax(&draft.logits);
+            drafts.push(draft_token);
+            hidden = draft.next_hidden_hc;
+        }
+        let draft_ms = draft_t0.elapsed().as_secs_f64() * 1e3;
+        let draft_delta = model.runtime_stats().delta_from(&draft_before);
+
+        // To validate drafts d1..dk the target consumes [current,d1..d{k-1}]
+        // and produces the authoritative distributions for [d1..dk].
+        let mut verify_inputs = Vec::with_capacity(k);
+        verify_inputs.push(current);
+        verify_inputs.extend_from_slice(&drafts[..k.saturating_sub(1)]);
+
+        let verify_before = model.runtime_stats();
+        let verify_t0 = Instant::now();
+        let verify = model.prefill_chunk_logits_all(&verify_inputs, pos)?;
+        if verify.logits.len() != k || verify.boundaries.len() != k {
+            return Err(format!(
+                "MTP verifier returned {} logits / {} boundaries for {k} inputs",
+                verify.logits.len(),
+                verify.boundaries.len(),
+            ));
+        }
+
+        let mut accepted = 0usize;
+        while accepted < k && argmax(&verify.logits[accepted]) == drafts[accepted] {
+            accepted += 1;
+        }
+
+        if accepted == k {
+            // Speculative GDN recurrence is evaluated out-of-place so every
+            // row remains a commit candidate. Publish only the fully accepted
+            // final boundary; dk is emitted but intentionally not consumed
+            // until the next block.
+            model.mtp_commit_verified_boundary(&verify.boundaries[k - 1])?;
+            out.extend_from_slice(&drafts);
+            current = *drafts.last().unwrap();
+        } else {
+            let correction = argmax(&verify.logits[accepted]);
+
+            // Rows after the mismatch were evaluated under a rejected prefix,
+            // but rows 0..=accepted are already authoritative target work.
+            // Commit the recurrent state captured immediately after the last
+            // valid consumed row instead of restoring the whole block and
+            // replaying that prefix. KV/QSA future rows remain physically
+            // present but are causally invisible and will be overwritten.
+            model.mtp_commit_verified_boundary(&verify.boundaries[accepted])?;
+
+            out.extend_from_slice(&drafts[..accepted]);
+            out.push(correction);
+            current = correction;
+        }
+
+        let verify_ms = verify_t0.elapsed().as_secs_f64() * 1e3;
+        let verify_delta = model.runtime_stats().delta_from(&verify_before);
+        model.mtp_record_block(
+            k,
+            accepted,
+            draft_ms,
+            verify_ms,
+            draft_delta.mio_bytes,
+            verify_delta.mio_bytes,
+        );
+    }
+
+    out.truncate(max_new);
+    Ok(out)
+}
+
+fn print_mtp_stats(model: &Model) {
+    let Some(stats) = model.mtp_stats() else {
+        return;
+    };
+    let rate = if stats.drafted == 0 {
+        0.0
+    } else {
+        100.0 * stats.accepted as f64 / stats.drafted as f64
+    };
+    let pos = (0..4)
+        .map(|i| {
+            let attempts = stats.attempted_by_pos[i];
+            let pct = if attempts == 0 {
+                0.0
+            } else {
+                100.0 * stats.accepted_by_pos[i] as f64 / attempts as f64
+            };
+            format!(
+                "{}:{}/{}={pct:.1}%",
+                i + 1,
+                stats.accepted_by_pos[i],
+                attempts
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[qwen4-rs] MTP block verify: block_cap={} blocks={} catchup_rows={} drafted={} accepted={} acceptance={rate:.1}% positions=[{pos}] draft_ms={:.1} verify_ms={:.1} draft_io={:.2}MiB verify_io={:.2}MiB",
+        mtp_block_len(),
+        stats.blocks,
+        stats.catchup_rows,
+        stats.drafted,
+        stats.accepted,
+        stats.draft_ms,
+        stats.verify_ms,
+        stats.draft_mio_bytes as f64 / (1024.0 * 1024.0),
+        stats.verify_mio_bytes as f64 / (1024.0 * 1024.0),
+    );
+}
+
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -289,6 +488,22 @@ pub fn run_greedy_cached_coli(
 
     if prompt.is_empty() || max_new == 0 {
         return Ok(Vec::new());
+    }
+
+    if model.mtp_enabled() {
+        // Prefix snapshots currently cover target causal state only. Until MTP
+        // KV is added to LPFX, replay the prompt once so the drafter catches up
+        // with exactly shifted (h[p-1], x[p]) rows.
+        eprintln!(
+            "[qwen4-rs] MTP active: embedded drafter + batched speculative verification (prefix-cache bypassed)"
+        );
+        let logits = prefill_with_mtp(&mut model, prompt)?;
+        let out = generate_from_logits_mtp_block(&mut model, logits, prompt.len(), max_new)?;
+        print_mtp_stats(&model);
+        if profile {
+            model.profile_summary(max_new, total_t0.elapsed().as_secs_f64() * 1e3);
+        }
+        return Ok(out);
     }
 
     if !auto_prefix_cache_enabled() {

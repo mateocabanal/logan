@@ -1006,6 +1006,74 @@ mod tests {
     }
 
     #[test]
+    fn layer_major_all_logits_matches_token_major_tiny_fixture() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/qwen4_moe_tiny");
+        let cfg = crate::load_cfg(&dir.join("config.json")).unwrap();
+        let st = crate::StFile::open(&dir.join("model.safetensors")).unwrap();
+        let prompt: Vec<u32> = vec![1, 2, 3, 4];
+
+        let mut token_major = crate::Model::load(&st, &cfg).unwrap();
+        let canonical = prompt
+            .iter()
+            .enumerate()
+            .map(|(pos, &token)| token_major.forward_token(token as usize, pos))
+            .collect::<Vec<_>>();
+
+        let mut layer_major = crate::Model::load(&st, &cfg).unwrap();
+        let batched = layer_major
+            .prefill_chunk_logits_all(&prompt, 0)
+            .expect("all-row verifier logits");
+        assert_eq!(
+            batched.logits, canonical,
+            "batched verifier changed row logits"
+        );
+        assert_eq!(batched.boundaries.len(), prompt.len());
+
+        let next = greedy_next(canonical.last().unwrap()).unwrap();
+        let a = token_major.forward_token(next as usize, prompt.len());
+        let b = layer_major.forward_token(next as usize, prompt.len());
+        assert_eq!(b, a, "batched verifier changed continuation state");
+    }
+
+    #[test]
+    fn speculative_boundary_commit_matches_prefix_only_execution() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/qwen4_moe_tiny");
+        let cfg = crate::load_cfg(&dir.join("config.json")).unwrap();
+        let st = crate::StFile::open(&dir.join("model.safetensors")).unwrap();
+        let rows: Vec<u32> = vec![1, 2, 3, 4];
+        let committed_rows = 2usize;
+
+        let mut canonical = crate::Model::load(&st, &cfg).unwrap();
+        for (pos, &token) in rows[..committed_rows].iter().enumerate() {
+            canonical.prefill_token(token as usize, pos);
+        }
+        let canonical_state = canonical.snapshot_state(committed_rows).unwrap();
+
+        let mut speculative = crate::Model::load(&st, &cfg).unwrap();
+        let verify = speculative
+            .prefill_chunk_logits_all(&rows, 0)
+            .expect("speculative verifier");
+        speculative
+            .mtp_commit_verified_boundary(&verify.boundaries[committed_rows - 1])
+            .expect("partial commit");
+        let committed_state = speculative.snapshot_state(committed_rows).unwrap();
+        assert!(
+            committed_state.exact_eq(&canonical_state),
+            "partial speculative commit changed causal prefix state"
+        );
+
+        // Rows 2 and 3 from the rejected speculative tail still physically
+        // exist in KV/QSA storage. Feeding position 2 must overwrite/ignore
+        // them and match a model that never computed that tail.
+        let next_token = 9usize;
+        let a = canonical.forward_token(next_token, committed_rows);
+        let b = speculative.forward_token(next_token, committed_rows);
+        assert_eq!(b, a, "stale speculative tail leaked into continuation");
+    }
+
+    #[test]
     fn layer_major_prefill_matches_token_major_tiny_fixture() {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/qwen4_moe_tiny");

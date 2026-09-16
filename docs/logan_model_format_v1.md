@@ -170,7 +170,7 @@ Open cost and fd count are healthy at 15 k records. That part of COLI is right a
 `logan-compiler` (`logan` binary) is `source discovery → semantic frontend → lowering → quant/codec →
 StoragePlan → shard write → manifest → optional external plan`.
 
-- **Frontends** exist for Qwen MoE, Qwen4-Exp (Qwen3.8-Flash-Next), Qwen MTP and **DeepSeek-V4**
+- **Frontends** exist for Qwen MoE, Qwen3-Next (including Qwen3-Coder-Next), Qwen4-Exp (Qwen3.8-Flash-Next), Qwen MTP and **DeepSeek-V4**
   (`model/deepseek_v4.rs`, `Architecture::DeepSeekV4Flash`, with hash layers via a `tid2eid` int64 tensor).
 - **Targets** are `TargetProfile` (Apple8/Metal, Linux x86-64 AVX2), resolved from a `MachineProfile` probe
   (`target/machine.rs`) that reads OS/arch/RAM and a few capability gates from env — no storage probing at all.

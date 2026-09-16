@@ -147,7 +147,9 @@ impl GgufSource {
         }
         let version = read_u32(&mut file)?;
         if version != 3 {
-            return Err(format!("GGUF version {version} is not supported; expected v3"));
+            return Err(format!(
+                "GGUF version {version} is not supported; expected v3"
+            ));
         }
         let tensor_count = read_u64(&mut file)?;
         let kv_count = read_u64(&mut file)?;
@@ -316,7 +318,12 @@ impl GgufSource {
     pub fn i64_array(&self, key: &str) -> Option<Vec<i64>> {
         match self.metadata(key)? {
             MetadataValue::I64Array(v) => Some(v.clone()),
-            MetadataValue::U64Array(v) => v.iter().copied().map(i64::try_from).collect::<Result<Vec<_>, _>>().ok(),
+            MetadataValue::U64Array(v) => v
+                .iter()
+                .copied()
+                .map(i64::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .ok(),
             _ => None,
         }
     }
@@ -324,7 +331,12 @@ impl GgufSource {
     pub fn u64_array(&self, key: &str) -> Option<Vec<u64>> {
         match self.metadata(key)? {
             MetadataValue::U64Array(v) => Some(v.clone()),
-            MetadataValue::I64Array(v) => v.iter().copied().map(u64::try_from).collect::<Result<Vec<_>, _>>().ok(),
+            MetadataValue::I64Array(v) => v
+                .iter()
+                .copied()
+                .map(u64::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .ok(),
             _ => None,
         }
     }
@@ -377,7 +389,12 @@ impl GgufSource {
         decode_row(tensor.dtype, &self.read_row(name, row)?, cols)
     }
 
-    pub fn read_tensor_range(&self, name: &str, offset: u64, bytes: usize) -> Result<Vec<u8>, String> {
+    pub fn read_tensor_range(
+        &self,
+        name: &str,
+        offset: u64,
+        bytes: usize,
+    ) -> Result<Vec<u8>, String> {
         let tensor = self
             .tensor(name)
             .ok_or_else(|| format!("missing GGUF tensor {name}"))?;
@@ -385,15 +402,22 @@ impl GgufSource {
             .checked_add(bytes as u64)
             .ok_or_else(|| format!("{name}: range overflow"))?;
         if end > tensor.stored_bytes {
-            return Err(format!("{name}: range {offset}..{end} exceeds {} bytes", tensor.stored_bytes));
+            return Err(format!(
+                "{name}: range {offset}..{end} exceeds {} bytes",
+                tensor.stored_bytes
+            ));
         }
         self.read_absolute(tensor.offset + offset, bytes)
     }
 
     pub fn read_absolute(&self, offset: u64, bytes: usize) -> Result<Vec<u8>, String> {
         let mut out = vec![0_u8; bytes];
-        let mut file = self.file.lock().map_err(|_| "GGUF file lock poisoned".to_string())?;
-        file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| "GGUF file lock poisoned".to_string())?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
         file.read_exact(&mut out).map_err(|e| e.to_string())?;
         Ok(out)
     }
@@ -407,7 +431,8 @@ impl GgufSource {
             .dims
             .last()
             .copied()
-            .ok_or_else(|| format!("{name}: missing expert dimension"))? as usize;
+            .ok_or_else(|| format!("{name}: missing expert dimension"))?
+            as usize;
         if expert >= experts {
             return Err(format!("{name}: expert {expert} >= {experts}"));
         }
@@ -483,7 +508,8 @@ fn read_string(file: &mut File) -> Result<String, String> {
 
 fn skip_bytes(file: &mut File, bytes: u64) -> Result<(), String> {
     let delta = i64::try_from(bytes).map_err(|_| "GGUF skip exceeds i64".to_string())?;
-    file.seek(SeekFrom::Current(delta)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Current(delta))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -497,7 +523,11 @@ fn scalar_width(ty: u32) -> Option<u64> {
     }
 }
 
-fn read_metadata_value(file: &mut File, ty: u32, keep_array: bool) -> Result<MetadataValue, String> {
+fn read_metadata_value(
+    file: &mut File,
+    ty: u32,
+    keep_array: bool,
+) -> Result<MetadataValue, String> {
     match ty {
         0 => Ok(MetadataValue::U64(read_u8(file)? as u64)),
         1 => Ok(MetadataValue::I64(read_i8(file)? as i64)),
@@ -545,7 +575,11 @@ fn read_metadata_value(file: &mut File, ty: u32, keep_array: bool) -> Result<Met
                 6 | 12 => {
                     let mut out = Vec::with_capacity(len as usize);
                     for _ in 0..len {
-                        out.push(if elem_ty == 6 { read_f32(file)? as f64 } else { read_f64(file)? });
+                        out.push(if elem_ty == 6 {
+                            read_f32(file)? as f64
+                        } else {
+                            read_f64(file)?
+                        });
                     }
                     Ok(MetadataValue::F64Array(out))
                 }
@@ -646,7 +680,10 @@ mod tests {
         let src = GgufSource::open(&root).unwrap();
         assert_eq!(src.data_start(), data_start as u64);
         assert_eq!(src.string("general.architecture"), Some("qwen4exp"));
-        assert!(matches!(src.metadata("tokenizer.ggml.tokens"), Some(MetadataValue::IgnoredArray(2))));
+        assert!(matches!(
+            src.metadata("tokenizer.ggml.tokens"),
+            Some(MetadataValue::IgnoredArray(2))
+        ));
         let t = src.tensor("weight").unwrap();
         assert_eq!(t.dtype, GgmlType::Q8_0);
         assert_eq!(t.stored_bytes, 34);
@@ -779,7 +816,8 @@ pub fn decode_row(dtype: GgmlType, row: &[u8], elements: usize) -> Result<Vec<f3
     if row.len() != expected {
         return Err(format!(
             "{} row has {} bytes, expected {expected} for {elements} values",
-            dtype.name(), row.len()
+            dtype.name(),
+            row.len()
         ));
     }
     let mut out = vec![0.0_f32; elements];

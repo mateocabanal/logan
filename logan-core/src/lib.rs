@@ -8,6 +8,8 @@
 pub mod cuda;
 pub mod expert;
 pub mod math;
+#[cfg(target_arch = "x86_64")]
+pub mod math_x86;
 pub mod sched;
 pub mod shared;
 pub mod storage;
