@@ -977,7 +977,8 @@ mod tests {
             cfg.clone(),
             &prompt,
             max_new,
-        );
+        )
+        .expect("canonical decode must succeed");
         let mut sched = crate::Model::load(&st, &cfg).unwrap();
         sched.enable_sched_mode();
         for (pos, &token) in prompt[..prompt.len() - 1].iter().enumerate() {

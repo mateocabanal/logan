@@ -9406,15 +9406,20 @@ pub fn run_greedy(
             }
         }
     }
-    Ok(run_greedy_with(model, cfg, prompt, max_new))
+    run_greedy_with(model, cfg, prompt, max_new)
 }
 
 /// Greedy decode against an already-loaded model.
-pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usize) -> Vec<u32> {
+pub fn run_greedy_with(
+    mut model: Model,
+    _cfg: Cfg,
+    prompt: &[u32],
+    max_new: usize,
+) -> Result<Vec<u32>, String> {
     let profile = logan_core::telemetry::enabled();
     let t0 = std::time::Instant::now();
     if prompt.is_empty() || max_new == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // With a drafter attached, decode in speculative blocks: the drafter proposes
@@ -9427,22 +9432,30 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
     // falls back to plain decode rather than yielding nothing, because a broken
     // drafter should cost speed and not correctness.
     if model.mtp_enabled() {
-        match crate::plan::prefix_runtime::run_greedy_mtp(&mut model, prompt, max_new) {
-            Ok(tokens) => {
-                // Always report acceptance: a drafter that proposes tokens the
-                // target rejects still produces correct output, so without these
-                // counters a useless drafter is indistinguishable from a working
-                // one except by timing.
-                crate::plan::prefix_runtime::print_mtp_stats_for(&model);
-                if profile {
-                    model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
-                }
-                return tokens;
-            }
-            Err(e) => {
-                eprintln!("[qwen4-rs] MTP decode failed ({e}); falling back to plain decode");
-            }
+        // NO FALLBACK once this is entered. `run_greedy_mtp` prefills the prompt
+        // before it can fail, which advances KV, GDN recurrent/convolution and
+        // QSA state. Continuing into the plain loop from there would decode from
+        // a position the model has already passed, producing plausible wrong
+        // tokens with no error -- the worst failure mode available.
+        //
+        // Attaching the drafter is the point at which a failure is cheap, and that
+        // path already reports and continues. Here it is not, so the error
+        // propagates.
+        let tokens = crate::plan::prefix_runtime::run_greedy_mtp(&mut model, prompt, max_new)
+            .map_err(|e| {
+                format!(
+                    "MTP decode failed after prefill: {e}. Not falling back, because target \
+                     state has already advanced past the prompt."
+                )
+            })?;
+        // Always report acceptance: a drafter whose proposals the target rejects
+        // still produces correct output, so without these counters a useless
+        // drafter is indistinguishable from a working one except by timing.
+        crate::plan::prefix_runtime::print_mtp_stats_for(&model);
+        if profile {
+            model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
         }
+        return Ok(tokens);
     }
 
     // The final prompt forward already returns the logits that predict token
@@ -9500,7 +9513,7 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
     if profile {
         model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
