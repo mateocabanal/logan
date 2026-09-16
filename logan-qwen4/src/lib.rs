@@ -6179,7 +6179,14 @@ impl Model {
         // the pool protocol takes a list of (layer, expert, input) and answers
         // in the same order, which is exactly the shape `moe_rows` already has.
         let _fill_t_outer = logan_core::telemetry::Span::begin("fill");
-        if let Some(pcfg) = self.pool.clone() {
+        // Only a real trunk layer may be delegated. The MTP drafter lives at a
+        // VIRTUAL layer past the trunk (`cfg.layers`) and is a separate model
+        // whose experts are local, 4-bit-packed into the drafter artifact; the
+        // pool holds the trunk's layers only. Without this guard the drafter's
+        // experts would be requested from the pool at an index it does not
+        // have, and speculative decoding would fail on every draft step.
+        let is_trunk_layer = (li as usize) < self.cfg.layers;
+        if let Some(pcfg) = self.pool.clone().filter(|_| is_trunk_layer) {
             let mut calls: Vec<crate::pool::ExpertCall> = Vec::with_capacity(k);
             for i in 0..k {
                 calls.push(crate::pool::ExpertCall {
@@ -8814,6 +8821,209 @@ fn cdim_total(cfg: &Cfg) -> usize {
 /// Standalone runner for `coli run`: loads a .coli package (or safetensors
 /// fixture dir) and greedy-decodes `max_new` tokens from `prompt`.
 /// Returns the generated token ids (prompt excluded).
+
+/// Load a standalone Qwen4Exp MTP drafter from a safetensors directory.
+///
+/// The drafter is a SEPARATE one-block model (`qwen4_exp_mtp`): a combiner
+/// (`fc_embedding`/`fc_hidden` with the two pre-norms), one full-attention +
+/// MoE trunk block, and a head mixer. Its experts are BF16 and stacked as
+/// `switch_mlp.{gate,up,down}_proj.weight [E, rows, cols]`, so they are split
+/// into the per-expert `[Wt; 3]` layout the MoE path already reads.
+///
+/// It is attached at a VIRTUAL layer index past the trunk (`cfg.layers`), which
+/// is what keeps it out of the target's forward: normal decoding never reaches
+/// index `cfg.layers`, and the pool seam refuses to delegate a non-trunk layer
+/// because the pool holds the trunk's experts and not the drafter's.
+///
+/// Loading it locally is deliberate. The drafter is ~5 GB and runs once per
+/// draft step, so a network round trip per draft would cost more than the
+/// speculative decoding saves.
+pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(), String> {
+    let st = StFile::open_dir(dir)?;
+    let d = cfg.hidden;
+    let hc = cfg.hc_count;
+    if hc == 0 {
+        return Err("Qwen4Exp MTP requires hc_count > 0".into());
+    }
+    let hcd = hc * d;
+    let hd = cfg.head_dim;
+    let lp = "layers.0";
+    let e = |n: &str| format!("{n}: missing from the drafter checkpoint");
+
+    let layer = Layer {
+        // Built from the empty layer so the GDN/quant fields stay in one place;
+        // only the fields the drafter actually uses are overridden below.
+        attn_q: load_wt(&st, &format!("{lp}.self_attn.q_proj.weight"), 2 * cfg.heads * hd, d)
+            .map_err(|x| e(&x))?,
+        attn_k: load_wt(&st, &format!("{lp}.self_attn.k_proj.weight"), cfg.kv_heads * hd, d)
+            .map_err(|x| e(&x))?,
+        attn_v: load_wt(&st, &format!("{lp}.self_attn.v_proj.weight"), cfg.kv_heads * hd, d)
+            .map_err(|x| e(&x))?,
+        attn_o: load_wt(&st, &format!("{lp}.self_attn.o_proj.weight"), d, cfg.heads * hd)
+            .map_err(|x| e(&x))?,
+        attn_qn: st
+            .f32(&format!("{lp}.self_attn.q_norm.weight"), &[hd as u64])
+            .map_err(|x| e(&x))?,
+        attn_kn: st
+            .f32(&format!("{lp}.self_attn.k_norm.weight"), &[hd as u64])
+            .map_err(|x| e(&x))?,
+        hc_norm: st
+            .f32(&format!("{lp}.attn_hyper_connection.hc_norm.weight"), &[hcd as u64])
+            .map_err(|x| e(&x))?,
+        hc_mix_down: load_wt(
+            &st,
+            &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
+            cfg.hc_lowrank,
+            hcd,
+        )
+        .map_err(|x| e(&x))?,
+        hc_mix_up: load_wt(
+            &st,
+            &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
+            hcd,
+            cfg.hc_lowrank,
+        )
+        .map_err(|x| e(&x))?,
+        hc_inject: load_wt(
+            &st,
+            &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
+            hc,
+            hcd,
+        )
+        .map_err(|x| e(&x))?,
+        hc_mlp_norm: st
+            .f32(&format!("{lp}.mlp_hyper_connection.hc_norm.weight"), &[hcd as u64])
+            .map_err(|x| e(&x))?,
+        hc_mlp_mix_down: load_wt(
+            &st,
+            &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
+            cfg.hc_lowrank,
+            hcd,
+        )
+        .map_err(|x| e(&x))?,
+        hc_mlp_mix_up: load_wt(
+            &st,
+            &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
+            hcd,
+            cfg.hc_lowrank,
+        )
+        .map_err(|x| e(&x))?,
+        hc_mlp_inject: load_wt(
+            &st,
+            &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
+            hc,
+            hcd,
+        )
+        .map_err(|x| e(&x))?,
+        router: load_wt(&st, &format!("{lp}.mlp.gate.weight"), cfg.experts, d)
+            .map_err(|x| e(&x))?,
+        se_gate: load_wt(&st, &format!("{lp}.mlp.shared_expert.gate_proj.weight"), cfg.shared_inter, d)
+            .map_err(|x| e(&x))?,
+        se_up: load_wt(&st, &format!("{lp}.mlp.shared_expert.up_proj.weight"), cfg.shared_inter, d)
+            .map_err(|x| e(&x))?,
+        se_down: load_wt(&st, &format!("{lp}.mlp.shared_expert.down_proj.weight"), d, cfg.shared_inter)
+            .map_err(|x| e(&x))?,
+        se_g: load_wt(&st, &format!("{lp}.mlp.shared_expert_gate.weight"), 1, d)
+            .map_err(|x| e(&x))?,
+        ..Layer::empty()
+    };
+
+    // Split the stacked switch_mlp experts into per-expert `[gate, up, down]`.
+    //
+    // The stacked form is efficient for a batched kernel but the MoE path reads
+    // one expert at a time, and the drafter runs a single token per draft step,
+    // so there is no batch to exploit. Splitting costs 4.9 GB once and saves a
+    // gather on every draft.
+    let gstack = st
+        .f32(&format!("{lp}.mlp.switch_mlp.gate_proj.weight"), &[cfg.experts as u64, cfg.moe_inter as u64, d as u64])
+        .map_err(|x| e(&x))?;
+    let ustack = st
+        .f32(&format!("{lp}.mlp.switch_mlp.up_proj.weight"), &[cfg.experts as u64, cfg.moe_inter as u64, d as u64])
+        .map_err(|x| e(&x))?;
+    let dstack = st
+        .f32(&format!("{lp}.mlp.switch_mlp.down_proj.weight"), &[cfg.experts as u64, d as u64, cfg.moe_inter as u64])
+        .map_err(|x| e(&x))?;
+    let per_g = cfg.moe_inter * d;
+    let per_d = d * cfg.moe_inter;
+    let mut experts = Vec::with_capacity(cfg.experts);
+    for x in 0..cfg.experts {
+        let mk = |src: &[f32], width_out: usize, width_in: usize| Wt {
+            f: src[x * width_out * width_in..(x + 1) * width_out * width_in].to_vec(),
+            bytes: None,
+            o: width_out,
+            i: width_in,
+        };
+        experts.push([
+            mk(&gstack, cfg.moe_inter, d),
+            mk(&ustack, cfg.moe_inter, d),
+            mk(&dstack, d, cfg.moe_inter),
+        ]);
+    }
+    debug_assert_eq!(gstack.len(), cfg.experts * per_g);
+    debug_assert_eq!(dstack.len(), cfg.experts * per_d);
+
+    let li = cfg.layers;
+    model.mtp = Some(crate::mtp::MtpRuntime {
+        layer_index: li,
+        experts: cfg.experts,
+        topk: cfg.topk,
+        fc_embedding: load_wt(&st, "fc_embedding.weight", d, d).map_err(|x| e(&x))?,
+        fc_hidden: load_wt(&st, "fc_hidden.weight", d, d).map_err(|x| e(&x))?,
+        enorm: st.f32("pre_fc_norm_embedding.weight", &[d as u64]).map_err(|x| e(&x))?,
+        hnorm: st.f32("pre_fc_norm_hidden.weight", &[hcd as u64]).map_err(|x| e(&x))?,
+        head_norm: st
+            .f32("hyper_connection_mixer.hc_norm.weight", &[hcd as u64])
+            .map_err(|x| e(&x))?,
+        head_down: load_wt(
+            &st,
+            "hyper_connection_mixer.input_mix_weight_down.weight",
+            cfg.hc_lowrank,
+            hcd,
+        )
+        .map_err(|x| e(&x))?,
+        head_up: load_wt(
+            &st,
+            "hyper_connection_mixer.input_mix_weight_up.weight",
+            hcd,
+            cfg.hc_lowrank,
+        )
+        .map_err(|x| e(&x))?,
+        catchup_rows: 0,
+        drafted: 0,
+        accepted: 0,
+        blocks: 0,
+        attempted_by_pos: [0; 4],
+        accepted_by_pos: [0; 4],
+        draft_ms: 0.0,
+        verify_ms: 0.0,
+        draft_mio_bytes: 0,
+        verify_mio_bytes: 0,
+    });
+
+    // Append the drafter as a virtual layer. Every per-layer vector has to grow
+    // together: the shared attention path indexes them by layer, so a vector
+    // left at trunk length would make the drafter's KV writes land on the wrong
+    // slot (or panic) rather than fail cleanly.
+    //
+    // The drafter runs plain full attention, so its KV buffers are real (not the
+    // empty vectors a GDN layer gets).
+    let kv_bytes = || crate::lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim);
+
+    model.layers.push(layer);
+    model.experts.push(experts);
+    model.kv_k.push(kv_bytes());
+    model.kv_v.push(kv_bytes());
+    model.idx_cache.push(Vec::new());
+    model.route_prev.push(Vec::new());
+    model.route_overlap_common.push(0);
+    model.route_overlap_total.push(0);
+    model.route_overlap_pairs.push(0);
+    model.gdn_metal.push(None);
+    model.gdn_ane.push(crate::gdn_ane::GdnAneState::default());
+    model.attn_metal.push(None);
+    Ok(())
+}
+
 pub fn run_greedy(
     package_dir: &std::path::Path,
     prompt: &[u32],
@@ -8827,7 +9037,7 @@ pub fn run_greedy(
     // `open_dir` subsumes the single-file case (it falls back to
     // model.safetensors when there is no index), so the sharded and
     // single-file branches are one.
-    let model = if package_dir.join("model.safetensors.index.json").is_file()
+    let mut model = if package_dir.join("model.safetensors.index.json").is_file()
         || package_dir.join("model.safetensors").is_file()
     {
         let st = StFile::open_dir(package_dir)?;
@@ -8836,6 +9046,40 @@ pub fn run_greedy(
         let src = colisource::ColiSource::open(package_dir)?;
         Model::load_coli(&src, &cfg)?
     };
+
+    // Attach a standalone MTP drafter when one is named. The .coli path embeds
+    // its drafter in the package; a safetensors checkpoint has none, so the
+    // drafter is a sibling directory (`config.json` + `model.safetensors`).
+    //
+    // `QWEN_MTP_DIR` names it; `QWEN_MTP=0` opts out of speculative decoding
+    // entirely, matching the .coli runtime's existing switch.
+    if model.mtp.is_none() {
+        let mtp_on = std::env::var("QWEN_MTP").map(|v| v != "0").unwrap_or(true);
+        if mtp_on {
+            if let Ok(dir) = std::env::var("QWEN_MTP_DIR") {
+                if !dir.is_empty() {
+                    let p = if let Some(rest) = dir.strip_prefix("~/") {
+                        match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+                            Ok(h) => std::path::PathBuf::from(h).join(rest),
+                            Err(_) => std::path::PathBuf::from(&dir),
+                        }
+                    } else {
+                        std::path::PathBuf::from(&dir)
+                    };
+                    match attach_mtp_from_dir(&mut model, &p, &cfg) {
+                        Ok(()) => eprintln!(
+                            "[qwen4-rs] MTP drafter attached from {} (layer={} experts={} topk={})",
+                            p.display(),
+                            cfg.layers,
+                            cfg.experts,
+                            cfg.topk
+                        ),
+                        Err(e) => eprintln!("[qwen4-rs] MTP drafter NOT attached: {e}"),
+                    }
+                }
+            }
+        }
+    }
     Ok(run_greedy_with(model, cfg, prompt, max_new))
 }
 
