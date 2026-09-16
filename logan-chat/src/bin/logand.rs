@@ -1103,10 +1103,14 @@ async fn api_load_model(
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
     let package = expand_home(&req.path);
-    if !is_logan_package(&package) {
+    if !is_loadable_model(&package) {
         return api_error(
             StatusCode::BAD_REQUEST,
-            format!("not a Logan .coli package: {}", package.display()),
+            format!(
+                "not a loadable model directory (expected a Logan .coli package, or a \
+                 safetensors checkpoint with config.json + model.safetensors[.index.json]): {}",
+                package.display()
+            ),
         );
     }
     let system_prompt = req
@@ -1689,6 +1693,27 @@ fn is_logan_package(path: &Path) -> bool {
         && path.join("manifest.coli").is_file()
 }
 
+/// A safetensors checkpoint directory: `config.json` plus either a sharded
+/// index or a single `model.safetensors`.
+///
+/// This is an open-weight HF layout, not a compiled Logan package, and it is
+/// supported first-class: `StFile::open_dir` reads every shard named by the
+/// index and decodes the stored dtypes (F32/BF16/F16/F8_E4M3), so a checkpoint
+/// can run without a `.coli` build step. No `tokenizer.json` requirement here —
+/// a raw checkpoint ships `tokenizer.json` OR the `vocab`/`merges` pair, and
+/// `logand` resolves whichever is present.
+fn is_safetensors_checkpoint(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("config.json").is_file()
+        && (path.join("model.safetensors.index.json").is_file()
+            || path.join("model.safetensors").is_file())
+}
+
+/// Either supported source layout.
+fn is_loadable_model(path: &Path) -> bool {
+    is_logan_package(path) || is_safetensors_checkpoint(path)
+}
+
 fn discover_models(root: &Path) -> Vec<ModelCandidate> {
     let mut out = Vec::new();
     discover_models_inner(root, 0, &mut out);
@@ -1700,7 +1725,7 @@ fn discover_models_inner(path: &Path, depth: usize, out: &mut Vec<ModelCandidate
     if depth > 2 || !path.is_dir() {
         return;
     }
-    if is_logan_package(path) {
+    if is_loadable_model(path) {
         out.push(ModelCandidate {
             name: path
                 .file_name()

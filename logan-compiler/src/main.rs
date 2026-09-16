@@ -545,11 +545,31 @@ fn run() -> logan_compiler::Result<()> {
                             detail: e,
                         }
                     })?;
-                    logan_qwen4::plan::run_greedy_cached_coli(&package, &cfg, &prompt_ids, max_new)
-                        .map_err(|e| logan_compiler::ColicError::Unsupported {
-                            stage: "run",
-                            detail: e,
+                    // A safetensors checkpoint directory loads through
+                    // `run_greedy` (StFile::open_dir). A compiled .coli package
+                    // takes the cached-coli path, which is the only one that
+                    // manages a package's shards and prefix cache.
+                    //
+                    // Chosen by what is on disk rather than by model_type,
+                    // because the same architecture arrives in both layouts and
+                    // the layout -- not the arch -- decides which loader can
+                    // read it.
+                    if package.join("model.safetensors.index.json").is_file()
+                        || package.join("model.safetensors").is_file()
+                    {
+                        logan_qwen4::run_greedy(&package, &prompt_ids, max_new).map_err(|e| {
+                            logan_compiler::ColicError::Unsupported {
+                                stage: "run",
+                                detail: e,
+                            }
                         })?
+                    } else {
+                        logan_qwen4::plan::run_greedy_cached_coli(&package, &cfg, &prompt_ids, max_new)
+                            .map_err(|e| logan_compiler::ColicError::Unsupported {
+                                stage: "run",
+                                detail: e,
+                            })?
+                    }
                 }
                 #[cfg(feature = "runtime")]
                 _ => {

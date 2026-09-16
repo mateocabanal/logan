@@ -128,6 +128,7 @@ pub fn load_cfg_gguf(src: &GgufSource) -> Result<Cfg, String> {
             .f64("qwen4exp.attention.layer_norm_rms_epsilon")
             .unwrap_or(1e-6) as f32,
         output_gate: OutputGate::Sigmoid,
+        zero_centered_norm: true,
         gdn_layers,
         qsa_layers,
         hc_count,
@@ -156,15 +157,18 @@ fn validate_cfg_geometry(src: &GgufSource, cfg: &Cfg) -> Result<(), String> {
         return Err("GGUF has zero-sized core model geometry".into());
     }
     if cfg.topk == 0 || cfg.topk > cfg.experts {
-        return Err(format!("invalid routed expert top-k {} of {}", cfg.topk, cfg.experts));
+        return Err(format!(
+            "invalid routed expert top-k {} of {}",
+            cfg.topk, cfg.experts
+        ));
     }
     if cfg.hc_count == 0 || cfg.hc_lowrank == 0 {
         return Err("Qwen4Exp GGUF is missing HyperConnection geometry".into());
     }
     if cfg.ple_layer >= 0 {
-        let ple = src
-            .tensor("per_layer_token_embd.weight")
-            .ok_or_else(|| "PLE is enabled but per_layer_token_embd.weight is missing".to_string())?;
+        let ple = src.tensor("per_layer_token_embd.weight").ok_or_else(|| {
+            "PLE is enabled but per_layer_token_embd.weight is missing".to_string()
+        })?;
         if ple.dims.len() != 2 || ple.dims[0] as usize * cfg.ngram_heads != cfg.ple_embed_dim {
             return Err(format!("unexpected PLE table shape {:?}", ple.dims));
         }
@@ -194,7 +198,10 @@ fn load_wt(src: &GgufSource, name: &str, o: usize, i: usize) -> Result<Wt, Strin
     let weights = src.read_tensor(name)?;
     let expected = tensor.dtype.stored_bytes((i as u64) * (o as u64))? as usize;
     if weights.len() != expected {
-        return Err(format!("{name}: stored byte count {} != {expected}", weights.len()));
+        return Err(format!(
+            "{name}: stored byte count {} != {expected}",
+            weights.len()
+        ));
     }
     Ok(Wt {
         f: vec![],
@@ -212,15 +219,26 @@ fn load_index_qk(src: &GgufSource, layer: usize, cfg: &Cfg) -> Result<Wt, String
     let k_name = format!("blk.{layer}.indexer.k_proj.weight");
     let q_rows = cfg.idx_n_heads * cfg.idx_head_dim;
     let k_rows = cfg.idx_kv_heads * cfg.idx_head_dim;
-    let q = src.tensor(&q_name).ok_or_else(|| format!("missing {q_name}"))?;
-    let k = src.tensor(&k_name).ok_or_else(|| format!("missing {k_name}"))?;
+    let q = src
+        .tensor(&q_name)
+        .ok_or_else(|| format!("missing {q_name}"))?;
+    let k = src
+        .tensor(&k_name)
+        .ok_or_else(|| format!("missing {k_name}"))?;
     if q.dtype != k.dtype {
-        return Err(format!("indexer Q/K GGUF dtypes differ: {} vs {}", q.dtype.name(), k.dtype.name()));
+        return Err(format!(
+            "indexer Q/K GGUF dtypes differ: {} vs {}",
+            q.dtype.name(),
+            k.dtype.name()
+        ));
     }
     if q.dims.as_slice() != [cfg.hidden as u64, q_rows as u64]
         || k.dims.as_slice() != [cfg.hidden as u64, k_rows as u64]
     {
-        return Err(format!("unexpected indexer Q/K shapes {:?} / {:?}", q.dims, k.dims));
+        return Err(format!(
+            "unexpected indexer Q/K shapes {:?} / {:?}",
+            q.dims, k.dims
+        ));
     }
     let mut weights = src.read_tensor(&q_name)?;
     weights.extend_from_slice(&src.read_tensor(&k_name)?);
@@ -239,10 +257,16 @@ fn vec_f32(src: &GgufSource, name: &str, want: usize) -> Result<Vec<f32>, String
     let tensor = src
         .tensor(name)
         .ok_or_else(|| format!("missing GGUF tensor {name}"))?;
-    let elements = tensor.dims.iter().try_fold(1_u64, |n, d| n.checked_mul(*d))
+    let elements = tensor
+        .dims
+        .iter()
+        .try_fold(1_u64, |n, d| n.checked_mul(*d))
         .ok_or_else(|| format!("{name}: element count overflow"))? as usize;
     if elements != want {
-        return Err(format!("{name}: {} values, expected {want}; shape {:?}", elements, tensor.dims));
+        return Err(format!(
+            "{name}: {} values, expected {want}; shape {:?}",
+            elements, tensor.dims
+        ));
     }
     decode_row(tensor.dtype, &src.read_tensor(name)?, want)
 }
@@ -265,7 +289,9 @@ fn a_log(src: &GgufSource, name: &str, want: usize) -> Result<Vec<f32>, String> 
     let mut out = vec_f32(src, name, want)?;
     for v in &mut out {
         if !v.is_finite() || *v >= 0.0 {
-            return Err(format!("{name}: expected finite negative -exp(A_log), got {v}"));
+            return Err(format!(
+                "{name}: expected finite negative -exp(A_log), got {v}"
+            ));
         }
         *v = (-*v).ln();
     }
@@ -286,9 +312,14 @@ pub(crate) fn load_expert(
         o: usize,
         i: usize,
     ) -> Result<Wt, String> {
-        let t = src.tensor(name).ok_or_else(|| format!("missing GGUF tensor {name}"))?;
+        let t = src
+            .tensor(name)
+            .ok_or_else(|| format!("missing GGUF tensor {name}"))?;
         if t.dims.as_slice() != [i as u64, o as u64, experts as u64] {
-            return Err(format!("{name}: shape {:?}, expected [{i}, {o}, {experts}]", t.dims));
+            return Err(format!(
+                "{name}: shape {:?}, expected [{i}, {o}, {experts}]",
+                t.dims
+            ));
         }
         Ok(Wt {
             f: vec![],
@@ -301,9 +332,30 @@ pub(crate) fn load_expert(
         })
     }
     Ok([
-        one(src, &format!("blk.{layer}.ffn_gate_exps.weight"), expert, cfg.experts, cfg.moe_inter, cfg.hidden)?,
-        one(src, &format!("blk.{layer}.ffn_up_exps.weight"), expert, cfg.experts, cfg.moe_inter, cfg.hidden)?,
-        one(src, &format!("blk.{layer}.ffn_down_exps.weight"), expert, cfg.experts, cfg.hidden, cfg.moe_inter)?,
+        one(
+            src,
+            &format!("blk.{layer}.ffn_gate_exps.weight"),
+            expert,
+            cfg.experts,
+            cfg.moe_inter,
+            cfg.hidden,
+        )?,
+        one(
+            src,
+            &format!("blk.{layer}.ffn_up_exps.weight"),
+            expert,
+            cfg.experts,
+            cfg.moe_inter,
+            cfg.hidden,
+        )?,
+        one(
+            src,
+            &format!("blk.{layer}.ffn_down_exps.weight"),
+            expert,
+            cfg.experts,
+            cfg.hidden,
+            cfg.moe_inter,
+        )?,
     ])
 }
 
@@ -324,39 +376,198 @@ impl Model {
                 in_ln: vec![],
                 is_gdn,
                 is_qsa,
-                gdn_a_log: if is_gdn { a_log(src, &format!("{p}.ssm_a"), cfg.lin_v_heads)? } else { vec![] },
-                gdn_dt_bias: if is_gdn { vec_f32(src, &format!("{p}.ssm_dt.bias"), cfg.lin_v_heads)? } else { vec![] },
-                gdn_conv1d: if is_gdn { vec_f32(src, &format!("{p}.ssm_conv1d.weight"), cdim * cfg.conv_kernel)? } else { vec![] },
-                gdn_in_a: if is_gdn { load_wt(src, &format!("{p}.ssm_alpha.weight"), cfg.lin_v_heads, cfg.hidden)? } else { empty_wt() },
-                gdn_in_b: if is_gdn { load_wt(src, &format!("{p}.ssm_beta.weight"), cfg.lin_v_heads, cfg.hidden)? } else { empty_wt() },
-                gdn_in_qkv: if is_gdn { load_wt(src, &format!("{p}.attn_qkv.weight"), cdim, cfg.hidden)? } else { empty_wt() },
-                gdn_in_z: if is_gdn { load_wt(src, &format!("{p}.attn_gate.weight"), vdim, cfg.hidden)? } else { empty_wt() },
+                gdn_a_log: if is_gdn {
+                    a_log(src, &format!("{p}.ssm_a"), cfg.lin_v_heads)?
+                } else {
+                    vec![]
+                },
+                gdn_dt_bias: if is_gdn {
+                    vec_f32(src, &format!("{p}.ssm_dt.bias"), cfg.lin_v_heads)?
+                } else {
+                    vec![]
+                },
+                gdn_conv1d: if is_gdn {
+                    vec_f32(
+                        src,
+                        &format!("{p}.ssm_conv1d.weight"),
+                        cdim * cfg.conv_kernel,
+                    )?
+                } else {
+                    vec![]
+                },
+                gdn_in_a: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{p}.ssm_alpha.weight"),
+                        cfg.lin_v_heads,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty_wt()
+                },
+                gdn_in_b: if is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{p}.ssm_beta.weight"),
+                        cfg.lin_v_heads,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty_wt()
+                },
+                gdn_in_qkv: if is_gdn {
+                    load_wt(src, &format!("{p}.attn_qkv.weight"), cdim, cfg.hidden)?
+                } else {
+                    empty_wt()
+                },
+                gdn_in_z: if is_gdn {
+                    load_wt(src, &format!("{p}.attn_gate.weight"), vdim, cfg.hidden)?
+                } else {
+                    empty_wt()
+                },
                 // linear_attn.norm.weight is the one norm the converter does
                 // not +1-shift; keep it directly multiplicative.
-                gdn_norm: if is_gdn { vec_f32(src, &format!("{p}.ssm_norm.weight"), cfg.lin_v_dim)? } else { vec![] },
-                gdn_out: if is_gdn { load_wt(src, &format!("{p}.ssm_out.weight"), cfg.hidden, vdim)? } else { empty_wt() },
-                attn_q: if !is_gdn { load_wt(src, &format!("{p}.attn_q.weight"), 2 * cfg.heads * cfg.head_dim, cfg.hidden)? } else { empty_wt() },
-                attn_k: if !is_gdn { load_wt(src, &format!("{p}.attn_k.weight"), cfg.kv_heads * cfg.head_dim, cfg.hidden)? } else { empty_wt() },
-                attn_v: if !is_gdn { load_wt(src, &format!("{p}.attn_v.weight"), cfg.kv_heads * cfg.head_dim, cfg.hidden)? } else { empty_wt() },
-                attn_o: if !is_gdn { load_wt(src, &format!("{p}.attn_output.weight"), cfg.hidden, cfg.heads * cfg.head_dim)? } else { empty_wt() },
-                attn_qn: if !is_gdn { zero_centered_norm(src, &format!("{p}.attn_q_norm.weight"), cfg.head_dim)? } else { vec![] },
-                attn_kn: if !is_gdn { zero_centered_norm(src, &format!("{p}.attn_k_norm.weight"), cfg.head_dim)? } else { vec![] },
-                index_qk: if is_qsa { load_index_qk(src, l, &cfg)? } else { empty_wt() },
-                idx_qn: if is_qsa { zero_centered_norm(src, &format!("{p}.indexer.q_norm.weight"), cfg.idx_head_dim)? } else { vec![] },
-                idx_kn: if is_qsa { zero_centered_norm(src, &format!("{p}.indexer.k_norm.weight"), cfg.idx_head_dim)? } else { vec![] },
+                gdn_norm: if is_gdn {
+                    vec_f32(src, &format!("{p}.ssm_norm.weight"), cfg.lin_v_dim)?
+                } else {
+                    vec![]
+                },
+                gdn_out: if is_gdn {
+                    load_wt(src, &format!("{p}.ssm_out.weight"), cfg.hidden, vdim)?
+                } else {
+                    empty_wt()
+                },
+                attn_q: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{p}.attn_q.weight"),
+                        2 * cfg.heads * cfg.head_dim,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty_wt()
+                },
+                attn_k: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{p}.attn_k.weight"),
+                        cfg.kv_heads * cfg.head_dim,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty_wt()
+                },
+                attn_v: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{p}.attn_v.weight"),
+                        cfg.kv_heads * cfg.head_dim,
+                        cfg.hidden,
+                    )?
+                } else {
+                    empty_wt()
+                },
+                attn_o: if !is_gdn {
+                    load_wt(
+                        src,
+                        &format!("{p}.attn_output.weight"),
+                        cfg.hidden,
+                        cfg.heads * cfg.head_dim,
+                    )?
+                } else {
+                    empty_wt()
+                },
+                attn_qn: if !is_gdn {
+                    zero_centered_norm(src, &format!("{p}.attn_q_norm.weight"), cfg.head_dim)?
+                } else {
+                    vec![]
+                },
+                attn_kn: if !is_gdn {
+                    zero_centered_norm(src, &format!("{p}.attn_k_norm.weight"), cfg.head_dim)?
+                } else {
+                    vec![]
+                },
+                index_qk: if is_qsa {
+                    load_index_qk(src, l, &cfg)?
+                } else {
+                    empty_wt()
+                },
+                idx_qn: if is_qsa {
+                    zero_centered_norm(
+                        src,
+                        &format!("{p}.indexer.q_norm.weight"),
+                        cfg.idx_head_dim,
+                    )?
+                } else {
+                    vec![]
+                },
+                idx_kn: if is_qsa {
+                    zero_centered_norm(
+                        src,
+                        &format!("{p}.indexer.k_norm.weight"),
+                        cfg.idx_head_dim,
+                    )?
+                } else {
+                    vec![]
+                },
                 hc_norm: zero_centered_norm(src, &format!("{p}.hc_attn_norm.weight"), hcd)?,
-                hc_mix_down: load_wt(src, &format!("{p}.hc_attn_down.weight"), cfg.hc_lowrank, hcd)?,
+                hc_mix_down: load_wt(
+                    src,
+                    &format!("{p}.hc_attn_down.weight"),
+                    cfg.hc_lowrank,
+                    hcd,
+                )?,
                 hc_mix_up: load_wt(src, &format!("{p}.hc_attn_up.weight"), hcd, cfg.hc_lowrank)?,
-                hc_inject: load_wt(src, &format!("{p}.hc_attn_inject.weight"), cfg.hc_count, hcd)?,
+                hc_inject: load_wt(
+                    src,
+                    &format!("{p}.hc_attn_inject.weight"),
+                    cfg.hc_count,
+                    hcd,
+                )?,
                 hc_mlp_norm: zero_centered_norm(src, &format!("{p}.hc_ffn_norm.weight"), hcd)?,
-                hc_mlp_mix_down: load_wt(src, &format!("{p}.hc_ffn_down.weight"), cfg.hc_lowrank, hcd)?,
+                hc_mlp_mix_down: load_wt(
+                    src,
+                    &format!("{p}.hc_ffn_down.weight"),
+                    cfg.hc_lowrank,
+                    hcd,
+                )?,
                 hc_mlp_mix_up: load_wt(src, &format!("{p}.hc_ffn_up.weight"), hcd, cfg.hc_lowrank)?,
-                hc_mlp_inject: load_wt(src, &format!("{p}.hc_ffn_inject.weight"), cfg.hc_count, hcd)?,
-                router: load_wt(src, &format!("{p}.ffn_gate_inp.weight"), cfg.experts, cfg.hidden)?,
-                se_gate: load_wt(src, &format!("{p}.ffn_gate_shexp.weight"), cfg.shared_inter, cfg.hidden)?,
-                se_up: load_wt(src, &format!("{p}.ffn_up_shexp.weight"), cfg.shared_inter, cfg.hidden)?,
-                se_down: load_wt(src, &format!("{p}.ffn_down_shexp.weight"), cfg.hidden, cfg.shared_inter)?,
-                se_g: load_wt(src, &format!("{p}.ffn_gate_inp_shexp.weight"), 1, cfg.hidden)?,
+                hc_mlp_inject: load_wt(
+                    src,
+                    &format!("{p}.hc_ffn_inject.weight"),
+                    cfg.hc_count,
+                    hcd,
+                )?,
+                router: load_wt(
+                    src,
+                    &format!("{p}.ffn_gate_inp.weight"),
+                    cfg.experts,
+                    cfg.hidden,
+                )?,
+                se_gate: load_wt(
+                    src,
+                    &format!("{p}.ffn_gate_shexp.weight"),
+                    cfg.shared_inter,
+                    cfg.hidden,
+                )?,
+                se_up: load_wt(
+                    src,
+                    &format!("{p}.ffn_up_shexp.weight"),
+                    cfg.shared_inter,
+                    cfg.hidden,
+                )?,
+                se_down: load_wt(
+                    src,
+                    &format!("{p}.ffn_down_shexp.weight"),
+                    cfg.hidden,
+                    cfg.shared_inter,
+                )?,
+                se_g: load_wt(
+                    src,
+                    &format!("{p}.ffn_gate_inp_shexp.weight"),
+                    1,
+                    cfg.hidden,
+                )?,
             };
             layers.push(layer);
         }
@@ -364,17 +575,25 @@ impl Model {
         let ple_sizes = if cfg.ple_layer >= 0 {
             src.i64_array("qwen4exp.ple.head_vocab_sizes")
                 .ok_or_else(|| "GGUF missing qwen4exp.ple.head_vocab_sizes".to_string())?
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let ple_offsets = if cfg.ple_layer >= 0 {
             src.i64_array("qwen4exp.ple.head_offsets")
                 .ok_or_else(|| "GGUF missing qwen4exp.ple.head_offsets".to_string())?
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let ple_mult: Vec<u64> = if cfg.ple_layer >= 0 {
             src.u64_array("qwen4exp.ple.layer_multipliers")
                 .ok_or_else(|| "GGUF missing qwen4exp.ple.layer_multipliers".to_string())?
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         if cfg.ple_layer >= 0
-            && (ple_sizes.len() != cfg.ngram_heads || ple_offsets.len() != cfg.ngram_heads || ple_mult.len() < cfg.ngram_size)
+            && (ple_sizes.len() != cfg.ngram_heads
+                || ple_offsets.len() != cfg.ngram_heads
+                || ple_mult.len() < cfg.ngram_size)
         {
             return Err(format!(
                 "invalid PLE metadata lengths: sizes={}, offsets={}, multipliers={} (heads={}, ngram={})",
@@ -384,26 +603,54 @@ impl Model {
 
         let ple_prefix = format!("blk.{}", cfg.ple_layer);
         let ple_key_proj = if cfg.ple_layer >= 0 {
-            load_wt(src, &format!("{ple_prefix}.ple_key.weight"), hcd, cfg.ple_embed_dim)?
-        } else { empty_wt() };
+            load_wt(
+                src,
+                &format!("{ple_prefix}.ple_key.weight"),
+                hcd,
+                cfg.ple_embed_dim,
+            )?
+        } else {
+            empty_wt()
+        };
         let ple_value_proj = if cfg.ple_layer >= 0 {
-            load_wt(src, &format!("{ple_prefix}.ple_value.weight"), cfg.hidden, cfg.ple_embed_dim)?
-        } else { empty_wt() };
+            load_wt(
+                src,
+                &format!("{ple_prefix}.ple_value.weight"),
+                cfg.hidden,
+                cfg.ple_embed_dim,
+            )?
+        } else {
+            empty_wt()
+        };
         let ple_norm_key = if cfg.ple_layer >= 0 {
             zero_centered_norm(src, &format!("{ple_prefix}.ple_norm_key.weight"), hcd)?
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let ple_norm_query = if cfg.ple_layer >= 0 {
             zero_centered_norm(src, &format!("{ple_prefix}.ple_norm_query.weight"), hcd)?
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let ple_norm_conv = if cfg.ple_layer >= 0 {
             zero_centered_norm(src, &format!("{ple_prefix}.ple_norm_conv.weight"), hcd)?
-        } else { vec![] };
+        } else {
+            vec![]
+        };
         let ple_conv1d = if cfg.ple_layer >= 0 {
-            vec_f32(src, &format!("{ple_prefix}.ple_conv1d.weight"), hcd * cfg.ple_conv_kernel)?
-        } else { vec![] };
+            vec_f32(
+                src,
+                &format!("{ple_prefix}.ple_conv1d.weight"),
+                hcd * cfg.ple_conv_kernel,
+            )?
+        } else {
+            vec![]
+        };
 
         let mut model = Model {
             cfg: cfg.clone(),
+            pool: crate::pool::PoolConfig::from_env(),
+            ple_shards: None,
             coli: None,
             gguf: Some(src.clone()),
             gdn_v_tiled: true,
@@ -421,6 +668,8 @@ impl Model {
                 mix_down: load_wt(src, "output_hc_down.weight", cfg.hc_lowrank, hcd)?,
                 mix_up: load_wt(src, "output_hc_up.weight", hcd, cfg.hc_lowrank)?,
             },
+            mtp: None,
+            last_hidden_nextn: Vec::new(),
             // PLE table stays file-backed in GgufSource.
             ple_ngram: empty_wt(),
             ple_key_proj,
@@ -432,23 +681,67 @@ impl Model {
             ple_offsets,
             ple_sizes,
             ple_mult,
-            gdn_conv: cfg.gdn_layers.iter().map(|&g| {
-                if g { vec![0.0; cdim * cfg.conv_kernel.saturating_sub(1)] } else { Vec::new() }
-            }).collect(),
-            gdn_s: cfg.gdn_layers.iter().map(|&g| {
-                if g { vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim] } else { Vec::new() }
-            }).collect(),
-            kv_k: cfg.gdn_layers.iter().map(|&g| {
-                if g { Vec::new() } else { lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim) }
-            }).collect(),
-            kv_v: cfg.gdn_layers.iter().map(|&g| {
-                if g { Vec::new() } else { lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim) }
-            }).collect(),
-            idx_cache: cfg.qsa_layers.iter().map(|&q| {
-                if q { lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim) } else { Vec::new() }
-            }).collect(),
+            gdn_conv: cfg
+                .gdn_layers
+                .iter()
+                .map(|&g| {
+                    if g {
+                        vec![0.0; cdim * cfg.conv_kernel.saturating_sub(1)]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
+            gdn_s: cfg
+                .gdn_layers
+                .iter()
+                .map(|&g| {
+                    if g {
+                        vec![0.0; cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
+            kv_k: cfg
+                .gdn_layers
+                .iter()
+                .map(|&g| {
+                    if g {
+                        Vec::new()
+                    } else {
+                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                    }
+                })
+                .collect(),
+            kv_v: cfg
+                .gdn_layers
+                .iter()
+                .map(|&g| {
+                    if g {
+                        Vec::new()
+                    } else {
+                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                    }
+                })
+                .collect(),
+            idx_cache: cfg
+                .qsa_layers
+                .iter()
+                .map(|&q| {
+                    if q {
+                        lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
-            ple_conv_state: vec![0.0; hcd * (cfg.ple_conv_kernel.saturating_sub(1) * cfg.ngram_size + 1).max(1)],
+            ple_conv_state: vec![
+                0.0;
+                hcd * (cfg.ple_conv_kernel.saturating_sub(1) * cfg.ngram_size + 1)
+                    .max(1)
+            ],
             expert_plan: None,
             expert_store: make_expert_store(cfg.layers, cfg.topk),
             spans: logan_core::telemetry::TokenSpans::default(),
@@ -460,7 +753,9 @@ impl Model {
             metal_direct: false,
             metal_overlap: false,
             gdn_metal: (0..cfg.layers).map(|_| None).collect(),
-            gdn_ane: (0..cfg.layers).map(|_| crate::gdn_ane::GdnAneState::default()).collect(),
+            gdn_ane: (0..cfg.layers)
+                .map(|_| crate::gdn_ane::GdnAneState::default())
+                .collect(),
             gdn_ane_dynamic: None,
             gdn_ane_dynamic_failed: false,
             attn_metal: (0..cfg.layers).map(|_| None).collect(),
@@ -471,14 +766,23 @@ impl Model {
 
         // Runtime requantization is forbidden for the GGUF source path. The
         // model already carries the user's chosen per-tensor GGML formats.
-        if std::env::var("QWEN_GDN_RUNTIME_Q8").ok().is_some_and(|v| v != "0")
-            || std::env::var("QWEN_GDN_RUNTIME_MXFP4").ok().is_some_and(|v| v != "0")
+        if std::env::var("QWEN_GDN_RUNTIME_Q8")
+            .ok()
+            .is_some_and(|v| v != "0")
+            || std::env::var("QWEN_GDN_RUNTIME_MXFP4")
+                .ok()
+                .is_some_and(|v| v != "0")
         {
-            eprintln!("qwen4-rs: ignoring runtime GDN requantization flags for byte-exact GGUF input");
+            eprintln!(
+                "qwen4-rs: ignoring runtime GDN requantization flags for byte-exact GGUF input"
+            );
         }
         // Keep ANE/Metal construction inert on the GGUF path. CUDA attaches at
         // the WtBytes::Gguf execution seam instead of changing storage.
-        model.gdn_ane.iter_mut().for_each(|state| *state = crate::gdn_ane::GdnAneState::default());
+        model
+            .gdn_ane
+            .iter_mut()
+            .for_each(|state| *state = crate::gdn_ane::GdnAneState::default());
         Ok(model)
     }
 }

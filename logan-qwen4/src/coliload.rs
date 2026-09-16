@@ -47,6 +47,209 @@ fn vec_f32(src: &ColiSource, name: &str, want: usize) -> Result<Vec<f32>, String
         .collect())
 }
 
+fn empty_wt() -> Wt {
+    Wt {
+        f: vec![],
+        bytes: None,
+        o: 0,
+        i: 0,
+    }
+}
+
+fn load_embedded_mtp(
+    src: &ColiSource,
+    cfg: &Cfg,
+) -> Result<Option<(crate::mtp::MtpRuntime, Layer)>, String> {
+    if src.rec("mtp.fc_embedding.weight").is_none() {
+        return Ok(None);
+    }
+    if cfg.hc_count == 0 {
+        return Err("embedded Qwen4Exp MTP requires hc_count > 0".into());
+    }
+
+    // The attachment compiler maps stage 0 to the first virtual layer after
+    // the target trunk. Infer expert cardinality from manifest records so the
+    // runtime does not depend on a second config file or hardcode 512.
+    let virtual_layer = cfg.layers as i32;
+    let mut expert_ids = src
+        .pkg_ref()
+        .records()
+        .iter()
+        .filter(|r| r.kind == 2 && r.layer == virtual_layer && r.expert >= 0)
+        .map(|r| r.expert as usize)
+        .collect::<Vec<_>>();
+    expert_ids.sort_unstable();
+    expert_ids.dedup();
+    if expert_ids.is_empty() {
+        return Err(format!(
+            "embedded MTP tensors exist but virtual layer {virtual_layer} has no expert records"
+        ));
+    }
+    if expert_ids.iter().copied().ne(0..expert_ids.len()) {
+        return Err(format!(
+            "embedded MTP virtual layer {virtual_layer} experts are not contiguous from zero"
+        ));
+    }
+    let experts = expert_ids.len();
+    let topk = cfg.topk;
+    if topk == 0 || topk > experts {
+        return Err(format!("invalid MTP top-k {topk} for {experts} experts"));
+    }
+
+    let d = cfg.hidden;
+    let hc = cfg.hc_count;
+    let hcd = hc * d;
+    let hd = cfg.head_dim;
+    let lp = "mtp.layers.0";
+
+    let layer = Layer {
+        in_ln: vec![],
+        is_gdn: false,
+        // Qwen4Exp MTP deliberately runs dense full attention with its own
+        // plain KV cache. Indexer tensors are present in the checkpoint but
+        // are not part of the MTP execution graph.
+        is_qsa: false,
+        gdn_a_log: vec![],
+        gdn_dt_bias: vec![],
+        gdn_conv1d: vec![],
+        gdn_in_a: empty_wt(),
+        gdn_in_b: empty_wt(),
+        gdn_in_qkv: empty_wt(),
+        gdn_in_z: empty_wt(),
+        gdn_norm: vec![],
+        gdn_out: empty_wt(),
+        attn_q: load_wt(
+            src,
+            &format!("{lp}.self_attn.q_proj.weight"),
+            2 * cfg.heads * hd,
+            d,
+        )?,
+        attn_k: load_wt(
+            src,
+            &format!("{lp}.self_attn.k_proj.weight"),
+            cfg.kv_heads * hd,
+            d,
+        )?,
+        attn_v: load_wt(
+            src,
+            &format!("{lp}.self_attn.v_proj.weight"),
+            cfg.kv_heads * hd,
+            d,
+        )?,
+        attn_o: load_wt(
+            src,
+            &format!("{lp}.self_attn.o_proj.weight"),
+            d,
+            cfg.heads * hd,
+        )?,
+        attn_qn: vec_f32(src, &format!("{lp}.self_attn.q_norm.weight"), hd)?,
+        attn_kn: vec_f32(src, &format!("{lp}.self_attn.k_norm.weight"), hd)?,
+        index_qk: empty_wt(),
+        idx_qn: vec![],
+        idx_kn: vec![],
+        hc_norm: vec_f32(
+            src,
+            &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
+            hcd,
+        )?,
+        hc_mix_down: load_wt(
+            src,
+            &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
+            cfg.hc_lowrank,
+            hcd,
+        )?,
+        hc_mix_up: load_wt(
+            src,
+            &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
+            hcd,
+            cfg.hc_lowrank,
+        )?,
+        hc_inject: load_wt(
+            src,
+            &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
+            hc,
+            hcd,
+        )?,
+        hc_mlp_norm: vec_f32(
+            src,
+            &format!("{lp}.mlp_hyper_connection.hc_norm.weight"),
+            hcd,
+        )?,
+        hc_mlp_mix_down: load_wt(
+            src,
+            &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
+            cfg.hc_lowrank,
+            hcd,
+        )?,
+        hc_mlp_mix_up: load_wt(
+            src,
+            &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
+            hcd,
+            cfg.hc_lowrank,
+        )?,
+        hc_mlp_inject: load_wt(
+            src,
+            &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
+            hc,
+            hcd,
+        )?,
+        router: load_wt(src, &format!("{lp}.mlp.gate.weight"), experts, d)?,
+        se_gate: load_wt(
+            src,
+            &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+            cfg.shared_inter,
+            d,
+        )?,
+        se_up: load_wt(
+            src,
+            &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+            cfg.shared_inter,
+            d,
+        )?,
+        se_down: load_wt(
+            src,
+            &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+            d,
+            cfg.shared_inter,
+        )?,
+        se_g: load_wt(src, &format!("{lp}.mlp.shared_expert_gate.weight"), 1, d)?,
+    };
+
+    let runtime = crate::mtp::MtpRuntime {
+        layer_index: virtual_layer as usize,
+        experts,
+        topk,
+        fc_embedding: load_wt(src, "mtp.fc_embedding.weight", d, d)?,
+        fc_hidden: load_wt(src, "mtp.fc_hidden.weight", d, d)?,
+        enorm: vec_f32(src, "mtp.pre_fc_norm_embedding.weight", d)?,
+        hnorm: vec_f32(src, "mtp.pre_fc_norm_hidden.weight", hcd)?,
+        head_norm: vec_f32(src, "mtp.hyper_connection_mixer.hc_norm.weight", hcd)?,
+        head_down: load_wt(
+            src,
+            "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+            cfg.hc_lowrank,
+            hcd,
+        )?,
+        head_up: load_wt(
+            src,
+            "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+            hcd,
+            cfg.hc_lowrank,
+        )?,
+        catchup_rows: 0,
+        drafted: 0,
+        accepted: 0,
+        blocks: 0,
+        attempted_by_pos: [0; 4],
+        accepted_by_pos: [0; 4],
+        draft_ms: 0.0,
+        verify_ms: 0.0,
+        draft_mio_bytes: 0,
+        verify_mio_bytes: 0,
+    };
+    Ok(Some((runtime, layer)))
+}
+
 impl Model {
     /// Loads from a `.coli` package. Dense matrices resident as BF16 bytes;
     /// experts + ngram fetched on demand (16 GB M2 budget).
@@ -367,6 +570,26 @@ impl Model {
             layers.push(layer);
         }
 
+        let mtp_loaded = load_embedded_mtp(src, &cfg)?;
+        let mtp = if let Some((runtime, draft_layer)) = mtp_loaded {
+            if runtime.layer_index != layers.len() {
+                return Err(format!(
+                    "MTP virtual layer {} does not follow target layer count {}",
+                    runtime.layer_index,
+                    layers.len()
+                ));
+            }
+            eprintln!(
+                "[qwen4-rs] embedded MTP detected: layer={} experts={} topk={} (QWEN_MTP=0 opts out)",
+                runtime.layer_index, runtime.experts, runtime.topk
+            );
+            layers.push(draft_layer);
+            Some(runtime)
+        } else {
+            None
+        };
+        let runtime_layers = layers.len();
+
         // PLE geometry: the package carries ground-truth vocab_sizes/offsets/
         // multipliers (i64 records). The config-derived prime math diverges
         // on the real model (row 173M vs computed 160M), so .coli mode reads
@@ -492,6 +715,8 @@ impl Model {
         }
         let mut model = Model {
             cfg: cfg.clone(),
+            pool: crate::pool::PoolConfig::from_env(),
+            ple_shards: None,
             coli: Some(src.clone()),
             gguf: None,
             gdn_v_tiled: false,
@@ -536,6 +761,8 @@ impl Model {
                     },
                 }
             },
+            mtp,
+            last_hidden_nextn: Vec::new(),
             ple_ngram: Wt {
                 f: vec![],
                 bytes: None,
@@ -573,39 +800,57 @@ impl Model {
                     }
                 })
                 .collect(),
-            kv_k: cfg
-                .gdn_layers
-                .iter()
-                .map(|&is_gdn| {
-                    if is_gdn {
-                        Vec::new()
-                    } else {
-                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
-                    }
-                })
-                .collect(),
-            kv_v: cfg
-                .gdn_layers
-                .iter()
-                .map(|&is_gdn| {
-                    if is_gdn {
-                        Vec::new()
-                    } else {
-                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
-                    }
-                })
-                .collect(),
-            idx_cache: cfg
-                .qsa_layers
-                .iter()
-                .map(|&is_qsa| {
-                    if is_qsa {
-                        lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim)
-                    } else {
-                        Vec::new()
-                    }
-                })
-                .collect(),
+            kv_k: {
+                let mut v = cfg
+                    .gdn_layers
+                    .iter()
+                    .map(|&is_gdn| {
+                        if is_gdn {
+                            Vec::new()
+                        } else {
+                            lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if runtime_layers > cfg.layers {
+                    v.push(lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim));
+                }
+                v
+            },
+            kv_v: {
+                let mut v = cfg
+                    .gdn_layers
+                    .iter()
+                    .map(|&is_gdn| {
+                        if is_gdn {
+                            Vec::new()
+                        } else {
+                            lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if runtime_layers > cfg.layers {
+                    v.push(lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim));
+                }
+                v
+            },
+            idx_cache: {
+                let mut v = cfg
+                    .qsa_layers
+                    .iter()
+                    .map(|&is_qsa| {
+                        if is_qsa {
+                            lazy_zeroed_f32(cfg.max_t * cfg.idx_kv_heads * cfg.idx_head_dim)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if runtime_layers > cfg.layers {
+                    v.push(Vec::new());
+                }
+                v
+            },
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
             ple_conv_state: vec![
                 0.0;
@@ -613,12 +858,12 @@ impl Model {
                     .max(1)
             ],
             expert_plan,
-            expert_store: make_expert_store(cfg.layers, cfg.topk),
+            expert_store: make_expert_store(runtime_layers, cfg.topk),
             spans: logan_core::telemetry::TokenSpans::default(),
-            route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
-            route_overlap_common: vec![0; cfg.layers],
-            route_overlap_total: vec![0; cfg.layers],
-            route_overlap_pairs: vec![0; cfg.layers],
+            route_prev: (0..runtime_layers).map(|_| Vec::new()).collect(),
+            route_overlap_common: vec![0; runtime_layers],
+            route_overlap_total: vec![0; runtime_layers],
+            route_overlap_pairs: vec![0; runtime_layers],
             metal_model_id: next_metal_model_id(),
             metal_direct: direct_ok
                 && std::env::var("QWEN_APPLE8_DIRECT")
@@ -627,13 +872,13 @@ impl Model {
             metal_overlap: std::env::var("QWEN_APPLE8_OVERLAP")
                 .map(|v| v != "0")
                 .unwrap_or(true),
-            gdn_metal: (0..cfg.layers).map(|_| None).collect(),
-            gdn_ane: (0..cfg.layers)
+            gdn_metal: (0..runtime_layers).map(|_| None).collect(),
+            gdn_ane: (0..runtime_layers)
                 .map(|_| crate::gdn_ane::GdnAneState::default())
                 .collect(),
             gdn_ane_dynamic: None,
             gdn_ane_dynamic_failed: false,
-            attn_metal: (0..cfg.layers).map(|_| None).collect(),
+            attn_metal: (0..runtime_layers).map(|_| None).collect(),
             sched_mode: false,
             sched_blocked: None,
             sched_pause: None,

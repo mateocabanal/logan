@@ -30,8 +30,41 @@ use logan_core::expert::Slot as _; // for SlotExpert::release
 const MAX_RESIDENT_PLE_NGRAM_BYTES: usize = 64 * 1024 * 1024;
 
 fn is_ple_ngram_weight(name: &str) -> bool {
-    name.ends_with("ple_embedding.ngram_embedding.weight")
+    // The monolithic spelling (tiny fixture, and any dense export) ...
+    if name.ends_with("ple_embedding.ngram_embedding.weight")
         || name.ends_with("ple.ngram_embedding.weight")
+    {
+        return true;
+    }
+    // ... and the SHARDED spelling the real checkpoint uses. Flash-Next stores
+    // the n-gram table as
+    // `...ple_embedding.ngram_embedding.shard_{N}.weight` (128 shards, ~400 MB
+    // each, 52 GB total). Matching only the monolithic name silently missed
+    // all of them, which is exactly the case the residency guard exists for.
+    for marker in ["ple_embedding.ngram_embedding.shard_", "ple.ngram_embedding.shard_"] {
+        if let Some(rest) = name.strip_prefix_marker(marker) {
+            // `rest` must be `<digits>.weight`; anything else is a different
+            // tensor that merely shares the prefix.
+            if let Some(idx) = rest.strip_suffix(".weight") {
+                if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `str::strip_prefix` for a marker that may appear anywhere in the name.
+trait StripPrefixMarker {
+    fn strip_prefix_marker<'a>(&'a self, marker: &str) -> Option<&'a str>;
+}
+
+impl StripPrefixMarker for str {
+    fn strip_prefix_marker<'a>(&'a self, marker: &str) -> Option<&'a str> {
+        let at = self.find(marker)?;
+        Some(&self[at + marker.len()..])
+    }
 }
 
 pub struct StFile {
@@ -39,118 +72,602 @@ pub struct StFile {
     // std::fs::read(), which made the entire source file resident before any
     // tensor was requested. Production Flash-Next uses .coli, but keeping this
     // adapter range-read prevents accidental whole-file residency as well.
-    file: std::sync::Mutex<std::fs::File>,
-    tensors: std::collections::HashMap<String, (Vec<u64>, usize, usize)>,
+    //
+    // A multi-shard checkpoint has one open file PER SHARD, so this is indexed
+    // by shard id rather than being a single handle.
+    //
+    // `Arc<Mutex<File>>` rather than `Mutex<File>` so the PLE n-gram reader can
+    // share the same open handles: the table stays file-backed, and a second
+    // reader must not re-open 128 shard files. Clone is a refcount bump.
+    files: std::sync::Arc<Vec<std::sync::Mutex<std::fs::File>>>,
+    /// name -> (shard index, shape, dtype, payload offset, payload length)
+    tensors: std::sync::Arc<std::collections::HashMap<String, (usize, Vec<u64>, String, usize, usize)>>,
+}
+
+impl Clone for StFile {
+    /// Shares the open shard handles and the tensor map; no file is re-opened.
+    fn clone(&self) -> Self {
+        Self {
+            files: std::sync::Arc::clone(&self.files),
+            tensors: std::sync::Arc::clone(&self.tensors),
+        }
+    }
+}
+
+/// Parse one safetensors shard into `(name, shape, dtype, abs_offset, len)`.
+///
+/// Shared by the single-file and sharded entry points so the range and
+/// bounds checking exists once. `abs_offset` is already absolute from the start
+/// of the FILE, so readers do not have to remember the header-length rule.
+fn parse_shard(path: &Path) -> Result<(std::fs::File, Vec<(String, Vec<u64>, String, usize, usize)>), String> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    let mut nbuf = [0_u8; 8];
+    file.read_exact(&mut nbuf)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let n = u64::from_le_bytes(nbuf);
+    let data_start = 8_u64
+        .checked_add(n)
+        .ok_or_else(|| format!("{}: header length overflow", path.display()))?;
+    if data_start > file_len {
+        return Err(format!(
+            "{}: header extends past EOF ({data_start} > {file_len})",
+            path.display()
+        ));
+    }
+    let n_usize = usize::try_from(n)
+        .map_err(|_| format!("{}: header too large for this host", path.display()))?;
+    let mut header_bytes = vec![0_u8; n_usize];
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let obj = header
+        .as_object()
+        .ok_or_else(|| format!("{}: header is not an object", path.display()))?;
+
+    let mut out = Vec::with_capacity(obj.len());
+    for (name, spec) in obj {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = spec["dtype"]
+            .as_str()
+            .ok_or_else(|| format!("{name}: missing dtype"))?
+            .to_string();
+        // Reject an unknown dtype HERE rather than at first read: a checkpoint
+        // with an unsupported encoding should fail loudly at open, not produce
+        // a confusing error deep inside a layer load.
+        if element_bytes(&dtype).is_none() {
+            return Err(format!(
+                "{name}: unsupported dtype `{dtype}` (supported: F32, I32, I64, BF16, F16, F8_E4M3, F8_E4M3FN)"
+            ));
+        }
+        let shape: Vec<u64> = spec["shape"]
+            .as_array()
+            .ok_or_else(|| format!("{name}: missing shape"))?
+            .iter()
+            .map(|v| v.as_u64().ok_or_else(|| format!("{name}: invalid shape")))
+            .collect::<Result<_, _>>()?;
+        let offs = spec["data_offsets"]
+            .as_array()
+            .ok_or_else(|| format!("{name}: missing data_offsets"))?;
+        if offs.len() != 2 {
+            return Err(format!("{name}: invalid data_offsets"));
+        }
+        let begin = offs[0]
+            .as_u64()
+            .ok_or_else(|| format!("{name}: invalid start offset"))?;
+        let end = offs[1]
+            .as_u64()
+            .ok_or_else(|| format!("{name}: invalid end offset"))?;
+        if end < begin || data_start.checked_add(end).is_none_or(|v| v > file_len) {
+            return Err(format!("{name}: tensor range is outside {}", path.display()));
+        }
+        // Payload size must match dtype x shape; a mismatch means a corrupt
+        // header, and catching it here keeps every read in bounds.
+        let elems: u64 = shape.iter().product::<u64>().max(1);
+        let expected = elems.saturating_mul(element_bytes(&dtype).unwrap_or(1) as u64);
+        if end - begin != expected {
+            return Err(format!(
+                "{name}: span {} != {elems} x {:?} = {expected}",
+                end - begin,
+                dtype
+            ));
+        }
+        let offset = usize::try_from(data_start + begin)
+            .map_err(|_| format!("{name}: offset too large for this host"))?;
+        let len = usize::try_from(end - begin)
+            .map_err(|_| format!("{name}: length too large for this host"))?;
+        out.push((name.clone(), shape, dtype, offset, len));
+    }
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((file, out))
+}
+
+/// The part after `layers.{N}.ple.`, for the model-root PLE alias.
+fn ple_in_layer(name: &str) -> Option<&str> {
+    let at = name.find(".layers.")?;
+    let after = &name[at + ".layers.".len()..];
+    let dot = after.find('.')?;
+    if !after[..dot].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    after[dot..].strip_prefix(".ple.")
+}
+
+/// Payload bytes per element, or `None` for a dtype this loader cannot decode.
+///
+/// E4M3FN is the finite-only E4M3 variant, which is what Qwen FP8 checkpoints
+/// store; the decoder below follows the ordinary (non-FNUZ) convention.
+fn element_bytes(dtype: &str) -> Option<usize> {
+    match dtype {
+        "F32" | "I32" => Some(4),
+        "BF16" | "F16" => Some(2),
+        "F8_E4M3" | "F8_E4M3FN" => Some(1),
+        // Integer side-tables (index maps, `layer_multipliers`, n-gram row ids)
+        // are metadata the runtime wants as f32. Widening an i64 index to f32
+        // is exact below 2^24, which every index in this model is.
+        "I64" => Some(8),
+        _ => None,
+    }
+}
+
+/// Register a tensor under its own name and, where the checkpoint uses an HF
+/// layout prefix, under the engine's shorter spelling as well.
+///
+/// The real checkpoint names the backbone
+/// `model.language_model.layers.N...`; `Model::load` builds `model.layers.N...`.
+/// Rather than touch every call site (and every future one), both names map to
+/// the same bytes. A genuine duplicate is left alone: the first registration
+/// wins so an explicit tensor is never shadowed by an alias.
+#[allow(clippy::too_many_arguments)]
+fn register(
+    tensors: &mut std::collections::HashMap<String, (usize, Vec<u64>, String, usize, usize)>,
+    shard: usize,
+    name: String,
+    shape: Vec<u64>,
+    dtype: String,
+    offset: usize,
+    len: usize,
+) {
+    const HF_PREFIX: &str = "model.language_model.";
+    const ENGINE_PREFIX: &str = "model.";
+    let alias = name
+        .strip_prefix(HF_PREFIX)
+        .map(|rest| format!("{ENGINE_PREFIX}{rest}"));
+
+    if let Some(alias) = alias {
+        // Insert the engine spelling first only when the checkpoint does not
+        // itself define it.
+        if !tensors.contains_key(&alias) {
+            tensors.insert(alias, (shard, shape.clone(), dtype.clone(), offset, len));
+        }
+    }
+    // PLE lives INSIDE a layer in this checkpoint
+    // (`...layers.{N}.ple.key_proj.weight`) but the loader asks for it at the
+    // model root (`model.ple.key_proj.weight`), because that is where the
+    // `.coli` packages put it. Alias it across so one loader serves both
+    // layouts. The layer index is deliberately not checked against config:
+    // this checkpoint's `ple_layer_ids` says 2 while its tensors are at
+    // `layers.1`, so the tensor names are the authoritative source.
+    if let Some(rest) = ple_in_layer(&name) {
+        let root = format!("model.ple.{rest}");
+        if !tensors.contains_key(&root) {
+            tensors.insert(root, (shard, shape.clone(), dtype.clone(), offset, len));
+        }
+    }
+    tensors.insert(name, (shard, shape, dtype, offset, len));
 }
 
 impl StFile {
+    /// Open a single safetensors file. Kept for the F32 fixtures the reference
+    /// tests use; a real checkpoint should go through [`StFile::open_dir`].
     pub fn open(path: &Path) -> Result<StFile, String> {
-        use std::io::Read as _;
-
-        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
-        let mut nbuf = [0_u8; 8];
-        file.read_exact(&mut nbuf).map_err(|e| e.to_string())?;
-        let n = u64::from_le_bytes(nbuf);
-        let data_start_u64 = 8_u64
-            .checked_add(n)
-            .ok_or_else(|| "safetensors header length overflow".to_string())?;
-        if data_start_u64 > file_len {
-            return Err(format!(
-                "safetensors header extends past EOF: {data_start_u64} > {file_len}"
-            ));
-        }
-        let n_usize = usize::try_from(n)
-            .map_err(|_| "safetensors header too large for this host".to_string())?;
-        let mut header_bytes = vec![0_u8; n_usize];
-        file.read_exact(&mut header_bytes)
-            .map_err(|e| e.to_string())?;
-        let header: serde_json::Value =
-            serde_json::from_slice(&header_bytes).map_err(|e| e.to_string())?;
-        let obj = header
-            .as_object()
-            .ok_or_else(|| "safetensors header is not an object".to_string())?;
-        usize::try_from(data_start_u64)
-            .map_err(|_| "safetensors data offset too large for this host".to_string())?;
-        let mut tensors = std::collections::HashMap::new();
-        for (name, spec) in obj {
-            if name == "__metadata__" {
-                continue;
-            }
-            let dtype = spec["dtype"]
-                .as_str()
-                .ok_or_else(|| format!("{name}: missing dtype"))?;
-            let shape: Vec<u64> = spec["shape"]
-                .as_array()
-                .ok_or_else(|| format!("{name}: missing shape"))?
-                .iter()
-                .map(|v| v.as_u64().ok_or_else(|| format!("{name}: invalid shape")))
-                .collect::<Result<_, _>>()?;
-            let offs = spec["data_offsets"]
-                .as_array()
-                .ok_or_else(|| format!("{name}: missing data_offsets"))?;
-            if offs.len() != 2 {
-                return Err(format!("{name}: invalid data_offsets"));
-            }
-            let begin = offs[0]
-                .as_u64()
-                .ok_or_else(|| format!("{name}: invalid start offset"))?;
-            let end = offs[1]
-                .as_u64()
-                .ok_or_else(|| format!("{name}: invalid end offset"))?;
-            if end < begin || data_start_u64.checked_add(end).is_none_or(|v| v > file_len) {
-                return Err(format!(
-                    "{name}: tensor range is outside the safetensors file"
-                ));
-            }
-            let offset = usize::try_from(data_start_u64 + begin)
-                .map_err(|_| format!("{name}: tensor offset too large for this host"))?;
-            let len = usize::try_from(end - begin)
-                .map_err(|_| format!("{name}: tensor length too large for this host"))?;
-            if dtype != "F32" {
-                return Err(format!("{name}: only F32 supported, got {dtype}"));
-            }
-            tensors.insert(name.clone(), (shape, offset, len));
+        let (file, entries) = parse_shard(path)?;
+        let mut tensors = std::collections::HashMap::with_capacity(entries.len());
+        for (name, shape, dtype, off, len) in entries {
+            tensors.insert(name, (0, shape, dtype, off, len));
         }
         Ok(StFile {
-            file: std::sync::Mutex::new(file),
-            tensors,
+            files: std::sync::Arc::new(vec![std::sync::Mutex::new(file)]),
+            tensors: std::sync::Arc::new(tensors),
         })
     }
 
-    pub fn f32(&self, name: &str, expect: &[u64]) -> Result<Vec<f32>, String> {
+    /// Open a checkpoint DIRECTORY: every shard named by
+    /// `model.safetensors.index.json`, or the single `model.safetensors` when
+    /// there is no index.
+    ///
+    /// This is what makes an open-weight HF checkpoint a first-class Logan
+    /// source. Three things the single-file `open` cannot do, all required by
+    /// the real Qwen3.8-Flash-Next export (131 shards, `model-000NN-of-00131`):
+    ///
+    /// * **Sharding.** One open handle per shard, with each tensor recording
+    ///   which shard holds it.
+    /// * **Dtypes.** The checkpoint is BF16 and F8_E4M3; `f32` decodes both.
+    /// * **Name canonicalisation.** HF names the backbone
+    ///   `model.language_model.layers.N...` while `Model::load` builds
+    ///   `model.layers.N...`, so both spellings are registered for the same
+    ///   bytes and every existing `st.f32("model.layers.N...")` call site works
+    ///   unchanged.
+    pub fn open_dir(dir: &Path) -> Result<StFile, String> {
+        let index = dir.join("model.safetensors.index.json");
+        let mut files = Vec::new();
+        let mut tensors = std::collections::HashMap::new();
+
+        if index.is_file() {
+            let raw = std::fs::read(&index).map_err(|e| format!("{}: {e}", index.display()))?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", index.display()))?;
+            let map = value
+                .get("weight_map")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| format!("{}: missing weight_map", index.display()))?;
+
+            // Deterministic shard order so shard indices are stable run to run.
+            let mut shard_names: Vec<&str> = map.values().filter_map(|v| v.as_str()).collect();
+            shard_names.sort_unstable();
+            shard_names.dedup();
+
+            let mut shard_id = std::collections::HashMap::new();
+            for (i, shard) in shard_names.iter().enumerate() {
+                let path = dir.join(shard);
+                let (file, entries) = parse_shard(&path)?;
+                files.push(std::sync::Mutex::new(file));
+                shard_id.insert((*shard).to_string(), i);
+                for (name, shape, dtype, off, len) in entries {
+                    register(&mut tensors, i, name, shape, dtype, off, len);
+                }
+            }
+            // Tensors the index forgot to list are absent, which surfaces as a
+            // clear "missing tensor" at load rather than a silent zero.
+            if tensors.is_empty() {
+                return Err(format!("{}: weight_map names no tensors", index.display()));
+            }
+        } else {
+            let single = dir.join("model.safetensors");
+            if !single.is_file() {
+                return Err(format!(
+                    "{}: neither model.safetensors.index.json nor model.safetensors",
+                    dir.display()
+                ));
+            }
+            let (file, entries) = parse_shard(&single)?;
+            files.push(std::sync::Mutex::new(file));
+            for (name, shape, dtype, off, len) in entries {
+                register(&mut tensors, 0, name, shape, dtype, off, len);
+            }
+        }
+
+        // Shard count is recoverable from the map, so a caller can report it.
+        Ok(StFile {
+            files: std::sync::Arc::new(files),
+            tensors: std::sync::Arc::new(tensors),
+        })
+    }
+
+    /// How many shard files back this checkpoint.
+    pub fn shard_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Distinct payload dtypes present, for diagnostics.
+    ///
+    /// Counts distinct PAYLOADS, not names: an aliased tensor is registered
+    /// under both its HF and engine spelling, and reporting those as two
+    /// tensors would overstate the checkpoint.
+    pub fn dtype_counts(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = std::collections::BTreeMap::new();
+        for (shard, _, dtype, offset, len) in self.tensors.values() {
+            if seen.insert((*shard, *offset, *len)) {
+                *out.entry(dtype.clone()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
+    /// Read a tensor's raw payload, after shape/dtype/residency validation.
+    ///
+    /// Both typed accessors below go through here, so the seek, the lock, and
+    /// the PLE residency guard exist once.
+    fn payload(&self, name: &str, expect: &[u64], elem: usize) -> Result<Vec<u8>, String> {
         use std::io::{Read as _, Seek as _, SeekFrom};
 
-        let (shape, offset, len) = self
+        let (shard, shape, dtype, offset, len) = self
             .tensors
             .get(name)
             .ok_or_else(|| format!("missing tensor {name}"))?;
-        let want: u64 = expect.iter().product();
-        let have: u64 = shape.iter().product();
-        if have != want || *len != want as usize * 4 {
+        if element_bytes(dtype) != Some(elem) {
+            return Err(format!("{name}: dtype `{dtype}` is not {elem}-byte"));
+        }
+        let want: u64 = expect.iter().product::<u64>().max(1);
+        let have: u64 = shape.iter().product::<u64>().max(1);
+        // A bare `expect` of [0] or [] means "don't check", used by callers that
+        // only want the payload (probes, metadata).
+        let shape_checked = expect.iter().all(|&d| d != 0);
+        if shape_checked && (have != want || *len != have as usize * elem) {
             return Err(format!(
-                "{name}: shape {shape:?} len {} != expected {expect:?}",
-                *len
+                "{name}: shape {shape:?} len {len} ({dtype}) != expected {expect:?}"
             ));
         }
         if is_ple_ngram_weight(name) && *len > MAX_RESIDENT_PLE_NGRAM_BYTES {
             return Err(format!(
-                "{name}: refusing to materialize {} bytes of PLE n-gram weights; compile/use a .coli package so n-gram rows stay on NVMe and are range-read on demand",
+                "{name}: refusing to materialize {} bytes of PLE n-gram weights; the n-gram table must stay file-backed and be range-read on demand",
                 *len
             ));
         }
         let mut raw = vec![0_u8; *len];
-        let mut file = self
-            .file
+        let mut file = self.files[*shard]
             .lock()
             .map_err(|_| "safetensors file lock poisoned".to_string())?;
         file.seek(SeekFrom::Start(*offset as u64))
             .map_err(|e| e.to_string())?;
         file.read_exact(&mut raw).map_err(|e| e.to_string())?;
+        Ok(raw)
+    }
+
+    /// Read one tensor as f32, decoding whatever dtype it is stored in.
+    ///
+    /// BF16 and F16 widen to f32; F8_E4M3 decodes through
+    /// [`colisource::ColiSource::e4m3_decode`], which is documented bit-exact
+    /// with the C engine's E4M3 LUT — reusing it rather than writing a second
+    /// FP8 decoder is what keeps the two from drifting.
+    ///
+    /// I64 is REFUSED here rather than widened: f32 has 24 bits of mantissa,
+    /// and the real checkpoint's `layer_multipliers` are ~2.4e13 (f32 spacing
+    /// at that magnitude is 2,097,152), so a conversion would silently corrupt
+    /// them. Use [`StFile::i64`] for integer side-tables.
+    pub fn f32(&self, name: &str, expect: &[u64]) -> Result<Vec<f32>, String> {
+        let dtype = self
+            .tensors
+            .get(name)
+            .map(|t| t.2.as_str())
+            .unwrap_or("");
+        if dtype == "I64" || dtype == "I32" {
+            return Err(format!(
+                "{name}: dtype `{dtype}` is an integer side-table; f32 cannot represent it losslessly (use StFile::i64)"
+            ));
+        }
+        let elem = element_bytes(dtype)
+            .ok_or_else(|| format!("{name}: unsupported dtype `{dtype}`"))?;
+        let raw = self.payload(name, expect, elem)?;
+
+        Ok(match elem {
+            4 => raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+            2 if dtype == "BF16" => raw
+                .chunks_exact(2)
+                // BF16 IS a truncated f32: widening is a 16-bit shift, which is
+                // exact and loses nothing.
+                .map(|c| f32::from_bits((u16::from_le_bytes(c.try_into().unwrap()) as u32) << 16))
+                .collect(),
+            2 => raw
+                .chunks_exact(2)
+                // F16 is a different encoding, so it needs a real conversion.
+                .map(|c| {
+                    let bits = u16::from_le_bytes(c.try_into().unwrap());
+                    let sign = ((bits >> 15) & 1) as u32;
+                    let exp = ((bits >> 10) & 0x1f) as i32;
+                    let mant = (bits & 0x3ff) as f32;
+                    let mag = if exp == 0 {
+                        mant * 2f32.powi(-24)
+                    } else if exp == 0x1f {
+                        if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+                    } else {
+                        (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+                    };
+                    if sign == 1 { -mag } else { mag }
+                })
+                .collect(),
+            _ => raw
+                .iter()
+                .map(|&b| colisource::ColiSource::e4m3_decode(b))
+                .collect(),
+        })
+    }
+
+    /// Shard index for the PLE n-gram table, or `None` when it is not sharded.
+    ///
+    /// The real checkpoint stores the n-gram table as 128 tensors named
+    /// `...layers.{L}.ple.ple_embedding.ngram_embedding.shard_{N}.weight`
+    /// (~400 MB each, 52 GB total), with the true geometry as i64 side-tables
+    /// rather than derivable from config. Returns the shard names sorted by
+    /// shard index so row arithmetic is a plain division.
+    pub fn ngram_shards(&self, layer: u32) -> Vec<(usize, String, u64, usize)> {
+        let mut found = self.ngram_shards_in_layer(layer);
+        if found.is_empty() {
+            // `ple_layer_ids` in this checkpoint is 0-based-inclusive but does
+            // not match where the tensors actually live (it says 2; they are at
+            // `layers.1`). Rather than trust a field that disagrees with the
+            // file, fall back to whichever layer actually holds the shards.
+            if let Some(actual) = self.ple_tensor_layer() {
+                if actual != layer {
+                    found = self.ngram_shards_in_layer(actual);
+                }
+            }
+        }
+        found
+    }
+
+    /// Which layer index actually holds `...layers.{N}.ple.*`, per the tensors.
+    pub fn ple_tensor_layer(&self) -> Option<u32> {
+        self.tensors.keys().find_map(|name| {
+            let at = name.find(".layers.")?;
+            let after = &name[at + ".layers.".len()..];
+            let dot = after.find('.')?;
+            if after[dot..].starts_with(".ple.") {
+                after[..dot].parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn ngram_shards_in_layer(&self, layer: u32) -> Vec<(usize, String, u64, usize)> {
+        let needle = format!(".layers.{layer}.ple.ple_embedding.ngram_embedding.shard_");
+        let mut out: Vec<(usize, String, u64, usize)> = Vec::new();
+        for (name, (_, shape, _, _, _)) in self.tensors.iter() {
+            let Some(at) = name.find(&needle) else { continue };
+            let rest = &name[at + needle.len()..];
+            let Some(idx) = rest.strip_suffix(".weight") else {
+                continue;
+            };
+            let Ok(idx) = idx.parse::<usize>() else { continue };
+            // [rows, width]; the width is the per-head embedding width.
+            if shape.len() != 2 {
+                continue;
+            }
+            out.push((idx, name.clone(), shape[0], shape[1] as usize));
+        }
+        out.sort_by_key(|(i, _, _, _)| *i);
+        out
+    }
+
+    /// Read a byte range from one tensor, decoding F8_E4M3 to f32.
+    ///
+    /// This is the SSD-residency primitive for the PLE n-gram table. A shard is
+    /// ~400 MB and the table is 52 GB, so a row must be fetched by pread and
+    /// decoded in place — materializing a shard (let alone the table) does not
+    /// fit on the anchor, and `f32` refuses it above
+    /// [`MAX_RESIDENT_PLE_NGRAM_BYTES`] for exactly that reason.
+    ///
+    /// Deliberately narrow: F8_E4M3 only, because that is the encoding of every
+    /// PLE n-gram shard.
+    pub fn f8_range(&self, name: &str, row: u64, width: usize) -> Result<Vec<f32>, String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let (shard, shape, dtype, offset, _len) = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        if dtype != "F8_E4M3" && dtype != "F8_E4M3FN" {
+            return Err(format!("{name}: expected F8_E4M3, got {dtype}"));
+        }
+        let (rows, cols) = match shape.as_slice() {
+            [r, c] => (*r, *c as usize),
+            other => return Err(format!("{name}: expected 2-D, got {other:?}")),
+        };
+        if row >= rows {
+            return Err(format!("{name}: row {row} out of range ({rows})"));
+        }
+        if width != cols {
+            return Err(format!("{name}: row width {width} != {cols}"));
+        }
+        let start = *offset as u64 + row * cols as u64;
+        let mut raw = vec![0_u8; cols];
+        let mut file = self.files[*shard]
+            .lock()
+            .map_err(|_| "safetensors file lock poisoned".to_string())?;
+        file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        file.read_exact(&mut raw).map_err(|e| e.to_string())?;
         Ok(raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .iter()
+            .map(|&b| colisource::ColiSource::e4m3_decode(b))
             .collect())
+    }
+
+    /// Shape of a tensor, or `None` when absent. Used to derive block geometry.
+    pub fn shape_of(&self, name: &str) -> Option<Vec<u64>> {
+        self.tensors.get(name).map(|t| t.1.clone())
+    }
+
+    /// Read a block-quantized tensor as f32, applying its `weight_scale_inv`.
+    ///
+    /// FP8 checkpoints store per-block NORMALIZED payloads; the scale is part
+    /// of the value, not a refinement. The real Flash-Next experts are exactly
+    /// this shape: `{proj}.weight` (F8_E4M3) beside `{proj}.weight_scale_inv`
+    /// (BF16), one scale per `block_rows x block_columns` tile. Decoding
+    /// without applying the scale reinterprets normalized bytes as weights and
+    /// every value comes out wrong.
+    ///
+    /// The block geometry is derived, not assumed: the scale grid must tile the
+    /// weight exactly, and a scale that does not is an error rather than a
+    /// guessed geometry.
+    pub fn f32_scaled(
+        &self,
+        weight_name: &str,
+        scale_name: &str,
+        expect: &[u64],
+    ) -> Result<Vec<f32>, String> {
+        let wshape = self
+            .shape_of(weight_name)
+            .ok_or_else(|| format!("missing tensor {weight_name}"))?;
+        if wshape.len() != 2 {
+            return Err(format!("{weight_name}: expected 2-D, got {wshape:?}"));
+        }
+        let (rows, cols) = (wshape[0], wshape[1]);
+        let sshape = self
+            .shape_of(scale_name)
+            .ok_or_else(|| format!("missing scale tensor {scale_name}"))?;
+        if sshape.len() != 2 || sshape[0] == 0 || sshape[1] == 0 {
+            return Err(format!("{scale_name}: invalid scale shape {sshape:?}"));
+        }
+        if rows % sshape[0] != 0 || cols % sshape[1] != 0 {
+            return Err(format!(
+                "{scale_name}: shape {sshape:?} does not tile {rows}x{cols} exactly"
+            ));
+        }
+        let block_rows = rows / sshape[0];
+        let block_cols = cols / sshape[1];
+        let scale_cols = sshape[1] as usize;
+
+        let raw = self.payload(weight_name, expect, 1)?;
+        let table = self.f32(scale_name, &sshape)?;
+
+        let mut out = vec![0.0_f32; raw.len()];
+        for (r, chunk) in raw.chunks_exact(cols as usize).enumerate() {
+            let srow = (r as u64 / block_rows) as usize * scale_cols;
+            let base = r * cols as usize;
+            for (c, &byte) in chunk.iter().enumerate() {
+                let s = table.get(srow + c as u64 as usize / block_cols as usize).copied();
+                let s = s.ok_or_else(|| {
+                    format!("{scale_name}: block scale index out of range at row {r} col {c}")
+                })?;
+                out[base + c] = colisource::ColiSource::e4m3_decode(byte) * s;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read an integer side-table losslessly. `layer_multipliers`, n-gram row
+    /// id maps, and vocab/offset tables are i64 in the checkpoint and are fed
+    /// to `wrapping_mul`/index arithmetic, where a rounded value is a wrong
+    /// answer rather than a slightly-off one.
+    pub fn i64(&self, name: &str, expect: &[u64]) -> Result<Vec<i64>, String> {
+        let dtype = self
+            .tensors
+            .get(name)
+            .map(|t| t.2.as_str())
+            .unwrap_or("");
+        let (elem, signed32) = match dtype {
+            "I64" => (8, false),
+            "I32" => (4, true),
+            other => {
+                return Err(format!(
+                    "{name}: dtype `{other}` is not an integer side-table (use StFile::f32)"
+                ))
+            }
+        };
+        let raw = self.payload(name, expect, elem)?;
+        Ok(if signed32 {
+            raw.chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
+                .collect()
+        } else {
+            raw.chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        })
     }
 }
 
@@ -848,6 +1365,19 @@ impl Layer {
 
 pub struct Model {
     cfg: Cfg,
+    /// Sharded PLE n-gram table, when the checkpoint stores it as shards.
+    ///
+    /// The table is 52 GB and must stay file-backed: rows are range-read on
+    /// demand, exactly as the `.coli` path does. `None` means the monolithic
+    /// form, which lives in `ple_ngram`.
+    ple_shards: Option<(std::sync::Arc<StFile>, Vec<(String, u64)>, usize, f32)>,
+    /// Inference-pool coordinator, when routed experts execute remotely.
+    ///
+    /// Set from `LOGAN_POOL_COORDINATOR` by [`Model::load`]. When present, the
+    /// local expert arrays are NOT populated: they cannot be, because the full
+    /// set is 483 GB as f32 against 31.9 GB of RAM on the anchor. The pool's
+    /// MXFP4 shards are the storage of record for experts in this mode.
+    pool: Option<crate::pool::PoolConfig>,
     /// .coli package for on-demand expert/ngram fetches (None in safetensors
     /// mode). ponytail: no cache yet — each fetch re-reads the record; add a
     /// per-layer FIFO when disk shows in profiles.
@@ -1176,10 +1706,57 @@ struct TokScratch {
 // math helpers (C-identical, same as qwen-rs)
 // ---------------------------------------------------------------------------
 
+/// NEON BF16 kernels entered, as evidence the aarch64 SIMD path executed.
+///
+/// The aarch64 counterpart of `logan_core::math_x86::bf16_calls`, for the same
+/// reason: a kernel can be correct and still reach no production path, and only
+/// a counter tells "wired" from "advertised". Also the assertion that factoring
+/// the row-chunking into [`matmul_bf16_simd`] left the NEON dispatch intact.
+#[cfg(target_arch = "aarch64")]
+static BF16_NEON_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`matmul_bf16_neon`] has been entered in this process.
+#[cfg(all(test, target_arch = "aarch64"))]
+fn bf16_neon_calls() -> u64 {
+    BF16_NEON_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many times the accelerated bf16 GEMV kernel has been entered.
+///
+/// One accessor over whichever counter this architecture has, so the wiring
+/// test is written once rather than duplicated per kernel.
+#[cfg(all(test, target_arch = "aarch64"))]
+fn bf16_simd_calls() -> u64 {
+    bf16_neon_calls()
+}
+
+/// See the aarch64 overload.
+#[cfg(all(test, target_arch = "x86_64"))]
+fn bf16_simd_calls() -> u64 {
+    logan_core::math_x86::bf16_calls()
+}
+
+/// Whether this host can run the accelerated bf16 kernel at all.
+///
+/// `false` means the scalar arm is not a wiring failure but a capability
+/// absence -- the distinction that lets the test skip rather than pass.
+#[cfg(all(test, target_arch = "aarch64"))]
+fn bf16_simd_available() -> bool {
+    true
+}
+
+/// AVX2 is not universal on x86_64, so this is a runtime probe.
+#[cfg(all(test, target_arch = "x86_64"))]
+fn bf16_simd_available() -> bool {
+    std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+}
+
 /// NEON BF16 dot: y[o] = x[.] · w[o,.], weights BF16 (u16<<16 = f32).
 /// 4-lane fma; fp-order differs from scalar (the gate decides).
 #[cfg(target_arch = "aarch64")]
 fn matmul_bf16_neon(y: &mut [f32], x: &[f32], w: &[u8], o: usize, i: usize) {
+    BF16_NEON_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use std::arch::aarch64::*;
     for oo in 0..o {
         let wr = &w[oo * i * 2..(oo + 1) * i * 2];
@@ -1210,9 +1787,51 @@ fn matmul_bf16_neon(y: &mut [f32], x: &[f32], w: &[u8], o: usize, i: usize) {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn matmul_bf16_neon(_y: &mut [f32], _x: &[f32], _w: &[u8], _o: usize, _i: usize) {
-    unreachable!();
+/// Row-chunked BF16 SIMD GEMV: run `kernel` over `y`'s rows, split across
+/// threads above the parallel threshold.
+///
+/// Both SIMD kernels take a row-major `[rows, i]` BF16 byte slice and write one
+/// f32 per row, so the split is shared between the NEON and AVX2 arms rather
+/// than restated per architecture. `QWEN_BF16_THREADS` caps the thread count,
+/// as it did before this was factored out.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matmul_bf16_simd(
+    y: &mut [f32],
+    bytes: &[u8],
+    x: &[f32],
+    o: usize,
+    i: usize,
+    parallel: bool,
+    kernel: impl Fn(&mut [f32], &[f32], &[u8], usize, usize) + Sync,
+) {
+    if !parallel {
+        kernel(y, x, bytes, o, i);
+        return;
+    }
+    std::thread::scope(|scope| {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let nthreads = std::env::var("QWEN_BF16_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(available)
+            .min(available)
+            .min(o.max(1));
+        let chunk = o.div_ceil(nthreads);
+        for (c, yslice) in y.chunks_mut(chunk).enumerate() {
+            let first_row = c * chunk;
+            let rows = yslice.len();
+            let byte_start = first_row * i * 2;
+            let byte_end = byte_start + rows * i * 2;
+            let wslice = &bytes[byte_start..byte_end];
+            let kernel = &kernel;
+            scope.spawn(move || {
+                kernel(yslice, x, wslice, rows, i);
+            });
+        }
+    });
 }
 
 fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize) {
@@ -1235,41 +1854,52 @@ fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize)
         .map(|v| v != "0")
         .unwrap_or(true);
 
-    #[cfg(target_arch = "aarch64")]
-    let neon = neon && o * i >= 1 << 18;
-    #[cfg(not(target_arch = "aarch64"))]
-    let neon = false;
+    // Size threshold: an 8-lane (AVX2) or 4-lane (NEON) kernel amortises its
+    // prologue only above ~256K MACs; below that the scalar loop wins. The same
+    // gate `logan_core::math::matmul` applies, so both engines select alike.
+    let big = o * i >= 1 << 18;
 
-    if neon {
-        if parallel {
-            std::thread::scope(|scope| {
-                let available = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let nthreads = std::env::var("QWEN_BF16_THREADS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(available)
-                    .min(available)
-                    .min(o.max(1));
-                let chunk = o.div_ceil(nthreads);
-                for (c, yslice) in y.chunks_mut(chunk).enumerate() {
-                    let first_row = c * chunk;
-                    let rows = yslice.len();
-                    let byte_start = first_row * i * 2;
-                    let byte_end = byte_start + rows * i * 2;
-                    let wslice = &bytes[byte_start..byte_end];
-                    scope.spawn(move || {
-                        matmul_bf16_neon(yslice, x, wslice, rows, i);
-                    });
-                }
-            });
-        } else {
-            matmul_bf16_neon(y, x, bytes, o, i);
-        }
+    #[cfg(target_arch = "aarch64")]
+    let simd = neon && big;
+    // AVX2 is not universal on x86_64 (the GPD's Atom x7 has SSE4.2 only), so
+    // the probe is runtime, never a compile-time assumption -- the same rule
+    // `logan_core::math_x86` states in its header.
+    #[cfg(target_arch = "x86_64")]
+    let simd = neon
+        && big
+        && std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma");
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let simd = {
+        // No SIMD bf16 kernel exists for this target; scalar only.
+        let _ = (neon, big);
+        false
+    };
+
+    // x86_64 runs `logan_core::math_x86::matmul_bf16_avx2` -- the kernel that
+    // crate already ships, verifies and measures -- under the very probe,
+    // opt-out and size gate `logan_core::math::matmul` uses. Reusing it instead
+    // of growing a second AVX2 kernel here is the point: the engine-neutral
+    // copy and this one cannot drift.
+    //
+    // Before this, an x86 host computed every BF16 GEMV on the scalar loop
+    // below while `MachineProfile` advertised `avx2` -- precisely the
+    // "plans for a capability that never executes" lie `math_x86` exists to
+    // end, one crate downstream of where it was fixed.
+    #[cfg(target_arch = "aarch64")]
+    if simd {
+        matmul_bf16_simd(y, bytes, x, o, i, parallel, matmul_bf16_neon);
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        matmul_bf16_simd(y, bytes, x, o, i, parallel, |y, x, w, o, i| unsafe {
+            // SAFETY: `simd` required the avx2 and fma runtime probes to pass.
+            logan_core::math_x86::matmul_bf16_avx2(y, x, w, o, i)
+        });
+        return;
+    }
+    let _ = simd;
 
     if parallel {
         std::thread::scope(|scope| {
@@ -5523,6 +6153,106 @@ impl Model {
         {
             eprintln!("[moe-fallback] layer={li} reason={fallback_reason}");
         }
+        // Pool mode: the routed experts for this layer execute on the
+        // inference-pool, and NOTHING expert-related stays resident here.
+        //
+        // This is what makes the anchor able to run at all. The full expert set
+        // is 512 experts x 48 layers x 3 matrices as f32 = 483 GB, against
+        // 31.9 GB of RAM on the anchor, so materializing them is not a tuning
+        // problem. Delegating the whole layer in one batch means the local side
+        // keeps only the dense backbone (attention, GDN state, routing, norms,
+        // PLE, lm_head) and the pool supplies the experts it already has as
+        // MXFP4 shards.
+        //
+        // One call per layer, matching `preload_expert_set`'s existing cadence:
+        // the pool protocol takes a list of (layer, expert, input) and answers
+        // in the same order, which is exactly the shape `moe_rows` already has.
+        let _fill_t_outer = logan_core::telemetry::Span::begin("fill");
+        if let Some(pcfg) = self.pool.clone() {
+            let mut calls: Vec<crate::pool::ExpertCall> = Vec::with_capacity(k);
+            for i in 0..k {
+                calls.push(crate::pool::ExpertCall {
+                    layer: li as u32,
+                    expert: idx[i] as u32,
+                    input: x.to_vec(),
+                });
+            }
+            match crate::pool::run_expert_batch(&pcfg, &calls, d, c.moe_inter, "silu") {
+                Ok(outs) if outs.len() == k => {
+                    for (i, o) in outs.iter().enumerate() {
+                        let w = val[i] / wsum;
+                        for dd in 0..d.min(o.len()) {
+                            acc[dd] += o[dd] * w;
+                        }
+                    }
+                    self.spans.fill_ms += _fill_t_outer.end();
+                    let (sy, gs) = if let Some(v) = shared_ready.take() {
+                        v
+                    } else {
+                        let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                        let v = self.shared_expert_value(layer, li, x);
+                        self.spans.shared_ms += _shared_t.end();
+                        v
+                    };
+                    for dd in 0..d {
+                        out[dd] = acc[dd] + sy[dd] * gs;
+                    }
+                    return;
+                }
+                Ok(outs) => {
+                    // A short answer would silently drop experts and change the
+                    // model's output, so it is a hard error rather than a
+                    // partial accumulation.
+                    panic!(
+                        "pool returned {} expert outputs for {k} routed experts on layer {li}; \
+                         refusing to compute a partial layer",
+                        outs.len()
+                    );
+                }
+                Err(e) => {
+                    // No local fallback exists in pool mode: the whole point is
+                    // that the expert arrays were never populated (483 GB does
+                    // not fit), so continuing to the local path would index into
+                    // an empty array and panic at a confusing line. A transport
+                    // blip is worth one retry, then it is a hard error with the
+                    // real reason attached.
+                    eprintln!("[pool] layer {li}: {e}; retrying once");
+                    match crate::pool::run_expert_batch(&pcfg, &calls, d, c.moe_inter, "silu") {
+                        Ok(outs) if outs.len() == k => {
+                            for (i, o) in outs.iter().enumerate() {
+                                let w = val[i] / wsum;
+                                for dd in 0..d.min(o.len()) {
+                                    acc[dd] += o[dd] * w;
+                                }
+                            }
+                            self.spans.fill_ms += _fill_t_outer.end();
+                            let (sy, gs) = if let Some(v) = shared_ready.take() {
+                                v
+                            } else {
+                                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                                let v = self.shared_expert_value(layer, li, x);
+                                self.spans.shared_ms += _shared_t.end();
+                                v
+                            };
+                            for dd in 0..d {
+                                out[dd] = acc[dd] + sy[dd] * gs;
+                            }
+                            return;
+                        }
+                        Ok(outs) => panic!(
+                            "pool returned {} expert outputs for {k} routed experts on layer {li} \
+                             (after retry); refusing to compute a partial layer",
+                            outs.len()
+                        ),
+                        Err(e2) => panic!(
+                            "pool expert batch failed twice on layer {li}: {e}; then {e2}. \
+                             There is no local fallback: this mode exists because the expert \
+                             weights do not fit on this host, so the layer cannot be computed."
+                        ),
+                    }
+                }
+            }
+        }
         let mut _fill_t = logan_core::telemetry::Span::begin("fill");
         for i in 0..k {
             let w = val[i] / wsum;
@@ -5690,6 +6420,33 @@ impl Model {
                 let scale = ngram_scale.unwrap();
                 for d in 0..hd_per {
                     emb[h * hd_per + d] = colisource::ColiSource::e4m3_decode(row_bytes[d]) * scale;
+                }
+            } else if let Some((st, shards, width, scale)) = &self.ple_shards {
+                // Sharded SSD table (the real checkpoint): map the global row to
+                // (shard, row-within-shard) and pread exactly one row.
+                //
+                // The table is ~52 GB against 31.9 GB of RAM, so it MUST stay on
+                // SSD: nothing here is cached, and one row costs one seek+read.
+                // `width` is the shard's own row width, which is `hd_per` on the
+                // real model; a mismatch means the geometry side-tables and the
+                // shard disagree, which is a hard error rather than a guess.
+                let mut remaining = r as u64;
+                let mut picked: Option<(&str, u64)> = None;
+                for (name, rows) in shards.iter() {
+                    if remaining < *rows {
+                        picked = Some((name.as_str(), remaining));
+                        break;
+                    }
+                    remaining -= rows;
+                }
+                let (name, within) = picked.unwrap_or_else(|| {
+                    panic!("ple ngram row {r} past the end of {} shards", shards.len())
+                });
+                let row = st
+                    .f8_range(name, within, *width)
+                    .unwrap_or_else(|e| panic!("ple ngram shard row fetch failed: {e}"));
+                for d in 0..hd_per.min(row.len()) {
+                    emb[h * hd_per + d] = row[d] * *scale;
                 }
             } else {
                 let row = &self.ple_ngram.f[r * hd_per..(r + 1) * hd_per];
@@ -7333,6 +8090,14 @@ fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
 
 impl Model {
     pub fn load(st: &StFile, cfg: &Cfg) -> Result<Model, String> {
+        // Experts come from the pool when it is configured. Reading them
+        // locally is not an option for this model (483 GB as f32), so the
+        // choice is "delegate" or "cannot run" -- not a preference.
+        let pool = crate::pool::PoolConfig::from_env();
+        // PLE metadata read from the checkpoint's own i64 side-tables, when it
+        // ships them (it does). The config-derived prime math diverges on the
+        // real model, so these override the derived values when present.
+        let mut ple_mult_cfg: Vec<u64> = Vec::new();
         let mut experts = Vec::new();
         let mut layers = Vec::new();
         for l in 0..cfg.layers {
@@ -7640,7 +8405,13 @@ impl Model {
                 )?,
             };
             let mut layer_experts = Vec::new();
+            // Pool mode: no local expert allocation at all. The layer's experts
+            // are fetched per routed batch in `moe_token_routed`, so building
+            // them here would be both impossible and pointless.
             for e in 0..cfg.experts {
+                if pool.is_some() {
+                    break;
+                }
                 let elp = format!("{lp}.mlp.experts.{e}");
                 let gu = st.f32(
                     &format!("{elp}.gate_up_proj"),
@@ -7687,23 +8458,100 @@ impl Model {
                 total += size;
             }
         }
-        let ple_embed: Wt = if cfg.ple_layer >= 0 && cfg.ngram_heads > 0 {
+        // PLE n-gram table. Two storage forms, and the choice is forced by
+        // size: the table is ~52 GB, so it stays on SSD and is pread per row.
+        //
+        //  * SHARDED (the real Qwen3.8-Flash-Next checkpoint): 128 F8 shards
+        //    under `layers.{ple_layer}.ple.ple_embedding.ngram_embedding`.
+        //    Never materialized — only the shard NAMES and geometry are held,
+        //    and `ple_forward` range-reads the row it needs.
+        //  * MONOLITHIC (tiny fixtures / dense exports): a single BF16 tensor,
+        //    small enough to be resident, guarded by `MAX_RESIDENT_PLE_NGRAM_BYTES`.
+        let shards = st.ngram_shards(cfg.ple_layer.max(0) as u32);
+        let (ple_shards, ple_embed): (
+            Option<(std::sync::Arc<StFile>, Vec<(String, u64)>, usize, f32)>,
+            Wt,
+        ) = if cfg.ple_layer >= 0 && !shards.is_empty() {
+            // True geometry comes from the checkpoint's own i64 side-tables;
+            // the config-derived prime math diverges on the real model.
+            let base = format!("layers.{}.ple.ple_embedding", cfg.ple_layer);
+            let sizes = st
+                .i64(
+                    &format!("model.language_model.{base}.ngram_heads_vocab_sizes"),
+                    &[cfg.ngram_heads as u64],
+                )
+                .unwrap_or(ple_sizes.clone());
+            let offsets = st
+                .i64(
+                    &format!("model.language_model.{base}.ngram_heads_offsets"),
+                    &[cfg.ngram_heads as u64],
+                )
+                .unwrap_or(ple_offsets.clone());
+            let mult = st
+                .i64(
+                    &format!("model.language_model.{base}.layer_multipliers"),
+                    // `ngram_size` entries, not `ngram_size - 1`: the row hash
+                    // mixes `j` over `0..ng` for every `ng` in `2..=ngram_size`,
+                    // so the largest index used is `ngram_size - 1` and the
+                    // table must hold `ngram_size` of them.
+                    &[cfg.ngram_size as u64],
+                )
+                .unwrap_or_default();
+            if !sizes.is_empty() {
+                ple_sizes = sizes;
+            }
+            if !offsets.is_empty() {
+                ple_offsets = offsets;
+            }
+            if !mult.is_empty() {
+                ple_mult_cfg = mult.into_iter().map(|m| m as u64).collect();
+            }
+            let scale = st
+                .f32(
+                    &format!("model.language_model.{base}.ngram_embedding.weight_scale"),
+                    &[1],
+                )
+                .ok()
+                .and_then(|v| v.first().copied())
+                .unwrap_or(1.0);
+            let first = &shards[0];
+            let width = first.3;
+            // (shard name, rows) per shard, so a global row maps to
+            // (shard, row-within-shard) by plain division.
+            let named: Vec<(String, u64)> =
+                shards.iter().map(|(_, n, r, _)| (n.clone(), *r)).collect();
+            (
+                Some((std::sync::Arc::new(st.clone()), named, width, scale)),
+                Wt {
+                    f: vec![],
+                    bytes: None,
+                    o: 0,
+                    i: width,
+                },
+            )
+        } else if cfg.ple_layer >= 0 && cfg.ngram_heads > 0 {
             let total: i64 = ple_sizes.iter().sum();
             let padded = (total + cfg.ngram_div - 1) / cfg.ngram_div * cfg.ngram_div;
             let hd_per = cfg.ple_embed_dim / cfg.ngram_heads;
-            load_wt(
-                st,
-                "model.ple.ple_embedding.ngram_embedding.weight",
-                padded as usize,
-                hd_per,
-            )?
+            (
+                None,
+                load_wt(
+                    st,
+                    "model.ple.ple_embedding.ngram_embedding.weight",
+                    padded as usize,
+                    hd_per,
+                )?,
+            )
         } else {
-            Wt {
-                f: vec![],
-                bytes: None,
-                o: 0,
-                i: 0,
-            }
+            (
+                None,
+                Wt {
+                    f: vec![],
+                    bytes: None,
+                    o: 0,
+                    i: 0,
+                },
+            )
         };
         let ple_key_proj = if cfg.ple_layer >= 0 {
             load_wt(
@@ -7759,9 +8607,10 @@ impl Model {
         } else {
             vec![]
         };
-        // ple_mult: odd multipliers from splitmix64
-        let mut ple_mult = Vec::new();
-        if cfg.ple_layer >= 0 && cfg.ngram_heads > 0 {
+        // ple_mult: the checkpoint's own i64 multipliers when it ships them
+        // (the real model does; they are not derivable), else splitmix64.
+        let mut ple_mult = ple_mult_cfg;
+        if ple_mult.is_empty() && cfg.ple_layer >= 0 && cfg.ngram_heads > 0 {
             let max_long = i64::MAX;
             let mult_max = max_long / (cfg.vocab.max(1) as i64);
             let half = (mult_max / 2).max(1);
@@ -7774,6 +8623,8 @@ impl Model {
 
         Ok(Model {
             cfg: cfg.clone(),
+            pool,
+            ple_shards,
             coli: None,
             gguf: None,
             gdn_v_tiled: false,
@@ -7923,8 +8774,17 @@ pub fn run_greedy(
     max_new: usize,
 ) -> Result<Vec<u32>, String> {
     let cfg = load_cfg(&package_dir.join("config.json"))?;
-    let model = if package_dir.join("model.safetensors").exists() {
-        let st = StFile::open(&package_dir.join("model.safetensors"))?;
+    // Three layouts, most specific first:
+    //   * a sharded safetensors checkpoint (index.json) -- open every shard
+    //   * a single-file safetensors fixture
+    //   * a compiled .coli package
+    // `open_dir` subsumes the single-file case (it falls back to
+    // model.safetensors when there is no index), so the sharded and
+    // single-file branches are one.
+    let model = if package_dir.join("model.safetensors.index.json").is_file()
+        || package_dir.join("model.safetensors").is_file()
+    {
+        let st = StFile::open_dir(package_dir)?;
         Model::load(&st, &cfg)?
     } else {
         let src = colisource::ColiSource::open(package_dir)?;
@@ -7975,8 +8835,9 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
 #[cfg(test)]
 mod tests {
     use super::{
-        causal_conv1d_sample, default_cache_cap_for_ram, load_cfg, quantize_bf16_to_mxfp4,
-        rmsnorm_row, rmsnorm_row_shifted, OutputGate, StFile, MAX_RESIDENT_PLE_NGRAM_BYTES,
+        causal_conv1d_sample, default_cache_cap_for_ram, is_ple_ngram_weight, load_cfg,
+        quantize_bf16_to_mxfp4, rmsnorm_row, rmsnorm_row_shifted, OutputGate, StFile,
+        MAX_RESIDENT_PLE_NGRAM_BYTES,
     };
 
     #[test]
@@ -8023,6 +8884,248 @@ mod tests {
             assert_eq!(cfg.gdn_layers[layer], (layer + 1) % 4 != 0, "layer {layer}");
             assert!(!cfg.qsa_layers[layer]);
         }
+    }
+
+    /// Build a tiny sharded safetensors checkpoint on disk.
+    ///
+    /// Returns the directory. `shards` is `(filename, [(name, dtype, shape, payload)])`.
+    #[cfg(test)]
+    fn write_sharded_checkpoint(
+        prefix: &str,
+        shards: &[(&str, Vec<(&str, &str, Vec<u64>, Vec<u8>)>)],
+    ) -> std::path::PathBuf {
+        let dir = logan_format::test_temp_path(prefix, "dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut weight_map = serde_json::Map::new();
+        for (file, tensors) in shards {
+            let mut header = serde_json::Map::new();
+            let mut payload = Vec::new();
+            for (name, dtype, shape, bytes) in tensors {
+                let begin = payload.len();
+                payload.extend_from_slice(bytes);
+                header.insert(
+                    (*name).to_string(),
+                    serde_json::json!({
+                        "dtype": *dtype,
+                        "shape": shape,
+                        "data_offsets": [begin, payload.len()],
+                    }),
+                );
+                weight_map.insert(
+                    (*name).to_string(),
+                    serde_json::Value::String((*file).to_string()),
+                );
+            }
+            let hb = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+            let mut out = (hb.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(&hb);
+            out.extend_from_slice(&payload);
+            std::fs::write(dir.join(file), out).unwrap();
+        }
+        let index = serde_json::json!({ "weight_map": weight_map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn bf16(v: f32) -> Vec<u8> {
+        // Truncate-to-bf16 round trip, the same widening the reader undoes.
+        ((v.to_bits() >> 16) as u16).to_le_bytes().to_vec()
+    }
+
+    fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
+        parts.iter().flatten().copied().collect()
+    }
+
+    #[test]
+    fn open_dir_spans_shards_and_resolves_the_hf_backbone_prefix() {
+        // Two shards, and the backbone named the way the real Flash-Next
+        // checkpoint names it (`model.language_model.*`). `Model::load` asks for
+        // `model.layers.*`, so the alias has to resolve to the same bytes.
+        // Two BF16 elements in shard 1, one in shard 2. Shapes must match the
+        // element count: the reader validates `len == elems x dtype_width`.
+        let a = concat(&[bf16(1.5), bf16(-0.5)]);
+        let b = bf16(-2.25);
+        let dir = write_sharded_checkpoint(
+            "logan-shard-alias",
+            &[
+                (
+                    "model-00001-of-00002.safetensors",
+                    vec![("model.language_model.embed_tokens.weight", "BF16", vec![2], a)],
+                ),
+                (
+                    "model-00002-of-00002.safetensors",
+                    vec![("model.language_model.layers.0.mlp.gate.weight", "BF16", vec![1], b)],
+                ),
+            ],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+
+        assert_eq!(st.shard_count(), 2, "both shards must be opened");
+        assert_eq!(st.dtype_counts().get("BF16"), Some(&2));
+
+        // The second tensor lives in the SECOND shard: proving the per-tensor
+        // shard index is real, not "everything is in file 0".
+        let via_hf = st.f32("model.language_model.layers.0.mlp.gate.weight", &[1]).unwrap();
+        let via_engine = st.f32("model.layers.0.mlp.gate.weight", &[1]).unwrap();
+        assert_eq!(via_hf, vec![-2.25]);
+        assert_eq!(via_hf, via_engine, "alias must resolve to identical bytes");
+
+        let emb = st.f32("model.embed_tokens.weight", &[2]).unwrap();
+        assert_eq!(emb, vec![1.5, -0.5]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn f32_refuses_integer_side_tables_instead_of_rounding_them() {
+        // The real `layer_multipliers` is ~2.4e13. f32 spacing there is
+        // 2_097_152, so widening would return a *different integer*, and these
+        // values feed `wrapping_mul` and index arithmetic.
+        let big: u64 = 23_703_572_000_000;
+        let dir = write_sharded_checkpoint(
+            "logan-i64-lossless",
+            &[(
+                "model-00001-of-00001.safetensors",
+                vec![(
+                    "model.ple.ple_embedding.layer_multipliers",
+                    "I64",
+                    vec![1],
+                    big.to_le_bytes().to_vec(),
+                )],
+            )],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+
+        let err = st
+            .f32("model.ple.ple_embedding.layer_multipliers", &[1])
+            .expect_err("f32 must refuse an i64 side-table");
+        assert!(err.contains("i64"), "error should point at StFile::i64: {err}");
+
+        assert_eq!(
+            st.i64("model.ple.ple_embedding.layer_multipliers", &[1]).unwrap(),
+            vec![big as i64],
+            "i64 must be lossless"
+        );
+
+        // The loss the refusal prevents, asserted rather than asserted-about.
+        assert_ne!(big as f32 as u64, big, "f32 would have changed the value");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn f32_scaled_applies_block_scales_and_derives_the_geometry() {
+        // A 4x4 F8_E4M3 weight with a 2x2 scale grid, so each block is 2x2.
+        // Every byte decodes to 1.0 in E4M3 (0x38 is 1.0), which makes the
+        // expected result exactly the scale table.
+        let weight: Vec<u8> = vec![0x38; 16];
+        let scales: Vec<u8> = concat(&[
+            bf16(1.0), bf16(2.0), // block row 0
+            bf16(3.0), bf16(4.0), // block row 1
+        ]);
+        let dir = write_sharded_checkpoint(
+            "logan-block-scale",
+            &[(
+                "model-00001-of-00001.safetensors",
+                vec![
+                    ("w.weight", "F8_E4M3", vec![4, 4], weight),
+                    ("w.weight_scale_inv", "BF16", vec![2, 2], scales),
+                ],
+            )],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+
+        let out = st.f32_scaled("w.weight", "w.weight_scale_inv", &[4, 4]).unwrap();
+        assert_eq!(out.len(), 16);
+        assert_eq!(
+            out,
+            vec![
+                1.0, 1.0, 2.0, 2.0, // row 0 -> block row 0
+                1.0, 1.0, 2.0, 2.0, // row 1 -> block row 0
+                3.0, 3.0, 4.0, 4.0, // row 2 -> block row 1
+                3.0, 3.0, 4.0, 4.0, // row 3 -> block row 1
+            ]
+        );
+
+        // A scale grid that does not tile the weight is an error, never a
+        // guessed geometry: a mismatched scale makes every value silently wrong.
+        let bad = write_sharded_checkpoint(
+            "logan-block-scale-bad",
+            &[(
+                "model-00001-of-00001.safetensors",
+                vec![
+                    ("w.weight", "F8_E4M3", vec![4, 4], vec![0x38; 16]),
+                    ("w.weight_scale_inv", "BF16", vec![3, 3], vec![0; 18]),
+                ],
+            )],
+        );
+        let stb = StFile::open_dir(&bad).unwrap();
+        let err = stb
+            .f32_scaled("w.weight", "w.weight_scale_inv", &[4, 4])
+            .expect_err("a non-tiling scale grid must be refused");
+        assert!(err.contains("does not tile"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(bad);
+    }
+
+    #[test]
+    fn sharded_ple_ngram_tensors_are_refused_by_the_residency_guard() {
+        // The real checkpoint stores the n-gram table as
+        // `...ngram_embedding.shard_{N}.weight` (128 shards, ~400 MB each).
+        // Matching only the monolithic spelling silently missed every shard,
+        // which is the exact case this guard exists for.
+        assert!(is_ple_ngram_weight(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+        ));
+        assert!(is_ple_ngram_weight(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"
+        ));
+        // The monolithic spelling still matches.
+        assert!(is_ple_ngram_weight("model.ple.ple_embedding.ngram_embedding.weight"));
+        // And things that merely share the prefix must NOT match.
+        assert!(!is_ple_ngram_weight(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
+        ));
+        assert!(!is_ple_ngram_weight(
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_x.weight"
+        ));
+        assert!(!is_ple_ngram_weight("model.layers.0.mlp.experts.0.gate_proj.weight"));
+    }
+
+    #[test]
+    fn oversized_sharded_ngram_payload_is_refused_without_reading_it() {
+        use std::io::Write as _;
+
+        // The guard must fire on the SHARDED name and must not read the bytes.
+        let name =
+            "model.ple.ple_embedding.ngram_embedding.shard_3.weight";
+        let payload_len = MAX_RESIDENT_PLE_NGRAM_BYTES + 4;
+        let elems = payload_len as u64; // F8: one byte per element
+        let header = serde_json::to_vec(&serde_json::json!({
+            name: { "dtype": "F8_E4M3", "shape": [elems], "data_offsets": [0, payload_len] }
+        }))
+        .unwrap();
+        let path = logan_format::test_temp_path("logan-ngram-shard-residency", "safetensors");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        // Sparse: the payload is declared but never written, so a reader that
+        // materializes it would fail on EOF rather than silently succeed.
+        file.set_len(8 + header.len() as u64 + payload_len as u64)
+            .unwrap();
+        drop(file);
+
+        let st = StFile::open(&path).unwrap();
+        let err = st
+            .f32(name, &[elems])
+            .expect_err("an oversized n-gram shard must be refused");
+        assert!(err.contains("refusing to materialize"), "got: {err}");
+        assert!(err.contains("file-backed"), "got: {err}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -8398,6 +9501,275 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // AVX2 BF16 wiring
+    // -----------------------------------------------------------------
+
+    /// Pseudo-random f32 in ~[-1, 1), as an xorshift stream.
+    ///
+    /// NOT a coarse grid: a grid like `(k % 37)` is exactly representable in
+    /// bf16 and the products then cancel to the bit, which makes a
+    /// reassociation comparison pass vacuously (max_abs == 0). Real weights are
+    /// not like that, so the parity evidence would not be about real data.
+    fn rng_vec(n: usize, mut seed: u64) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                let u = seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                ((u >> 32) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+            })
+            .collect()
+    }
+
+    /// A `Wt` holding canonical BF16 bytes, as `coliload` builds them.
+    fn bf16_wt(o: usize, i: usize) -> super::Wt {
+        let vals = rng_vec(o * i, 0x51ED_2A3Bu64 ^ (o as u64) << 32 ^ i as u64);
+        let weights: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| crate::colisource::bf16_bytes(v))
+            .collect();
+        super::Wt {
+            f: Vec::new(),
+            bytes: Some(super::WtBytes::Bf16 {
+                weights,
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
+            o,
+            i,
+        }
+    }
+
+    /// The scalar bf16 reference: the exact loop `matmul_bf16_bytes` runs when
+    /// no SIMD path is selected. This is the oracle the wired path must match.
+    fn scalar_bf16(w: &super::Wt, x: &[f32]) -> Vec<f32> {
+        let Some(super::WtBytes::Bf16 { weights, .. }) = &w.bytes else {
+            panic!("expected a Bf16 weight");
+        };
+        (0..w.o)
+            .map(|oo| {
+                let mut acc = 0.0f32;
+                for ii in 0..w.i {
+                    let off = (oo * w.i + ii) * 2;
+                    let u = u16::from_le_bytes([weights[off], weights[off + 1]]);
+                    acc += x[ii] * f32::from_bits((u as u32) << 16);
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// Max absolute and max relative deviation from `want`.
+    ///
+    /// Relative is against the magnitude of the *result set*, not elementwise:
+    /// these dot products sum thousands of O(1) terms with cancelling signs, so
+    /// a near-zero row divided by itself is pure noise. Same rationale as
+    /// `logan_core::math`'s `assert_close`.
+    fn deviation(got: &[f32], want: &[f32]) -> (f32, f32) {
+        let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+        let max_abs = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        (max_abs, max_abs / scale)
+    }
+
+    /// **The guard against dead code**: `matmul` must actually REACH the
+    /// accelerated bf16 kernel on a shape that should select it.
+    ///
+    /// This is the test whose absence let a verified, 3x-faster kernel sit
+    /// unreachable for a whole release: correctness tests pass whether or not
+    /// the kernel runs, so only an execution counter distinguishes "wired" from
+    /// "advertised". It asserts on the AVX2 kernel's counter on x86_64 and the
+    /// NEON kernel's on aarch64 -- the same shape on both, via
+    /// [`bf16_simd_calls`].
+    ///
+    /// It also pins the two conditions that must SURVIVE the wiring: the
+    /// `QWEN_NEON_BF16=0` opt-out still bypasses the kernel (bit-exactly), and
+    /// the `o * i >= 1 << 18` size gate still keeps small matmuls scalar.
+    ///
+    /// Runs in a child process per arm -- the established convention here --
+    /// so the environment each arm sets cannot leak into a sibling test under
+    /// the parallel harness.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn matmul_reaches_the_simd_bf16_kernel() {
+        const CHILD: &str = "LOGAN_BF16_WIRING_CHILD";
+
+        // Below the gate: 131072 MACs < 1 << 18. Must stay scalar.
+        let (os, is) = (256usize, 512usize);
+
+        if std::env::var(CHILD).is_ok() {
+            if !super::bf16_simd_available() {
+                // Skip rather than pass: reporting success for a kernel that
+                // never ran is exactly the failure this test prevents.
+                println!("arm: SKIP no accelerated bf16 kernel on this CPU");
+                return;
+            }
+
+            match std::env::var("LOGAN_BF16_EXPECT").as_deref() {
+                Ok("simd") => {
+                    // THE guard. Above the gate, with the kernel available and
+                    // QWEN_NEON_BF16 not disabling it, it must run -- and the
+                    // result must be the scalar oracle's to f32 reassociation
+                    // tolerance.
+                    //
+                    // Above-gate shapes in both orientations: a GEMV is
+                    // row-major over `w[o, i]`, so the transposed shape puts the
+                    // long axis on the inner loop instead of the row count and
+                    // exercises a different share of prologue per MAC.
+                    //
+                    // The third shape is above the 16M parallel threshold, so it
+                    // exercises `matmul_bf16_simd`'s row-chunking -- a dropped or
+                    // duplicated chunk is the failure that would hide there.
+                    for (o, i) in [(640usize, 2560usize), (2560, 640), (4096, 4096)] {
+                        assert!(o * i >= 1 << 18, "{o}x{i} is below the gate");
+                        let w = bf16_wt(o, i);
+                        let x = rng_vec(i, 0x0BAD_F00D_1234_5678 ^ i as u64);
+                        let want = scalar_bf16(&w, &x);
+
+                        let threads = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4);
+                        let before = super::bf16_simd_calls();
+                        let mut got = vec![0.0f32; o];
+                        super::matmul(&mut got, &x, &w);
+                        let calls = super::bf16_simd_calls() - before;
+
+                        assert!(
+                            calls > 0,
+                            "the SIMD bf16 kernel is unreachable: {o}x{i} should have \
+                             selected it, so `matmul_bf16_bytes` never reaches it"
+                        );
+                        // One entry below the parallel gate, one per worker
+                        // above it. Never more than the workers: an extra entry
+                        // would mean the row split ran twice.
+                        let max_calls: u64 =
+                            if o * i >= 16_000_000 { threads as u64 } else { 1 };
+                        assert!(
+                            calls <= max_calls,
+                            "{o}x{i} ({} MACs): {calls} kernel entries for at most \
+                             {max_calls} row chunks -- the split must partition the \
+                             rows exactly once",
+                            o * i
+                        );
+
+                        let (max_abs, max_rel) = deviation(&got, &want);
+                        assert!(
+                            max_rel < 1e-5,
+                            "bf16 matmul diverges from the scalar oracle at {o}x{i}: \
+                             max_abs={max_abs:e} max_rel={max_rel:e} (a dropped or \
+                             duplicated row chunk shows up here, as does a kernel bug)"
+                        );
+                        assert!(got.iter().all(|v| v.is_finite()));
+                        println!(
+                            "simd arm: o={o} i={i} calls={calls}/{max_calls} \
+                             max_abs={max_abs:e} max_rel={max_rel:e}"
+                        );
+                    }
+                }
+                Ok("optout") => {
+                    let (o, i) = (640usize, 2560usize);
+                    let w = bf16_wt(o, i);
+                    let x = rng_vec(i, 0x0BAD_F00D_1234_5678);
+                    let want = scalar_bf16(&w, &x);
+
+                    let before = super::bf16_simd_calls();
+                    let mut got = vec![0.0f32; o];
+                    super::matmul(&mut got, &x, &w);
+                    let calls = super::bf16_simd_calls() - before;
+
+                    assert_eq!(
+                        calls, 0,
+                        "QWEN_NEON_BF16=0 must bypass the SIMD kernel, not just \
+                         reassociate around it"
+                    );
+                    // The opt-out is the byte-identity escape hatch, so it must
+                    // reproduce the scalar loop exactly, not to tolerance.
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "QWEN_NEON_BF16=0 must be bit-identical to scalar"
+                    );
+                    println!("optout arm: o={o} i={i} calls={calls} (bit-identical)");
+                }
+                Ok("small") => {
+                    let ws = bf16_wt(os, is);
+                    let xs = rng_vec(is, 0xFEED_FACE_CAFE_BEEF);
+                    let before_small = super::bf16_simd_calls();
+                    let mut got_small = vec![0.0f32; os];
+                    super::matmul(&mut got_small, &xs, &ws);
+                    let small_calls = super::bf16_simd_calls() - before_small;
+                    assert_eq!(
+                        small_calls, 0,
+                        "{os}x{is} is {} MACs, below the 1<<18 gate: the SIMD prologue \
+                         does not amortise there and the scalar loop must win",
+                        os * is
+                    );
+                    let want_small = scalar_bf16(&ws, &xs);
+                    let (a, r) = deviation(&got_small, &want_small);
+                    assert!(r < 1e-5, "small-shape scalar path: max_abs={a:e} max_rel={r:e}");
+                    println!(
+                        "small arm: o={os} i={is} calls={small_calls} max_abs={a:e} \
+                         max_rel={r:e}"
+                    );
+                }
+                other => panic!("unknown LOGAN_BF16_EXPECT={other:?}"),
+            }
+            return;
+        }
+
+        for (label, neon_bf16) in [("simd", Some("1")), ("optout", Some("0"))] {
+            let exe = std::env::current_exe().expect("test binary path");
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([
+                "--exact",
+                "tests::matmul_reaches_the_simd_bf16_kernel",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("LOGAN_BF16_EXPECT", label)
+            .env("QWEN_NEON_BF16", neon_bf16.unwrap());
+            let out = cmd.output().expect("spawn child test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "{label} child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                stdout.contains("arm:"),
+                "{label} child did not take its arm:\n{stdout}"
+            );
+            print!("[{label}] {stdout}");
+        }
+
+        // The below-gate arm uses the default environment (no opt-out), so it
+        // is the one that proves the size gate alone keeps the kernel out.
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::matmul_reaches_the_simd_bf16_kernel",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("LOGAN_BF16_EXPECT", "small")
+            .env_remove("QWEN_NEON_BF16")
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "small child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("arm:"), "small child took no arm:\n{stdout}");
+        print!("[small] {stdout}");
+    }
+
+    // -----------------------------------------------------------------
     // Benchmark (manual, not run by default)
     // -----------------------------------------------------------------
 
@@ -8641,6 +10013,176 @@ mod tests {
                 "        -> vs cpu: cuda-alt {:.2}x   cuda-warm {:.2}x   (wbytes={wbytes}, moved={moved})",
                 cpu / alt,
                 cpu / warm,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // AVX2 BF16 benchmark (manual, not run by default)
+    // -----------------------------------------------------------------
+
+    /// Shapes the bf16 benchmark reports.
+    ///
+    /// 640x2560 and 2560x640 are the expert gate/up and the transposed
+    /// projection: the second exercises `i` as the large axis, where the AVX2
+    /// inner loop runs long and the row count is large enough that the
+    /// per-row prologue is a smaller share. 256x512 is *below* the 1<<18 gate
+    /// and must therefore show ratio ~= 1.0 -- including it is what shows the
+    /// speedup is the kernel and not measurement noise.
+    const BF16_BENCH_SHAPES: [(usize, usize); 3] = [(640, 2560), (2560, 640), (256, 512)];
+
+    /// **Manual benchmark**: the wired bf16 SIMD path against the scalar arm,
+    /// on the REAL private `matmul`/`matmul_bf16_bytes` path.
+    ///
+    /// Both arms run through `super::matmul` on a `WtBytes::Bf16` weight, so the
+    /// numbers describe the engine's GEMV, not a synthetic harness around the
+    /// kernel. The only difference between arms is `QWEN_NEON_BF16`, which is
+    /// the opt-out this codebase already uses to select the scalar path.
+    ///
+    /// The kernel is AVX2 on x86_64 and NEON on aarch64; the arms are labelled
+    /// `simd`/`scalar` rather than by kernel so the same run works on both.
+    ///
+    /// `#[ignore]`d: it asserts no timing. Correctness is owned by
+    /// `matmul_reaches_the_simd_bf16_kernel` (reachability plus tolerance), not
+    /// by this. The ratio is reported alongside the raw ms because this runs on
+    /// a shared machine, where absolute times drift but the within-process
+    /// ratio is comparable across sessions. Per-arm `calls_per_op` is printed
+    /// so a ratio measured with both arms on one code path cannot be mistaken
+    /// for a speedup; it is also asserted.
+    ///
+    /// Run with:
+    ///
+    /// ```text
+    /// cargo test --release --no-default-features -p logan-qwen4 --lib \
+    ///     -- --ignored --nocapture bf16_bench
+    /// ```
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "manual benchmark: prints timings, asserts none"]
+    fn bf16_bench_simd_vs_scalar() {
+        const ARM: &str = "LOGAN_BF16_BENCH_ARM";
+
+        if let Ok(arm) = std::env::var(ARM) {
+            let idx: usize = std::env::var("LOGAN_BF16_BENCH_SHAPE")
+                .expect("parent sets LOGAN_BF16_BENCH_SHAPE")
+                .parse()
+                .expect("shape index");
+            let (o, i) = BF16_BENCH_SHAPES[idx];
+            let w = bf16_wt(o, i);
+            let x = rng_vec(i, 0xC0FF_EE00_1234_5678);
+            let mut y = vec![0.0f32; o];
+
+            // Enough repetitions that a scheduling hiccup on a shared box is
+            // visible as a spread rather than baked into the number.
+            const REPS: usize = 7;
+            let (warm, iters) = if o * i > 3_000_000 { (3, 5) } else { (5, 30) };
+
+            // Assert the arm is the one we think it is, or the timings are
+            // unlabelled: "simd" must have moved the counter, "scalar" must not.
+            let before = super::bf16_simd_calls();
+            let mut best = f64::INFINITY;
+            let mut all = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let ms = bench_matmul(&w, &x, &mut y, warm, iters);
+                all.push(ms);
+                best = best.min(ms);
+            }
+            let calls = super::bf16_simd_calls() - before;
+
+            println!(
+                "BENCH arm={arm} o={o} i={i} best_ms={best:.6} median_ms={:.6} \
+                 calls_per_op={:.1} sum={:.6}",
+                {
+                    let mut s = all.clone();
+                    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    s[s.len() / 2]
+                },
+                calls as f64 / (REPS * (warm + iters)) as f64,
+                checksum(&y)
+            );
+            return;
+        }
+
+        if !super::bf16_simd_available() {
+            eprintln!("skipping: no accelerated bf16 kernel on this CPU");
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test binary path");
+        for (idx, (o, i)) in BF16_BENCH_SHAPES.iter().copied().enumerate() {
+            let mut arms: Vec<(String, f64, String)> = Vec::new();
+            // The scalar arm sets the opt-out the codebase already defines for
+            // "do not take the SIMD bf16 path"; it is not a benchmark-only knob.
+            for (arm, neon) in [("simd", "1"), ("scalar", "0")] {
+                let out = std::process::Command::new(&exe)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "tests::bf16_bench_simd_vs_scalar",
+                        "--nocapture",
+                    ])
+                    .env(ARM, arm)
+                    .env("LOGAN_BF16_BENCH_SHAPE", idx.to_string())
+                    .env("QWEN_NEON_BF16", neon)
+                    .output()
+                    .expect("spawn benchmark child");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let line = stdout
+                    .lines()
+                    .find(|l| l.starts_with("BENCH "))
+                    .unwrap_or_else(|| {
+                        panic!("arm={arm} o={o} i={i} produced no BENCH line:\n{stdout}")
+                    })
+                    .to_string();
+                print!("{line}\n");
+                arms.push((
+                    arm.to_string(),
+                    field(&line, "best_ms").parse().unwrap(),
+                    line,
+                ));
+            }
+
+            // The two arms must agree, or the ratio describes a fast but wrong
+            // kernel. Same cross-check the CUDA benchmark does.
+            let sums: Vec<f64> = arms
+                .iter()
+                .map(|a| field(&a.2, "sum").parse().unwrap())
+                .collect();
+            let scale = sums.iter().map(|v| v.abs()).fold(0.0f64, f64::max).max(1e-30);
+            let rel = (sums[0] - sums[1]).abs() / scale;
+            assert!(
+                rel < 1e-5,
+                "o={o} i={i}: arms disagree (sums {sums:?}), these timings are meaningless"
+            );
+
+            // The SIMD arm must have entered the kernel and the scalar arm must
+            // not -- a ratio measured with both arms on the same code path would
+            // be pure noise presented as a result.
+            let simd_calls: f64 = field(&arms[0].2, "calls_per_op").parse().unwrap();
+            let scalar_calls: f64 = field(&arms[1].2, "calls_per_op").parse().unwrap();
+            if o * i >= 1 << 18 {
+                assert!(
+                    simd_calls > 0.0,
+                    "o={o} i={i}: the simd arm never entered the kernel"
+                );
+            } else {
+                assert_eq!(
+                    simd_calls, 0.0,
+                    "o={o} i={i} is below the gate; it must not enter the kernel"
+                );
+            }
+            assert_eq!(
+                scalar_calls, 0.0,
+                "o={o} i={i}: the scalar arm must not enter the kernel"
+            );
+
+            let ratio = arms[1].1 / arms[0].1;
+            println!(
+                "        -> o={o} i={i}: scalar {:.4} ms / simd {:.4} ms = {ratio:.2}x  \
+                 (gate {})",
+                arms[1].1,
+                arms[0].1,
+                if o * i >= 1 << 18 { "SIMD" } else { "scalar" },
             );
         }
     }

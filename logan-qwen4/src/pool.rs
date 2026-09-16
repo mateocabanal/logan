@@ -174,7 +174,18 @@ mod json {
     /// `{"state":"complete","result":{"output":[…]},"items":N}` for a batch.
     /// `items` carries the count, which is what lets a caller check that every
     /// expert came back before scattering results into a layer.
-    pub fn outputs(body: &str) -> Result<Vec<Vec<f32>>, String> {
+    /// Parse `result.output` into one vector per item.
+    ///
+    /// `row_width` is the output width of ONE item (`d_model`). It is needed
+    /// because the coordinator answers a batch with a FLAT
+    /// `[items x row_width]` array — 10 items of 2560 comes back as 25600
+    /// numbers with no structure marking the boundaries. Without the width the
+    /// only honest reading of a flat array is "one very long vector", which is
+    /// how a 10-expert layer silently became a 1-expert one.
+    ///
+    /// Bodies that ARE nested (a single-expert job, or a future coordinator that
+    /// nests) are returned as-is, with the width used only to validate.
+    pub fn outputs_with_width(body: &str, row_width: usize) -> Result<Vec<Vec<f32>>, String> {
         // Batch jobs answer with `result.output` as a flat [items × d_model]
         // list; a single-expert job nests one level differently. Handle the
         // flat form, which is what this client requests.
@@ -209,12 +220,77 @@ mod json {
         if inner.trim().is_empty() {
             return Err("empty output".into());
         }
-        // A flat vector of numbers (single expert) or a list of vectors.
+        // A list of vectors (nested) ...
         if inner.trim_start().starts_with('[') {
-            parse_float_arrays(inner)
-        } else {
-            Ok(vec![parse_floats(inner)?])
+            return parse_float_arrays(inner);
         }
+        // ... or a flat run of numbers, which must be chunked by item width.
+        let flat = parse_floats(inner)?;
+        // An empty output is "no experts ran", which must never look like a
+        // successful layer: a caller accumulating this would compute with the
+        // experts silently missing.
+        if flat.is_empty() {
+            return Err("empty output".into());
+        }
+        if row_width == 0 {
+            return Err("flat output needs a nonzero row width to split".into());
+        }
+        if flat.len() % row_width != 0 {
+            return Err(format!(
+                "flat output of {} is not a whole number of {row_width}-wide items",
+                flat.len()
+            ));
+        }
+        Ok(flat.chunks(row_width).map(|c| c.to_vec()).collect())
+    }
+
+    /// Back-compat wrapper for a caller that has no item width.
+    ///
+    /// Only useful for a NESTED body or a genuine single-item flat body; a flat
+    /// multi-item body is indistinguishable from one long vector without a
+    /// width, so callers handling batches must use
+    /// [`outputs_with_width`]. Kept so a probe or test can parse a reply
+    /// without knowing the model's width.
+    pub fn outputs(body: &str) -> Result<Vec<Vec<f32>>, String> {
+        // A flat multi-item body cannot be split here; the width is unknown by
+        // construction. Nested bodies are unambiguous, so parse those, and for a
+        // flat body return it as ONE vector (the historical single-expert shape)
+        // after the same validation the width-aware path applies.
+        //
+        // Truncation must still be detected: an unterminated array is an error
+        // rather than a short read that looks successful.
+        let start = body.find("\"output\"").ok_or("no output key")?;
+        let rest = &body[start..];
+        let open = rest.find('[').ok_or("no output array")?;
+        let bytes = rest.as_bytes();
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.ok_or("unterminated output array")?;
+        let inner = &rest[open + 1..end];
+        if inner.trim().is_empty() {
+            return Err("empty output".into());
+        }
+        if inner.trim_start().starts_with('[') {
+            return parse_float_arrays(inner);
+        }
+        let v = parse_floats(inner)?;
+        if v.is_empty() {
+            return Err("empty output".into());
+        }
+        Ok(vec![v])
     }
 
     fn parse_floats(s: &str) -> Result<Vec<f32>, String> {
@@ -372,7 +448,9 @@ pub fn run_expert_batch(
         }
         let state = request(cfg, "GET", &format!("/v1/jobs/{job_id}"), "")?;
         if state.contains("\"complete\"") {
-            return json::outputs(&state);
+            // A batch answers flat, so the item width is required to split it.
+            // `d_model` is the output width of one expert evaluation.
+            return json::outputs_with_width(&state, d_model);
         }
         if state.contains("\"failed\"") {
             return Err(format!("job {job_id} failed: {}", truncate(&state)));
@@ -443,6 +521,41 @@ mod tests {
         assert!(json::outputs(r#"{"state":"pending"}"#).is_err());
         assert!(json::outputs(r#"{"result":{"output":[]}}"#).is_err());
         assert!(json::outputs(r#"{"result":{"output":[[1.0]"#).is_err());
+    }
+
+    #[test]
+    fn splits_a_flat_batch_reply_by_item_width() {
+        // Captured from a live 10-item batch: the coordinator returns a FLAT
+        // `items x d_model` run with nothing marking item boundaries. Reading
+        // that as one vector is how a 10-expert layer silently became 1 expert
+        // and the layer computed with 9 experts missing.
+        let mut nums = Vec::new();
+        for item in 0..10 {
+            for col in 0..4 {
+                nums.push(format!("{}", item as f32 + col as f32 / 10.0));
+            }
+        }
+        let body = format!(
+            r#"{{"items":10,"state":"complete","result":{{"output":[{}]}}}}"#,
+            nums.join(",")
+        );
+        let out = json::outputs_with_width(&body, 4).unwrap();
+        assert_eq!(out.len(), 10, "one vector per item");
+        assert!(out.iter().all(|v| v.len() == 4));
+        assert_eq!(out[0], vec![0.0, 0.1, 0.2, 0.3]);
+        assert_eq!(out[9], vec![9.0, 9.1, 9.2, 9.3]);
+
+        // A run that is not a whole number of items is an error, never a
+        // silently truncated or padded layer.
+        let ragged = r#"{"state":"complete","result":{"output":[1.0,2.0,3.0]}}"#;
+        assert!(json::outputs_with_width(ragged, 2).is_err());
+
+        // Nested replies still parse, and the width only validates them.
+        let nested = r#"{"state":"complete","result":{"output":[[1.0,2.0],[3.0,4.0]]}}"#;
+        assert_eq!(
+            json::outputs_with_width(nested, 2).unwrap(),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]]
+        );
     }
 
     #[test]
