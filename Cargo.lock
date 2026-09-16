@@ -1008,6 +1008,7 @@ dependencies = [
  "logan-core",
  "logan-format",
  "logan-metal",
+ "parking_lot",
  "serde_json",
  "sha2",
 ]

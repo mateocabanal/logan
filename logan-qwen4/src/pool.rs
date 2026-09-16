@@ -101,6 +101,71 @@ pub struct ExpertCall {
 /// local kernel, and the reason only needs to reach the log.
 pub type PoolError = String;
 
+/// Where a layer's routed experts get evaluated.
+///
+/// The engine computes routing and then needs one thing: given a list of
+/// `(layer, expert, activation)`, return the experts' output vectors in the same
+/// order. That is a transport-independent contract, and stating it as a trait is
+/// what keeps the engine from owning a socket.
+///
+/// Why this exists: `pool::run_expert_batch` hard-wires the inference-pool
+/// coordinator into the engine, which is the one place the project boundary says
+/// Logan must not go (Logan owns kernels, residency and local scheduling; the
+/// pool owns networking and placement). The engine's three dispatch sites call
+/// through this trait instead, so the HTTP client is one implementation rather
+/// than the only possibility -- an embedder can drive the pool itself and pass
+/// its own source in, and the engine is unchanged.
+///
+/// `&mut self` because an implementation is expected to hold connection state
+/// (the HTTP client keeps a keep-alive socket pool, which is worth 2x on fill
+/// time per the comments in `pool.rs`), and `Send` so an embedder can move it
+/// behind a lock or a channel.
+pub trait ExpertSource: Send {
+    /// Evaluate each call and return outputs positionally aligned with `calls`.
+    ///
+    /// Must return exactly `calls.len()` vectors, each `d_model` long: the
+    /// caller scatters them by route weight into the layer's residual, so a
+    /// short or misordered reply silently corrupts the layer rather than
+    /// failing. The HTTP implementation already panics on a wrong count for
+    /// this reason; the contract is stated here so every implementation inherits
+    /// the obligation, and callers still check.
+    fn eval(
+        &mut self,
+        calls: &[ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+        activation: &str,
+    ) -> Result<Vec<Vec<f32>>, PoolError>;
+}
+
+/// [`ExpertSource`] backed by the inference-pool coordinator over HTTP.
+///
+/// Kept in this crate so existing users (`run_greedy`, the probe binaries, the
+/// `LOGAN_POOL_COORDINATOR` env path) keep working unchanged, while an embedder
+/// that wants to own placement can supply a different source.
+pub struct HttpPoolSource {
+    cfg: PoolConfig,
+}
+
+impl HttpPoolSource {
+    pub fn new(cfg: PoolConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl ExpertSource for HttpPoolSource {
+    fn eval(
+        &mut self,
+        calls: &[ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+        activation: &str,
+    ) -> Result<Vec<Vec<f32>>, PoolError> {
+        run_expert_batch(&self.cfg, calls, d_model, d_hidden, activation)
+    }
+}
+
+
 /// POST a body to `path` on the coordinator and return the response body.
 ///
 /// Deliberately a hand-rolled HTTP/1.1 client: this crate takes no HTTP
@@ -733,5 +798,67 @@ mod tests {
         let body = encode_batch_request(&[], "f", None, 8, 8, "silu");
         assert!(body.contains("\"items\":[]"));
         assert!(body.contains("\"source_hash\":\"\""));
+    }
+
+    /// Records what it was asked for and answers with a value derived from the
+    /// call, so a misordered or duplicated batch is detectable downstream.
+    struct Recording {
+        seen: std::sync::Arc<parking_lot::Mutex<Vec<(u32, u32)>>>,
+    }
+
+    impl ExpertSource for Recording {
+        fn eval(
+            &mut self,
+            calls: &[ExpertCall],
+            d_model: usize,
+            _d_hidden: usize,
+            _activation: &str,
+        ) -> Result<Vec<Vec<f32>>, PoolError> {
+            self.seen
+                .lock()
+                .extend(calls.iter().map(|c| (c.layer, c.expert)));
+            // First element encodes the expert, so the caller can prove the
+            // reply reached the right item rather than merely having the right
+            // length.
+            Ok(calls
+                .iter()
+                .map(|c| {
+                    let mut v = vec![0.0f32; d_model];
+                    v[0] = c.expert as f32;
+                    v
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn expert_source_is_object_safe_and_positional() {
+        // The point of the trait is that an embedder can hold it behind a
+        // `Box<dyn _>` and hand it to the engine, so object safety is part of
+        // the contract rather than an implementation detail.
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut src: Box<dyn ExpertSource> = Box::new(Recording { seen: seen.clone() });
+
+        let calls: Vec<ExpertCall> = [7u32, 3, 11]
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| ExpertCall {
+                layer: 4,
+                expert: e,
+                input: vec![i as f32; 2],
+            })
+            .collect();
+
+        let out = src.eval(&calls, 4, 8, "silu").unwrap();
+
+        assert_eq!(*seen.lock(), vec![(4, 7), (4, 3), (4, 11)]);
+        assert_eq!(out.len(), calls.len(), "one output per call, positionally");
+        // Order, not just count: the caller scatters by index, so a reordered
+        // reply would silently pair an expert's output with another's weight.
+        assert_eq!(
+            out.iter().map(|v| v[0] as u32).collect::<Vec<_>>(),
+            vec![7, 3, 11]
+        );
+        assert!(out.iter().all(|v| v.len() == 4), "each output is d_model long");
     }
 }

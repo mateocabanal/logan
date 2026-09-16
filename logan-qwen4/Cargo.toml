@@ -13,3 +13,8 @@ libc = "0.2"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 logan-ane = { path = "../logan-ane" }
+
+[dev-dependencies]
+# Test-only: the project convention prefers parking_lot for locks that are
+# immediately unwrapped, and this crate takes no runtime lock dependency.
+parking_lot = "0.12"

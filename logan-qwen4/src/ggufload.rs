@@ -650,6 +650,7 @@ impl Model {
         let mut model = Model {
             cfg: cfg.clone(),
             pool: crate::pool::PoolConfig::from_env(),
+            expert_source: None,
             ple_shards: None,
             coli: None,
             gguf: Some(src.clone()),

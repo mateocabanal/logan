@@ -1389,6 +1389,13 @@ pub struct Model {
     /// set is 483 GB as f32 against 31.9 GB of RAM on the anchor. The pool's
     /// MXFP4 shards are the storage of record for experts in this mode.
     pool: Option<crate::pool::PoolConfig>,
+    /// Where routed experts are evaluated, when an embedder supplies one.
+    ///
+    /// Takes precedence over `pool`: an embedder (the inference-pool itself)
+    /// drives placement and transport on its own terms and hands the engine a
+    /// source, rather than the engine reaching out to a coordinator. `None`
+    /// means "use `pool`", which preserves the existing env-var path.
+    expert_source: Option<Box<dyn crate::pool::ExpertSource>>,
     /// .coli package for on-demand expert/ngram fetches (None in safetensors
     /// mode). ponytail: no cache yet — each fetch re-reads the record; add a
     /// per-layer FIFO when disk shows in profiles.
@@ -6322,7 +6329,11 @@ impl Model {
             let n = POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             eprintln!("[pool-trace] layer {li} PER-TOKEN call #{n}");
         }
-        if let Some(pcfg) = self.pool.clone().filter(|_| is_trunk_layer) {
+        // Pool mode is: an injected expert source, or an env-configured
+        // coordinator. Either way the local expert arrays are empty, so this is
+        // the only path that can evaluate a routed expert.
+        let delegated = self.expert_source.is_some() || self.pool.is_some();
+        if delegated && is_trunk_layer {
             let mut calls: Vec<crate::pool::ExpertCall> = Vec::with_capacity(k);
             for i in 0..k {
                 calls.push(crate::pool::ExpertCall {
@@ -6331,39 +6342,47 @@ impl Model {
                     input: x.to_vec(),
                 });
             }
-            match crate::pool::run_expert_batch(&pcfg, &calls, d, c.moe_inter, "silu") {
-                Ok(outs) if outs.len() == k => {
-                    for (i, o) in outs.iter().enumerate() {
-                        let w = val[i] / wsum;
-                        for dd in 0..d.min(o.len()) {
-                            acc[dd] += o[dd] * w;
-                        }
+            // Scatter one successful reply into the layer's residual and finish
+            // the layer. Factored out because the retry arm needs it too, and
+            // two copies of this is how the batch-shape bug (reading a flat
+            // `items x d_model` reply as one vector) recurred.
+            let mut finish_with = |me: &mut Self, outs: &[Vec<f32>]| {
+                for (i, o) in outs.iter().enumerate() {
+                    let w = val[i] / wsum;
+                    for dd in 0..d.min(o.len()) {
+                        acc[dd] += o[dd] * w;
                     }
-                    self.spans.fill_ms += _fill_t_outer.end();
-                    let (sy, gs) = if let Some(v) = shared_ready.take() {
-                        v
-                    } else {
-                        let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-                        let v = self.shared_expert_value(layer, li, x);
-                        self.spans.shared_ms += _shared_t.end();
-                        v
-                    };
-                    for dd in 0..d {
-                        out[dd] = acc[dd] + sy[dd] * gs;
-                    }
+                }
+                me.spans.fill_ms += _fill_t_outer.end();
+                let (sy, gs) = if let Some(v) = shared_ready.take() {
+                    v
+                } else {
+                    let mut _shared_t = logan_core::telemetry::Span::begin("shared");
+                    let v = me.shared_expert_value(layer, li, x);
+                    me.spans.shared_ms += _shared_t.end();
+                    v
+                };
+                for dd in 0..d {
+                    out[dd] = acc[dd] + sy[dd] * gs;
+                }
+            };
+
+            match self.eval_experts(&calls, d, c.moe_inter, "silu") {
+                Some(Ok(outs)) if outs.len() == k => {
+                    finish_with(self, &outs);
                     return;
                 }
-                Ok(outs) => {
+                Some(Ok(outs)) => {
                     // A short answer would silently drop experts and change the
                     // model's output, so it is a hard error rather than a
                     // partial accumulation.
                     panic!(
-                        "pool returned {} expert outputs for {k} routed experts on layer {li}; \
-                         refusing to compute a partial layer",
+                        "expert source returned {} expert outputs for {k} routed experts on \
+                         layer {li}; refusing to compute a partial layer",
                         outs.len()
                     );
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     // No local fallback exists in pool mode: the whole point is
                     // that the expert arrays were never populated (483 GB does
                     // not fit), so continuing to the local path would index into
@@ -6371,40 +6390,26 @@ impl Model {
                     // blip is worth one retry, then it is a hard error with the
                     // real reason attached.
                     eprintln!("[pool] layer {li}: {e}; retrying once");
-                    match crate::pool::run_expert_batch(&pcfg, &calls, d, c.moe_inter, "silu") {
-                        Ok(outs) if outs.len() == k => {
-                            for (i, o) in outs.iter().enumerate() {
-                                let w = val[i] / wsum;
-                                for dd in 0..d.min(o.len()) {
-                                    acc[dd] += o[dd] * w;
-                                }
-                            }
-                            self.spans.fill_ms += _fill_t_outer.end();
-                            let (sy, gs) = if let Some(v) = shared_ready.take() {
-                                v
-                            } else {
-                                let mut _shared_t = logan_core::telemetry::Span::begin("shared");
-                                let v = self.shared_expert_value(layer, li, x);
-                                self.spans.shared_ms += _shared_t.end();
-                                v
-                            };
-                            for dd in 0..d {
-                                out[dd] = acc[dd] + sy[dd] * gs;
-                            }
+                    match self.eval_experts(&calls, d, c.moe_inter, "silu") {
+                        Some(Ok(outs)) if outs.len() == k => {
+                            finish_with(self, &outs);
                             return;
                         }
-                        Ok(outs) => panic!(
-                            "pool returned {} expert outputs for {k} routed experts on layer {li} \
-                             (after retry); refusing to compute a partial layer",
+                        Some(Ok(outs)) => panic!(
+                            "expert source returned {} expert outputs for {k} routed experts on \
+                             layer {li} (after retry); refusing to compute a partial layer",
                             outs.len()
                         ),
-                        Err(e2) => panic!(
-                            "pool expert batch failed twice on layer {li}: {e}; then {e2}. \
+                        Some(Err(e2)) => panic!(
+                            "expert batch failed twice on layer {li}: {e}; then {e2}. \
                              There is no local fallback: this mode exists because the expert \
                              weights do not fit on this host, so the layer cannot be computed."
                         ),
+                        // `delegated` was true, so a source exists; unreachable.
+                        None => unreachable!("delegated without an expert source"),
                     }
                 }
+                None => unreachable!("delegated without an expert source"),
             }
         }
         let mut _fill_t = logan_core::telemetry::Span::begin("fill");
@@ -7366,7 +7371,10 @@ impl Model {
                         (l as usize) < self.cfg.layers
                     );
                 }
-                if let Some(pcfg) = self.pool.clone().filter(|_| (l as usize) < self.cfg.layers) {
+                // Pool mode: an injected expert source or an env-configured
+                // coordinator. Both mean the local expert arrays are empty.
+                let delegated = self.expert_source.is_some() || self.pool.is_some();
+                if delegated && (l as usize) < self.cfg.layers {
                     let mut calls: Vec<crate::pool::ExpertCall> = Vec::new();
                     let mut scatter: Vec<(usize, usize)> = Vec::new();
                     for (row, (idx, _, _)) in routes.iter().enumerate() {
@@ -7388,14 +7396,13 @@ impl Model {
                         );
                     }
                     let mut _fill_t = logan_core::telemetry::Span::begin("fill");
-                    match crate::pool::run_expert_batch(
-                        &pcfg,
+                    match self.eval_experts(
                         &calls,
                         c.hidden,
                         c.moe_inter,
                         "silu",
                     ) {
-                        Ok(outs) if outs.len() == calls.len() => {
+                        Some(Ok(outs)) if outs.len() == calls.len() => {
                             self.spans.fill_ms += _fill_t.end();
                             // Accumulate each answer into its own token's output,
                             // weighted exactly as the per-token path would have.
@@ -7422,23 +7429,25 @@ impl Model {
                             }
                             pool_done = true;
                         }
-                        Ok(outs) => {
+                        Some(Ok(outs)) => {
                             self.spans.fill_ms += _fill_t.end();
                             return Err(format!(
-                                "pool returned {} outputs for {} routed experts on layer {l}; \
-                                 refusing to compute a partial layer",
+                                "expert source returned {} outputs for {} routed experts on \
+                                 layer {l}; refusing to compute a partial layer",
                                 outs.len(),
                                 calls.len()
                             ));
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             self.spans.fill_ms += _fill_t.end();
                             return Err(format!(
-                                "pool expert batch failed on layer {l}: {e}. There is no local \
+                                "expert batch failed on layer {l}: {e}. There is no local \
                                  fallback: this mode exists because the expert weights do not fit \
                                  on this host."
                             ));
                         }
+                        // `delegated` was true, so a source exists; unreachable.
+                        None => unreachable!("delegated without an expert source"),
                     }
                 }
                 if !pool_done {
@@ -7822,7 +7831,10 @@ impl Model {
                         (l as usize) < self.cfg.layers
                     );
                 }
-                if let Some(pcfg) = self.pool.clone().filter(|_| (l as usize) < self.cfg.layers) {
+                // Pool mode: an injected expert source or an env-configured
+                // coordinator. Both mean the local expert arrays are empty.
+                let delegated = self.expert_source.is_some() || self.pool.is_some();
+                if delegated && (l as usize) < self.cfg.layers {
                     let mut calls: Vec<crate::pool::ExpertCall> = Vec::new();
                     let mut scatter: Vec<(usize, usize)> = Vec::new();
                     for (row, (idx, _, _)) in routes.iter().enumerate() {
@@ -7844,8 +7856,8 @@ impl Model {
                         );
                     }
                     let mut _fill_t = logan_core::telemetry::Span::begin("fill");
-                    match crate::pool::run_expert_batch(&pcfg, &calls, c.hidden, c.moe_inter, "silu") {
-                        Ok(outs) if outs.len() == calls.len() => {
+                    match self.eval_experts(&calls, c.hidden, c.moe_inter, "silu") {
+                        Some(Ok(outs)) if outs.len() == calls.len() => {
                             self.spans.fill_ms += _fill_t.end();
                             let mut moe_rows = vec![vec![0.0f32; c.hidden]; tokens.len()];
                             for ((row, rank), out) in scatter.iter().zip(outs.iter()) {
@@ -7870,23 +7882,25 @@ impl Model {
                             }
                             pool_done = true;
                         }
-                        Ok(outs) => {
+                        Some(Ok(outs)) => {
                             self.spans.fill_ms += _fill_t.end();
                             return Err(format!(
-                                "pool returned {} outputs for {} routed experts on layer {l}; \
-                                 refusing to compute a partial layer",
+                                "expert source returned {} outputs for {} routed experts on \
+                                 layer {l}; refusing to compute a partial layer",
                                 outs.len(),
                                 calls.len()
                             ));
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             self.spans.fill_ms += _fill_t.end();
                             return Err(format!(
-                                "pool expert batch failed on layer {l}: {e}. There is no local \
+                                "expert batch failed on layer {l}: {e}. There is no local \
                                  fallback: this mode exists because the expert weights do not fit \
                                  on this host."
                             ));
                         }
+                        // `delegated` was true, so a source exists; unreachable.
+                        None => unreachable!("delegated without an expert source"),
                     }
                 }
                 if !pool_done {
@@ -8124,6 +8138,50 @@ impl Model {
     /// Must be called before any forward; the canonical path never does.
     pub fn enable_sched_mode(&mut self) {
         self.sched_mode = true;
+    }
+
+    /// Supply the source that evaluates this model's routed experts.
+    ///
+    /// This is the embedding seam. An embedder that owns networking and
+    /// placement -- the inference-pool -- calls this with its own implementation
+    /// instead of pointing the engine at a coordinator via
+    /// `LOGAN_POOL_COORDINATOR`, so the engine keeps computing and the embedder
+    /// keeps scheduling. `None` restores the env-var behaviour.
+    ///
+    /// Must be called after `load`. Setting it implies pool mode: local expert
+    /// arrays are not populated for a model like this one (483 GB as f32), so a
+    /// source is the only way its experts can be evaluated at all.
+    pub fn set_expert_source(&mut self, source: Option<Box<dyn crate::pool::ExpertSource>>) {
+        self.expert_source = source;
+    }
+
+    /// Whether experts will be evaluated by a supplied source rather than
+    /// locally. The embedder uses this to decide whether it must serve them.
+    pub fn has_expert_source(&self) -> bool {
+        self.expert_source.is_some()
+    }
+
+    /// Evaluate a layer's routed experts through the supplied source, falling
+    /// back to the env-configured HTTP pool when no source was injected.
+    ///
+    /// One helper for all three dispatch sites so they cannot drift: they
+    /// previously each called `pool::run_expert_batch` directly, which is why
+    /// the same call had to be edited in three places whenever the transport
+    /// changed.
+    fn eval_experts(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+        activation: &str,
+    ) -> Option<Result<Vec<Vec<f32>>, crate::pool::PoolError>> {
+        if let Some(src) = self.expert_source.as_mut() {
+            return Some(src.eval(calls, d_model, d_hidden, activation));
+        }
+        let cfg = self.pool.clone()?;
+        Some(crate::pool::run_expert_batch(
+            &cfg, calls, d_model, d_hidden, activation,
+        ))
     }
 
     /// Scheduler-driven forward (issue #53): one token forward with the
@@ -8998,6 +9056,9 @@ impl Model {
         Ok(Model {
             cfg: cfg.clone(),
             pool,
+            // Set by `set_expert_source` after load: the embedder that owns
+            // transport supplies this, and `load` has no way to know it yet.
+            expert_source: None,
             ple_shards,
             coli: None,
             gguf: None,
