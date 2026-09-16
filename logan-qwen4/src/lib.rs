@@ -7336,6 +7336,13 @@ impl Model {
                 // per-token weighted reduction still follows the canonical top-k
                 // order.
                 let mut pool_done = false;
+                if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                    eprintln!(
+                        "[pool-trace] layer {l} entering batched block (pool_is_some={} l<c.layers={})",
+                        self.pool.is_some(),
+                        (l as usize) < self.cfg.layers
+                    );
+                }
                 if let Some(pcfg) = self.pool.clone().filter(|_| (l as usize) < self.cfg.layers) {
                     let mut calls: Vec<crate::pool::ExpertCall> = Vec::new();
                     let mut scatter: Vec<(usize, usize)> = Vec::new();
@@ -7348,6 +7355,14 @@ impl Model {
                             });
                             scatter.push((row, rank));
                         }
+                    }
+                    if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                        eprintln!(
+                            "[pool-trace] layer {l} BATCHED #{} items={} ({} tokens)",
+                            POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                            calls.len(),
+                            tokens.len()
+                        );
                     }
                     let mut _fill_t = logan_core::telemetry::Span::begin("fill");
                     match crate::pool::run_expert_batch(
@@ -7777,6 +7792,13 @@ impl Model {
                 // its own slot so the weighted reduction still follows canonical
                 // top-k order.
                 let mut pool_done = false;
+                if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                    eprintln!(
+                        "[pool-trace] layer {l} entering batched block (pool_is_some={} l<c.layers={})",
+                        self.pool.is_some(),
+                        (l as usize) < self.cfg.layers
+                    );
+                }
                 if let Some(pcfg) = self.pool.clone().filter(|_| (l as usize) < self.cfg.layers) {
                     let mut calls: Vec<crate::pool::ExpertCall> = Vec::new();
                     let mut scatter: Vec<(usize, usize)> = Vec::new();
@@ -7789,6 +7811,14 @@ impl Model {
                             });
                             scatter.push((row, rank));
                         }
+                    }
+                    if std::env::var("LOGAN_POOL_TRACE").map(|v| v != "0").unwrap_or(false) {
+                        eprintln!(
+                            "[pool-trace] layer {l} BATCHED #{} items={} ({} tokens)",
+                            POOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                            calls.len(),
+                            tokens.len()
+                        );
                     }
                     let mut _fill_t = logan_core::telemetry::Span::begin("fill");
                     match crate::pool::run_expert_batch(&pcfg, &calls, c.hidden, c.moe_inter, "silu") {
@@ -9364,15 +9394,70 @@ pub fn run_greedy_with(mut model: Model, _cfg: Cfg, prompt: &[u32], max_new: usi
         return Vec::new();
     }
 
+    // With a drafter attached, decode in speculative blocks: the drafter proposes
+    // `block` tokens and the target verifies them in ONE batched pass, so the
+    // expensive per-token path runs once per accepted block instead of once per
+    // token. This is the structural answer to the pool's per-call latency, which
+    // is otherwise a floor of one round trip per layer per token.
+    //
+    // `load_model`'s caller sets the drafter; a failure here is reported and
+    // falls back to plain decode rather than yielding nothing, because a broken
+    // drafter should cost speed and not correctness.
+    if model.mtp_enabled() {
+        match crate::plan::prefix_runtime::run_greedy_mtp(&mut model, prompt, max_new) {
+            Ok(tokens) => {
+                // Always report acceptance: a drafter that proposes tokens the
+                // target rejects still produces correct output, so without these
+                // counters a useless drafter is indistinguishable from a working
+                // one except by timing.
+                crate::plan::prefix_runtime::print_mtp_stats_for(&model);
+                if profile {
+                    model.profile_summary(max_new, t0.elapsed().as_secs_f64() * 1e3);
+                }
+                return tokens;
+            }
+            Err(e) => {
+                eprintln!("[qwen4-rs] MTP decode failed ({e}); falling back to plain decode");
+            }
+        }
+    }
+
     // The final prompt forward already returns the logits that predict token
     // prompt.len(). Refeeding prompt.last() at that position duplicates the
     // final prompt token in recurrent/KV state and is not causal-LM decode.
+    //
+    // Prefill LAYER-MAJOR when the pool is in use. The token-major loop below
+    // calls `forward_token` once per token, and each of those issues one pool
+    // batch per layer, so a 5-token prompt cost 5 x 48 round trips before
+    // generating anything. `prefill_chunk` visits each layer once for the whole
+    // chunk, which is what lets the pool seam send every token's routed experts
+    // in a single request.
+    //
+    // Only the traversal ORDER changes, not the arithmetic: each causal layer is
+    // still evaluated in increasing token position, so KV, GDN recurrent and
+    // convolution state, and QSA state advance exactly as in token-major
+    // execution. The logits for the last token are the same either way.
     let mut logits = Vec::new();
-    for (i, &t) in prompt.iter().enumerate() {
-        if i + 1 == prompt.len() {
-            logits = model.forward_token(t as usize, i);
-        } else {
-            model.prefill_token(t as usize, i);
+    let mut chunk_prefilled = false;
+    if model.pool.is_some() {
+        match model.prefill_chunk(prompt, 0, true) {
+            Ok(Some(l)) => {
+                logits = l;
+                chunk_prefilled = true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[qwen4-rs] batched prefill unavailable ({e}); using token-major");
+            }
+        }
+    }
+    if !chunk_prefilled {
+        for (i, &t) in prompt.iter().enumerate() {
+            if i + 1 == prompt.len() {
+                logits = model.forward_token(t as usize, i);
+            } else {
+                model.prefill_token(t as usize, i);
+            }
         }
     }
 

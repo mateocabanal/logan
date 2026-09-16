@@ -474,6 +474,29 @@ fn generate_from_logits(
 /// Validated performance defaults are applied before model load. Explicit env
 /// values are preserved, so every fast path remains opt-out for A/B, fallback,
 /// and debugging.
+/// Greedy decode with MTP speculative blocks, against an ALREADY-LOADED model.
+///
+/// Split out of [`run_greedy_cached_coli`] so the safetensors path can use it
+/// too: that entry point loads a `.coli` package, while the safetensors loader
+/// builds the model itself and only shares the generation loop.
+///
+/// Requires a drafter to be attached (`model.mtp_enabled()`); callers decide
+/// whether to take this path or plain decode.
+pub fn run_greedy_mtp(model: &mut Model, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
+    if prompt.is_empty() || max_new == 0 {
+        return Ok(Vec::new());
+    }
+    // Prefix snapshots cover target causal state only, so replay the prompt once
+    // and let the drafter catch up on exactly shifted (h[p-1], x[p]) rows.
+    let logits = prefill_with_mtp(model, prompt)?;
+    generate_from_logits_mtp_block(model, logits, prompt.len(), max_new)
+}
+
+/// Emit the drafter's acceptance counters, for a caller that wants them.
+pub fn print_mtp_stats_for(model: &Model) {
+    print_mtp_stats(model)
+}
+
 pub fn run_greedy_cached_coli(
     package_dir: &Path,
     cfg: &Cfg,
