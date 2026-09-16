@@ -132,8 +132,6 @@ fn request(cfg: &PoolConfig, method: &str, path: &str, body: &str) -> Result<Str
     // The anchor sends one submit and one wait per layer, so per token that was
     // ~96 connections. Measured as `fill` = 24-30 s per token, which is the
     // entire expert phase and was previously misread as compute.
-    let mut stream = connection(cfg, &addr)?;
-
     // The pool's job-state endpoint is a GET; posting to it returns 405. The
     // method is a parameter rather than hard-coded POST because of that.
     //
@@ -144,22 +142,45 @@ fn request(cfg: &PoolConfig, method: &str, path: &str, body: &str) -> Result<Str
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| format!("write: {e}"))?;
 
-    // Read headers, then exactly Content-Length bytes of body. `read_to_end`
-    // cannot be used once the connection is kept alive: it would block until the
-    // peer closed, which it no longer does.
-    let (head, payload) = read_response(&mut stream)?;
-
-    // A kept-alive connection is only reusable if the read left it in a clean
-    // state. Any error path above drops it, which is the conservative choice.
-    if let Ok(mut pool) = pool_conns().lock() {
-        if pool.len() < 4 {
-            pool.insert(addr.clone(), stream);
+    // A pooled socket may have been closed by the peer while idle, in which case
+    // the write or read fails on a connection that was fine when it was stored.
+    // Retry ONCE on a fresh connection rather than probing liveness up front: a
+    // probe would cost a round trip on the happy path, which is the path that
+    // matters here, and a genuinely dead coordinator still fails on the retry.
+    let mut retried = false;
+    let (head, payload) = loop {
+        let mut stream = connection(cfg, &addr)?;
+        let attempt = (|| -> Result<(String, String), PoolError> {
+            stream
+                .write_all(req.as_bytes())
+                .map_err(|e| format!("write: {e}"))?;
+            // Read headers, then exactly Content-Length bytes of body.
+            // `read_to_end` cannot be used once the connection is kept alive: it
+            // would block until the peer closed, which it no longer does.
+            read_response(&mut stream)
+        })();
+        match attempt {
+            Ok(ok) => {
+                // Return the socket for reuse only on success, so a failed
+                // exchange never leaves a half-read stream in the pool.
+                if let Ok(mut pool) = pool_conns().lock() {
+                    if pool.len() < 4 {
+                        pool.insert(addr.clone(), stream);
+                    }
+                }
+                break ok;
+            }
+            Err(e) => {
+                drop(stream);
+                if retried {
+                    return Err(e);
+                }
+                retried = true;
+                continue;
+            }
         }
-    }
+    };
 
     let head = head.as_str();
     let payload = payload.as_str();
