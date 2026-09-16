@@ -120,36 +120,49 @@ fn request(cfg: &PoolConfig, method: &str, path: &str, body: &str) -> Result<Str
         format!("{host_port}:80")
     };
 
-    let stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(cfg.timeout))
-        .map_err(|e| format!("set timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(cfg.timeout))
-        .map_err(|e| format!("set timeout: {e}"))?;
-    let mut stream = stream;
+    // Reuse one connection per coordinator instead of dialing per request.
+    //
+    // This is the dominant cost of the whole expert path, and it is not the
+    // work: a fresh TCP connect from the worker's host measures **398 ms** on
+    // the first request after idle and 15-34 ms afterwards, while the worker's
+    // own persistent connection reports a 2.5 ms RTT. The path runs
+    // the worker's LAN -> consumer-router NAT -> anchor, so a new connection pays
+    // established one does not.
+    //
+    // The anchor sends one submit and one wait per layer, so per token that was
+    // ~96 connections. Measured as `fill` = 24-30 s per token, which is the
+    // entire expert phase and was previously misread as compute.
+    let mut stream = connection(cfg, &addr)?;
 
     // The pool's job-state endpoint is a GET; posting to it returns 405. The
     // method is a parameter rather than hard-coded POST because of that.
+    //
+    // `Connection: close` is gone: the response is read to a declared
+    // Content-Length boundary instead, and the socket goes back to the pool.
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
 
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("read: {e}"))?;
-    let text = String::from_utf8_lossy(&raw).to_string();
+    // Read headers, then exactly Content-Length bytes of body. `read_to_end`
+    // cannot be used once the connection is kept alive: it would block until the
+    // peer closed, which it no longer does.
+    let (head, payload) = read_response(&mut stream)?;
 
-    // Split headers from body; `Connection: close` means one response per read.
-    let (head, payload) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "malformed response (no header terminator)".to_string())?;
+    // A kept-alive connection is only reusable if the read left it in a clean
+    // state. Any error path above drops it, which is the conservative choice.
+    if let Ok(mut pool) = pool_conns().lock() {
+        if pool.len() < 4 {
+            pool.insert(addr.clone(), stream);
+        }
+    }
+
+    let head = head.as_str();
+    let payload = payload.as_str();
     let status: u16 = head
         .split_whitespace()
         .nth(1)
@@ -159,6 +172,90 @@ fn request(cfg: &PoolConfig, method: &str, path: &str, body: &str) -> Result<Str
         return Err(format!("HTTP {status}: {}", payload.trim()));
     }
     Ok(payload.to_string())
+}
+
+/// Idle keep-alive connections, keyed by coordinator address.
+///
+/// Small and unbounded-free: a caller talks to one coordinator, and the cap
+/// keeps a misconfigured caller from accumulating sockets.
+fn pool_conns() -> &'static std::sync::Mutex<std::collections::HashMap<String, TcpStream>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, TcpStream>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A pooled connection to `addr`, or a fresh one.
+///
+/// A pooled socket may have been closed by the peer while idle, so the caller's
+/// first write can fail. That is handled by retrying once on a new connection
+/// rather than by probing, which would cost a round trip on the happy path.
+fn connection(cfg: &PoolConfig, addr: &str) -> Result<TcpStream, PoolError> {
+    if let Ok(mut pool) = pool_conns().lock() {
+        if let Some(s) = pool.remove(addr) {
+            return Ok(s);
+        }
+    }
+    let stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(cfg.timeout))
+        .map_err(|e| format!("set timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(cfg.timeout))
+        .map_err(|e| format!("set timeout: {e}"))?;
+    Ok(stream)
+}
+
+/// Read one HTTP/1.1 response: `(headers, body)`.
+///
+/// Content-Length delimited rather than read-to-EOF, because the connection is
+/// reused. A chunked response is refused rather than guessed at: the coordinator
+/// always sets Content-Length, so a chunked reply means something is wrong and
+/// silently mis-parsing it would corrupt expert output.
+fn read_response(stream: &mut TcpStream) -> Result<(String, String), PoolError> {
+    use std::io::Read as _;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let head_end = loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("connection closed before headers completed".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let len = header_value(&head, "content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .ok_or_else(|| format!("response has no Content-Length: {}", head.lines().next().unwrap_or("")))?;
+    while buf.len() - head_end < len {
+        let mut chunk = [0u8; 8192];
+        let n = stream.read(&mut chunk).map_err(|e| format!("read body: {e}"))?;
+        if n == 0 {
+            return Err(format!(
+                "connection closed after {} of {len} body bytes",
+                buf.len() - head_end
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok((head, String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string()))
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Case-insensitive header lookup.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines()
+        .skip(1)
+        .find(|l| {
+            l.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+        })
+        .and_then(|l| l.split_once(':').map(|(_, v)| v.to_string()))
 }
 
 /// Minimal JSON extraction without a serde dependency.
@@ -437,16 +534,33 @@ pub fn run_expert_batch(
     let job_id = json::string_field(&submitted, "job_id")
         .ok_or_else(|| format!("no job_id in {}", truncate(&submitted)))?;
 
-    // Poll until terminal. The coordinator has no push channel for results, so
-    // polling is the contract; the interval is short because a batched layer is
-    // expected to finish in tens of milliseconds.
+    // Wait for the result with the coordinator's LONG POLL, not a sleep loop.
+    //
+    // `/v1/jobs/{id}?wait=true&wait_ms=N` blocks on the coordinator until the job
+    // is terminal or the window expires, and the worker's 16-byte result-announce
+    // datagram wakes it — so the reply arrives as soon as the work does.
+    //
+    // This matters more than it looks. The previous version slept 2ms, then 4, 8,
+    // 16, and settled at **20 ms per check**, so a layer that finished in 6ms was
+    // still reported up to 20ms late, and the anchor paid that 48 times per token.
+    // Measured end to end: 508 ms per layer with the sleep loop. The sleep was
+    // also pure overhead on a path whose whole job is to be short.
     let deadline = std::time::Instant::now() + cfg.timeout;
-    let mut delay = Duration::from_millis(2);
+    // One long-poll window per request, bounded so a cancellation or a dead
+    // coordinator is still noticed. Re-issued until the overall deadline.
+    let window_ms = 5000u64;
     loop {
-        if std::time::Instant::now() > deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             return Err(format!("job {job_id} timed out after {:?}", cfg.timeout));
         }
-        let state = request(cfg, "GET", &format!("/v1/jobs/{job_id}"), "")?;
+        let this_window = window_ms.min(remaining.as_millis().max(1) as u64);
+        let state = request(
+            cfg,
+            "GET",
+            &format!("/v1/jobs/{job_id}?wait=true&wait_ms={this_window}"),
+            "",
+        )?;
         if state.contains("\"complete\"") {
             // A batch answers flat, so the item width is required to split it.
             // `d_model` is the output width of one expert evaluation.
@@ -455,10 +569,9 @@ pub fn run_expert_batch(
         if state.contains("\"failed\"") {
             return Err(format!("job {job_id} failed: {}", truncate(&state)));
         }
-        std::thread::sleep(delay);
-        // Back off to 20ms: a busy loop would hammer the coordinator's lock for
-        // no gain, and layers are not so fast that 20ms matters.
-        delay = (delay * 2).min(Duration::from_millis(20));
+        // Still pending after a full window: loop and wait again. No sleep here —
+        // the coordinator already waited, and adding one would reintroduce the
+        // latency this replaced.
     }
 }
 
