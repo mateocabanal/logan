@@ -29,6 +29,17 @@ use logan_core::expert::Slot as _; // for SlotExpert::release
 
 const MAX_RESIDENT_PLE_NGRAM_BYTES: usize = 64 * 1024 * 1024;
 
+/// A boolean env override that defaults to false.
+///
+/// Only for knobs where the WRONG value still produces plausible output (layout
+/// and tiling choices), so the default must stay the validated one and the
+/// override exists to A/B a new checkpoint quickly.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
 fn is_ple_ngram_weight(name: &str) -> bool {
     // The monolithic spelling (tiny fixture, and any dense export) ...
     if name.ends_with("ple_embedding.ngram_embedding.weight")
@@ -8094,6 +8105,36 @@ impl Model {
         // locally is not an option for this model (483 GB as f32), so the
         // choice is "delegate" or "cannot run" -- not a preference.
         let pool = crate::pool::PoolConfig::from_env();
+        // The checkpoint's tensors are ground truth for the PLE layer, and
+        // config is NOT. `ple_layer_ids` says 2 while the tensors are at
+        // `layers.1.ple.*`; taking config at face value fires `ple_forward` on
+        // layer 2 while reading layer 1's table, which injects the wrong
+        // n-gram embedding into the wrong residual and yields fluent-looking
+        // nonsense. The .coli loader already pins this from its package
+        // (coliload.rs), so this is the same rule applied to a safetensors
+        // source rather than a new one.
+        let mut cfg = cfg.clone();
+        if let Some(actual) = st.ple_tensor_layer() {
+            if actual as i64 != cfg.ple_layer {
+                if std::env::var("QWEN_PLE_LAYER_FROM_CONFIG")
+                    .map(|v| v != "0")
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "[ple] keeping config ple_layer={} (checkpoint has {actual})",
+                        cfg.ple_layer
+                    );
+                } else {
+                    eprintln!(
+                        "[ple] ple_layer: config says {} but the checkpoint stores it at \
+                         layers.{actual}; using {actual}",
+                        cfg.ple_layer
+                    );
+                    cfg.ple_layer = actual as i64;
+                }
+            }
+        }
+        let cfg = &cfg;
         // PLE metadata read from the checkpoint's own i64 side-tables, when it
         // ships them (it does). The config-derived prime math diverges on the
         // real model, so these override the derived values when present.
@@ -8627,8 +8668,13 @@ impl Model {
             ple_shards,
             coli: None,
             gguf: None,
-            gdn_v_tiled: false,
-            rope_interleaved: false,
+            // These two flags decide GDN head-tiling and RoPE layout, and a
+            // wrong value produces fluent-looking nonsense rather than an
+            // error, so they are overridable for A/B while the correct
+            // setting for a new checkpoint is established. Defaults match the
+            // validated .coli path.
+            gdn_v_tiled: env_flag("QWEN_GDN_V_TILED"),
+            rope_interleaved: env_flag("QWEN_ROPE_INTERLEAVED"),
             embed: load_wt(st, "model.embed_tokens.weight", cfg.vocab, cfg.hidden)?,
             lm_head: load_wt(st, "lm_head.weight", cfg.vocab, cfg.hidden)?,
             lm_head_aligned: None,
