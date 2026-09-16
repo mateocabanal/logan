@@ -8161,6 +8161,18 @@ impl Model {
         self.expert_source.is_some()
     }
 
+    /// Whether routed experts are delegated at all -- by an injected source or by
+    /// an env-configured coordinator.
+    ///
+    /// The single place that answers this question. Call sites that gate on
+    /// `pool.is_some()` are asking it with the wrong predicate: an embedder that
+    /// injects a source never sets `pool`, so the answer is "no" exactly when
+    /// delegation is the whole point. That mistake cost the batched prefill, and
+    /// with it a round trip per prompt token per layer.
+    pub fn experts_delegated(&self) -> bool {
+        self.expert_source.is_some() || self.pool.is_some()
+    }
+
     /// Evaluate a layer's routed experts through the supplied source, falling
     /// back to the env-configured HTTP pool when no source was injected.
     ///
@@ -9536,7 +9548,11 @@ pub fn run_greedy_with(
     // execution. The logits for the last token are the same either way.
     let mut logits = Vec::new();
     let mut chunk_prefilled = false;
-    if model.pool.is_some() {
+    // "Are experts delegated" is a property of the SEAM, not of the env var:
+    // an embedder that injects its own `ExpertSource` (the inference-pool does)
+    // never sets `pool`, so gating on `pool.is_some()` silently denied it the
+    // batched prefill and made it pay a round trip per prompt token per layer.
+    if model.experts_delegated() {
         match model.prefill_chunk(prompt, 0, true) {
             Ok(Some(l)) => {
                 logits = l;
