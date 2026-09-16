@@ -1855,11 +1855,11 @@ fn matmul_bf16_bytes(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize)
         return;
     }
 
-    let parallel = o * i >= 16_000_000
-        && std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            > 1;
+    // Same cost-based gate as the f32 path: rows are the only split axis, and
+    // the work has to repay the spawn. See `matmul_f32_rows` for why a bare
+    // element-count threshold under-threads this model.
+    let threads = available_threads();
+    let parallel = threads > 1 && o >= threads && o.saturating_mul(i) >= 64 * 1024 * threads;
 
     let neon = std::env::var("QWEN_NEON_BF16")
         .map(|v| v != "0")
@@ -1956,21 +1956,44 @@ fn matmul_mxfp4_bytes(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o
     let ng = i.div_ceil(32);
     debug_assert!(weights.len() >= o * rb);
     debug_assert!(scales.len() >= o * ng);
-    for row in 0..o {
+
+    // One row = `i` multiply-adds plus a nibble unpack and an E8M0 scale
+    // lookup per element, so this is the most expensive inner loop in the file
+    // and it was fully serial. Rows are independent (each reads the whole
+    // activation and writes only its own output), so rows are the split axis.
+    let threads = available_threads();
+    let parallel = threads > 1 && o >= threads && o.saturating_mul(i) >= 64 * 1024 * threads;
+
+    let row_dot = |row: usize, dst: &mut f32| {
         let wr = &weights[row * rb..(row + 1) * rb];
         let sr = &scales[row * ng..(row + 1) * ng];
         let mut acc = 0.0_f32;
         for col in 0..i {
             let packed = wr[col / 2];
-            let code = if col & 1 == 0 {
-                packed & 0x0f
-            } else {
-                packed >> 4
-            };
+            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
             let scale = f32::from_bits((sr[col / 32] as u32) << 23);
             acc += x[col] * MX4[code as usize] * scale;
         }
-        y[row] = acc;
+        *dst = acc;
+    };
+
+    if parallel {
+        let chunk = o.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ci, ys) in y.chunks_mut(chunk).enumerate() {
+                let first = ci * chunk;
+                let row_dot = &row_dot;
+                sc.spawn(move || {
+                    for (local, dst) in ys.iter_mut().enumerate() {
+                        row_dot(first + local, dst);
+                    }
+                });
+            }
+        });
+    } else {
+        for (row, dst) in y.iter_mut().enumerate() {
+            row_dot(row, dst);
+        }
     }
 }
 
@@ -2530,6 +2553,103 @@ fn quantize_wt_bf16_to_mxfp4(w: &mut Wt) -> bool {
     true
 }
 
+/// Run the f32 GEMV used by the in-memory (`Wt.f`) paths, for benchmarking.
+///
+/// Exists so the threading gate can be measured rather than assumed: a gate that
+/// never fires looks exactly like no gate at all.
+pub fn matmul_exposed(y: &mut [f32], x: &[f32], w: &[f32], o: usize, i: usize) {
+    debug_assert_eq!(w.len(), o * i);
+    matmul_f32_rows(y, x, w, o, i);
+}
+
+/// Run the BF16 GEMV, for benchmarking the same way.
+pub fn matmul_bf16_exposed(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: usize) {
+    matmul_bf16_bytes(y, x, bytes, o, i);
+}
+
+/// Run the MXFP4 GEMV, for benchmarking the same way.
+pub fn matmul_mxfp4_exposed(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize) {
+    matmul_mxfp4_bytes(y, x, weights, scales, o, i);
+}
+
+/// The thread count the parallel gates will use, for the same reason.
+pub fn thread_count_exposed() -> usize {
+    available_threads()
+}
+
+/// The f32 row-split GEMV, factored out of [`matmul`] so the threading gate is
+/// one implementation measured by one benchmark rather than a block buried in a
+/// dispatch.
+fn matmul_f32_rows(y: &mut [f32], x: &[f32], w: &[f32], o: usize, i: usize) {
+    // Thread on COST, not on a raw element count. `thread::scope` costs
+    // ~50-100us of spawn, so the split must amortize it; and rows are the only
+    // split axis (each output row reads the whole activation), so a matrix with
+    // fewer rows than threads cannot use them all however large it is.
+    //
+    // A pure element-count gate fails the common case: a matrix with many rows
+    // and a short inner loop is cheap per row and threads beautifully, while a
+    // wide matrix with few rows cannot be split at all. The previous
+    // `o * i >= 16_000_000` excluded almost everything this model actually runs
+    // -- `o_proj` [2560, 6144] at 15.7M, `fc_embedding`/`fc_hidden` [2560, 2560]
+    // at 6.6M, every expert projection at 1.6M -- leaving ~74 MFLOP/token of
+    // drafter work on one core.
+    let threads = available_threads();
+    let parallel = threads > 1 && o >= threads && o.saturating_mul(i) >= 64 * 1024 * threads;
+    if parallel {
+        let chunk = o.div_ceil(threads);
+        let (w, x) = (&*w, &*x);
+        std::thread::scope(|s| {
+            for (ci, ys) in y.chunks_mut(chunk).enumerate() {
+                let first = ci * chunk;
+                s.spawn(move || {
+                    for (local, dst) in ys.iter_mut().enumerate() {
+                        let row = first + local;
+                        let wr = &w[row * i..(row + 1) * i];
+                        let mut acc = 0.0_f32;
+                        for (xx, ww) in x.iter().zip(wr) {
+                            acc += xx * ww;
+                        }
+                        *dst = acc;
+                    }
+                });
+            }
+        });
+    } else {
+        for (row, dst) in y.iter_mut().enumerate() {
+            let wr = &w[row * i..(row + 1) * i];
+            let mut acc = 0.0_f32;
+            for (xx, ww) in x.iter().zip(wr) {
+                acc += xx * ww;
+            }
+            *dst = acc;
+        }
+    }
+}
+
+/// Threads to use for one parallel split.
+///
+/// One definition so the several `thread::scope` sites in this file cannot
+/// disagree: they previously each called `available_parallelism` with different
+/// fallbacks (1 in some places, 4 in others), so the same matrix could be split
+/// differently depending on which path reached it.
+///
+/// Leaves one core free when there is more than one, because the anchor also
+/// serves HTTP and drives the pool client, and starving those adds latency that
+/// the extra worker does not repay.
+fn available_threads() -> usize {
+    if let Ok(v) = std::env::var("QWEN_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if n > 2 { n - 1 } else { n }
+}
+
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     let (o, i) = (w.o, w.i);
     if let Some(bytes) = &w.bytes {
@@ -2672,43 +2792,26 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
         }
         return;
     }
-    // ponytail: thread::scope per call costs ~50-100us of spawn; only
-    // parallelize in-memory f32 matrices big enough to amortize it.
-    let parallel = o * i >= 16_000_000
-        && std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            > 1;
-    if parallel {
-        std::thread::scope(|s| {
-            let nthreads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            let chunk = o.div_ceil(nthreads);
-            for (c, yslice) in y.chunks_mut(chunk).enumerate() {
-                let rows = c * chunk;
-                let (x, w) = (&*x, &*w);
-                s.spawn(move || {
-                    for (oo, yv) in yslice.iter_mut().enumerate() {
-                        let oo = rows + oo;
-                        let mut acc = 0.0_f32;
-                        for ii in 0..i {
-                            acc += x[ii] * w.f[oo * i + ii];
-                        }
-                        *yv = acc;
-                    }
-                });
-            }
-        });
-    } else {
-        for oo in 0..o {
-            let mut acc = 0.0_f32;
-            for ii in 0..i {
-                acc += x[ii] * w.f[oo * i + ii];
-            }
-            y[oo] = acc;
-        }
-    }
+    // Thread the in-memory f32 path on COST, not on a raw element count.
+    //
+    // `thread::scope` costs ~50-100us in spawn, so the split has to amortize
+    // that. The previous gate was `o * i >= 16_000_000`, which is a proxy for
+    // cost that fails in the common case: a matrix with many rows but a short
+    // inner loop is cheap per row and threads beautifully, while a wide matrix
+    // with few rows cannot be split by row at all. Concretely, the MTP drafter
+    // and the safetensors trunk are full of matrices just under the old gate --
+    // `o_proj` [2560, 6144] at 15.7M, `fc_embedding`/`fc_hidden` [2560, 2560] at
+    // 6.6M, every expert projection at 1.6M -- so ~74 MFLOP/token of drafter work
+    // ran on one core for no reason.
+    //
+    // The rule used here: parallelize when the work is large enough to repay the
+    // spawn, AND there are at least as many rows as threads so every worker gets
+    // a non-empty slice. Rows are the only split axis (each output row reads the
+    // whole activation), so a matrix with fewer rows than cores cannot use them
+    // all however large it is -- `k_proj` [512, 2560] is 1.3M elements and 512
+    // rows, which is worth threading on 8 cores; a hypothetical [2, 100_000_000]
+    // matrix is not.
+    matmul_f32_rows(y, x, &w.f, o, i);
 }
 
 /// Encode several resident MXFP4 GEMVs that consume the same activation in a
@@ -9935,8 +10038,10 @@ mod tests {
                         // One entry below the parallel gate, one per worker
                         // above it. Never more than the workers: an extra entry
                         // would mean the row split ran twice.
-                        let max_calls: u64 =
-                            if o * i >= 16_000_000 { threads as u64 } else { 1 };
+                        let split = threads > 1
+                            && o >= threads
+                            && o.saturating_mul(i) >= 64 * 1024 * threads;
+                        let max_calls: u64 = if split { threads as u64 } else { 1 };
                         assert!(
                             calls <= max_calls,
                             "{o}x{i} ({} MACs): {calls} kernel entries for at most \
