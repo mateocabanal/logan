@@ -476,36 +476,60 @@ pub fn encode_batch_request(
     let first = calls.first();
     let (layer, expert) = first.map(|c| (c.layer, c.expert)).unwrap_or((0, 0));
 
-    let mut items = String::new();
-    for (i, c) in calls.iter().enumerate() {
-        if i > 0 {
-            items.push(',');
-        }
-        items.push_str(&format!(
-            "{{\"layer\":{},\"expert\":{},\"input\":[",
-            c.layer, c.expert
-        ));
-        for (j, v) in c.input.iter().enumerate() {
-            if j > 0 {
-                items.push(',');
-            }
-            items.push_str(&format!("{v}"));
-        }
-        items.push_str("]}");
-    }
+    use std::fmt::Write as _;
 
-    let hash = match source_hash {
-        Some(h) => format!("\"{h}\""),
-        None => "\"\"".to_string(),
-    };
-    format!(
+    // Build the body into ONE preallocated buffer, writing floats directly into
+    // it.
+    //
+    // The previous version called `format!("{v}")` per float, which allocates a
+    // fresh `String` for every value: 2560 values x 10 experts x 48 layers x 7
+    // token-passes = 8.6 million allocations per run, and the resulting pieces
+    // were then copied again into `items` and copied again into the final body.
+    // Float formatting itself is unavoidable here, but the allocations are not.
+    //
+    // Capacity is estimated from the inputs so the buffer usually does not
+    // reallocate: a float prints in at most ~14 bytes, plus ~48 of framing per
+    // item.
+    let est: usize = calls
+        .iter()
+        .map(|c| c.input.len() * 14 + 48)
+        .sum::<usize>()
+        + 256;
+    let mut out = String::with_capacity(est);
+
+    let _ = write!(
+        out,
         "{{\"schedule\":{{\"model_id\":\"logan\",\"family\":\"{family}\",\"layer\":{layer},\
          \"expert\":{expert},\"expert_bytes\":0,\"activation_bytes\":{},\
-         \"max_latency_ms\":null,\"source_hash\":{hash}}},\
-         \"shape\":{{\"d_model\":{d_model},\"d_hidden\":{d_hidden}}},\
-         \"activation\":\"{activation}\",\"items\":[{items}]}}",
+         \"max_latency_ms\":null,\"source_hash\":",
         d_model * 4 * calls.len()
-    )
+    );
+    match source_hash {
+        Some(h) => {
+            let _ = write!(out, "\"{h}\"");
+        }
+        None => out.push_str("\"\""),
+    }
+    let _ = write!(
+        out,
+        "}},\"shape\":{{\"d_model\":{d_model},\"d_hidden\":{d_hidden}}},\
+         \"activation\":\"{activation}\",\"items\":["
+    );
+    for (i, c) in calls.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{{\"layer\":{},\"expert\":{},\"input\":[", c.layer, c.expert);
+        for (j, v) in c.input.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{v}");
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+    out
 }
 
 /// Submit one expert batch and wait for the outputs.
