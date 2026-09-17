@@ -181,6 +181,7 @@ mod tests {
             rows,
             columns,
             scale: None,
+            bias: None,
         }
     }
 

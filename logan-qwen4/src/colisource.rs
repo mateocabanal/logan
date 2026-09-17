@@ -287,11 +287,77 @@ impl ColiSource {
                     i,
                 })
             }
+            0x23..=0x26 => self.dequant_mlx_affine(name, rec, payload, rec.math_format, o, i),
             0x0005 => self.dequant_affine_q8(name, payload, o, i),
             other => Err(format!(
                 "{name}: unsupported resident matrix math format 0x{other:04x}"
             )),
         }
+    }
+
+    fn dequant_mlx_affine(
+        &self,
+        name: &str,
+        rec: &RecordInfo,
+        payload: Vec<u8>,
+        math: u16,
+        o: usize,
+        i: usize,
+    ) -> Result<ColiWt, String> {
+        let bits = mlx_affine_bits_from_math(math)
+            .ok_or_else(|| format!("{name}: unsupported MLX affine math 0x{math:04x}"))?;
+        let packed_bits = o
+            .checked_mul(i)
+            .and_then(|count| count.checked_mul(bits as usize))
+            .ok_or_else(|| format!("{name}: MLX affine packed size overflows"))?;
+        if packed_bits % 8 != 0 || payload.len() != packed_bits / 8 {
+            return Err(format!(
+                "{name}: MLX affine packed payload {} bytes != expected {} for {o}x{i} at {bits} bits",
+                payload.len(),
+                packed_bits.div_ceil(8)
+            ));
+        }
+        let base = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| format!("{name}: MLX affine matrix is not a .weight record"))?;
+        let scale_name = format!("{base}.scales");
+        let bias_name = format!("{base}.biases");
+        let scales = self
+            .pkg
+            .read_tensor_payload(
+                self.rec(&scale_name)
+                    .ok_or_else(|| format!("missing MLX affine scales {scale_name}"))?,
+            )
+            .map_err(|e| e.to_string())?;
+        let biases = self
+            .pkg
+            .read_tensor_payload(
+                self.rec(&bias_name)
+                    .ok_or_else(|| format!("missing MLX affine biases {bias_name}"))?,
+            )
+            .map_err(|e| e.to_string())?;
+        let header = self
+            .pkg
+            .read_payload_range(rec, 0, 128)
+            .map_err(|e| e.to_string())?;
+        let group_size = u32::from_le_bytes(
+            header[124..128]
+                .try_into()
+                .map_err(|_| format!("{name}: invalid COLITENS group-size field"))?,
+        ) as usize;
+        let decoded =
+            decode_mlx_affine_dense_matrix(math, group_size, &payload, &scales, &biases, o, i)?;
+        let mut out = Vec::with_capacity(decoded.len() * 2);
+        for value in decoded {
+            out.extend_from_slice(&f32_to_bf16(value).to_le_bytes());
+        }
+        Ok(ColiWt {
+            bytes: out,
+            scales: Vec::new(),
+            fmt: 5,
+            o,
+            i,
+        })
     }
 
     fn dequant_affine_q8(
@@ -407,6 +473,17 @@ impl ColiSource {
                     let f =
                         logan_format::codecs::int4_grouped_decode(w, s, rows as usize, cols as usize)
                             .map_err(|e| e.to_string())?;
+                    f.into_iter().flat_map(bf16_bytes).collect()
+                }
+                // MLX affine: packed U32-derived bytes plus one aux blob
+                // containing BF16 scales followed immediately by BF16 biases.
+                (0x23..=0x26, 0x0003) => {
+                    let aux = &raw[s_off as usize..(s_off + s_stored) as usize];
+                    let group_size =
+                        u32::from_le_bytes(raw[d + 104..d + 108].try_into().unwrap()) as usize;
+                    let f = decode_mlx_affine_expert_matrix(
+                        math, group_size, w, aux, rows as usize, cols as usize,
+                    )?;
                     f.into_iter().flat_map(bf16_bytes).collect()
                 }
                 // Apple8 MXFP4: rANS or raw tiles -> f32 -> BF16
@@ -639,6 +716,145 @@ pub fn bf16_to_f32(u: u16) -> f32 {
     f32::from_bits((u as u32) << 16)
 }
 
+/// Decode MLX affine-packed row-major weights exactly as `mx.dequantize`: the
+/// first code starts in the least-significant bits of the first U32 and
+/// non-power-of-two widths continue as one contiguous LSB-first bitstream.
+/// Each output is `code * scale + bias` for its quantization group.
+fn mlx_affine_bits_from_math(math: u16) -> Option<u8> {
+    match math {
+        0x23 => Some(4),
+        0x24 => Some(5),
+        0x25 => Some(6),
+        0x26 => Some(8),
+        _ => None,
+    }
+}
+
+fn decode_mlx_affine_expert_matrix(
+    math: u16,
+    group_size: usize,
+    packed: &[u8],
+    aux: &[u8],
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, String> {
+    let bits = mlx_affine_bits_from_math(math)
+        .ok_or_else(|| format!("unsupported MLX affine math format 0x{math:04x}"))?;
+    if group_size == 0 || columns % group_size != 0 {
+        return Err(format!(
+            "invalid MLX affine expert group_size={group_size} for {columns} columns"
+        ));
+    }
+    let param_bytes = rows
+        .checked_mul(columns / group_size)
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| "MLX affine expert parameter size overflows".to_owned())?;
+    let want_aux = param_bytes
+        .checked_mul(2)
+        .ok_or_else(|| "MLX affine expert aux size overflows".to_owned())?;
+    if aux.len() != want_aux {
+        return Err(format!(
+            "MLX affine expert aux payload {} bytes != expected {want_aux} ({param_bytes} scales + {param_bytes} biases)",
+            aux.len()
+        ));
+    }
+    let (scales, biases) = aux.split_at(param_bytes);
+    mlx_affine_decode(packed, scales, biases, rows, columns, bits, group_size)
+}
+
+fn decode_mlx_affine_dense_matrix(
+    math: u16,
+    group_size: usize,
+    packed: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, String> {
+    let bits = mlx_affine_bits_from_math(math)
+        .ok_or_else(|| format!("unsupported MLX affine math format 0x{math:04x}"))?;
+    mlx_affine_decode(packed, scales, biases, rows, columns, bits, group_size)
+}
+
+pub(crate) fn mlx_affine_decode(
+    packed: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    rows: usize,
+    columns: usize,
+    bits: u8,
+    group_size: usize,
+) -> Result<Vec<f32>, String> {
+    if !matches!(bits, 4 | 5 | 6 | 8) {
+        return Err(format!("unsupported MLX affine bit width {bits}"));
+    }
+    if rows == 0 || columns == 0 || group_size == 0 || columns % group_size != 0 {
+        return Err(format!(
+            "invalid MLX affine geometry rows={rows} columns={columns} group_size={group_size}"
+        ));
+    }
+    let row_bits = columns
+        .checked_mul(bits as usize)
+        .ok_or_else(|| "MLX affine row bit count overflows".to_owned())?;
+    if row_bits % 32 != 0 {
+        return Err(format!(
+            "MLX affine row uses {row_bits} bits, not an integral number of U32 words"
+        ));
+    }
+    let row_bytes = row_bits / 8;
+    let want_weights = rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "MLX affine packed byte count overflows".to_owned())?;
+    if packed.len() != want_weights {
+        return Err(format!(
+            "MLX affine packed payload {} bytes != expected {want_weights}",
+            packed.len()
+        ));
+    }
+    let groups_per_row = columns / group_size;
+    let params = rows
+        .checked_mul(groups_per_row)
+        .ok_or_else(|| "MLX affine parameter count overflows".to_owned())?;
+    let want_params = params
+        .checked_mul(2)
+        .ok_or_else(|| "MLX affine parameter byte count overflows".to_owned())?;
+    if scales.len() != want_params || biases.len() != want_params {
+        return Err(format!(
+            "MLX affine scale/bias payloads {}/{} bytes != expected {want_params}",
+            scales.len(),
+            biases.len()
+        ));
+    }
+
+    let bf16_at = |bytes: &[u8], index: usize| {
+        let offset = index * 2;
+        bf16_to_f32(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+    };
+    let mask = (1_u64 << bits) - 1;
+    let mut output = Vec::with_capacity(rows * columns);
+    for row in 0..rows {
+        let row_data = &packed[row * row_bytes..(row + 1) * row_bytes];
+        for column in 0..columns {
+            let bit = column * bits as usize;
+            let word_index = bit / 32;
+            let shift = bit % 32;
+            let byte = word_index * 4;
+            let lo = u32::from_le_bytes(row_data[byte..byte + 4].try_into().unwrap()) as u64;
+            let combined = if shift + bits as usize > 32 {
+                let next =
+                    u32::from_le_bytes(row_data[byte + 4..byte + 8].try_into().unwrap()) as u64;
+                lo | (next << 32)
+            } else {
+                lo
+            };
+            let code = ((combined >> shift) & mask) as f32;
+            let group = row * groups_per_row + column / group_size;
+            output.push(code * bf16_at(scales, group) + bf16_at(biases, group));
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ColiSource;
@@ -761,5 +977,148 @@ mod tests {
         );
         assert_eq!(ColiSource::e4m3_decode(0x01), 2.0_f32.powi(-9));
         assert_eq!(ColiSource::e4m3_decode(0x08), 2.0_f32.powi(-6));
+    }
+}
+
+#[cfg(test)]
+mod mlx_affine_decode_tests {
+    use super::*;
+
+    fn bf16_vec(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|&value| bf16_bytes(value)).collect()
+    }
+
+    fn words_le(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn mlx_affine_decode_matches_lsb_first_mlx_packing() {
+        let cases: &[(u8, &[u32])] = &[
+            (4, &[0x7654_3210, 0xfedc_ba98, 0x7654_3210, 0xfedc_ba98]),
+            (
+                5,
+                &[
+                    0x8a41_8820,
+                    0xc5a9_2839,
+                    0xca30_7b9a,
+                    0x38bd_ab49,
+                    0xffbb_cdeb,
+                ],
+            ),
+            (
+                6,
+                &[
+                    0x440c_2040,
+                    0xa248_1c61,
+                    0x3ce3_4c2c,
+                    0x544d_2450,
+                    0xa658_5d65,
+                    0x7de7_5c6d,
+                ],
+            ),
+            (
+                8,
+                &[
+                    0x0302_0100,
+                    0x0706_0504,
+                    0x0b0a_0908,
+                    0x0f0e_0d0c,
+                    0x1312_1110,
+                    0x1716_1514,
+                    0x1b1a_1918,
+                    0x1f1e_1d1c,
+                ],
+            ),
+        ];
+
+        for &(bits, words) in cases {
+            // Two 32-value groups. The second repeats the same packed codes so
+            // group-specific scale/bias application is visible independently
+            // from bit unpacking.
+            let mut packed = words_le(words);
+            packed.extend_from_slice(&words_le(words));
+            let scales = bf16_vec(&[1.0, 2.0]);
+            let biases = bf16_vec(&[0.5, -1.0]);
+            let decoded = mlx_affine_decode(&packed, &scales, &biases, 1, 64, bits, 32).unwrap();
+
+            let mask = (1_u32 << bits) - 1;
+            let expected: Vec<f32> = (0..64)
+                .map(|column| {
+                    let code = (column % 32) as u32 & mask;
+                    if column < 32 {
+                        code as f32 + 0.5
+                    } else {
+                        code as f32 * 2.0 - 1.0
+                    }
+                })
+                .collect();
+            assert_eq!(decoded, expected, "bits={bits}");
+        }
+    }
+
+    #[test]
+    fn mlx_affine_expert_aux_is_scale_then_bias() {
+        let packed = words_le(&[
+            0x7654_3210,
+            0xfedc_ba98,
+            0x7654_3210,
+            0xfedc_ba98,
+            0x7654_3210,
+            0xfedc_ba98,
+            0x7654_3210,
+            0xfedc_ba98,
+        ]);
+        let mut aux = bf16_vec(&[2.0]);
+        aux.extend_from_slice(&bf16_vec(&[-1.0]));
+        let decoded = decode_mlx_affine_expert_matrix(0x23, 64, &packed, &aux, 1, 64).unwrap();
+        let expected: Vec<f32> = (0..64)
+            .map(|column| ((column % 16) as f32) * 2.0 - 1.0)
+            .collect();
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[cfg(test)]
+mod mlx_affine_dense_tests {
+    use super::*;
+
+    fn bf16_vec(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|&value| bf16_bytes(value)).collect()
+    }
+
+    fn words_le(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn dense_affine_adapter_maps_math_and_group_metadata() {
+        let packed = words_le(&[
+            0x8a41_8820,
+            0xc5a9_2839,
+            0xca30_7b9a,
+            0x38bd_ab49,
+            0xffbb_cdeb,
+            0x8a41_8820,
+            0xc5a9_2839,
+            0xca30_7b9a,
+            0x38bd_ab49,
+            0xffbb_cdeb,
+        ]);
+        let scales = bf16_vec(&[1.0, 2.0]);
+        let biases = bf16_vec(&[0.5, -1.0]);
+        let decoded =
+            decode_mlx_affine_dense_matrix(0x24, 32, &packed, &scales, &biases, 1, 64).unwrap();
+        let expected: Vec<f32> = (0..64)
+            .map(|column| {
+                let code = (column % 32) as u32 & 31;
+                if column < 32 {
+                    code as f32 + 0.5
+                } else {
+                    code as f32 * 2.0 - 1.0
+                }
+            })
+            .collect();
+        assert_eq!(decoded, expected);
     }
 }

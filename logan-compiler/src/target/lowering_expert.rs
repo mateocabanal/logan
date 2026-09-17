@@ -22,15 +22,33 @@ pub fn lower_exact_expert(expert: &RoutedExpert) -> Result<Vec<u8>> {
     let mut logical = Vec::new();
     for (index, (matrix, role)) in matrices.into_iter().enumerate() {
         let weight = read_tensor(&matrix.source)?;
-        let (scale, scale_format) = match &matrix.scale {
-            Some(scale) => (read_tensor(scale)?, scale_format(&scale.dtype)?),
-            None => (Vec::new(), 0),
+        let (aux, scale_format) = match (&matrix.scale, &matrix.bias) {
+            (Some(scale), bias) => {
+                let mut aux = read_tensor(scale)?;
+                if let Some(bias) = bias {
+                    if bias.dtype != scale.dtype || bias.shape != scale.shape {
+                        return Err(ColicError::InvalidSource {
+                            path: bias.source.clone(),
+                            detail: "affine expert bias must match its scale dtype/shape".into(),
+                        });
+                    }
+                    aux.extend_from_slice(&read_tensor(bias)?);
+                }
+                (aux, scale_format(&scale.dtype)?)
+            }
+            (None, Some(bias)) => {
+                return Err(ColicError::InvalidSource {
+                    path: bias.source.clone(),
+                    detail: "expert bias cannot be present without scales".into(),
+                });
+            }
+            (None, None) => (Vec::new(), 0),
         };
         let weight_offset = append_aligned(&mut payload, &weight)?;
-        let scale_offset = if scale.is_empty() {
+        let scale_offset = if aux.is_empty() {
             0
         } else {
-            append_aligned(&mut payload, &scale)?
+            append_aligned(&mut payload, &aux)?
         };
         let desc = HEADER_BYTES + index * DESC_BYTES;
         put_u16(&mut payload, desc, role);
@@ -42,14 +60,17 @@ pub fn lower_exact_expert(expert: &RoutedExpert) -> Result<Vec<u8>> {
             put_u32(&mut payload, desc + 32, 1);
             put_u32(&mut payload, desc + 36, 32);
         }
+        if let Some((_bits, group_size)) = crate::model::qwen_moe::parse_mlx_affine_dtype(&matrix.source.dtype) {
+            put_u32(&mut payload, desc + 104, group_size);
+        }
         put_u64(&mut payload, desc + 48, weight_offset);
         put_u64(&mut payload, desc + 56, weight.len() as u64);
         put_u64(&mut payload, desc + 64, weight.len() as u64);
         put_u64(&mut payload, desc + 72, scale_offset);
-        put_u64(&mut payload, desc + 80, scale.len() as u64);
-        put_u64(&mut payload, desc + 88, scale.len() as u64);
+        put_u64(&mut payload, desc + 80, aux.len() as u64);
+        put_u64(&mut payload, desc + 88, aux.len() as u64);
         let mut matrix_logical = weight.clone();
-        matrix_logical.extend_from_slice(&scale);
+        matrix_logical.extend_from_slice(&aux);
         put_u32(&mut payload, desc + 96, crc32c(&matrix_logical));
         logical.extend_from_slice(&matrix_logical);
     }
@@ -63,10 +84,23 @@ pub fn exact_expert_stored_bytes(expert: &RoutedExpert) -> Result<u64> {
         bytes = align_up(bytes, 16)?
             .checked_add(matrix.source.len)
             .ok_or_else(|| ColicError::Usage("projected expert payload size overflows u64".into()))?;
-        if let Some(scale) = &matrix.scale {
-            bytes = align_up(bytes, 16)?
-                .checked_add(scale.len)
-                .ok_or_else(|| ColicError::Usage("projected expert payload size overflows u64".into()))?;
+        match (&matrix.scale, &matrix.bias) {
+            (Some(scale), bias) => {
+                let aux_len = scale
+                    .len
+                    .checked_add(bias.as_ref().map_or(0, |bias| bias.len))
+                    .ok_or_else(|| ColicError::Usage("projected expert aux size overflows u64".into()))?;
+                bytes = align_up(bytes, 16)?
+                    .checked_add(aux_len)
+                    .ok_or_else(|| ColicError::Usage("projected expert payload size overflows u64".into()))?;
+            }
+            (None, Some(bias)) => {
+                return Err(ColicError::InvalidSource {
+                    path: bias.source.clone(),
+                    detail: "expert bias cannot be present without scales".into(),
+                });
+            }
+            (None, None) => {}
         }
     }
     Ok(bytes)
@@ -77,9 +111,11 @@ pub fn exact_expert_decoded_bytes(expert: &RoutedExpert) -> Result<u64> {
         .into_iter()
         .try_fold(0_u64, |total, matrix| {
             let scale_bytes = matrix.scale.as_ref().map_or(0, |scale| scale.len);
+            let bias_bytes = matrix.bias.as_ref().map_or(0, |bias| bias.len);
             total
                 .checked_add(matrix.source.len)
                 .and_then(|bytes| bytes.checked_add(scale_bytes))
+                .and_then(|bytes| bytes.checked_add(bias_bytes))
                 .ok_or_else(|| ColicError::Usage("expert logical byte count overflows u64".into()))
         })
 }
@@ -124,16 +160,37 @@ pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut 
         copy_tensor_stream(&matrix.source, output, &mut data_state, Some(&mut logical_state))?;
         cursor = cursor.checked_add(matrix.source.len)
             .ok_or_else(|| ColicError::Usage("expert source size overflows u64".into()))?;
-        let (scale_offset, scale_len, scale_id) = if let Some(scale) = &matrix.scale {
-            let offset = align_up(cursor, 16)?;
-            write_padding(output, offset - cursor, &mut data_state, &scale.source)?;
-            cursor = offset;
-            copy_tensor_stream(scale, output, &mut data_state, Some(&mut logical_state))?;
-            cursor = cursor.checked_add(scale.len)
-                .ok_or_else(|| ColicError::Usage("expert scale size overflows u64".into()))?;
-            (offset, scale.len, scale_format(&scale.dtype)?)
-        } else {
-            (0, 0, 0)
+        let (scale_offset, scale_len, scale_id) = match (&matrix.scale, &matrix.bias) {
+            (Some(scale), bias) => {
+                let offset = align_up(cursor, 16)?;
+                write_padding(output, offset - cursor, &mut data_state, &scale.source)?;
+                cursor = offset;
+                copy_tensor_stream(scale, output, &mut data_state, Some(&mut logical_state))?;
+                cursor = cursor.checked_add(scale.len)
+                    .ok_or_else(|| ColicError::Usage("expert scale size overflows u64".into()))?;
+                let mut aux_len = scale.len;
+                if let Some(bias) = bias {
+                    if bias.dtype != scale.dtype || bias.shape != scale.shape {
+                        return Err(ColicError::InvalidSource {
+                            path: bias.source.clone(),
+                            detail: "affine expert bias must match its scale dtype/shape".into(),
+                        });
+                    }
+                    copy_tensor_stream(bias, output, &mut data_state, Some(&mut logical_state))?;
+                    cursor = cursor.checked_add(bias.len)
+                        .ok_or_else(|| ColicError::Usage("expert bias size overflows u64".into()))?;
+                    aux_len = aux_len.checked_add(bias.len)
+                        .ok_or_else(|| ColicError::Usage("expert aux size overflows u64".into()))?;
+                }
+                (offset, aux_len, scale_format(&scale.dtype)?)
+            }
+            (None, Some(bias)) => {
+                return Err(ColicError::InvalidSource {
+                    path: bias.source.clone(),
+                    detail: "expert bias cannot be present without scales".into(),
+                });
+            }
+            (None, None) => (0, 0, 0),
         };
         put_u16(&mut header, desc, role);
         put_u16(&mut header, desc + 4, expert_math_format(&matrix.source.dtype)?);
@@ -143,6 +200,9 @@ pub fn stream_exact_expert<W: Write + Seek>(expert: &RoutedExpert, output: &mut 
         if matrix.source.dtype == "I8" {
             put_u32(&mut header, desc + 32, 1);
             put_u32(&mut header, desc + 36, 32);
+        }
+        if let Some((_bits, group_size)) = crate::model::qwen_moe::parse_mlx_affine_dtype(&matrix.source.dtype) {
+            put_u32(&mut header, desc + 104, group_size);
         }
         put_u64(&mut header, desc + 48, weight_offset);
         put_u64(&mut header, desc + 56, matrix.source.len);

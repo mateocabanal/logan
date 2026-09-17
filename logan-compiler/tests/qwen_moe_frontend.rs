@@ -562,3 +562,165 @@ fn rejects_truncated_fused_expert_payload() {
         "unexpected error: {message}"
     );
 }
+
+fn mlx_affine_fixture() -> Fixture {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "colic-qwen-mlx-affine-frontend-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("config.json"),
+        r#"{
+          "model_type": "qwen3_5_moe",
+          "quantization_config": {
+            "mode":"affine", "group_size":64, "bits":4,
+            "language_model.model.embed_tokens":{"mode":"affine","group_size":64,"bits":8},
+            "language_model.lm_head":{"mode":"affine","group_size":64,"bits":8},
+            "language_model.model.layers.0.self_attn.q_proj":{"mode":"affine","group_size":64,"bits":5}
+          },
+          "text_config": {
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "hidden_size": 64,
+            "num_experts": 2,
+            "moe_intermediate_size": 64,
+            "shared_expert_intermediate_size": 64,
+            "vocab_size": 64,
+            "num_experts_per_tok": 1,
+            "num_attention_heads": 1,
+            "head_dim": 64,
+            "num_key_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 64,
+            "linear_num_value_heads": 1,
+            "linear_value_head_dim": 64,
+            "linear_conv_kernel_dim": 4
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let weights = root.join("weights.bin");
+    fs::write(&weights, []).unwrap();
+    let mut tensors = BTreeMap::new();
+    let mut offset = 8192;
+
+    for (name, dtype, shape) in [
+        (
+            "language_model.model.embed_tokens.weight",
+            "U32",
+            vec![64, 16],
+        ),
+        (
+            "language_model.model.embed_tokens.scales",
+            "BF16",
+            vec![64, 1],
+        ),
+        (
+            "language_model.model.embed_tokens.biases",
+            "BF16",
+            vec![64, 1],
+        ),
+        ("language_model.lm_head.weight", "U32", vec![64, 16]),
+        ("language_model.lm_head.scales", "BF16", vec![64, 1]),
+        ("language_model.lm_head.biases", "BF16", vec![64, 1]),
+        ("language_model.model.norm.weight", "BF16", vec![64]),
+        (
+            "language_model.model.layers.0.input_layernorm.weight",
+            "BF16",
+            vec![64],
+        ),
+        (
+            "language_model.model.layers.0.post_attention_layernorm.weight",
+            "BF16",
+            vec![64],
+        ),
+        (
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "U32",
+            vec![128, 10],
+        ),
+        (
+            "language_model.model.layers.0.self_attn.q_proj.scales",
+            "BF16",
+            vec![128, 1],
+        ),
+        (
+            "language_model.model.layers.0.self_attn.q_proj.biases",
+            "BF16",
+            vec![128, 1],
+        ),
+    ] {
+        add_typed_tensor(&mut tensors, &weights, &mut offset, name, dtype, &shape);
+    }
+
+    for role in ["gate_proj", "up_proj", "down_proj"] {
+        for (suffix, dtype, shape) in [
+            ("weight", "U32", vec![2, 64, 8]),
+            ("scales", "BF16", vec![2, 64, 1]),
+            ("biases", "BF16", vec![2, 64, 1]),
+        ] {
+            add_typed_tensor(
+                &mut tensors,
+                &weights,
+                &mut offset,
+                format!("language_model.model.layers.0.mlp.switch_mlp.{role}.{suffix}"),
+                dtype,
+                &shape,
+            );
+        }
+    }
+
+    let inventory = SourceInventory {
+        root: root.clone(),
+        files: vec![root.join("config.json"), weights],
+        source_stored_bytes: tensors.values().map(|tensor| tensor.len).sum(),
+        dtype_counts: BTreeMap::new(),
+        source_fingerprint: "22".repeat(32),
+        config_fingerprint: None,
+        architecture_hint: Some("Qwen3_5MoeForConditionalGeneration".into()),
+        tensors,
+    };
+    Fixture { root, inventory }
+}
+
+#[test]
+fn adapts_mlx_affine_mixed_precision_without_requantizing() {
+    let fixture = mlx_affine_fixture();
+    let model = QwenMoeFrontend::build(&fixture.inventory).unwrap();
+
+    let expert = model.routed_experts.get(&(0, 1)).unwrap();
+    assert_eq!(expert.gate.source.dtype, "MLX_AFFINE:4:64");
+    assert_eq!(expert.gate.source.shape, vec![64, 64]);
+    assert_eq!(expert.gate.source.len, 64 * 8 * 4);
+    assert_eq!(expert.gate.scale.as_ref().unwrap().dtype, "BF16");
+    assert_eq!(expert.gate.scale.as_ref().unwrap().shape, vec![64, 1]);
+
+    assert_eq!(
+        model.global_tensors["embed.weight"].dtype,
+        "MLX_AFFINE:8:64"
+    );
+    assert_eq!(model.global_tensors["embed.weight"].shape, vec![64, 64]);
+    assert_eq!(model.global_tensors["embed.biases"].dtype, "BF16");
+    assert_eq!(model.global_tensors["head.biases"].dtype, "BF16");
+    assert_eq!(
+        model.layer_static_tensors[&0]["self_attn.q_proj.weight"].dtype,
+        "MLX_AFFINE:5:64"
+    );
+    assert_eq!(
+        model.layer_static_tensors[&0]["self_attn.q_proj.weight"].shape,
+        vec![128, 64]
+    );
+
+    assert!(
+        !model
+            .resident_tensors
+            .contains_key("language_model.model.layers.0.mlp.switch_mlp.gate_proj.biases"),
+        "affine expert biases must travel with the streamed expert, not be duplicated as resident tensors"
+    );
+}

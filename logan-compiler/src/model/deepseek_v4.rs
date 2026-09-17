@@ -428,6 +428,7 @@ fn matrix(
         rows: spec.rows,
         columns: spec.columns,
         scale: Some((*scale).clone()),
+        bias: None,
     })
 }
 

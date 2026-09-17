@@ -305,6 +305,10 @@ fn choose_optimizer_plan(plans: &[logan_ir::ParetoPlan]) -> logan_compiler::Resu
 /// that this class of failure cannot come back by adding a larger model.
 const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
 
+fn uses_modern_qwen_runtime(model_type: &str) -> bool {
+    matches!(model_type, "qwen3_5_moe" | "qwen4_exp_text" | "qwen4_exp")
+}
+
 fn main() {
     // Do the work on a thread with a large stack rather than raising the main
     // thread's: `main`'s stack size is fixed by the platform at process start
@@ -538,7 +542,7 @@ fn run() -> logan_compiler::Result<()> {
                     })?
                 }
                 #[cfg(feature = "runtime")]
-                "qwen4_exp_text" | "qwen4_exp" => {
+                model_type if uses_modern_qwen_runtime(model_type) => {
                     let cfg = logan_qwen4::load_cfg(&cfg_path).map_err(|e| {
                         logan_compiler::ColicError::Unsupported {
                             stage: "run",
@@ -564,11 +568,18 @@ fn run() -> logan_compiler::Result<()> {
                             }
                         })?
                     } else {
-                        logan_qwen4::plan::run_greedy_cached_coli(&package, &cfg, &prompt_ids, max_new)
-                            .map_err(|e| logan_compiler::ColicError::Unsupported {
+                        logan_qwen4::plan::run_greedy_cached_coli(
+                            &package,
+                            &cfg,
+                            &prompt_ids,
+                            max_new,
+                        )
+                        .map_err(|e| {
+                            logan_compiler::ColicError::Unsupported {
                                 stage: "run",
                                 detail: e,
-                            })?
+                            }
+                        })?
                     }
                 }
                 #[cfg(feature = "runtime")]
@@ -666,5 +677,13 @@ mod tests {
     fn byte_rate_handles_unavailable_and_known_rates() {
         assert_eq!(byte_rate(0, 1.0), "-- MiB/s");
         assert_eq!(byte_rate(10 * 1024 * 1024, 2.0), "5.0 MiB/s");
+    }
+
+    #[test]
+    fn qwen35_moe_uses_modern_qwen_runtime() {
+        assert!(uses_modern_qwen_runtime("qwen3_5_moe"));
+        assert!(uses_modern_qwen_runtime("qwen4_exp_text"));
+        assert!(uses_modern_qwen_runtime("qwen4_exp"));
+        assert!(!uses_modern_qwen_runtime("spark2_5"));
     }
 }

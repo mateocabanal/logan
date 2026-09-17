@@ -405,6 +405,14 @@ pub fn exact_record_inventory(model: &SemanticModel) -> Result<Vec<LoweredRecord
     )
 }
 
+fn exact_expert_is_mlx_affine(expert: &crate::ir::RoutedExpert) -> bool {
+    [&expert.gate, &expert.up, &expert.down]
+        .into_iter()
+        .all(|matrix| {
+            crate::model::qwen_moe::parse_mlx_affine_dtype(&matrix.source.dtype).is_some()
+        })
+}
+
 fn record_inventory(
     model: &SemanticModel,
     expert_quantization: &ExpertQuantizationPlan,
@@ -427,15 +435,25 @@ fn record_inventory(
         let (stored_bytes, decoded_bytes) = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1
         {
             match expert_quantization {
-                ExpertQuantization::Exact => target::validate_apple8_exact_mxfp4_expert(expert)?,
+                ExpertQuantization::Exact if exact_expert_is_mlx_affine(expert) => (
+                    target::exact_expert_stored_bytes(expert)?,
+                    target::exact_expert_decoded_bytes(expert)?,
+                ),
+                ExpertQuantization::Exact => {
+                    target::validate_apple8_exact_mxfp4_expert(expert)?;
+                    (
+                        target::apple8_expert_stored_bytes(expert)?,
+                        target::apple8_expert_decoded_bytes(expert)?,
+                    )
+                }
                 ExpertQuantization::Mxfp4 => {
-                    target::validate_apple8_quantized_mxfp4_expert(expert)?
+                    target::validate_apple8_quantized_mxfp4_expert(expert)?;
+                    (
+                        target::apple8_expert_stored_bytes(expert)?,
+                        target::apple8_expert_decoded_bytes(expert)?,
+                    )
                 }
             }
-            (
-                target::apple8_expert_stored_bytes(expert)?,
-                target::apple8_expert_decoded_bytes(expert)?,
-            )
         } else {
             match expert_quantization {
                 ExpertQuantization::Exact => (
@@ -704,20 +722,32 @@ fn stream_payload(
             quantization,
         } => {
             let crc = if target_profile == target::MACOS_ARM64_METAL_APPLE8_V1 {
-                let bytes = match quantization {
-                    ExpertQuantization::Exact => target::lower_apple8_exact_mxfp4_expert(expert)?,
-                    ExpertQuantization::Mxfp4 => {
-                        target::lower_apple8_quantized_mxfp4_expert(expert)?
+                if *quantization == ExpertQuantization::Exact && exact_expert_is_mlx_affine(expert)
+                {
+                    let mut crc = 0;
+                    writer.write_record_stream(planned, |file| {
+                        crc = target::stream_exact_expert(expert, file)?;
+                        Ok(planned.record.stored_bytes)
+                    })?;
+                    crc
+                } else {
+                    let bytes = match quantization {
+                        ExpertQuantization::Exact => {
+                            target::lower_apple8_exact_mxfp4_expert(expert)?
+                        }
+                        ExpertQuantization::Mxfp4 => {
+                            target::lower_apple8_quantized_mxfp4_expert(expert)?
+                        }
+                    };
+                    if bytes.len() as u64 != planned.record.stored_bytes {
+                        return Err(ColicError::Usage(
+                            "Apple8 expert emission does not match its raw storage plan".into(),
+                        ));
                     }
-                };
-                if bytes.len() as u64 != planned.record.stored_bytes {
-                    return Err(ColicError::Usage(
-                        "Apple8 expert emission does not match its raw storage plan".into(),
-                    ));
+                    let crc = storage::crc32c(&bytes);
+                    writer.write_record(planned, &bytes)?;
+                    crc
                 }
-                let crc = storage::crc32c(&bytes);
-                writer.write_record(planned, &bytes)?;
-                crc
             } else {
                 match quantization {
                     ExpertQuantization::Exact => {
@@ -1450,6 +1480,7 @@ mod tests {
             rows: 1,
             columns: 1,
             scale: None,
+            bias: None,
         };
         let mut globals = BTreeMap::new();
         globals.insert("embed.weight".into(), tensor(2));
@@ -1520,6 +1551,7 @@ mod tests {
             rows: 2,
             columns: 32,
             scale: None,
+            bias: None,
         };
         let mut experts = BTreeMap::new();
         experts.insert(
@@ -1594,6 +1626,79 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].stored_bytes, 872);
         assert_eq!(records[0].decoded_bytes, 408);
+    }
+
+    #[test]
+    fn apple8_exact_mlx_affine_expert_stays_canonical() {
+        let tensor = |offset: u64| TensorRef {
+            source: "mlx-affine-fixture.safetensors".into(),
+            offset,
+            len: 32,
+            dtype: "MLX_AFFINE:4:64".into(),
+            shape: vec![1, 64],
+        };
+        let aux = |offset: u64| TensorRef {
+            source: "mlx-affine-fixture.safetensors".into(),
+            offset,
+            len: 2,
+            dtype: "BF16".into(),
+            shape: vec![1, 1],
+        };
+        let matrix = |offset: u64| Matrix {
+            source: tensor(offset),
+            rows: 1,
+            columns: 64,
+            scale: Some(aux(offset + 32)),
+            bias: Some(aux(offset + 34)),
+        };
+        let mut experts = BTreeMap::new();
+        experts.insert(
+            (0, 0),
+            RoutedExpert {
+                layer: 0,
+                expert: 0,
+                gate: matrix(0),
+                up: matrix(36),
+                down: matrix(72),
+            },
+        );
+        let model = SemanticModel {
+            architecture: Architecture::Qwen3_5MoeMoE,
+            geometry: ModelGeometry {
+                hidden_size: 64,
+                layers: 1,
+                routed_experts_per_layer: 1,
+                moe_intermediate_size: 1,
+                vocab_size: 1,
+                hc_mult: 0,
+                num_hash_layers: 0,
+                experts_per_token: 1,
+                attention_heads: 1,
+                head_dim: 64,
+                num_key_value_heads: 1,
+                linear_key_head_dim: 0,
+                q_lora_rank: 0,
+                o_groups: 0,
+                o_lora_rank: 0,
+                index_heads: 0,
+                index_head_dim: 0,
+                compression_ratios: Vec::new(),
+            },
+            routed_experts: experts,
+            global_tensors: BTreeMap::new(),
+            layer_static_tensors: BTreeMap::new(),
+            resident_tensors: BTreeMap::new(),
+        };
+
+        let records = record_inventory(
+            &model,
+            &ExpertQuantizationPlan::uniform(ExpertQuantization::Exact),
+            target::MACOS_ARM64_METAL_APPLE8_V1,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].stored_bytes, 580);
+        assert_eq!(records[0].decoded_bytes, 108);
     }
 
     #[test]

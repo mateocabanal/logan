@@ -734,6 +734,7 @@ fn whole_matrix(source: &SourceInventory, name: &str, rows: u32, cols: u32) -> R
         rows,
         columns: cols,
         scale: None,
+        bias: None,
     })
 }
 
@@ -757,6 +758,7 @@ fn slice_rows(tensor: &TensorRef, row_start: u32, rows: u32, cols: u32) -> Resul
         rows,
         columns: cols,
         scale: None,
+        bias: None,
     })
 }
 
@@ -793,6 +795,7 @@ fn slice_fused(
         rows,
         columns: cols,
         scale: None,
+        bias: None,
     })
 }
 

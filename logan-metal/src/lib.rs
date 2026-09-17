@@ -68,11 +68,15 @@ mod imp {
 
     impl MetalAneFence {
         pub fn new(value: u64) -> Option<Self> {
-            if value == 0 { return None; }
+            if value == 0 {
+                return None;
+            }
             let mut shared = std::ptr::null_mut();
             let handle = unsafe { coli_apple8_metalio_ane_fence_create(value, &mut shared) };
             if handle.is_null() || shared.is_null() {
-                if !handle.is_null() { unsafe { coli_apple8_metalio_ane_fence_free(handle) }; }
+                if !handle.is_null() {
+                    unsafe { coli_apple8_metalio_ane_fence_free(handle) };
+                }
                 return None;
             }
             Some(Self {
@@ -83,13 +87,17 @@ mod imp {
             })
         }
 
-        pub fn ane_shared_event(&self) -> *mut c_void { self.ane_shared_event }
+        pub fn ane_shared_event(&self) -> *mut c_void {
+            self.ane_shared_event
+        }
         /// Borrow the underlying MTLSharedEvent for Metal command encoding.
         /// Lifetime is tied to this fence; native pending objects retain it.
         pub fn metal_shared_event(&self) -> *mut c_void {
             unsafe { coli_apple8_metalio_ane_fence_metal_event(self.handle) }
         }
-        pub fn value(&self) -> u64 { self.value }
+        pub fn value(&self) -> u64 {
+            self.value
+        }
         pub fn advance(&mut self) -> Option<u64> {
             let next = self.value.checked_add(1)?;
             if unsafe { coli_apple8_metalio_ane_fence_set_value(self.handle, next) } != 1 {
@@ -98,7 +106,9 @@ mod imp {
             self.value = next;
             Some(next)
         }
-        fn raw_handle(&self) -> *mut c_void { self.handle }
+        fn raw_handle(&self) -> *mut c_void {
+            self.handle
+        }
     }
 
     impl Drop for MetalAneFence {
@@ -132,11 +142,23 @@ mod imp {
         pub o: usize,
     }
 
+    pub struct MlxAffineMatmulDesc<'a> {
+        pub tensor: *mut ColiMetalTensor,
+        pub y: &'a mut [f32],
+        pub weights: &'a [u8],
+        pub aux: &'a [u8],
+        pub bits: u8,
+        pub group_size: usize,
+        pub i: usize,
+        pub o: usize,
+    }
+
     pub struct MetalWeightDesc<'a> {
         pub tensor: *mut ColiMetalTensor,
         pub weights: &'a [u8],
         pub scales: &'a [u8],
         pub fmt: i32,
+        pub group_size: usize,
         pub i: usize,
         pub o: usize,
     }
@@ -175,7 +197,10 @@ mod imp {
             gpu_ms: *mut f64,
         ) -> i32;
         fn logan_metal_ane_dynamic_pack_begin(
-            handle: *mut c_void, x: *const f32, signal_event: *mut c_void, signal_value: u64,
+            handle: *mut c_void,
+            x: *const f32,
+            signal_event: *mut c_void,
+            signal_value: u64,
         ) -> *mut c_void;
         fn logan_metal_ane_dynamic_pack_finish(pending: *mut c_void, gpu_ms: *mut f64) -> i32;
         fn logan_metal_ane_dynamic_pack_discard(pending: *mut c_void);
@@ -439,7 +464,6 @@ mod imp {
         }
     }
 
-
     impl MetalAneDynamicPack {
         #[allow(clippy::too_many_arguments)]
         pub fn new(
@@ -461,33 +485,66 @@ mod imp {
             a_offset: usize,
             b_offset: usize,
         ) -> Option<Self> {
-            if hidden == 0 || spatial == 0 || qkv_rows == 0 || z_rows == 0 || ab_rows == 0 ||
-                wqkv.len() != qkv_rows.checked_mul(hidden)?.checked_mul(2)? ||
-                wz.len() != z_rows.checked_mul(hidden)?.checked_mul(2)? ||
-                wa.len() != ab_rows.checked_mul(hidden)?.checked_mul(2)? ||
-                wb.len() != ab_rows.checked_mul(hidden)?.checked_mul(2)? {
+            if hidden == 0
+                || spatial == 0
+                || qkv_rows == 0
+                || z_rows == 0
+                || ab_rows == 0
+                || wqkv.len() != qkv_rows.checked_mul(hidden)?.checked_mul(2)?
+                || wz.len() != z_rows.checked_mul(hidden)?.checked_mul(2)?
+                || wa.len() != ab_rows.checked_mul(hidden)?.checked_mul(2)?
+                || wb.len() != ab_rows.checked_mul(hidden)?.checked_mul(2)?
+            {
                 return None;
             }
             let cv = |v: usize| u32::try_from(v).ok();
             let handle = unsafe {
                 logan_metal_ane_dynamic_pack_create(
-                    qkv_dst.handle, aux_dst.handle,
-                    wqkv.as_ptr().cast(), wz.as_ptr().cast(), wa.as_ptr().cast(), wb.as_ptr().cast(),
-                    cv(hidden)?, cv(spatial)?, cv(qkv_rows)?, cv(z_rows)?, cv(ab_rows)?,
-                    cv(qkv_stride)?, cv(aux_stride)?, cv(qkv_offset)?, cv(z_offset)?,
-                    cv(a_offset)?, cv(b_offset)?,
+                    qkv_dst.handle,
+                    aux_dst.handle,
+                    wqkv.as_ptr().cast(),
+                    wz.as_ptr().cast(),
+                    wa.as_ptr().cast(),
+                    wb.as_ptr().cast(),
+                    cv(hidden)?,
+                    cv(spatial)?,
+                    cv(qkv_rows)?,
+                    cv(z_rows)?,
+                    cv(ab_rows)?,
+                    cv(qkv_stride)?,
+                    cv(aux_stride)?,
+                    cv(qkv_offset)?,
+                    cv(z_offset)?,
+                    cv(a_offset)?,
+                    cv(b_offset)?,
                 )
             };
-            if handle.is_null() { return None; }
-            Some(Self { handle, hidden, _not_send_sync: std::marker::PhantomData })
+            if handle.is_null() {
+                return None;
+            }
+            Some(Self {
+                handle,
+                hidden,
+                _not_send_sync: std::marker::PhantomData,
+            })
         }
 
         /// Commit the pack and signal the shared event when both ANE input surfaces are complete.
-        pub fn begin(&mut self, x: &[f32], fence: &MetalAneFence) -> Option<MetalAneDynamicPackPending> {
-            if x.len() != self.hidden || fence.value() == 0 { return None; }
+        pub fn begin(
+            &mut self,
+            x: &[f32],
+            fence: &MetalAneFence,
+        ) -> Option<MetalAneDynamicPackPending> {
+            if x.len() != self.hidden || fence.value() == 0 {
+                return None;
+            }
             let event = fence.metal_shared_event();
-            if event.is_null() { return None; }
-            let raw = unsafe { logan_metal_ane_dynamic_pack_begin(self.handle, x.as_ptr(), event, fence.value()) };
+            if event.is_null() {
+                return None;
+            }
+            let raw = unsafe {
+                logan_metal_ane_dynamic_pack_begin(self.handle, x.as_ptr(), event, fence.value())
+            };
             Some(MetalAneDynamicPackPending {
                 raw: Some(std::ptr::NonNull::new(raw)?),
                 _not_send_sync: std::marker::PhantomData,
@@ -498,22 +555,30 @@ mod imp {
         /// Returns actual GPU execution milliseconds; callers can separately
         /// measure exposed host wall time to diagnose queue/residency stalls.
         pub fn run(&mut self, x: &[f32]) -> Option<f64> {
-            if x.len() != self.hidden { return None; }
+            if x.len() != self.hidden {
+                return None;
+            }
             let mut gpu_ms = 0.0;
-            let rc = unsafe { logan_metal_ane_dynamic_pack_run(self.handle, x.as_ptr(), &mut gpu_ms) };
+            let rc =
+                unsafe { logan_metal_ane_dynamic_pack_run(self.handle, x.as_ptr(), &mut gpu_ms) };
             (rc > 0).then_some(gpu_ms)
         }
     }
 
     impl MetalAneDynamicPackPending {
         pub fn finish(mut self) -> Option<f64> {
-            let raw = self.raw.take()?; let mut gpu_ms=0.0;
-            let rc=unsafe { logan_metal_ane_dynamic_pack_finish(raw.as_ptr(), &mut gpu_ms) };
+            let raw = self.raw.take()?;
+            let mut gpu_ms = 0.0;
+            let rc = unsafe { logan_metal_ane_dynamic_pack_finish(raw.as_ptr(), &mut gpu_ms) };
             (rc > 0).then_some(gpu_ms)
         }
     }
     impl Drop for MetalAneDynamicPackPending {
-        fn drop(&mut self) { if let Some(raw)=self.raw.take() { unsafe { logan_metal_ane_dynamic_pack_discard(raw.as_ptr()) } } }
+        fn drop(&mut self) {
+            if let Some(raw) = self.raw.take() {
+                unsafe { logan_metal_ane_dynamic_pack_discard(raw.as_ptr()) }
+            }
+        }
     }
 
     impl Drop for MetalAneDynamicPack {
@@ -545,7 +610,9 @@ mod imp {
     impl Drop for MetalGdnConvPending<'_> {
         fn drop(&mut self) {
             if !self.handle.is_null() {
-                unsafe { logan_metal_gdn_conv_silu_finish(self.handle, std::ptr::null_mut()); }
+                unsafe {
+                    logan_metal_gdn_conv_silu_finish(self.handle, std::ptr::null_mut());
+                }
             }
         }
     }
@@ -673,7 +740,10 @@ mod imp {
             11 => (o * i, o * i.div_ceil(32) * std::mem::size_of::<f32>()),
             12 => (o * i, o * i.div_ceil(16) * std::mem::size_of::<f32>()),
             13 => (o * i, o * i.div_ceil(8) * std::mem::size_of::<f32>()),
-            14 => (o * i + o * i.div_ceil(32) * 3, o * i.div_ceil(32) * std::mem::size_of::<f32>()),
+            14 => (
+                o * i + o * i.div_ceil(32) * 3,
+                o * i.div_ceil(32) * std::mem::size_of::<f32>(),
+            ),
             15 => (o * i, 2 * o * i.div_ceil(64) * std::mem::size_of::<u16>()),
             _ => return false,
         };
@@ -697,10 +767,462 @@ mod imp {
                 1,
                 i as i32,
                 o as i32,
-                match fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => 0 },
+                match fmt {
+                    11 | 14 => 32,
+                    12 => 16,
+                    13 => 8,
+                    _ => 0,
+                },
             )
         };
         rc == 1
+    }
+
+    /// Native MLX affine GEMV over the checkpoint's packed U32 bitstream.
+    /// `aux` is `[BF16 scales][BF16 biases]`, each `[O, I/group_size]`.
+    /// Formats 16..19 map to 4/5/6/8-bit respectively; fmt15 remains the
+    /// legacy Spark affine-8/group-64 contract.
+    pub fn metal_matmul_mlx_affine(
+        tensor: &mut *mut ColiMetalTensor,
+        y: &mut [f32],
+        x: &[f32],
+        weights: &[u8],
+        aux: &[u8],
+        bits: u8,
+        group_size: usize,
+        i: usize,
+        o: usize,
+    ) -> bool {
+        if !metal_available()
+            || i == 0
+            || o == 0
+            || group_size == 0
+            || i % group_size != 0
+            || x.len() < i
+            || y.len() < o
+        {
+            return false;
+        }
+        let fmt = match bits {
+            4 => 16,
+            5 => 17,
+            6 => 18,
+            8 => 19,
+            _ => return false,
+        };
+        let row_bits = match i.checked_mul(bits as usize) {
+            Some(v) if v % 32 == 0 => v,
+            _ => return false,
+        };
+        let weight_bytes = match o.checked_mul(row_bits / 8) {
+            Some(v) => v,
+            None => return false,
+        };
+        let groups = i / group_size;
+        let aux_bytes = match 2_usize
+            .checked_mul(o)
+            .and_then(|v| v.checked_mul(groups))
+            .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        if weights.len() < weight_bytes || aux.len() < aux_bytes {
+            return false;
+        }
+        unsafe {
+            coli_metal_matmul(
+                tensor,
+                y.as_mut_ptr(),
+                x.as_ptr(),
+                weights.as_ptr() as *const c_void,
+                aux.as_ptr() as *const f32,
+                fmt,
+                1,
+                i as i32,
+                o as i32,
+                group_size as i32,
+            ) == 1
+        }
+    }
+
+    pub fn metal_matmul_mlx_affine_multi(x: &[f32], descs: &mut [MlxAffineMatmulDesc<'_>]) -> bool {
+        if !metal_available() || descs.is_empty() || descs.len() > 16 {
+            return false;
+        }
+        let common_i = descs[0].i;
+        if common_i == 0 || common_i > i32::MAX as usize || x.len() < common_i {
+            return false;
+        }
+        let mut raw = Vec::with_capacity(descs.len());
+        for d in descs.iter_mut() {
+            if d.i != common_i
+                || d.o == 0
+                || d.o > i32::MAX as usize
+                || d.y.len() < d.o
+                || d.group_size == 0
+                || d.i % d.group_size != 0
+                || d.group_size > i32::MAX as usize
+            {
+                return false;
+            }
+            let fmt = match d.bits {
+                4 => 16,
+                5 => 17,
+                6 => 18,
+                8 => 19,
+                _ => return false,
+            };
+            let row_bits = match d.i.checked_mul(d.bits as usize) {
+                Some(v) if v % 32 == 0 => v,
+                _ => return false,
+            };
+            let weight_bytes = match d.o.checked_mul(row_bits / 8) {
+                Some(v) => v,
+                None => return false,
+            };
+            let groups = d.i / d.group_size;
+            let aux_bytes = match 2_usize
+                .checked_mul(d.o)
+                .and_then(|v| v.checked_mul(groups))
+                .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
+            {
+                Some(v) => v,
+                None => return false,
+            };
+            if d.weights.len() < weight_bytes || d.aux.len() < aux_bytes {
+                return false;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: d.tensor,
+                y: d.y.as_mut_ptr(),
+                weights: d.weights.as_ptr() as *const c_void,
+                scales: d.aux.as_ptr() as *const f32,
+                fmt,
+                i: d.i as i32,
+                o: d.o as i32,
+                gs: d.group_size as i32,
+            });
+        }
+        let ok = unsafe {
+            coli_metal_matmul_multi(x.as_ptr(), 1, raw.as_mut_ptr(), raw.len() as i32) == 1
+        };
+        for (d, r) in descs.iter_mut().zip(raw.iter()) {
+            d.tensor = r.tensor;
+        }
+        ok
+    }
+
+    #[cfg(test)]
+    mod mlx_affine_tests {
+        use super::{
+            ColiMetalTensor, MetalWeightDesc, MlxAffineMatmulDesc, gdn_mxfp4, gdn_mxfp4_drop_model,
+            metal_init, metal_matmul_mlx_affine, metal_matmul_mlx_affine_multi,
+        };
+
+        fn bf16(v: f32) -> [u8; 2] {
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        }
+
+        fn pack_codes(codes: &[u32], bits: u8) -> Vec<u8> {
+            let total_bits = codes.len() * bits as usize;
+            assert_eq!(total_bits % 32, 0);
+            let mut words = vec![0_u32; total_bits / 32];
+            for (index, &code) in codes.iter().enumerate() {
+                let bit = index * bits as usize;
+                let word = bit / 32;
+                let shift = bit % 32;
+                words[word] |= code << shift;
+                if shift + bits as usize > 32 {
+                    words[word + 1] |= code >> (32 - shift);
+                }
+            }
+            words.into_iter().flat_map(u32::to_le_bytes).collect()
+        }
+
+        #[test]
+        fn fused_gdn_accepts_mixed_mlx_affine_formats_and_group_sizes() {
+            assert!(
+                metal_init(),
+                "Metal backend must initialize on Apple Silicon"
+            );
+            const D: usize = 128;
+            const KH: usize = 1;
+            const KD: usize = 64;
+            const VH: usize = 2;
+            const VD: usize = 64;
+            const KK: usize = 4;
+            const KDIM: usize = KH * KD;
+            const VDIM: usize = VH * VD;
+            const CDIM: usize = 2 * KDIM + VDIM;
+
+            fn zero_affine(o: usize, i: usize, bits: u8, group: usize) -> (Vec<u8>, Vec<u8>) {
+                let weights = vec![0_u8; o * i * bits as usize / 8];
+                let groups = i / group;
+                let mut aux = Vec::with_capacity(2 * o * groups * 2);
+                for _ in 0..o * groups {
+                    aux.extend_from_slice(&bf16(1.0));
+                }
+                for _ in 0..o * groups {
+                    aux.extend_from_slice(&bf16(0.0));
+                }
+                (weights, aux)
+            }
+
+            let (wq, aq) = zero_affine(CDIM, D, 4, 64);
+            let (wz, az) = zero_affine(VDIM, D, 5, 128);
+            let (wa, aa) = zero_affine(VH, D, 6, 64);
+            let (wb, ab) = zero_affine(VH, D, 8, 128);
+            let (wo, ao) = zero_affine(D, VDIM, 4, 64);
+            let mut descs = [
+                MetalWeightDesc {
+                    tensor: std::ptr::null_mut(),
+                    weights: &wq,
+                    scales: &aq,
+                    fmt: 16,
+                    group_size: 64,
+                    i: D,
+                    o: CDIM,
+                },
+                MetalWeightDesc {
+                    tensor: std::ptr::null_mut(),
+                    weights: &wz,
+                    scales: &az,
+                    fmt: 17,
+                    group_size: 128,
+                    i: D,
+                    o: VDIM,
+                },
+                MetalWeightDesc {
+                    tensor: std::ptr::null_mut(),
+                    weights: &wa,
+                    scales: &aa,
+                    fmt: 18,
+                    group_size: 64,
+                    i: D,
+                    o: VH,
+                },
+                MetalWeightDesc {
+                    tensor: std::ptr::null_mut(),
+                    weights: &wb,
+                    scales: &ab,
+                    fmt: 19,
+                    group_size: 128,
+                    i: D,
+                    o: VH,
+                },
+                MetalWeightDesc {
+                    tensor: std::ptr::null_mut(),
+                    weights: &wo,
+                    scales: &ao,
+                    fmt: 16,
+                    group_size: 64,
+                    i: VDIM,
+                    o: D,
+                },
+            ];
+            let x = vec![0.25_f32; D];
+            let mut out = vec![123.0_f32; D];
+            let a_log = vec![0.0_f32; VH];
+            let dt_bias = vec![0.0_f32; VH];
+            let conv_w = vec![1.0_f32; CDIM * KK];
+            let norm_w = vec![1.0_f32; VD];
+            unsafe fn aligned_zeroed_f32(len: usize) -> (*mut f32, std::alloc::Layout) {
+                let logical = len.checked_mul(std::mem::size_of::<f32>()).unwrap();
+                let bytes = logical.div_ceil(16_384) * 16_384;
+                let layout =
+                    std::alloc::Layout::from_size_align(bytes.max(16_384), 16_384).unwrap();
+                let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut f32;
+                assert!(!ptr.is_null());
+                (ptr, layout)
+            }
+            let state_len = VH * KD * VD;
+            let conv_state_len = CDIM * (KK - 1);
+            let (state_ptr, state_layout) = unsafe { aligned_zeroed_f32(state_len) };
+            let (conv_ptr, conv_layout) = unsafe { aligned_zeroed_f32(conv_state_len) };
+            let state = unsafe { std::slice::from_raw_parts_mut(state_ptr, state_len) };
+            let conv_state = unsafe { std::slice::from_raw_parts_mut(conv_ptr, conv_state_len) };
+            let model_id = 0xaff1_u64;
+            let rc = gdn_mxfp4(
+                model_id, 0, &mut descs, &x, &mut out, &a_log, &dt_bias, &conv_w, &norm_w, state,
+                conv_state, D, KH, KD, VH, VD, KK, 0, 1e-6,
+            );
+            assert_eq!(
+                rc, 1,
+                "full fused GDN must accept native MLX affine descriptors"
+            );
+            assert!(
+                out.iter().all(|v| v.abs() <= 1e-6),
+                "zero affine projections must produce zero output: {:?}",
+                &out[..8]
+            );
+            for d in &descs {
+                if !d.tensor.is_null() {
+                    unsafe { super::coli_metal_tensor_free(d.tensor) };
+                }
+            }
+            gdn_mxfp4_drop_model(model_id);
+            unsafe {
+                std::alloc::dealloc(state_ptr as *mut u8, state_layout);
+                std::alloc::dealloc(conv_ptr as *mut u8, conv_layout);
+            }
+        }
+
+        #[test]
+        fn native_mlx_affine_multi_handles_mixed_bits_and_groups() {
+            assert!(
+                metal_init(),
+                "Metal backend must initialize on Apple Silicon"
+            );
+            const I: usize = 128;
+            let x: Vec<f32> = (0..I)
+                .map(|i| ((i as i32 % 13) - 6) as f32 * 0.0625)
+                .collect();
+
+            let build = |bits: u8, group_size: usize, o: usize| {
+                let mask = (1_u32 << bits) - 1;
+                let groups = I / group_size;
+                let mut weights = Vec::new();
+                let mut scales = Vec::new();
+                let mut biases = Vec::new();
+                let mut expected = vec![0.0_f32; o];
+                for row in 0..o {
+                    let codes: Vec<u32> = (0..I)
+                        .map(|col| (row as u32 * 11 + col as u32 * 5 + 1) & mask)
+                        .collect();
+                    weights.extend_from_slice(&pack_codes(&codes, bits));
+                    for group in 0..groups {
+                        let scale = 0.0625 * (row + group + 1) as f32;
+                        let bias = -0.125 + 0.03125 * (row + group) as f32;
+                        scales.extend_from_slice(&bf16(scale));
+                        biases.extend_from_slice(&bf16(bias));
+                        let start = group * group_size;
+                        for col in start..start + group_size {
+                            expected[row] += (codes[col] as f32 * scale + bias) * x[col];
+                        }
+                    }
+                }
+                let mut aux = scales;
+                aux.extend_from_slice(&biases);
+                (weights, aux, expected)
+            };
+
+            let (w5, a5, e5) = build(5, 128, 2);
+            let (w6, a6, e6) = build(6, 64, 3);
+            let mut y5 = vec![0.0_f32; 2];
+            let mut y6 = vec![0.0_f32; 3];
+            let mut t5: *mut ColiMetalTensor = std::ptr::null_mut();
+            let mut t6: *mut ColiMetalTensor = std::ptr::null_mut();
+            let mut descs = [
+                MlxAffineMatmulDesc {
+                    tensor: t5,
+                    y: &mut y5,
+                    weights: &w5,
+                    aux: &a5,
+                    bits: 5,
+                    group_size: 128,
+                    i: I,
+                    o: 2,
+                },
+                MlxAffineMatmulDesc {
+                    tensor: t6,
+                    y: &mut y6,
+                    weights: &w6,
+                    aux: &a6,
+                    bits: 6,
+                    group_size: 64,
+                    i: I,
+                    o: 3,
+                },
+            ];
+            assert!(metal_matmul_mlx_affine_multi(&x, &mut descs));
+            t5 = descs[0].tensor;
+            t6 = descs[1].tensor;
+            drop(descs);
+            for (got, expected) in y5.iter().zip(e5.iter()).chain(y6.iter().zip(e6.iter())) {
+                let tol = 2e-3_f32.max(expected.abs() * 2e-4);
+                assert!(
+                    (got - expected).abs() <= tol,
+                    "gpu={got} ref={expected} tol={tol}"
+                );
+            }
+            if !t5.is_null() {
+                unsafe { super::coli_metal_tensor_free(t5) };
+            }
+            if !t6.is_null() {
+                unsafe { super::coli_metal_tensor_free(t6) };
+            }
+        }
+
+        #[test]
+        fn native_mlx_affine_gemv_matches_reference_for_all_supported_widths() {
+            assert!(
+                metal_init(),
+                "Metal backend must initialize on Apple Silicon"
+            );
+            const O: usize = 3;
+            const I: usize = 128;
+            let x: Vec<f32> = (0..I)
+                .map(|i| ((i as i32 % 11) - 5) as f32 * 0.125)
+                .collect();
+
+            for &(bits, group_size) in &[(4_u8, 64_usize), (5, 128), (6, 64), (8, 128)] {
+                let mask = (1_u32 << bits) - 1;
+                let groups = I / group_size;
+                let mut weights = Vec::new();
+                let mut expected = vec![0.0_f32; O];
+                let mut scale_bytes = Vec::new();
+                let mut bias_bytes = Vec::new();
+
+                for row in 0..O {
+                    let codes: Vec<u32> = (0..I)
+                        .map(|col| (row as u32 * 17 + col as u32 * 7 + 3) & mask)
+                        .collect();
+                    weights.extend_from_slice(&pack_codes(&codes, bits));
+                    for group in 0..groups {
+                        let scale = 0.125 * (row + group + 1) as f32;
+                        let bias = -0.25 + 0.0625 * (row + group) as f32;
+                        scale_bytes.extend_from_slice(&bf16(scale));
+                        bias_bytes.extend_from_slice(&bf16(bias));
+                        let start = group * group_size;
+                        let end = start + group_size;
+                        for col in start..end {
+                            expected[row] += (codes[col] as f32 * scale + bias) * x[col];
+                        }
+                    }
+                }
+                let mut aux = scale_bytes;
+                aux.extend_from_slice(&bias_bytes);
+                let mut out = vec![0.0_f32; O];
+                let mut tensor: *mut ColiMetalTensor = std::ptr::null_mut();
+                assert!(
+                    metal_matmul_mlx_affine(
+                        &mut tensor,
+                        &mut out,
+                        &x,
+                        &weights,
+                        &aux,
+                        bits,
+                        group_size,
+                        I,
+                        O,
+                    ),
+                    "Metal declined MLX affine bits={bits} group={group_size}"
+                );
+                if !tensor.is_null() {
+                    unsafe { super::coli_metal_tensor_free(tensor) };
+                }
+                for row in 0..O {
+                    let tol = 2e-3_f32.max(expected[row].abs() * 2e-4);
+                    assert!(
+                        (out[row] - expected[row]).abs() <= tol,
+                        "bits={bits} group={group_size} row={row}: gpu={} ref={} tol={tol}",
+                        out[row],
+                        expected[row]
+                    );
+                }
+            }
+        }
     }
 
     /// Several independent one-token quantized GEMVs that share the same
@@ -726,10 +1248,22 @@ mod imp {
                     d.o * d.i,
                     d.o.div_ceil(128) * d.i.div_ceil(128) * std::mem::size_of::<f32>(),
                 ),
-                11 => (d.o * d.i, d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>()),
-                12 => (d.o * d.i, d.o * d.i.div_ceil(16) * std::mem::size_of::<f32>()),
-                13 => (d.o * d.i, d.o * d.i.div_ceil(8) * std::mem::size_of::<f32>()),
-                14 => (d.o * d.i + d.o * d.i.div_ceil(32) * 3, d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>()),
+                11 => (
+                    d.o * d.i,
+                    d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>(),
+                ),
+                12 => (
+                    d.o * d.i,
+                    d.o * d.i.div_ceil(16) * std::mem::size_of::<f32>(),
+                ),
+                13 => (
+                    d.o * d.i,
+                    d.o * d.i.div_ceil(8) * std::mem::size_of::<f32>(),
+                ),
+                14 => (
+                    d.o * d.i + d.o * d.i.div_ceil(32) * 3,
+                    d.o * d.i.div_ceil(32) * std::mem::size_of::<f32>(),
+                ),
                 15 => (
                     d.o * d.i,
                     2 * d.o * d.i.div_ceil(64) * std::mem::size_of::<u16>(),
@@ -753,7 +1287,12 @@ mod imp {
                 fmt: d.fmt,
                 i: d.i as i32,
                 o: d.o as i32,
-                gs: match d.fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => 0 },
+                gs: match d.fmt {
+                    11 | 14 => 32,
+                    12 => 16,
+                    13 => 8,
+                    _ => 0,
+                },
             });
         }
         let ok = unsafe {
@@ -1322,7 +1861,15 @@ mod imp {
         }
         let mut raw = Vec::with_capacity(5);
         for dsc in descs.iter_mut() {
-            if (dsc.fmt != 5 && dsc.fmt != 7 && dsc.fmt != 9 && dsc.fmt != 10 && dsc.fmt != 11 && dsc.fmt != 12 && dsc.fmt != 13 && dsc.fmt != 14)
+            if (dsc.fmt != 5
+                && dsc.fmt != 7
+                && dsc.fmt != 9
+                && dsc.fmt != 10
+                && dsc.fmt != 11
+                && dsc.fmt != 12
+                && dsc.fmt != 13
+                && dsc.fmt != 14
+                && !(16..=19).contains(&dsc.fmt))
                 || dsc.i == 0
                 || dsc.o == 0
                 || dsc.i > i32::MAX as usize
@@ -1331,19 +1878,61 @@ mod imp {
                 return 0;
             }
             let (weight_bytes, scale_bytes) = if dsc.fmt == 5 {
-                (dsc.o.saturating_mul(dsc.i).saturating_mul(std::mem::size_of::<u16>()), 0)
+                (
+                    dsc.o
+                        .saturating_mul(dsc.i)
+                        .saturating_mul(std::mem::size_of::<u16>()),
+                    0,
+                )
+            } else if (16..=19).contains(&dsc.fmt) {
+                let bits = match dsc.fmt {
+                    16 => 4usize,
+                    17 => 5,
+                    18 => 6,
+                    19 => 8,
+                    _ => unreachable!(),
+                };
+                if dsc.group_size == 0
+                    || dsc.group_size > i32::MAX as usize
+                    || dsc.i % dsc.group_size != 0
+                    || dsc.i.checked_mul(bits).is_none_or(|v| v % 32 != 0)
+                {
+                    return 0;
+                }
+                (
+                    dsc.o.saturating_mul(dsc.i.saturating_mul(bits) / 8),
+                    2usize
+                        .saturating_mul(dsc.o)
+                        .saturating_mul(dsc.i / dsc.group_size)
+                        .saturating_mul(std::mem::size_of::<u16>()),
+                )
             } else if (11..=14).contains(&dsc.fmt) {
-                let block = match dsc.fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => unreachable!() };
+                let block = match dsc.fmt {
+                    11 | 14 => 32,
+                    12 => 16,
+                    13 => 8,
+                    _ => unreachable!(),
+                };
                 let base = dsc.o.saturating_mul(dsc.i);
                 let weights = if dsc.fmt == 14 {
                     base.saturating_add(dsc.o.saturating_mul(dsc.i.div_ceil(32)).saturating_mul(3))
-                } else { base };
+                } else {
+                    base
+                };
                 (
                     weights,
-                    dsc.o.saturating_mul(dsc.i.div_ceil(block)).saturating_mul(std::mem::size_of::<f32>()),
+                    dsc.o
+                        .saturating_mul(dsc.i.div_ceil(block))
+                        .saturating_mul(std::mem::size_of::<f32>()),
                 )
             } else {
-                let planes = if dsc.fmt == 10 { 3 } else if dsc.fmt == 9 { 2 } else { 1 };
+                let planes = if dsc.fmt == 10 {
+                    3
+                } else if dsc.fmt == 9 {
+                    2
+                } else {
+                    1
+                };
                 (
                     planes * dsc.o.saturating_mul(dsc.i.div_ceil(2)),
                     planes * dsc.o.saturating_mul(dsc.i.div_ceil(32)),
@@ -1353,7 +1942,11 @@ mod imp {
                 return 0;
             }
             static BF16_DUMMY_SCALE_GDN: [f32; 1] = [1.0];
-            let scale_ptr = if dsc.fmt == 5 { BF16_DUMMY_SCALE_GDN.as_ptr() } else { dsc.scales.as_ptr() as *const f32 };
+            let scale_ptr = if dsc.fmt == 5 {
+                BF16_DUMMY_SCALE_GDN.as_ptr()
+            } else {
+                dsc.scales.as_ptr() as *const f32
+            };
             raw.push(ColiMetalMatmulDescRaw {
                 tensor: dsc.tensor,
                 y: std::ptr::null_mut(),
@@ -1362,7 +1955,13 @@ mod imp {
                 fmt: dsc.fmt,
                 i: dsc.i as i32,
                 o: dsc.o as i32,
-                gs: match dsc.fmt { 11 | 14 => 32, 12 => 16, 13 => 8, _ => 0 },
+                gs: match dsc.fmt {
+                    11 | 14 => 32,
+                    12 => 16,
+                    13 => 8,
+                    16..=19 => dsc.group_size as i32,
+                    _ => 0,
+                },
             });
         }
         let rc = unsafe {
@@ -1872,10 +2471,14 @@ mod imp {
         pub fn coli_apple8_metalio_gdn_ane_begin(
             model_id: u64,
             layer: i32,
-            qkv_surface: *mut c_void, qkv_bytes: usize,
-            z_surface: *mut c_void, z_bytes: usize,
-            a_surface: *mut c_void, a_bytes: usize,
-            b_surface: *mut c_void, b_bytes: usize,
+            qkv_surface: *mut c_void,
+            qkv_bytes: usize,
+            z_surface: *mut c_void,
+            z_bytes: usize,
+            a_surface: *mut c_void,
+            a_bytes: usize,
+            b_surface: *mut c_void,
+            b_bytes: usize,
             spatial: i32,
             wqkv: *const u16,
             wz: *const u16,
@@ -2156,8 +2759,7 @@ mod imp {
     /// blocks. These counters make driver/queue stalls visible separately
     /// from actual GPU execution.
     pub fn metal_profile_detail() -> (u64, u64, u64, u64, u64, u64) {
-        let (mut gw, mut gk, mut gc, mut mw, mut mk, mut mc) =
-            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut gw, mut gk, mut gc, mut mw, mut mk, mut mc) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         unsafe {
             coli_apple8_metalio_profile_detail_get(
                 &mut gw, &mut gk, &mut gc, &mut mw, &mut mk, &mut mc,
@@ -2250,7 +2852,10 @@ mod imp {
         };
         let raw = std::ptr::NonNull::new(pending)?;
         if rc == 1 {
-            Some(GdnPending { raw: Some(raw), hidden: d })
+            Some(GdnPending {
+                raw: Some(raw),
+                hidden: d,
+            })
         } else {
             unsafe { coli_apple8_metalio_gdn_discard(raw.as_ptr()) };
             None
@@ -2370,30 +2975,65 @@ mod imp {
         output_gate: i32,
         eps: f32,
     ) -> Option<GdnPending> {
-        if [layer,d,kheads,kd,vheads,vd,kk,spatial].iter().any(|&n| n > i32::MAX as usize)
-            || d == 0 || kd == 0 || vd == 0 || kheads == 0 || vheads == 0 || kk == 0 || spatial == 0
-            || vheads % kheads != 0 { return None; }
-        let Some(kdim) = kheads.checked_mul(kd) else { return None; };
-        let Some(vdim) = vheads.checked_mul(vd) else { return None; };
-        let Some(cdim) = kdim.checked_mul(2).and_then(|n| n.checked_add(vdim)) else { return None; };
-        let fits = |actual: usize, rows: usize, cols: usize, bytes: usize| {
-            rows.checked_mul(cols).and_then(|n| n.checked_mul(bytes)).is_some_and(|n| actual >= n)
+        if [layer, d, kheads, kd, vheads, vd, kk, spatial]
+            .iter()
+            .any(|&n| n > i32::MAX as usize)
+            || d == 0
+            || kd == 0
+            || vd == 0
+            || kheads == 0
+            || vheads == 0
+            || kk == 0
+            || spatial == 0
+            || vheads % kheads != 0
+        {
+            return None;
+        }
+        let Some(kdim) = kheads.checked_mul(kd) else {
+            return None;
         };
-        if !fits(wqkv.len(), cdim, d, 2) || !fits(wz.len(), vdim, d, 2)
-            || !fits(wa.len(), vheads, d, 2) || !fits(wb.len(), vheads, d, 2)
-            || !fits(wout.len(), d, vdim, 2) || a_log.len() < vheads || dt_bias.len() < vheads
-            || !fits(conv_w.len(), cdim, kk, 1) || norm_w.len() < vd
-            || !fits(state.len(), vdim, kd, 1) || !fits(conv_state.len(), cdim, kk-1, 1) { return None; }
-        if !direct_available() { return None; }
+        let Some(vdim) = vheads.checked_mul(vd) else {
+            return None;
+        };
+        let Some(cdim) = kdim.checked_mul(2).and_then(|n| n.checked_add(vdim)) else {
+            return None;
+        };
+        let fits = |actual: usize, rows: usize, cols: usize, bytes: usize| {
+            rows.checked_mul(cols)
+                .and_then(|n| n.checked_mul(bytes))
+                .is_some_and(|n| actual >= n)
+        };
+        if !fits(wqkv.len(), cdim, d, 2)
+            || !fits(wz.len(), vdim, d, 2)
+            || !fits(wa.len(), vheads, d, 2)
+            || !fits(wb.len(), vheads, d, 2)
+            || !fits(wout.len(), d, vdim, 2)
+            || a_log.len() < vheads
+            || dt_bias.len() < vheads
+            || !fits(conv_w.len(), cdim, kk, 1)
+            || norm_w.len() < vd
+            || !fits(state.len(), vdim, kd, 1)
+            || !fits(conv_state.len(), cdim, kk - 1, 1)
+        {
+            return None;
+        }
+        if !direct_available() {
+            return None;
+        }
         let mut pending = std::ptr::null_mut();
         let rc = unsafe {
             coli_apple8_metalio_gdn_ane_begin(
                 model_id,
                 layer as i32,
-                surfaces[0].0, surfaces[0].1,
-                surfaces[1].0, surfaces[1].1,
-                surfaces[2].0, surfaces[2].1,
-                surfaces[3].0, surfaces[3].1, spatial as i32,
+                surfaces[0].0,
+                surfaces[0].1,
+                surfaces[1].0,
+                surfaces[1].1,
+                surfaces[2].0,
+                surfaces[2].1,
+                surfaces[3].0,
+                surfaces[3].1,
+                spatial as i32,
                 wqkv.as_ptr() as *const u16,
                 wz.as_ptr() as *const u16,
                 wa.as_ptr() as *const u16,
@@ -2417,9 +3057,14 @@ mod imp {
                 &mut pending,
             )
         };
-        if rc != 1 { return None; }
+        if rc != 1 {
+            return None;
+        }
         let raw = std::ptr::NonNull::new(pending)?;
-        Some(GdnPending { raw: Some(raw), hidden: d })
+        Some(GdnPending {
+            raw: Some(raw),
+            hidden: d,
+        })
     }
 
     /// Synchronous compatibility wrapper used by the existing GPU-tail A/B.
@@ -2450,15 +3095,39 @@ mod imp {
         output_gate: i32,
         eps: f32,
     ) -> i32 {
-        let pending = unsafe { gdn_ane_token_begin(
-            model_id, layer, surfaces, spatial, None,
-            wqkv, wz, wa, wb, wout, a_log, dt_bias, conv_w, norm_w,
-            state, conv_state, d, kheads, kd, vheads, vd, kk, output_gate, eps,
-        ) };
-        let Some(pending) = pending else { return 0; };
+        let pending = unsafe {
+            gdn_ane_token_begin(
+                model_id,
+                layer,
+                surfaces,
+                spatial,
+                None,
+                wqkv,
+                wz,
+                wa,
+                wb,
+                wout,
+                a_log,
+                dt_bias,
+                conv_w,
+                norm_w,
+                state,
+                conv_state,
+                d,
+                kheads,
+                kd,
+                vheads,
+                vd,
+                kk,
+                output_gate,
+                eps,
+            )
+        };
+        let Some(pending) = pending else {
+            return 0;
+        };
         gdn_token_finish(pending, out)
     }
-
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2514,17 +3183,32 @@ mod imp {
         }
     }
 
-
     impl MetalAneDynamicPack {
         #[allow(clippy::too_many_arguments)]
         pub fn new(
-            _qkv_dst: &MetalSharedSurface, _aux_dst: &MetalSharedSurface,
-            _wqkv: &[u8], _wz: &[u8], _wa: &[u8], _wb: &[u8],
-            _hidden: usize, _spatial: usize, _qkv_rows: usize, _z_rows: usize,
-            _ab_rows: usize, _qkv_stride: usize, _aux_stride: usize,
-            _qkv_offset: usize, _z_offset: usize, _a_offset: usize, _b_offset: usize,
-        ) -> Option<Self> { None }
-        pub fn run(&mut self, _x: &[f32]) -> Option<f64> { None }
+            _qkv_dst: &MetalSharedSurface,
+            _aux_dst: &MetalSharedSurface,
+            _wqkv: &[u8],
+            _wz: &[u8],
+            _wa: &[u8],
+            _wb: &[u8],
+            _hidden: usize,
+            _spatial: usize,
+            _qkv_rows: usize,
+            _z_rows: usize,
+            _ab_rows: usize,
+            _qkv_stride: usize,
+            _aux_stride: usize,
+            _qkv_offset: usize,
+            _z_offset: usize,
+            _a_offset: usize,
+            _b_offset: usize,
+        ) -> Option<Self> {
+            None
+        }
+        pub fn run(&mut self, _x: &[f32]) -> Option<f64> {
+            None
+        }
     }
 
     pub struct MetalMatmulDesc<'a> {
@@ -2542,6 +3226,7 @@ mod imp {
         pub weights: &'a [u8],
         pub scales: &'a [u8],
         pub fmt: i32,
+        pub group_size: usize,
         pub i: usize,
         pub o: usize,
     }
@@ -2563,6 +3248,19 @@ mod imp {
         _weights: &[u8],
         _scales: &[u8],
         _fmt: i32,
+        _i: usize,
+        _o: usize,
+    ) -> bool {
+        false
+    }
+    pub fn metal_matmul_mlx_affine(
+        _tensor: &mut *mut ColiMetalTensor,
+        _y: &mut [f32],
+        _x: &[f32],
+        _weights: &[u8],
+        _aux: &[u8],
+        _bits: u8,
+        _group_size: usize,
         _i: usize,
         _o: usize,
     ) -> bool {
@@ -2902,14 +3600,35 @@ mod imp {
 
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_token_begin(
-        _model_id: u64, _layer: usize, _x: &[f32], _wqkv: &[u8], _wz: &[u8],
-        _wa: &[u8], _wb: &[u8], _wout: &[u8], _a_log: &[f32], _dt_bias: &[f32],
-        _conv_w: &[f32], _norm_w: &[f32], _state: &mut [f32], _conv_state: &mut [f32],
-        _d: usize, _kheads: usize, _kd: usize, _vheads: usize, _vd: usize, _kk: usize,
-        _output_gate: i32, _eps: f32,
-    ) -> Option<GdnPending> { None }
+        _model_id: u64,
+        _layer: usize,
+        _x: &[f32],
+        _wqkv: &[u8],
+        _wz: &[u8],
+        _wa: &[u8],
+        _wb: &[u8],
+        _wout: &[u8],
+        _a_log: &[f32],
+        _dt_bias: &[f32],
+        _conv_w: &[f32],
+        _norm_w: &[f32],
+        _state: &mut [f32],
+        _conv_state: &mut [f32],
+        _d: usize,
+        _kheads: usize,
+        _kd: usize,
+        _vheads: usize,
+        _vd: usize,
+        _kk: usize,
+        _output_gate: i32,
+        _eps: f32,
+    ) -> Option<GdnPending> {
+        None
+    }
 
-    pub fn gdn_token_finish(_pending: GdnPending, _out: &mut [f32]) -> i32 { 0 }
+    pub fn gdn_token_finish(_pending: GdnPending, _out: &mut [f32]) -> i32 {
+        0
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_token(
         _model_id: u64,

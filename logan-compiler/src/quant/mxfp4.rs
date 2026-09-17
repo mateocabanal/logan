@@ -179,7 +179,11 @@ pub fn quantize_bf16_row(
 /// 2^-127, but those kernels intentionally do not implement that denormal edge.
 /// We therefore never emit code 0; an all-zero block uses scale 1.0 instead.
 fn choose_scale(values: &[f32]) -> (u8, f32) {
-    choose_scale_from_max(values.iter().fold(0.0_f32, |acc, value| acc.max(value.abs())))
+    choose_scale_from_max(
+        values
+            .iter()
+            .fold(0.0_f32, |acc, value| acc.max(value.abs())),
+    )
 }
 
 /// Scale selection from a group's maximum magnitude.
@@ -672,6 +676,7 @@ mod tests {
             rows: 2,
             columns: 33,
             scale: None,
+            bias: None,
         };
         let packed = quantize_matrix(&matrix).unwrap();
         assert_eq!(packed.row_bytes(), 17);
@@ -700,6 +705,7 @@ mod tests {
             rows: 1,
             columns: 32,
             scale: None,
+            bias: None,
         };
         let packed = quantize_matrix(&matrix).unwrap();
         assert_eq!(packed.scales, vec![125]);

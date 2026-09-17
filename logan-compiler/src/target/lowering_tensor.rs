@@ -19,6 +19,9 @@ pub fn lower_exact_tensor(tensor: &source::TensorRef) -> Result<Vec<u8>> {
     put_u64(&mut payload, 104, data.len() as u64);
     put_u64(&mut payload, 112, data.len() as u64);
     put_u32(&mut payload, 120, crc32c(&data));
+    if let Some((_bits, group_size)) = crate::model::qwen_moe::parse_mlx_affine_dtype(&tensor.dtype) {
+        put_u32(&mut payload, 124, group_size);
+    }
     payload.extend_from_slice(&data);
     Ok(payload)
 }
@@ -63,6 +66,9 @@ pub fn stream_exact_tensor<W: Write + Seek>(
     copy_tensor_stream(tensor, output, &mut payload_state, Some(&mut logical_state))?;
     let logical_crc32c = !logical_state;
     put_u32(&mut header, 120, logical_crc32c);
+    if let Some((_bits, group_size)) = crate::model::qwen_moe::parse_mlx_affine_dtype(&tensor.dtype) {
+        put_u32(&mut header, 124, group_size);
+    }
     output.seek(SeekFrom::Start(record_start)).map_err(|source| ColicError::Io {
         path: tensor.source.clone(), source,
     })?;
@@ -549,6 +555,18 @@ fn read_tensor(tensor: &source::TensorRef) -> Result<Vec<u8>> {
 }
 
 pub fn math_format_for_dtype(dtype: &str) -> Result<u16> {
+    if let Some((bits, _group_size)) = crate::model::qwen_moe::parse_mlx_affine_dtype(dtype) {
+        return match bits {
+            4 => Ok(0x23),
+            5 => Ok(0x24),
+            6 => Ok(0x25),
+            8 => Ok(0x26),
+            other => Err(ColicError::unsupported(
+                "exact expert lowering",
+                format!("unsupported MLX affine bit width `{other}`"),
+            )),
+        };
+    }
     if parse_qwen3_next_split(dtype).is_some() {
         return Ok(3);
     }

@@ -203,6 +203,7 @@ fn apple8_exact_mxfp4_repack_matches_frozen_tile_order() {
             dtype: "F8_E8M0".into(),
             shape: vec![rows as u64, groups as u64],
         }),
+        bias: None,
     };
     let expert = RoutedExpert {
         layer: 7,
@@ -287,6 +288,7 @@ fn apple8_exact_rejects_fp8_source() {
             dtype: "F8_E8M0".into(),
             shape: vec![1, 1],
         }),
+        bias: None,
     };
     let expert = RoutedExpert {
         layer: 0,
@@ -319,6 +321,7 @@ fn apple8_compiler_quantized_mxfp4_emits_production_layout() {
         rows: 1,
         columns: 32,
         scale: None,
+        bias: None,
     };
     let expert = RoutedExpert {
         layer: 2,
@@ -373,6 +376,7 @@ fn exact_expert_lowering_emits_envelope_and_preserves_matrix_bytes() {
             dtype: "F8_E8M0".into(),
             shape: vec![1, 1],
         }),
+        bias: None,
     };
     let expert = RoutedExpert {
         layer: 4,
@@ -425,6 +429,7 @@ fn packed_mxfp4_expert_uses_logical_shape_and_block_metadata() {
             dtype: "F8_E8M0".into(),
             shape: vec![1, 1],
         }),
+        bias: None,
     };
     let expert = RoutedExpert {
         layer: 0,
@@ -466,5 +471,88 @@ fn exact_tensor_lowering_emits_envelope_and_preserves_bytes() {
     assert_eq!(u16::from_le_bytes(bytes[16..18].try_into().unwrap()), 2);
     assert_eq!(u64::from_le_bytes(bytes[96..104].try_into().unwrap()), 128);
     assert_eq!(&bytes[128..], &[0x2a, 0x3b]);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn mlx_affine_exact_lowering_preserves_packed_bytes_and_group_metadata() {
+    let path = std::env::temp_dir().join(format!("colic-mlx-affine-expert-{}", std::process::id()));
+    // Each matrix is [4 packed weight bytes][2 BF16 scale bytes][2 BF16 bias bytes].
+    std::fs::write(
+        &path,
+        [
+            0x10_u8, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x23, 0x30, 0x31, 0x32, 0x33, 0x40, 0x41,
+            0x42, 0x43, 0x50, 0x51, 0x52, 0x53, 0x60, 0x61, 0x62, 0x63,
+        ],
+    )
+    .unwrap();
+    let matrix = |offset: u64| Matrix {
+        source: TensorRef {
+            source: path.clone(),
+            offset,
+            len: 4,
+            dtype: "MLX_AFFINE:4:64".into(),
+            shape: vec![1, 64],
+        },
+        rows: 1,
+        columns: 64,
+        scale: Some(TensorRef {
+            source: path.clone(),
+            offset: offset + 4,
+            len: 2,
+            dtype: "BF16".into(),
+            shape: vec![1, 1],
+        }),
+        bias: Some(TensorRef {
+            source: path.clone(),
+            offset: offset + 6,
+            len: 2,
+            dtype: "BF16".into(),
+            shape: vec![1, 1],
+        }),
+    };
+    let expert = RoutedExpert {
+        layer: 0,
+        expert: 0,
+        gate: matrix(0),
+        up: matrix(8),
+        down: matrix(16),
+    };
+
+    let bytes = lower_exact_expert(&expert).unwrap();
+    let mut streamed = std::io::Cursor::new(Vec::new());
+    stream_exact_expert(&expert, &mut streamed).unwrap();
+    assert_eq!(streamed.into_inner(), bytes);
+    for index in 0..3 {
+        let desc = 64 + index * 128;
+        assert_eq!(
+            u16::from_le_bytes(bytes[desc + 4..desc + 6].try_into().unwrap()),
+            0x23
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[desc + 6..desc + 8].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[desc + 104..desc + 108].try_into().unwrap()),
+            64
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[desc + 80..desc + 88].try_into().unwrap()),
+            4,
+            "affine aux payload must contain scale then bias"
+        );
+        let aux = u64::from_le_bytes(bytes[desc + 72..desc + 80].try_into().unwrap()) as usize;
+        let expected_aux = [
+            [0x20_u8, 0x21, 0x22, 0x23],
+            [0x40_u8, 0x41, 0x42, 0x43],
+            [0x60_u8, 0x61, 0x62, 0x63],
+        ];
+        assert_eq!(&bytes[aux..aux + 4], &expected_aux[index]);
+    }
+    assert_eq!(math_format_for_dtype("MLX_AFFINE:4:64").unwrap(), 0x23);
+    assert_eq!(math_format_for_dtype("MLX_AFFINE:5:128").unwrap(), 0x24);
+    assert_eq!(math_format_for_dtype("MLX_AFFINE:6:64").unwrap(), 0x25);
+    assert_eq!(math_format_for_dtype("MLX_AFFINE:8:128").unwrap(), 0x26);
     std::fs::remove_file(path).unwrap();
 }

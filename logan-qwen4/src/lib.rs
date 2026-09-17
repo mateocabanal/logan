@@ -52,7 +52,10 @@ fn is_ple_ngram_weight(name: &str) -> bool {
     // `...ple_embedding.ngram_embedding.shard_{N}.weight` (128 shards, ~400 MB
     // each, 52 GB total). Matching only the monolithic name silently missed
     // all of them, which is exactly the case the residency guard exists for.
-    for marker in ["ple_embedding.ngram_embedding.shard_", "ple.ngram_embedding.shard_"] {
+    for marker in [
+        "ple_embedding.ngram_embedding.shard_",
+        "ple.ngram_embedding.shard_",
+    ] {
         if let Some(rest) = name.strip_prefix_marker(marker) {
             // `rest` must be `<digits>.weight`; anything else is a different
             // tensor that merely shares the prefix.
@@ -92,7 +95,8 @@ pub struct StFile {
     // reader must not re-open 128 shard files. Clone is a refcount bump.
     files: std::sync::Arc<Vec<std::sync::Mutex<std::fs::File>>>,
     /// name -> (shard index, shape, dtype, payload offset, payload length)
-    tensors: std::sync::Arc<std::collections::HashMap<String, (usize, Vec<u64>, String, usize, usize)>>,
+    tensors:
+        std::sync::Arc<std::collections::HashMap<String, (usize, Vec<u64>, String, usize, usize)>>,
 }
 
 impl Clone for StFile {
@@ -110,7 +114,9 @@ impl Clone for StFile {
 /// Shared by the single-file and sharded entry points so the range and
 /// bounds checking exists once. `abs_offset` is already absolute from the start
 /// of the FILE, so readers do not have to remember the header-length rule.
-fn parse_shard(path: &Path) -> Result<(std::fs::File, Vec<(String, Vec<u64>, String, usize, usize)>), String> {
+fn parse_shard(
+    path: &Path,
+) -> Result<(std::fs::File, Vec<(String, Vec<u64>, String, usize, usize)>), String> {
     use std::io::{Read as _, Seek as _};
 
     let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -156,7 +162,7 @@ fn parse_shard(path: &Path) -> Result<(std::fs::File, Vec<(String, Vec<u64>, Str
         // a confusing error deep inside a layer load.
         if element_bytes(&dtype).is_none() {
             return Err(format!(
-                "{name}: unsupported dtype `{dtype}` (supported: F32, I32, I64, BF16, F16, F8_E4M3, F8_E4M3FN)"
+                "{name}: unsupported dtype `{dtype}` (supported: F32, I32, I64, U32, U8, BF16, F16, F8_E4M3, F8_E4M3FN)"
             ));
         }
         let shape: Vec<u64> = spec["shape"]
@@ -178,7 +184,10 @@ fn parse_shard(path: &Path) -> Result<(std::fs::File, Vec<(String, Vec<u64>, Str
             .as_u64()
             .ok_or_else(|| format!("{name}: invalid end offset"))?;
         if end < begin || data_start.checked_add(end).is_none_or(|v| v > file_len) {
-            return Err(format!("{name}: tensor range is outside {}", path.display()));
+            return Err(format!(
+                "{name}: tensor range is outside {}",
+                path.display()
+            ));
         }
         // Payload size must match dtype x shape; a mismatch means a corrupt
         // header, and catching it here keeps every read in bounds.
@@ -219,9 +228,9 @@ fn ple_in_layer(name: &str) -> Option<&str> {
 /// store; the decoder below follows the ordinary (non-FNUZ) convention.
 fn element_bytes(dtype: &str) -> Option<usize> {
     match dtype {
-        "F32" | "I32" => Some(4),
+        "F32" | "I32" | "U32" => Some(4),
         "BF16" | "F16" => Some(2),
-        "F8_E4M3" | "F8_E4M3FN" => Some(1),
+        "U8" | "F8_E4M3" | "F8_E4M3FN" => Some(1),
         // Integer side-tables (index maps, `layer_multipliers`, n-gram row ids)
         // are metadata the runtime wants as f32. Widening an i64 index to f32
         // is exact below 2^24, which every index in this model is.
@@ -249,12 +258,19 @@ fn register(
     len: usize,
 ) {
     const HF_PREFIX: &str = "model.language_model.";
+    const MLX_BACKBONE_PREFIX: &str = "language_model.model.";
+    const MLX_HEAD_PREFIX: &str = "language_model.lm_head.";
     const ENGINE_PREFIX: &str = "model.";
-    let alias = name
-        .strip_prefix(HF_PREFIX)
-        .map(|rest| format!("{ENGINE_PREFIX}{rest}"));
+    let aliases = [
+        name.strip_prefix(HF_PREFIX)
+            .map(|rest| format!("{ENGINE_PREFIX}{rest}")),
+        name.strip_prefix(MLX_BACKBONE_PREFIX)
+            .map(|rest| format!("{ENGINE_PREFIX}{rest}")),
+        name.strip_prefix(MLX_HEAD_PREFIX)
+            .map(|rest| format!("lm_head.{rest}")),
+    ];
 
-    if let Some(alias) = alias {
+    for alias in aliases.into_iter().flatten() {
         // Insert the engine spelling first only when the checkpoint does not
         // itself define it.
         if !tensors.contains_key(&alias) {
@@ -425,6 +441,38 @@ impl StFile {
         Ok(raw)
     }
 
+    /// Read a bounded byte range from one tensor payload. `within` is relative
+    /// to the tensor, not the safetensors file. This is the raw-MLX expert
+    /// streaming primitive: one selected expert is a contiguous slice of each
+    /// stacked switch bank.
+    fn payload_range(&self, name: &str, within: usize, len: usize) -> Result<Vec<u8>, String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let (shard, _shape, _dtype, offset, total) = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        let end = within
+            .checked_add(len)
+            .ok_or_else(|| format!("{name}: requested byte range overflows"))?;
+        if end > *total {
+            return Err(format!(
+                "{name}: requested byte range {within}..{end} exceeds payload length {total}"
+            ));
+        }
+        let absolute = offset
+            .checked_add(within)
+            .ok_or_else(|| format!("{name}: absolute byte offset overflows"))?;
+        let mut raw = vec![0_u8; len];
+        let mut file = self.files[*shard]
+            .lock()
+            .map_err(|_| "safetensors file lock poisoned".to_string())?;
+        file.seek(SeekFrom::Start(absolute as u64))
+            .map_err(|e| e.to_string())?;
+        file.read_exact(&mut raw).map_err(|e| e.to_string())?;
+        Ok(raw)
+    }
+
     /// Read one tensor as f32, decoding whatever dtype it is stored in.
     ///
     /// BF16 and F16 widen to f32; F8_E4M3 decodes through
@@ -437,18 +485,19 @@ impl StFile {
     /// at that magnitude is 2,097,152), so a conversion would silently corrupt
     /// them. Use [`StFile::i64`] for integer side-tables.
     pub fn f32(&self, name: &str, expect: &[u64]) -> Result<Vec<f32>, String> {
-        let dtype = self
-            .tensors
-            .get(name)
-            .map(|t| t.2.as_str())
-            .unwrap_or("");
+        let dtype = self.tensors.get(name).map(|t| t.2.as_str()).unwrap_or("");
         if dtype == "I64" || dtype == "I32" {
             return Err(format!(
                 "{name}: dtype `{dtype}` is an integer side-table; f32 cannot represent it losslessly (use StFile::i64)"
             ));
         }
-        let elem = element_bytes(dtype)
-            .ok_or_else(|| format!("{name}: unsupported dtype `{dtype}`"))?;
+        if dtype == "U32" || dtype == "U8" {
+            return Err(format!(
+                "{name}: dtype `{dtype}` is quantized storage and cannot be reinterpreted as f32; use the native quantized weight loader"
+            ));
+        }
+        let elem =
+            element_bytes(dtype).ok_or_else(|| format!("{name}: unsupported dtype `{dtype}`"))?;
         let raw = self.payload(name, expect, elem)?;
 
         Ok(match elem {
@@ -473,11 +522,19 @@ impl StFile {
                     let mag = if exp == 0 {
                         mant * 2f32.powi(-24)
                     } else if exp == 0x1f {
-                        if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+                        if mant == 0.0 {
+                            f32::INFINITY
+                        } else {
+                            f32::NAN
+                        }
                     } else {
                         (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
                     };
-                    if sign == 1 { -mag } else { mag }
+                    if sign == 1 {
+                        -mag
+                    } else {
+                        mag
+                    }
                 })
                 .collect(),
             _ => raw
@@ -528,12 +585,16 @@ impl StFile {
         let needle = format!(".layers.{layer}.ple.ple_embedding.ngram_embedding.shard_");
         let mut out: Vec<(usize, String, u64, usize)> = Vec::new();
         for (name, (_, shape, _, _, _)) in self.tensors.iter() {
-            let Some(at) = name.find(&needle) else { continue };
+            let Some(at) = name.find(&needle) else {
+                continue;
+            };
             let rest = &name[at + needle.len()..];
             let Some(idx) = rest.strip_suffix(".weight") else {
                 continue;
             };
-            let Ok(idx) = idx.parse::<usize>() else { continue };
+            let Ok(idx) = idx.parse::<usize>() else {
+                continue;
+            };
             // [rows, width]; the width is the per-head embedding width.
             if shape.len() != 2 {
                 continue;
@@ -579,7 +640,8 @@ impl StFile {
         let mut file = self.files[*shard]
             .lock()
             .map_err(|_| "safetensors file lock poisoned".to_string())?;
-        file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| e.to_string())?;
         file.read_exact(&mut raw).map_err(|e| e.to_string())?;
         Ok(raw
             .iter()
@@ -640,7 +702,9 @@ impl StFile {
             let srow = (r as u64 / block_rows) as usize * scale_cols;
             let base = r * cols as usize;
             for (c, &byte) in chunk.iter().enumerate() {
-                let s = table.get(srow + c as u64 as usize / block_cols as usize).copied();
+                let s = table
+                    .get(srow + c as u64 as usize / block_cols as usize)
+                    .copied();
                 let s = s.ok_or_else(|| {
                     format!("{scale_name}: block scale index out of range at row {r} col {c}")
                 })?;
@@ -655,11 +719,7 @@ impl StFile {
     /// to `wrapping_mul`/index arithmetic, where a rounded value is a wrong
     /// answer rather than a slightly-off one.
     pub fn i64(&self, name: &str, expect: &[u64]) -> Result<Vec<i64>, String> {
-        let dtype = self
-            .tensors
-            .get(name)
-            .map(|t| t.2.as_str())
-            .unwrap_or("");
+        let dtype = self.tensors.get(name).map(|t| t.2.as_str()).unwrap_or("");
         let (elem, signed32) = match dtype {
             "I64" => (8, false),
             "I32" => (4, true),
@@ -979,6 +1039,21 @@ pub enum WtBytes {
         scales: Vec<u8>,
         metal_tensor: std::sync::Mutex<usize>,
     },
+    /// Native MLX affine quantization. Weights are the checkpoint's packed
+    /// little-endian U32 bitstream, while scales/biases are BF16 per group.
+    /// The logical matrix shape lives on `Wt`; nothing is dequantized at load.
+    MlxAffine {
+        weights: Vec<u8>,
+        scales: Vec<u8>,
+        biases: Vec<u8>,
+        bits: u8,
+        group_size: usize,
+        /// Lazily materialized `[scales][biases]` sidecar expected by Metal.
+        /// Keeping the source vectors separate preserves the CPU oracle without
+        /// paying a concatenation/allocation on every token.
+        metal_aux: std::sync::OnceLock<Vec<u8>>,
+        metal_tensor: std::sync::Mutex<usize>,
+    },
     /// Signed INT8 with one FP32 scale per 32 input columns. This is an
     /// experimental GDN qualification format; weights remain row-major.
     Q8Block {
@@ -1012,6 +1087,22 @@ impl Clone for WtBytes {
                 // Clones must create their own handle lazily.
                 metal_tensor: std::sync::Mutex::new(0),
             },
+            Self::MlxAffine {
+                weights,
+                scales,
+                biases,
+                bits,
+                group_size,
+                ..
+            } => Self::MlxAffine {
+                weights: weights.clone(),
+                scales: scales.clone(),
+                biases: biases.clone(),
+                bits: *bits,
+                group_size: *group_size,
+                metal_aux: std::sync::OnceLock::new(),
+                metal_tensor: std::sync::Mutex::new(0),
+            },
             Self::Q8Block {
                 weights,
                 scales,
@@ -1038,6 +1129,7 @@ impl Drop for WtBytes {
         let metal_tensor = match self {
             Self::Bf16 { metal_tensor, .. }
             | Self::Mxfp4 { metal_tensor, .. }
+            | Self::MlxAffine { metal_tensor, .. }
             | Self::Q8Block { metal_tensor, .. } => Some(metal_tensor),
             Self::Gguf { .. } => None,
         };
@@ -1070,7 +1162,10 @@ impl Wt {
     fn bf16_bytes(&self) -> Option<&[u8]> {
         match self.bytes.as_ref()? {
             WtBytes::Bf16 { weights, .. } => Some(weights),
-            WtBytes::Mxfp4 { .. } | WtBytes::Q8Block { .. } | WtBytes::Gguf { .. } => None,
+            WtBytes::Mxfp4 { .. }
+            | WtBytes::MlxAffine { .. }
+            | WtBytes::Q8Block { .. }
+            | WtBytes::Gguf { .. } => None,
         }
     }
 
@@ -1135,6 +1230,14 @@ impl Wt {
                     })
                     .collect()
             }
+            WtBytes::MlxAffine {
+                weights,
+                scales,
+                biases,
+                bits,
+                group_size,
+                ..
+            } => mlx_affine_row_f32(weights, scales, biases, self.i, row, *bits, *group_size),
             WtBytes::Q8Block {
                 weights,
                 scales,
@@ -1731,8 +1834,7 @@ struct TokScratch {
 /// a counter tells "wired" from "advertised". Also the assertion that factoring
 /// the row-chunking into [`matmul_bf16_simd`] left the NEON dispatch intact.
 #[cfg(target_arch = "aarch64")]
-static BF16_NEON_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static BF16_NEON_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many times [`matmul_bf16_neon`] has been entered in this process.
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -1977,7 +2079,11 @@ fn matmul_mxfp4_bytes(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o
         let mut acc = 0.0_f32;
         for col in 0..i {
             let packed = wr[col / 2];
-            let code = if col & 1 == 0 { packed & 0x0f } else { packed >> 4 };
+            let code = if col & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
             let scale = f32::from_bits((sr[col / 32] as u32) << 23);
             acc += x[col] * MX4[code as usize] * scale;
         }
@@ -2575,7 +2681,14 @@ pub fn matmul_bf16_exposed(y: &mut [f32], x: &[f32], bytes: &[u8], o: usize, i: 
 }
 
 /// Run the MXFP4 GEMV, for benchmarking the same way.
-pub fn matmul_mxfp4_exposed(y: &mut [f32], x: &[f32], weights: &[u8], scales: &[u8], o: usize, i: usize) {
+pub fn matmul_mxfp4_exposed(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    scales: &[u8],
+    o: usize,
+    i: usize,
+) {
     matmul_mxfp4_bytes(y, x, weights, scales, o, i);
 }
 
@@ -2682,8 +2795,93 @@ fn available_threads() -> usize {
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        if n > 2 { n - 1 } else { n }
+        if n > 2 {
+            n - 1
+        } else {
+            n
+        }
     })
+}
+
+fn mlx_affine_bf16_at(bytes: &[u8], index: usize) -> f32 {
+    let off = index * 2;
+    f32::from_bits((u16::from_le_bytes([bytes[off], bytes[off + 1]]) as u32) << 16)
+}
+
+fn mlx_affine_code(row: &[u8], column: usize, bits: u8) -> u32 {
+    let bit = column * bits as usize;
+    let word_index = bit / 32;
+    let shift = bit % 32;
+    let byte = word_index * 4;
+    let lo = u32::from_le_bytes(row[byte..byte + 4].try_into().unwrap()) as u64;
+    let combined = if shift + bits as usize > 32 {
+        let next = u32::from_le_bytes(row[byte + 4..byte + 8].try_into().unwrap()) as u64;
+        lo | (next << 32)
+    } else {
+        lo
+    };
+    ((combined >> shift) & ((1_u64 << bits) - 1)) as u32
+}
+
+fn mlx_affine_row_f32(
+    weights: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    columns: usize,
+    row: usize,
+    bits: u8,
+    group_size: usize,
+) -> Vec<f32> {
+    debug_assert!(matches!(bits, 4 | 5 | 6 | 8));
+    debug_assert!(group_size > 0 && columns % group_size == 0);
+    let row_bits = columns * bits as usize;
+    debug_assert_eq!(row_bits % 32, 0);
+    let row_bytes = row_bits / 8;
+    let groups = columns / group_size;
+    let wr = &weights[row * row_bytes..(row + 1) * row_bytes];
+    (0..columns)
+        .map(|column| {
+            let group = row * groups + column / group_size;
+            mlx_affine_code(wr, column, bits) as f32 * mlx_affine_bf16_at(scales, group)
+                + mlx_affine_bf16_at(biases, group)
+        })
+        .collect()
+}
+
+fn matmul_mlx_affine_storage(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    o: usize,
+    i: usize,
+    bits: u8,
+    group_size: usize,
+) {
+    debug_assert_eq!(x.len(), i);
+    debug_assert_eq!(y.len(), o);
+    debug_assert!(group_size > 0 && i % group_size == 0);
+    let row_bits = i * bits as usize;
+    debug_assert_eq!(row_bits % 32, 0);
+    let row_bytes = row_bits / 8;
+    let groups = i / group_size;
+    debug_assert_eq!(weights.len(), o * row_bytes);
+    debug_assert_eq!(scales.len(), o * groups * 2);
+    debug_assert_eq!(biases.len(), o * groups * 2);
+
+    for row in 0..o {
+        let wr = &weights[row * row_bytes..(row + 1) * row_bytes];
+        let mut sum = 0.0_f32;
+        for column in 0..i {
+            let group = row * groups + column / group_size;
+            let value = mlx_affine_code(wr, column, bits) as f32
+                * mlx_affine_bf16_at(scales, group)
+                + mlx_affine_bf16_at(biases, group);
+            sum += value * x[column];
+        }
+        y[row] = sum;
+    }
 }
 
 fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
@@ -2733,6 +2931,43 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                 *handle = tensor as usize;
                 drop(handle);
                 matmul_mxfp4_storage(y, x, weights, scales, o, i);
+            }
+            WtBytes::MlxAffine {
+                weights,
+                scales,
+                biases,
+                bits,
+                group_size,
+                metal_aux,
+                metal_tensor,
+            } => {
+                let aux = metal_aux.get_or_init(|| {
+                    let mut combined = Vec::with_capacity(scales.len() + biases.len());
+                    combined.extend_from_slice(scales);
+                    combined.extend_from_slice(biases);
+                    combined
+                });
+                let mut handle = metal_tensor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut tensor = *handle as *mut logan_metal::ColiMetalTensor;
+                if logan_metal::metal_matmul_mlx_affine(
+                    &mut tensor,
+                    y,
+                    x,
+                    weights,
+                    aux,
+                    *bits,
+                    *group_size,
+                    i,
+                    o,
+                ) {
+                    *handle = tensor as usize;
+                    return;
+                }
+                *handle = tensor as usize;
+                drop(handle);
+                matmul_mlx_affine_storage(y, x, weights, scales, biases, o, i, *bits, *group_size);
             }
             WtBytes::Q8Block {
                 weights,
@@ -2850,6 +3085,75 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     matmul_f32_rows(y, x, &w.f, o, i);
 }
 
+/// Encode several resident MLX-affine GEMVs that consume the same activation
+/// in one Metal command buffer. All matrices keep their checkpoint bit width and
+/// group size; unsupported mixtures decline without changing numerical state.
+fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
+    if ys.is_empty() || ys.len() != ws.len() {
+        return false;
+    }
+    let mut parts = Vec::with_capacity(ws.len());
+    for &w in ws {
+        let Some(WtBytes::MlxAffine {
+            weights,
+            scales,
+            biases,
+            bits,
+            group_size,
+            metal_aux,
+            metal_tensor,
+        }) = w.bytes.as_ref()
+        else {
+            return false;
+        };
+        let aux = metal_aux.get_or_init(|| {
+            let mut combined = Vec::with_capacity(scales.len() + biases.len());
+            combined.extend_from_slice(scales);
+            combined.extend_from_slice(biases);
+            combined
+        });
+        parts.push((
+            weights.as_slice(),
+            aux.as_slice(),
+            *bits,
+            *group_size,
+            metal_tensor,
+            w.i,
+            w.o,
+        ));
+    }
+
+    let mut guards = Vec::with_capacity(parts.len());
+    for (_, _, _, _, metal_tensor, _, _) in &parts {
+        guards.push(
+            metal_tensor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    let mut descs = Vec::with_capacity(parts.len());
+    for ((y, part), guard) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()) {
+        let (weights, aux, bits, group_size, _, input, output) = *part;
+        descs.push(logan_metal::MlxAffineMatmulDesc {
+            tensor: **guard as *mut logan_metal::ColiMetalTensor,
+            y: &mut **y,
+            weights,
+            aux,
+            bits,
+            group_size,
+            i: input,
+            o: output,
+        });
+    }
+
+    let ok = logan_metal::metal_matmul_mlx_affine_multi(x, &mut descs);
+    for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
+        **guard = desc.tensor as usize;
+    }
+    ok
+}
+
 /// Encode several resident MXFP4 GEMVs that consume the same activation in a
 /// single Metal command buffer. Returns false without changing numerical state
 /// when any weight is not MXFP4 or Metal declines, so callers can fall back to
@@ -2909,6 +3213,96 @@ fn matmul_mxfp4_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
     ok
 }
 
+struct GdnMetalWeightView<'a> {
+    weights: &'a [u8],
+    scales: &'a [u8],
+    metal_tensor: &'a std::sync::Mutex<usize>,
+    fmt: i32,
+    group_size: usize,
+}
+
+fn gdn_metal_weight_view(w: &Wt) -> Option<GdnMetalWeightView<'_>> {
+    match w.bytes.as_ref()? {
+        WtBytes::Bf16 {
+            weights,
+            metal_tensor,
+        } => Some(GdnMetalWeightView {
+            weights,
+            scales: &[],
+            metal_tensor,
+            fmt: 5,
+            group_size: 0,
+        }),
+        WtBytes::Mxfp4 {
+            weights,
+            scales,
+            metal_tensor,
+        } => Some(GdnMetalWeightView {
+            weights,
+            scales,
+            metal_tensor,
+            fmt: mxfp4_storage_fmt(weights, scales, w.o, w.i),
+            group_size: 0,
+        }),
+        WtBytes::MlxAffine {
+            weights,
+            scales,
+            biases,
+            bits,
+            group_size,
+            metal_aux,
+            metal_tensor,
+        } => {
+            let fmt = match *bits {
+                4 => 16,
+                5 => 17,
+                6 => 18,
+                8 => 19,
+                _ => return None,
+            };
+            let aux = metal_aux.get_or_init(|| {
+                let mut combined = Vec::with_capacity(scales.len() + biases.len());
+                combined.extend_from_slice(scales);
+                combined.extend_from_slice(biases);
+                combined
+            });
+            Some(GdnMetalWeightView {
+                weights,
+                scales: aux,
+                metal_tensor,
+                fmt,
+                group_size: *group_size,
+            })
+        }
+        WtBytes::Q8Block {
+            weights,
+            scales,
+            block,
+            residuals,
+            metal_tensor,
+        } => {
+            let fmt = if *block == 32 && *residuals == 1 {
+                14
+            } else {
+                match *block {
+                    32 => 11,
+                    16 => 12,
+                    8 => 13,
+                    _ => return None,
+                }
+            };
+            Some(GdnMetalWeightView {
+                weights,
+                scales,
+                metal_tensor,
+                fmt,
+                group_size: *block,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Full one-command-buffer quantized Gated DeltaNet decode. Supports MXFP4
 /// qualification formats and block-scaled INT8 while sharing persistent Metal
 /// tensor handles and state-only GdnMetalLayer storage.
@@ -2933,63 +3327,29 @@ fn gdn_mxfp4_full_token(
     ];
     let mut parts = Vec::with_capacity(ws.len());
     for &w in &ws {
-        let (weights, scales, metal_tensor, fmt): (&[u8], &[u8], &std::sync::Mutex<usize>, i32) =
-            match w.bytes.as_ref() {
-                Some(WtBytes::Bf16 {
-                    weights,
-                    metal_tensor,
-                }) => (weights.as_slice(), &[], metal_tensor, 5),
-                Some(WtBytes::Mxfp4 {
-                    weights,
-                    scales,
-                    metal_tensor,
-                }) => (
-                    weights.as_slice(),
-                    scales.as_slice(),
-                    metal_tensor,
-                    mxfp4_storage_fmt(weights, scales, w.o, w.i),
-                ),
-                Some(WtBytes::Q8Block {
-                    weights,
-                    scales,
-                    block,
-                    residuals,
-                    metal_tensor,
-                }) => {
-                    let fmt = if *block == 32 && *residuals == 1 {
-                        14
-                    } else {
-                        match *block {
-                            32 => 11,
-                            16 => 12,
-                            8 => 13,
-                            _ => return 0,
-                        }
-                    };
-                    (weights.as_slice(), scales.as_slice(), metal_tensor, fmt)
-                }
-                _ => return 0,
-            };
-        parts.push((weights, scales, metal_tensor, w.i, w.o, fmt));
+        let Some(view) = gdn_metal_weight_view(w) else {
+            return 0;
+        };
+        parts.push((view, w.i, w.o));
     }
     let mut guards = Vec::with_capacity(parts.len());
-    for (_, _, metal_tensor, _, _, _) in &parts {
+    for (view, _, _) in &parts {
         guards.push(
-            metal_tensor
+            view.metal_tensor
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
     }
     let mut descs = Vec::with_capacity(parts.len());
-    for (part, guard) in parts.iter().zip(guards.iter()) {
-        let (weights, scales, _, input, output, fmt) = *part;
+    for ((view, input, output), guard) in parts.iter().zip(guards.iter()) {
         descs.push(logan_metal::MetalWeightDesc {
             tensor: **guard as *mut logan_metal::ColiMetalTensor,
-            weights,
-            scales,
-            fmt,
-            i: input,
-            o: output,
+            weights: view.weights,
+            scales: view.scales,
+            fmt: view.fmt,
+            group_size: view.group_size,
+            i: *input,
+            o: *output,
         });
     }
 
@@ -4813,7 +5173,7 @@ impl Model {
                         &layer.gdn_in_b,
                         &layer.gdn_in_z,
                     ];
-                    matmul_mxfp4_multi(&mut ys, x, &ws)
+                    matmul_mxfp4_multi(&mut ys, x, &ws) || matmul_mlx_affine_multi(&mut ys, x, &ws)
                 } else {
                     false
                 };
@@ -5961,6 +6321,7 @@ impl Model {
                         weights,
                         scales,
                         fmt: 7,
+                        group_size: 0,
                         i: input,
                         o: output,
                     });
@@ -7396,12 +7757,7 @@ impl Model {
                         );
                     }
                     let mut _fill_t = logan_core::telemetry::Span::begin("fill");
-                    match self.eval_experts(
-                        &calls,
-                        c.hidden,
-                        c.moe_inter,
-                        "silu",
-                    ) {
+                    match self.eval_experts(&calls, c.hidden, c.moe_inter, "silu") {
                         Some(Ok(outs)) if outs.len() == calls.len() => {
                             self.spans.fill_ms += _fill_t.end();
                             // Accumulate each answer into its own token's output,
@@ -7423,7 +7779,8 @@ impl Model {
                                 }
                                 for g in 0..c.hc_count {
                                     for dd in 0..c.hidden {
-                                        streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                                        streams[row][g * c.hidden + dd] +=
+                                            injectors[row][g] * moe[dd];
                                     }
                                 }
                             }
@@ -7454,7 +7811,15 @@ impl Model {
                     for row in 0..tokens.len() {
                         let mut moe = vec![0.0; c.hidden];
                         let (idx, val, wsum) = &routes[row];
-                        self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
+                        self.moe_token_routed(
+                            &layer,
+                            l,
+                            &moe_inputs[row],
+                            &mut moe,
+                            idx,
+                            val,
+                            *wsum,
+                        );
                         for g in 0..c.hc_count {
                             for dd in 0..c.hidden {
                                 streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
@@ -7876,7 +8241,8 @@ impl Model {
                                 }
                                 for g in 0..c.hc_count {
                                     for dd in 0..c.hidden {
-                                        streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
+                                        streams[row][g * c.hidden + dd] +=
+                                            injectors[row][g] * moe[dd];
                                     }
                                 }
                             }
@@ -7907,7 +8273,15 @@ impl Model {
                     for row in 0..tokens.len() {
                         let mut moe = vec![0.0; c.hidden];
                         let (idx, val, wsum) = &routes[row];
-                        self.moe_token_routed(&layer, l, &moe_inputs[row], &mut moe, idx, val, *wsum);
+                        self.moe_token_routed(
+                            &layer,
+                            l,
+                            &moe_inputs[row],
+                            &mut moe,
+                            idx,
+                            val,
+                            *wsum,
+                        );
                         for g in 0..c.hc_count {
                             for dd in 0..c.hidden {
                                 streams[row][g * c.hidden + dd] += injectors[row][g] * moe[dd];
@@ -8494,6 +8868,14 @@ fn detect_physical_ram_bytes() -> Option<u64> {
 }
 
 fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
+    let dtype = st
+        .tensors
+        .get(name)
+        .map(|tensor| tensor.2.as_str())
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    if dtype == "U32" {
+        return load_mlx_quantized_wt(st, name, o, i);
+    }
     Ok(Wt {
         f: st.f32(name, &[o as u64, i as u64])?,
         bytes: None,
@@ -8502,12 +8884,390 @@ fn load_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
     })
 }
 
+fn load_mlx_quantized_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<Wt, String> {
+    if o == 0 || i == 0 {
+        return Err(format!(
+            "{name}: quantized matrix dimensions must be non-zero"
+        ));
+    }
+    let (_, wshape, wdtype, _, _) = st
+        .tensors
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    if wdtype != "U32" || wshape.len() != 2 || wshape[0] != o as u64 {
+        return Err(format!(
+            "{name}: expected U32 packed matrix with {o} rows, got {wdtype}/{wshape:?}"
+        ));
+    }
+    let packed_words = usize::try_from(wshape[1])
+        .map_err(|_| format!("{name}: packed row width does not fit usize"))?;
+    let row_bits = packed_words
+        .checked_mul(32)
+        .ok_or_else(|| format!("{name}: packed row bit count overflows"))?;
+    if row_bits % i != 0 {
+        return Err(format!(
+            "{name}: {packed_words} U32 words cannot represent {i} logical columns exactly"
+        ));
+    }
+    let bits = u8::try_from(row_bits / i)
+        .map_err(|_| format!("{name}: inferred bit width overflows u8"))?;
+    if !matches!(bits, 4 | 5 | 6 | 8) {
+        return Err(format!(
+            "{name}: inferred unsupported MLX quantization width {bits} from {wshape:?} -> {o}x{i}"
+        ));
+    }
+
+    let base = name
+        .strip_suffix(".weight")
+        .ok_or_else(|| format!("{name}: quantized matrix name must end in .weight"))?;
+    let scale_name = format!("{base}.scales");
+    let (_, sshape, sdtype, _, _) = st
+        .tensors
+        .get(&scale_name)
+        .cloned()
+        .ok_or_else(|| format!("missing quantization sidecar {scale_name}"))?;
+    let weights = st.payload(name, &wshape, 4)?;
+
+    match sdtype.as_str() {
+        "BF16" => {
+            if sshape.len() != 2 || sshape[0] != o as u64 || sshape[1] == 0 {
+                return Err(format!(
+                    "{scale_name}: expected [rows, groups] BF16 scales for {o} rows, got {sshape:?}"
+                ));
+            }
+            let groups = usize::try_from(sshape[1])
+                .map_err(|_| format!("{scale_name}: group count does not fit usize"))?;
+            if i % groups != 0 {
+                return Err(format!(
+                    "{scale_name}: {groups} groups do not divide {i} logical columns"
+                ));
+            }
+            let group_size = i / groups;
+            let bias_name = format!("{base}.biases");
+            let (_, bshape, bdtype, _, _) = st
+                .tensors
+                .get(&bias_name)
+                .cloned()
+                .ok_or_else(|| format!("missing affine quantization sidecar {bias_name}"))?;
+            if bdtype != "BF16" || bshape != sshape {
+                return Err(format!(
+                    "{bias_name}: expected BF16 shape {sshape:?}, got {bdtype}/{bshape:?}"
+                ));
+            }
+            let scales = st.payload(&scale_name, &sshape, 2)?;
+            let biases = st.payload(&bias_name, &bshape, 2)?;
+            Ok(Wt {
+                f: Vec::new(),
+                bytes: Some(WtBytes::MlxAffine {
+                    weights,
+                    scales,
+                    biases,
+                    bits,
+                    group_size,
+                    metal_aux: std::sync::OnceLock::new(),
+                    metal_tensor: std::sync::Mutex::new(0),
+                }),
+                o,
+                i,
+            })
+        }
+        "U8" => {
+            if bits != 4 {
+                return Err(format!(
+                    "{name}: U8 scale sidecar identifies MLX MXFP4, but inferred weight width is {bits}"
+                ));
+            }
+            let want_groups = i.div_ceil(32);
+            if sshape != vec![o as u64, want_groups as u64] {
+                return Err(format!(
+                    "{scale_name}: expected MLX MXFP4 scale shape [{o}, {want_groups}], got {sshape:?}"
+                ));
+            }
+            let scales = st.payload(&scale_name, &sshape, 1)?;
+            Ok(Wt {
+                f: Vec::new(),
+                bytes: Some(WtBytes::Mxfp4 {
+                    weights,
+                    scales,
+                    metal_tensor: std::sync::Mutex::new(0),
+                }),
+                o,
+                i,
+            })
+        }
+        other => Err(format!(
+            "{scale_name}: unsupported MLX quantization scale dtype {other}; expected BF16 affine or U8 MXFP4"
+        )),
+    }
+}
+
+fn load_mlx_quantized_expert_wt(
+    st: &StFile,
+    name: &str,
+    expert: usize,
+    experts: usize,
+    o: usize,
+    i: usize,
+) -> Result<Wt, String> {
+    if expert >= experts || o == 0 || i == 0 {
+        return Err(format!(
+            "{name}: invalid expert geometry expert={expert}/{experts} matrix={o}x{i}"
+        ));
+    }
+    let (_, wshape, wdtype, _, _) = st
+        .tensors
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("missing tensor {name}"))?;
+    if wdtype != "U32" || wshape.len() != 3 || wshape[0] != experts as u64 || wshape[1] != o as u64
+    {
+        return Err(format!(
+            "{name}: expected stacked U32 [{experts}, {o}, words], got {wdtype}/{wshape:?}"
+        ));
+    }
+    let packed_words = usize::try_from(wshape[2])
+        .map_err(|_| format!("{name}: packed row width does not fit usize"))?;
+    let row_bits = packed_words
+        .checked_mul(32)
+        .ok_or_else(|| format!("{name}: packed row bit count overflows"))?;
+    if row_bits % i != 0 {
+        return Err(format!(
+            "{name}: {packed_words} U32 words cannot represent {i} logical columns exactly"
+        ));
+    }
+    let bits = u8::try_from(row_bits / i)
+        .map_err(|_| format!("{name}: inferred bit width overflows u8"))?;
+    if !matches!(bits, 4 | 5 | 6 | 8) {
+        return Err(format!("{name}: unsupported MLX expert bit width {bits}"));
+    }
+
+    let base = name
+        .strip_suffix(".weight")
+        .ok_or_else(|| format!("{name}: quantized expert name must end in .weight"))?;
+    let scale_name = format!("{base}.scales");
+    let (_, sshape, sdtype, _, _) = st
+        .tensors
+        .get(&scale_name)
+        .cloned()
+        .ok_or_else(|| format!("missing expert sidecar {scale_name}"))?;
+    if sshape.len() != 3 || sshape[0] != experts as u64 || sshape[1] != o as u64 || sshape[2] == 0 {
+        return Err(format!(
+            "{scale_name}: expected [{experts}, {o}, groups], got {sshape:?}"
+        ));
+    }
+    let groups = usize::try_from(sshape[2])
+        .map_err(|_| format!("{scale_name}: group count does not fit usize"))?;
+    if i % groups != 0 {
+        return Err(format!(
+            "{scale_name}: {groups} groups do not divide {i} logical columns"
+        ));
+    }
+    let group_size = i / groups;
+    let weight_slice = o
+        .checked_mul(packed_words)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| format!("{name}: expert weight slice size overflows"))?;
+    let weight_offset = expert
+        .checked_mul(weight_slice)
+        .ok_or_else(|| format!("{name}: expert weight offset overflows"))?;
+    let weights = st.payload_range(name, weight_offset, weight_slice)?;
+
+    match sdtype.as_str() {
+        "BF16" => {
+            let param_slice = o
+                .checked_mul(groups)
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| format!("{scale_name}: expert parameter slice size overflows"))?;
+            let param_offset = expert
+                .checked_mul(param_slice)
+                .ok_or_else(|| format!("{scale_name}: expert parameter offset overflows"))?;
+            let bias_name = format!("{base}.biases");
+            let (_, bshape, bdtype, _, _) = st
+                .tensors
+                .get(&bias_name)
+                .cloned()
+                .ok_or_else(|| format!("missing affine expert sidecar {bias_name}"))?;
+            if bdtype != "BF16" || bshape != sshape {
+                return Err(format!(
+                    "{bias_name}: expected BF16 shape {sshape:?}, got {bdtype}/{bshape:?}"
+                ));
+            }
+            let scales = st.payload_range(&scale_name, param_offset, param_slice)?;
+            let biases = st.payload_range(&bias_name, param_offset, param_slice)?;
+            Ok(Wt {
+                f: Vec::new(),
+                bytes: Some(WtBytes::MlxAffine {
+                    weights,
+                    scales,
+                    biases,
+                    bits,
+                    group_size,
+                    metal_aux: std::sync::OnceLock::new(),
+                    metal_tensor: std::sync::Mutex::new(0),
+                }),
+                o,
+                i,
+            })
+        }
+        "U8" => {
+            if bits != 4 || group_size != 32 {
+                return Err(format!(
+                    "{name}: MLX MXFP4 expert requires 4-bit/group-32, got {bits}-bit/group-{group_size}"
+                ));
+            }
+            let scale_slice = o
+                .checked_mul(groups)
+                .ok_or_else(|| format!("{scale_name}: expert scale slice size overflows"))?;
+            let scale_offset = expert
+                .checked_mul(scale_slice)
+                .ok_or_else(|| format!("{scale_name}: expert scale offset overflows"))?;
+            let scales = st.payload_range(&scale_name, scale_offset, scale_slice)?;
+            Ok(Wt {
+                f: Vec::new(),
+                bytes: Some(WtBytes::Mxfp4 {
+                    weights,
+                    scales,
+                    metal_tensor: std::sync::Mutex::new(0),
+                }),
+                o,
+                i,
+            })
+        }
+        other => Err(format!(
+            "{scale_name}: unsupported MLX expert scale dtype {other}"
+        )),
+    }
+}
+
+pub(crate) struct MlxLocalExpertSource {
+    st: StFile,
+    experts: usize,
+}
+
+impl MlxLocalExpertSource {
+    fn new(st: StFile, experts: usize) -> Self {
+        Self { st, experts }
+    }
+}
+
+impl crate::pool::ExpertSource for MlxLocalExpertSource {
+    fn eval(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+        activation: &str,
+    ) -> Result<Vec<Vec<f32>>, crate::pool::PoolError> {
+        if activation != "silu" {
+            return Err(format!(
+                "raw MLX expert source supports only silu activation, got {activation}"
+            ));
+        }
+        let mut outputs = Vec::with_capacity(calls.len());
+        for call in calls {
+            let expert = usize::try_from(call.expert)
+                .map_err(|_| format!("expert id {} does not fit usize", call.expert))?;
+            if call.input.len() != d_model {
+                return Err(format!(
+                    "layer {} expert {} input width {} != d_model {d_model}",
+                    call.layer,
+                    call.expert,
+                    call.input.len()
+                ));
+            }
+            let prefix = format!("model.layers.{}.mlp.switch_mlp", call.layer);
+            let gate = load_mlx_quantized_expert_wt(
+                &self.st,
+                &format!("{prefix}.gate_proj.weight"),
+                expert,
+                self.experts,
+                d_hidden,
+                d_model,
+            )?;
+            let up = load_mlx_quantized_expert_wt(
+                &self.st,
+                &format!("{prefix}.up_proj.weight"),
+                expert,
+                self.experts,
+                d_hidden,
+                d_model,
+            )?;
+            let down = load_mlx_quantized_expert_wt(
+                &self.st,
+                &format!("{prefix}.down_proj.weight"),
+                expert,
+                self.experts,
+                d_model,
+                d_hidden,
+            )?;
+
+            let mut gate_out = vec![0.0_f32; d_hidden];
+            let mut hidden = vec![0.0_f32; d_hidden];
+            matmul(&mut gate_out, &call.input, &gate);
+            matmul(&mut hidden, &call.input, &up);
+            for index in 0..d_hidden {
+                hidden[index] *= silu(gate_out[index]);
+            }
+            let mut output = vec![0.0_f32; d_model];
+            matmul(&mut output, &hidden, &down);
+            outputs.push(output);
+        }
+        Ok(outputs)
+    }
+}
+
+fn load_mlp_residual_norm(
+    st: &StFile,
+    layer_prefix: &str,
+    hc_count: usize,
+    width: usize,
+) -> Result<Vec<f32>, String> {
+    if hc_count > 0 {
+        st.f32(
+            &format!("{layer_prefix}.mlp_hyper_connection.hc_norm.weight"),
+            &[width as u64],
+        )
+    } else {
+        st.f32(
+            &format!("{layer_prefix}.post_attention_layernorm.weight"),
+            &[width as u64],
+        )
+    }
+}
+
 impl Model {
     pub fn load(st: &StFile, cfg: &Cfg) -> Result<Model, String> {
+        // Raw safetensors checkpoints use the same engine-neutral Metal backend
+        // as compiled COLI packages. Initialization is idempotent and non-macOS
+        // builds simply decline, preserving the CPU fallback contract.
+        crate::ffi::metal_init();
         // Experts come from the pool when it is configured. Reading them
         // locally is not an option for this model (483 GB as f32), so the
         // choice is "delegate" or "cannot run" -- not a preference.
         let pool = crate::pool::PoolConfig::from_env();
+        let mlx_switch_layout = st
+            .tensors
+            .contains_key("model.layers.0.mlp.switch_mlp.gate_proj.weight");
+        if mlx_switch_layout {
+            for layer in 0..cfg.layers {
+                for role in ["gate_proj", "up_proj", "down_proj"] {
+                    let name = format!("model.layers.{layer}.mlp.switch_mlp.{role}.weight");
+                    if !st.tensors.contains_key(&name) {
+                        return Err(format!(
+                            "raw MLX switch layout is incomplete: missing {name}"
+                        ));
+                    }
+                }
+            }
+        }
+        let streamed_mlx_experts = mlx_switch_layout && pool.is_none();
+        let local_mlx_expert_source: Option<Box<dyn crate::pool::ExpertSource>> =
+            if streamed_mlx_experts {
+                Some(Box::new(MlxLocalExpertSource::new(st.clone(), cfg.experts)))
+            } else {
+                None
+            };
         // The checkpoint's tensors are ground truth for the PLE layer, and
         // config is NOT. `ple_layer_ids` says 2 while the tensors are at
         // `layers.1.ple.*`; taking config at face value fires `ple_forward` on
@@ -8773,50 +9533,110 @@ impl Model {
                 } else {
                     vec![]
                 },
-                hc_norm: st.f32(
-                    &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
-                    &[hcd as u64],
-                )?,
-                hc_mix_down: load_wt(
+                hc_norm: if cfg.hc_count > 0 {
+                    st.f32(
+                        &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
+                        &[hcd as u64],
+                    )?
+                } else {
+                    vec![]
+                },
+                hc_mix_down: if cfg.hc_count > 0 {
+                    load_wt(
+                        st,
+                        &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
+                        cfg.hc_lowrank,
+                        hcd,
+                    )?
+                } else {
+                    Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    }
+                },
+                hc_mix_up: if cfg.hc_count > 0 {
+                    load_wt(
+                        st,
+                        &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
+                        hcd,
+                        cfg.hc_lowrank,
+                    )?
+                } else {
+                    Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    }
+                },
+                hc_inject: if cfg.hc_count > 0 {
+                    load_wt(
+                        st,
+                        &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
+                        cfg.hc_count,
+                        hcd,
+                    )?
+                } else {
+                    Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    }
+                },
+                hc_mlp_norm: load_mlp_residual_norm(
                     st,
-                    &format!("{lp}.attn_hyper_connection.input_mix_weight_down.weight"),
-                    cfg.hc_lowrank,
-                    hcd,
-                )?,
-                hc_mix_up: load_wt(
-                    st,
-                    &format!("{lp}.attn_hyper_connection.input_mix_weight_up.weight"),
-                    hcd,
-                    cfg.hc_lowrank,
-                )?,
-                hc_inject: load_wt(
-                    st,
-                    &format!("{lp}.attn_hyper_connection.block_inject_weight.weight"),
+                    &lp,
                     cfg.hc_count,
-                    hcd,
+                    if cfg.hc_count > 0 { hcd } else { cfg.hidden },
                 )?,
-                hc_mlp_norm: st.f32(
-                    &format!("{lp}.mlp_hyper_connection.hc_norm.weight"),
-                    &[hcd as u64],
-                )?,
-                hc_mlp_mix_down: load_wt(
-                    st,
-                    &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
-                    cfg.hc_lowrank,
-                    hcd,
-                )?,
-                hc_mlp_mix_up: load_wt(
-                    st,
-                    &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
-                    hcd,
-                    cfg.hc_lowrank,
-                )?,
-                hc_mlp_inject: load_wt(
-                    st,
-                    &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
-                    cfg.hc_count,
-                    hcd,
-                )?,
+                hc_mlp_mix_down: if cfg.hc_count > 0 {
+                    load_wt(
+                        st,
+                        &format!("{lp}.mlp_hyper_connection.input_mix_weight_down.weight"),
+                        cfg.hc_lowrank,
+                        hcd,
+                    )?
+                } else {
+                    Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    }
+                },
+                hc_mlp_mix_up: if cfg.hc_count > 0 {
+                    load_wt(
+                        st,
+                        &format!("{lp}.mlp_hyper_connection.input_mix_weight_up.weight"),
+                        hcd,
+                        cfg.hc_lowrank,
+                    )?
+                } else {
+                    Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    }
+                },
+                hc_mlp_inject: if cfg.hc_count > 0 {
+                    load_wt(
+                        st,
+                        &format!("{lp}.mlp_hyper_connection.block_inject_weight.weight"),
+                        cfg.hc_count,
+                        hcd,
+                    )?
+                } else {
+                    Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    }
+                },
                 router: load_wt(
                     st,
                     &format!("{lp}.mlp.gate.weight"),
@@ -8853,7 +9673,7 @@ impl Model {
             // are fetched per routed batch in `moe_token_routed`, so building
             // them here would be both impossible and pointless.
             for e in 0..cfg.experts {
-                if pool.is_some() {
+                if pool.is_some() || streamed_mlx_experts {
                     break;
                 }
                 let elp = format!("{lp}.mlp.experts.{e}");
@@ -9068,9 +9888,10 @@ impl Model {
         Ok(Model {
             cfg: cfg.clone(),
             pool,
-            // Set by `set_expert_source` after load: the embedder that owns
-            // transport supplies this, and `load` has no way to know it yet.
-            expert_source: None,
+            // Raw MLX switch-expert checkpoints install a local file-backed
+            // source automatically. Embedders can still replace it later via
+            // `set_expert_source`, and an explicit pool configuration wins.
+            expert_source: local_mlx_expert_source,
             ple_shards,
             coli: None,
             gguf: None,
@@ -9093,20 +9914,38 @@ impl Model {
             },
             layers,
             experts,
-            hc_global: HcGlobal {
-                norm: st.f32("model.hyper_connection_mixer.hc_norm.weight", &[hcd as u64])?,
-                mix_down: load_wt(
-                    st,
-                    "model.hyper_connection_mixer.input_mix_weight_down.weight",
-                    cfg.hc_lowrank,
-                    hcd,
-                )?,
-                mix_up: load_wt(
-                    st,
-                    "model.hyper_connection_mixer.input_mix_weight_up.weight",
-                    hcd,
-                    cfg.hc_lowrank,
-                )?,
+            hc_global: if cfg.hc_count > 0 {
+                HcGlobal {
+                    norm: st.f32("model.hyper_connection_mixer.hc_norm.weight", &[hcd as u64])?,
+                    mix_down: load_wt(
+                        st,
+                        "model.hyper_connection_mixer.input_mix_weight_down.weight",
+                        cfg.hc_lowrank,
+                        hcd,
+                    )?,
+                    mix_up: load_wt(
+                        st,
+                        "model.hyper_connection_mixer.input_mix_weight_up.weight",
+                        hcd,
+                        cfg.hc_lowrank,
+                    )?,
+                }
+            } else {
+                HcGlobal {
+                    norm: vec![],
+                    mix_down: Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    },
+                    mix_up: Wt {
+                        f: vec![],
+                        bytes: None,
+                        o: 0,
+                        i: 0,
+                    },
+                }
             },
             mtp: None,
             last_hidden_nextn: Vec::new(),
@@ -9176,10 +10015,7 @@ impl Model {
                 })
                 .collect(),
             ple_ring: vec![cfg.eos; cfg.ngram_size.max(1)],
-            ple_conv_state: vec![
-                0.0;
-                hcd * ((cfg.ple_conv_kernel - 1) * cfg.ngram_size + 1).max(1)
-            ],
+            ple_conv_state: vec![0.0; ple_conv_state_len(hcd, cfg.ple_conv_kernel, cfg.ngram_size)],
             expert_plan: None,
             expert_store: make_expert_store(cfg.layers, cfg.topk),
             spans: logan_core::telemetry::TokenSpans::default(),
@@ -9211,6 +10047,13 @@ impl Model {
             sched_pause: None,
         })
     }
+}
+
+fn ple_conv_state_len(hcd: usize, kernel: usize, ngram_size: usize) -> usize {
+    if hcd == 0 || kernel == 0 || ngram_size == 0 {
+        return 0;
+    }
+    hcd * ((kernel - 1) * ngram_size + 1)
 }
 
 fn cdim_total(cfg: &Cfg) -> usize {
@@ -9252,14 +10095,34 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
     let layer = Layer {
         // Built from the empty layer so the GDN/quant fields stay in one place;
         // only the fields the drafter actually uses are overridden below.
-        attn_q: load_wt(&st, &format!("{lp}.self_attn.q_proj.weight"), 2 * cfg.heads * hd, d)
-            .map_err(|x| e(&x))?,
-        attn_k: load_wt(&st, &format!("{lp}.self_attn.k_proj.weight"), cfg.kv_heads * hd, d)
-            .map_err(|x| e(&x))?,
-        attn_v: load_wt(&st, &format!("{lp}.self_attn.v_proj.weight"), cfg.kv_heads * hd, d)
-            .map_err(|x| e(&x))?,
-        attn_o: load_wt(&st, &format!("{lp}.self_attn.o_proj.weight"), d, cfg.heads * hd)
-            .map_err(|x| e(&x))?,
+        attn_q: load_wt(
+            &st,
+            &format!("{lp}.self_attn.q_proj.weight"),
+            2 * cfg.heads * hd,
+            d,
+        )
+        .map_err(|x| e(&x))?,
+        attn_k: load_wt(
+            &st,
+            &format!("{lp}.self_attn.k_proj.weight"),
+            cfg.kv_heads * hd,
+            d,
+        )
+        .map_err(|x| e(&x))?,
+        attn_v: load_wt(
+            &st,
+            &format!("{lp}.self_attn.v_proj.weight"),
+            cfg.kv_heads * hd,
+            d,
+        )
+        .map_err(|x| e(&x))?,
+        attn_o: load_wt(
+            &st,
+            &format!("{lp}.self_attn.o_proj.weight"),
+            d,
+            cfg.heads * hd,
+        )
+        .map_err(|x| e(&x))?,
         attn_qn: st
             .f32(&format!("{lp}.self_attn.q_norm.weight"), &[hd as u64])
             .map_err(|x| e(&x))?,
@@ -9267,7 +10130,10 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
             .f32(&format!("{lp}.self_attn.k_norm.weight"), &[hd as u64])
             .map_err(|x| e(&x))?,
         hc_norm: st
-            .f32(&format!("{lp}.attn_hyper_connection.hc_norm.weight"), &[hcd as u64])
+            .f32(
+                &format!("{lp}.attn_hyper_connection.hc_norm.weight"),
+                &[hcd as u64],
+            )
             .map_err(|x| e(&x))?,
         hc_mix_down: load_wt(
             &st,
@@ -9291,7 +10157,10 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
         )
         .map_err(|x| e(&x))?,
         hc_mlp_norm: st
-            .f32(&format!("{lp}.mlp_hyper_connection.hc_norm.weight"), &[hcd as u64])
+            .f32(
+                &format!("{lp}.mlp_hyper_connection.hc_norm.weight"),
+                &[hcd as u64],
+            )
             .map_err(|x| e(&x))?,
         hc_mlp_mix_down: load_wt(
             &st,
@@ -9316,12 +10185,27 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
         .map_err(|x| e(&x))?,
         router: load_wt(&st, &format!("{lp}.mlp.gate.weight"), cfg.experts, d)
             .map_err(|x| e(&x))?,
-        se_gate: load_wt(&st, &format!("{lp}.mlp.shared_expert.gate_proj.weight"), cfg.shared_inter, d)
-            .map_err(|x| e(&x))?,
-        se_up: load_wt(&st, &format!("{lp}.mlp.shared_expert.up_proj.weight"), cfg.shared_inter, d)
-            .map_err(|x| e(&x))?,
-        se_down: load_wt(&st, &format!("{lp}.mlp.shared_expert.down_proj.weight"), d, cfg.shared_inter)
-            .map_err(|x| e(&x))?,
+        se_gate: load_wt(
+            &st,
+            &format!("{lp}.mlp.shared_expert.gate_proj.weight"),
+            cfg.shared_inter,
+            d,
+        )
+        .map_err(|x| e(&x))?,
+        se_up: load_wt(
+            &st,
+            &format!("{lp}.mlp.shared_expert.up_proj.weight"),
+            cfg.shared_inter,
+            d,
+        )
+        .map_err(|x| e(&x))?,
+        se_down: load_wt(
+            &st,
+            &format!("{lp}.mlp.shared_expert.down_proj.weight"),
+            d,
+            cfg.shared_inter,
+        )
+        .map_err(|x| e(&x))?,
         se_g: load_wt(&st, &format!("{lp}.mlp.shared_expert_gate.weight"), 1, d)
             .map_err(|x| e(&x))?,
         ..Layer::empty()
@@ -9334,13 +10218,22 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
     // so there is no batch to exploit. Splitting costs 4.9 GB once and saves a
     // gather on every draft.
     let gstack = st
-        .f32(&format!("{lp}.mlp.switch_mlp.gate_proj.weight"), &[cfg.experts as u64, cfg.moe_inter as u64, d as u64])
+        .f32(
+            &format!("{lp}.mlp.switch_mlp.gate_proj.weight"),
+            &[cfg.experts as u64, cfg.moe_inter as u64, d as u64],
+        )
         .map_err(|x| e(&x))?;
     let ustack = st
-        .f32(&format!("{lp}.mlp.switch_mlp.up_proj.weight"), &[cfg.experts as u64, cfg.moe_inter as u64, d as u64])
+        .f32(
+            &format!("{lp}.mlp.switch_mlp.up_proj.weight"),
+            &[cfg.experts as u64, cfg.moe_inter as u64, d as u64],
+        )
         .map_err(|x| e(&x))?;
     let dstack = st
-        .f32(&format!("{lp}.mlp.switch_mlp.down_proj.weight"), &[cfg.experts as u64, d as u64, cfg.moe_inter as u64])
+        .f32(
+            &format!("{lp}.mlp.switch_mlp.down_proj.weight"),
+            &[cfg.experts as u64, d as u64, cfg.moe_inter as u64],
+        )
         .map_err(|x| e(&x))?;
     let per_g = cfg.moe_inter * d;
     let per_d = d * cfg.moe_inter;
@@ -9368,8 +10261,12 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
         topk: cfg.topk,
         fc_embedding: load_wt(&st, "fc_embedding.weight", d, d).map_err(|x| e(&x))?,
         fc_hidden: load_wt(&st, "fc_hidden.weight", d, d).map_err(|x| e(&x))?,
-        enorm: st.f32("pre_fc_norm_embedding.weight", &[d as u64]).map_err(|x| e(&x))?,
-        hnorm: st.f32("pre_fc_norm_hidden.weight", &[hcd as u64]).map_err(|x| e(&x))?,
+        enorm: st
+            .f32("pre_fc_norm_embedding.weight", &[d as u64])
+            .map_err(|x| e(&x))?,
+        hnorm: st
+            .f32("pre_fc_norm_hidden.weight", &[hcd as u64])
+            .map_err(|x| e(&x))?,
         head_norm: st
             .f32("hyper_connection_mixer.hc_norm.weight", &[hcd as u64])
             .map_err(|x| e(&x))?,
@@ -9596,10 +10493,39 @@ pub fn run_greedy_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        causal_conv1d_sample, default_cache_cap_for_ram, is_ple_ngram_weight, load_cfg,
-        quantize_bf16_to_mxfp4, rmsnorm_row, rmsnorm_row_shifted, OutputGate, StFile,
-        MAX_RESIDENT_PLE_NGRAM_BYTES,
+        causal_conv1d_sample, default_cache_cap_for_ram, gdn_metal_weight_view,
+        is_ple_ngram_weight, load_cfg, load_mlp_residual_norm, load_wt, matmul, ple_conv_state_len,
+        quantize_bf16_to_mxfp4, rmsnorm_row, rmsnorm_row_shifted, silu, MlxLocalExpertSource,
+        OutputGate, StFile, Wt, WtBytes, MAX_RESIDENT_PLE_NGRAM_BYTES,
     };
+
+    #[test]
+    fn raw_classic_qwen_uses_post_attention_norm_for_mlp_residual() {
+        let values = concat(&[bf16(1.25), bf16(-0.75)]);
+        let dir = write_sharded_checkpoint(
+            "logan-classic-post-attn-norm",
+            &[(
+                "model-00001-of-00001.safetensors",
+                vec![(
+                    "language_model.model.layers.0.post_attention_layernorm.weight",
+                    "BF16",
+                    vec![2],
+                    values,
+                )],
+            )],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+        let got = load_mlp_residual_norm(&st, "model.layers.0", 0, 2).unwrap();
+        assert_eq!(got, vec![1.25, -0.75]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ple_conv_state_len_handles_disabled_ple() {
+        assert_eq!(ple_conv_state_len(0, 0, 0), 0);
+        assert_eq!(ple_conv_state_len(4096, 0, 0), 0);
+        assert_eq!(ple_conv_state_len(4096, 4, 3), 4096 * ((4 - 1) * 3 + 1));
+    }
 
     #[test]
     fn qwen3_next_config_derives_hybrid_schedule_and_raw_norm_semantics() {
@@ -9716,11 +10642,21 @@ mod tests {
             &[
                 (
                     "model-00001-of-00002.safetensors",
-                    vec![("model.language_model.embed_tokens.weight", "BF16", vec![2], a)],
+                    vec![(
+                        "model.language_model.embed_tokens.weight",
+                        "BF16",
+                        vec![2],
+                        a,
+                    )],
                 ),
                 (
                     "model-00002-of-00002.safetensors",
-                    vec![("model.language_model.layers.0.mlp.gate.weight", "BF16", vec![1], b)],
+                    vec![(
+                        "model.language_model.layers.0.mlp.gate.weight",
+                        "BF16",
+                        vec![1],
+                        b,
+                    )],
                 ),
             ],
         );
@@ -9731,13 +10667,319 @@ mod tests {
 
         // The second tensor lives in the SECOND shard: proving the per-tensor
         // shard index is real, not "everything is in file 0".
-        let via_hf = st.f32("model.language_model.layers.0.mlp.gate.weight", &[1]).unwrap();
+        let via_hf = st
+            .f32("model.language_model.layers.0.mlp.gate.weight", &[1])
+            .unwrap();
         let via_engine = st.f32("model.layers.0.mlp.gate.weight", &[1]).unwrap();
         assert_eq!(via_hf, vec![-2.25]);
         assert_eq!(via_hf, via_engine, "alias must resolve to identical bytes");
 
         let emb = st.f32("model.embed_tokens.weight", &[2]).unwrap();
         assert_eq!(emb, vec![1.5, -0.5]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_dir_accepts_and_aliases_mlx_quantized_payloads() {
+        let weight = [0x0123_4567_u32, 0x89ab_cdef]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scales = bf16(0.5);
+        let biases = bf16(-1.0);
+        let dir = write_sharded_checkpoint(
+            "logan-mlx-quantized-alias",
+            &[
+                (
+                    "model-00001-of-00002.safetensors",
+                    vec![
+                        (
+                            "language_model.model.layers.0.linear_attn.in_proj_a.weight",
+                            "U32",
+                            vec![1, 2],
+                            weight,
+                        ),
+                        (
+                            "language_model.model.layers.0.linear_attn.in_proj_a.scales",
+                            "BF16",
+                            vec![1, 1],
+                            scales,
+                        ),
+                        (
+                            "language_model.model.layers.0.linear_attn.in_proj_a.biases",
+                            "BF16",
+                            vec![1, 1],
+                            biases,
+                        ),
+                    ],
+                ),
+                (
+                    "model-00002-of-00002.safetensors",
+                    vec![(
+                        "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales",
+                        "U8",
+                        vec![1, 1, 1],
+                        vec![127],
+                    )],
+                ),
+            ],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+
+        assert_eq!(st.dtype_counts().get("U32"), Some(&1));
+        assert_eq!(st.dtype_counts().get("U8"), Some(&1));
+        assert_eq!(
+            st.shape_of("model.layers.0.linear_attn.in_proj_a.weight"),
+            Some(vec![1, 2])
+        );
+        assert_eq!(
+            st.shape_of("model.layers.0.linear_attn.in_proj_a.scales"),
+            Some(vec![1, 1])
+        );
+        assert_eq!(
+            st.shape_of("model.layers.0.linear_attn.in_proj_a.biases"),
+            Some(vec![1, 1])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn qwen_fused_gdn_view_preserves_mlx_affine_format_and_group_size() {
+        let scales = (0..4).flat_map(|_| bf16(0.5)).collect::<Vec<_>>();
+        let biases = (0..4).flat_map(|_| bf16(-0.25)).collect::<Vec<_>>();
+        let w = Wt {
+            f: vec![],
+            bytes: Some(WtBytes::MlxAffine {
+                weights: vec![0_u8; 2 * 128 * 6 / 8],
+                scales: scales.clone(),
+                biases: biases.clone(),
+                bits: 6,
+                group_size: 64,
+                metal_aux: std::sync::OnceLock::new(),
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
+            o: 2,
+            i: 128,
+        };
+        let view = gdn_metal_weight_view(&w).expect("MLX affine must be eligible for fused GDN");
+        assert_eq!(view.fmt, 18);
+        assert_eq!(view.group_size, 64);
+        assert_eq!(view.weights.len(), 192);
+        assert_eq!(view.scales.len(), scales.len() + biases.len());
+        assert_eq!(&view.scales[..scales.len()], scales.as_slice());
+        assert_eq!(&view.scales[scales.len()..], biases.as_slice());
+    }
+
+    #[test]
+    fn qwen_mlx_affine_multi_batches_mixed_formats_on_metal() {
+        assert!(
+            logan_metal::metal_init(),
+            "Metal backend must initialize on Apple Silicon"
+        );
+        const I: usize = 128;
+        let make = |bits: u8, group_size: usize, o: usize| Wt {
+            f: vec![],
+            bytes: Some(WtBytes::MlxAffine {
+                weights: vec![0; o * I * bits as usize / 8],
+                scales: (0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect(),
+                biases: (0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect(),
+                bits,
+                group_size,
+                metal_aux: std::sync::OnceLock::new(),
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
+            o,
+            i: I,
+        };
+        let w5 = make(5, 128, 2);
+        let w6 = make(6, 64, 3);
+        let x = vec![1.0_f32; I];
+        let mut y5 = vec![0.0_f32; 2];
+        let mut y6 = vec![0.0_f32; 3];
+        let mut ys: [&mut [f32]; 2] = [&mut y5, &mut y6];
+        let ws = [&w5, &w6];
+        logan_metal::dense_profile_start();
+        assert!(super::matmul_mlx_affine_multi(&mut ys, &x, &ws));
+        let (_encode_ns, _submit_ns, _wait_ns, kernel_ns) = logan_metal::dense_profile_stop();
+        assert!(
+            kernel_ns > 0,
+            "batched Qwen MLX affine matmul must execute on Metal"
+        );
+        assert_eq!(y5, vec![128.0; 2]);
+        assert_eq!(y6, vec![128.0; 3]);
+    }
+
+    #[test]
+    fn qwen_mlx_affine_matmul_uses_native_metal_path() {
+        assert!(
+            logan_metal::metal_init(),
+            "Metal backend must initialize on Apple Silicon"
+        );
+        const O: usize = 3;
+        const I: usize = 128;
+        const GROUP: usize = 64;
+        let weights = vec![0x11_u8; O * I / 2];
+        let groups = I / GROUP;
+        let scales = (0..O * groups).flat_map(|_| bf16(1.0)).collect::<Vec<_>>();
+        let biases = (0..O * groups).flat_map(|_| bf16(0.0)).collect::<Vec<_>>();
+        let w = Wt {
+            f: vec![],
+            bytes: Some(WtBytes::MlxAffine {
+                weights,
+                scales,
+                biases,
+                bits: 4,
+                group_size: GROUP,
+                metal_aux: std::sync::OnceLock::new(),
+                metal_tensor: std::sync::Mutex::new(0),
+            }),
+            o: O,
+            i: I,
+        };
+        let x = vec![1.0_f32; I];
+        let mut y = vec![0.0_f32; O];
+        logan_metal::dense_profile_start();
+        matmul(&mut y, &x, &w);
+        let (_encode_ns, _submit_ns, _wait_ns, kernel_ns) = logan_metal::dense_profile_stop();
+        assert!(
+            kernel_ns > 0,
+            "Qwen MLX affine matmul must execute on Metal"
+        );
+        assert_eq!(y, vec![128.0; O]);
+    }
+
+    #[test]
+    fn load_wt_preserves_mlx_affine_packed_storage() {
+        let packed_words: Vec<u32> = (0..8).map(|v| v as u32 * 0x1111_1111).collect();
+        let packed = packed_words
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let dir = write_sharded_checkpoint(
+            "logan-mlx-affine-wt",
+            &[(
+                "model-00001-of-00001.safetensors",
+                vec![
+                    (
+                        "language_model.model.layers.0.linear_attn.in_proj_a.weight",
+                        "U32",
+                        vec![1, 8],
+                        packed.clone(),
+                    ),
+                    (
+                        "language_model.model.layers.0.linear_attn.in_proj_a.scales",
+                        "BF16",
+                        vec![1, 1],
+                        bf16(0.25),
+                    ),
+                    (
+                        "language_model.model.layers.0.linear_attn.in_proj_a.biases",
+                        "BF16",
+                        vec![1, 1],
+                        bf16(-0.5),
+                    ),
+                ],
+            )],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+        let w = load_wt(&st, "model.layers.0.linear_attn.in_proj_a.weight", 1, 64).unwrap();
+        let Some(WtBytes::MlxAffine {
+            weights,
+            scales,
+            biases,
+            bits,
+            group_size,
+            ..
+        }) = w.bytes.as_ref()
+        else {
+            panic!("expected native MLX affine storage");
+        };
+        assert_eq!(weights, &packed);
+        assert_eq!(*bits, 4);
+        assert_eq!(*group_size, 64);
+        assert_eq!(scales, &bf16(0.25));
+        assert_eq!(biases, &bf16(-0.5));
+        assert!(
+            w.f.is_empty(),
+            "native quantized load must not expand to f32"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mlx_local_expert_source_range_reads_the_selected_stacked_expert() {
+        use crate::pool::{ExpertCall, ExpertSource};
+
+        let experts = 2_usize;
+        let rows = 64_usize;
+        let cols = 64_usize;
+        let words = cols * 4 / 32;
+        let mut tensors: Vec<(&str, &str, Vec<u64>, Vec<u8>)> = Vec::new();
+        for role in ["gate_proj", "up_proj", "down_proj"] {
+            let weight_name: &'static str = Box::leak(
+                format!("language_model.model.layers.0.mlp.switch_mlp.{role}.weight")
+                    .into_boxed_str(),
+            );
+            let scale_name: &'static str = Box::leak(
+                format!("language_model.model.layers.0.mlp.switch_mlp.{role}.scales")
+                    .into_boxed_str(),
+            );
+            let bias_name: &'static str = Box::leak(
+                format!("language_model.model.layers.0.mlp.switch_mlp.{role}.biases")
+                    .into_boxed_str(),
+            );
+            let mut packed = Vec::with_capacity(experts * rows * words * 4);
+            for expert in 0..experts {
+                let word = if expert == 0 { 0_u32 } else { 0x1111_1111 };
+                for _ in 0..rows * words {
+                    packed.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            let scales = (0..experts * rows)
+                .flat_map(|_| bf16(1.0))
+                .collect::<Vec<_>>();
+            let biases = (0..experts * rows)
+                .flat_map(|_| bf16(0.0))
+                .collect::<Vec<_>>();
+            tensors.push((weight_name, "U32", vec![2, 64, 8], packed));
+            tensors.push((scale_name, "BF16", vec![2, 64, 1], scales));
+            tensors.push((bias_name, "BF16", vec![2, 64, 1], biases));
+        }
+        let dir = write_sharded_checkpoint(
+            "logan-mlx-local-expert",
+            &[("model-00001-of-00001.safetensors", tensors)],
+        );
+        let st = StFile::open_dir(&dir).unwrap();
+        let mut source = MlxLocalExpertSource::new(st, experts);
+        let input = vec![1.0_f32; cols];
+        let outs = source
+            .eval(
+                &[
+                    ExpertCall {
+                        layer: 0,
+                        expert: 0,
+                        input: input.clone(),
+                    },
+                    ExpertCall {
+                        layer: 0,
+                        expert: 1,
+                        input,
+                    },
+                ],
+                cols,
+                rows,
+                "silu",
+            )
+            .unwrap();
+        assert!(outs[0].iter().all(|&v| v == 0.0));
+        let hidden = silu(64.0) * 64.0;
+        let expected = 64.0 * hidden;
+        assert!(
+            outs[1]
+                .iter()
+                .all(|&v| (v - expected).abs() <= expected.abs() * 1e-6),
+            "selected expert must use expert-1 packed bytes"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9764,10 +11006,14 @@ mod tests {
         let err = st
             .f32("model.ple.ple_embedding.layer_multipliers", &[1])
             .expect_err("f32 must refuse an i64 side-table");
-        assert!(err.contains("i64"), "error should point at StFile::i64: {err}");
+        assert!(
+            err.contains("i64"),
+            "error should point at StFile::i64: {err}"
+        );
 
         assert_eq!(
-            st.i64("model.ple.ple_embedding.layer_multipliers", &[1]).unwrap(),
+            st.i64("model.ple.ple_embedding.layer_multipliers", &[1])
+                .unwrap(),
             vec![big as i64],
             "i64 must be lossless"
         );
@@ -9784,8 +11030,10 @@ mod tests {
         // expected result exactly the scale table.
         let weight: Vec<u8> = vec![0x38; 16];
         let scales: Vec<u8> = concat(&[
-            bf16(1.0), bf16(2.0), // block row 0
-            bf16(3.0), bf16(4.0), // block row 1
+            bf16(1.0),
+            bf16(2.0), // block row 0
+            bf16(3.0),
+            bf16(4.0), // block row 1
         ]);
         let dir = write_sharded_checkpoint(
             "logan-block-scale",
@@ -9799,7 +11047,9 @@ mod tests {
         );
         let st = StFile::open_dir(&dir).unwrap();
 
-        let out = st.f32_scaled("w.weight", "w.weight_scale_inv", &[4, 4]).unwrap();
+        let out = st
+            .f32_scaled("w.weight", "w.weight_scale_inv", &[4, 4])
+            .unwrap();
         assert_eq!(out.len(), 16);
         assert_eq!(
             out,
@@ -9846,7 +11096,9 @@ mod tests {
             "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"
         ));
         // The monolithic spelling still matches.
-        assert!(is_ple_ngram_weight("model.ple.ple_embedding.ngram_embedding.weight"));
+        assert!(is_ple_ngram_weight(
+            "model.ple.ple_embedding.ngram_embedding.weight"
+        ));
         // And things that merely share the prefix must NOT match.
         assert!(!is_ple_ngram_weight(
             "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"
@@ -9854,7 +11106,9 @@ mod tests {
         assert!(!is_ple_ngram_weight(
             "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_x.weight"
         ));
-        assert!(!is_ple_ngram_weight("model.layers.0.mlp.experts.0.gate_proj.weight"));
+        assert!(!is_ple_ngram_weight(
+            "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
     }
 
     #[test]
@@ -9862,8 +11116,7 @@ mod tests {
         use std::io::Write as _;
 
         // The guard must fire on the SHARDED name and must not read the bytes.
-        let name =
-            "model.ple.ple_embedding.ngram_embedding.shard_3.weight";
+        let name = "model.ple.ple_embedding.ngram_embedding.shard_3.weight";
         let payload_len = MAX_RESIDENT_PLE_NGRAM_BYTES + 4;
         let elems = payload_len as u64; // F8: one byte per element
         let header = serde_json::to_vec(&serde_json::json!({
@@ -9872,7 +11125,8 @@ mod tests {
         .unwrap();
         let path = logan_format::test_temp_path("logan-ngram-shard-residency", "safetensors");
         let mut file = std::fs::File::create(&path).unwrap();
-        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
         file.write_all(&header).unwrap();
         // Sparse: the payload is declared but never written, so a reader that
         // materializes it would fail on EOF rather than silently succeed.
@@ -10130,7 +11384,11 @@ mod tests {
             // not the device answers, `matmul` must return the oracle's result.
             // A divergence means the wiring broke the CPU path or the device
             // path is wrong, and neither is acceptable on any machine.
-            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+            let scale = want
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-30);
             let max_rel = got
                 .iter()
                 .zip(&want)
@@ -10327,7 +11585,11 @@ mod tests {
     /// a near-zero row divided by itself is pure noise. Same rationale as
     /// `logan_core::math`'s `assert_close`.
     fn deviation(got: &[f32], want: &[f32]) -> (f32, f32) {
-        let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+        let scale = want
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-30);
         let max_abs = got
             .iter()
             .zip(want)
@@ -10465,14 +11727,18 @@ mod tests {
                     super::matmul(&mut got_small, &xs, &ws);
                     let small_calls = super::bf16_simd_calls() - before_small;
                     assert_eq!(
-                        small_calls, 0,
+                        small_calls,
+                        0,
                         "{os}x{is} is {} MACs, below the 1<<18 gate: the SIMD prologue \
                          does not amortise there and the scalar loop must win",
                         os * is
                     );
                     let want_small = scalar_bf16(&ws, &xs);
                     let (a, r) = deviation(&got_small, &want_small);
-                    assert!(r < 1e-5, "small-shape scalar path: max_abs={a:e} max_rel={r:e}");
+                    assert!(
+                        r < 1e-5,
+                        "small-shape scalar path: max_abs={a:e} max_rel={r:e}"
+                    );
                     println!(
                         "small arm: o={os} i={is} calls={small_calls} max_abs={a:e} \
                          max_rel={r:e}"
@@ -10528,7 +11794,10 @@ mod tests {
             "small child failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(stdout.contains("arm:"), "small child took no arm:\n{stdout}");
+        assert!(
+            stdout.contains("arm:"),
+            "small child took no arm:\n{stdout}"
+        );
         print!("[small] {stdout}");
     }
 
@@ -10660,8 +11929,7 @@ mod tests {
                     } else {
                         let before = super::ggufsource::cuda_q4k::kernel_launches();
                         let ms = bench_matmul(&a, &x, &mut y, warm, iters);
-                        let launches =
-                            super::ggufsource::cuda_q4k::kernel_launches() - before;
+                        let launches = super::ggufsource::cuda_q4k::kernel_launches() - before;
                         // `warm + iters` calls, all with the same matrix, so all
                         // but the first skipped the upload.
                         (
@@ -10733,7 +12001,11 @@ mod tests {
                 .iter()
                 .map(|r| field(&r.4, "sum").parse().unwrap())
                 .collect();
-            let scale = sums.iter().map(|v| v.abs()).fold(0.0f64, f64::max).max(1e-30);
+            let scale = sums
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f64, f64::max)
+                .max(1e-30);
             for pair in sums.windows(2) {
                 let rel = (pair[0] - pair[1]).abs() / scale;
                 assert!(
@@ -10750,11 +12022,7 @@ mod tests {
         );
         for (idx, (o, i)) in BENCH_SHAPES.iter().copied().enumerate() {
             // rows are pushed cpu, cuda-alt, cuda-warm per shape, in that order.
-            let (cpu, alt, warm) = (
-                rows[idx * 3].3,
-                rows[idx * 3 + 1].3,
-                rows[idx * 3 + 2].3,
-            );
+            let (cpu, alt, warm) = (rows[idx * 3].3, rows[idx * 3 + 1].3, rows[idx * 3 + 2].3);
             // gate+up+down at [o, i]: two of the three are `o` rows, so the
             // per-call weight payload is `wbytes + i*4 + o*4` for ONE matrix.
             let wbytes = q4k_weight_bytes(o, i);
@@ -10911,7 +12179,11 @@ mod tests {
                 .iter()
                 .map(|a| field(&a.2, "sum").parse().unwrap())
                 .collect();
-            let scale = sums.iter().map(|v| v.abs()).fold(0.0f64, f64::max).max(1e-30);
+            let scale = sums
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f64, f64::max)
+                .max(1e-30);
             let rel = (sums[0] - sums[1]).abs() / scale;
             assert!(
                 rel < 1e-5,

@@ -137,13 +137,13 @@ impl QwenMoeFrontend {
                 detail: "linear-attention QKV width overflows u64".into(),
             })?;
 
-        // MLX-community MXFP4 checkpoints use a different, already-packed
-        // text layout (`language_model.model.*`) with routed experts under
-        // `mlp.switch_mlp.{gate,up,down}_proj.{weight,scales}`. Preserve that
-        // quantization exactly and adapt it into the same semantic IR rather
-        // than dequantizing/requantizing through BF16.
-        if is_mlx_mxfp4_layout(source) {
-            return build_mlx_mxfp4(source, geometry);
+        // MLX Qwen3.5 checkpoints use a different, already-packed text layout
+        // (`language_model.model.*`) with routed experts under
+        // `mlp.switch_mlp.{gate,up,down}_proj.*`. Preserve both standard MLX
+        // MXFP4 and MLX affine quantization exactly instead of routing either
+        // representation through BF16.
+        if is_mlx_quantized_layout(source) {
+            return build_mlx_quantized(source, geometry, &config);
         }
 
         // ---- routed experts: slice the fused per-layer tensors ----
@@ -518,15 +518,19 @@ impl QwenMoeFrontend {
     }
 }
 
-fn is_mlx_mxfp4_layout(source: &SourceInventory) -> bool {
+fn is_mlx_quantized_layout(source: &SourceInventory) -> bool {
     source
         .tensors
         .contains_key("language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight")
 }
 
-fn build_mlx_mxfp4(source: &SourceInventory, geometry: ModelGeometry) -> Result<SemanticModel> {
+fn build_mlx_quantized(
+    source: &SourceInventory,
+    geometry: ModelGeometry,
+    config: &Value,
+) -> Result<SemanticModel> {
     let mut consumed = BTreeSet::new();
-    let routed_experts = build_mlx_switch_experts(source, &geometry, &mut consumed)?;
+    let routed_experts = build_mlx_switch_experts(source, &geometry, config, &mut consumed)?;
 
     let mut global_tensors = BTreeMap::new();
     for (canonical, source_name) in [
@@ -539,9 +543,20 @@ fn build_mlx_mxfp4(source: &SourceInventory, geometry: ModelGeometry) -> Result<
         let tensor = tensor_by_name(source, source_name)?;
         global_tensors.insert(
             canonical.to_owned(),
-            mlx_tensor_view(source, source_name, tensor)?,
+            mlx_tensor_view(source, config, source_name, tensor)?,
         );
         consumed.insert(source_name.to_owned());
+    }
+    // Affine MLX tensors have an additive BF16 bias per quantization group.
+    // MXFP4 does not, so these global sidecars are deliberately optional.
+    for (canonical, source_name) in [
+        ("embed.biases", "language_model.model.embed_tokens.biases"),
+        ("head.biases", "language_model.lm_head.biases"),
+    ] {
+        if let Some(tensor) = source.tensors.get(source_name) {
+            global_tensors.insert(canonical.to_owned(), tensor.clone());
+            consumed.insert(source_name.to_owned());
+        }
     }
 
     let mut layer_static_tensors = BTreeMap::new();
@@ -555,7 +570,10 @@ fn build_mlx_mxfp4(source: &SourceInventory, geometry: ModelGeometry) -> Result<
             if role.starts_with("mlp.switch_mlp.") {
                 continue;
             }
-            tensors.insert(role.to_owned(), mlx_tensor_view(source, name, tensor)?);
+            tensors.insert(
+                role.to_owned(),
+                mlx_tensor_view(source, config, name, tensor)?,
+            );
             consumed.insert(name.clone());
         }
         if tensors.is_empty() {
@@ -579,7 +597,7 @@ fn build_mlx_mxfp4(source: &SourceInventory, geometry: ModelGeometry) -> Result<
             continue;
         }
         if name.starts_with("language_model.") {
-            resident_tensors.insert(name.clone(), mlx_tensor_view(source, name, tensor)?);
+            resident_tensors.insert(name.clone(), mlx_tensor_view(source, config, name, tensor)?);
         }
     }
 
@@ -593,10 +611,93 @@ fn build_mlx_mxfp4(source: &SourceInventory, geometry: ModelGeometry) -> Result<
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MlxWeightQuant {
+    Mxfp4,
+    Affine { bits: u8, group_size: u32 },
+}
+
+fn mlx_weight_quant(
+    source: &SourceInventory,
+    config: &Value,
+    base: &str,
+) -> Result<MlxWeightQuant> {
+    let quant = config
+        .get("quantization_config")
+        .or_else(|| config.get("quantization"))
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: "MLX quantized checkpoint is missing quantization_config".into(),
+        })?;
+    let effective = quant
+        .get(base)
+        .filter(|value| value.is_object())
+        .unwrap_or(quant);
+    let mode = effective
+        .get("mode")
+        .and_then(Value::as_str)
+        .or_else(|| quant.get("mode").and_then(Value::as_str))
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX quantization entry `{base}` is missing mode"),
+        })?;
+    match mode {
+        "mxfp4" => Ok(MlxWeightQuant::Mxfp4),
+        "affine" => {
+            let bits = effective
+                .get("bits")
+                .and_then(Value::as_u64)
+                .or_else(|| quant.get("bits").and_then(Value::as_u64))
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|bits| matches!(*bits, 2 | 3 | 4 | 5 | 6 | 8))
+                .ok_or_else(|| ColicError::InvalidSource {
+                    path: source.root.clone(),
+                    detail: format!("MLX affine entry `{base}` has unsupported bits"),
+                })?;
+            let group_size = effective
+                .get("group_size")
+                .and_then(Value::as_u64)
+                .or_else(|| quant.get("group_size").and_then(Value::as_u64))
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| ColicError::InvalidSource {
+                    path: source.root.clone(),
+                    detail: format!("MLX affine entry `{base}` has invalid group_size"),
+                })?;
+            Ok(MlxWeightQuant::Affine { bits, group_size })
+        }
+        other => invalid(
+            &source.root,
+            format!("MLX tensor `{base}` uses unsupported quantization mode `{other}`"),
+        ),
+    }
+}
+
+pub(crate) fn mlx_affine_dtype(bits: u8, group_size: u32) -> String {
+    format!("MLX_AFFINE:{bits}:{group_size}")
+}
+
+pub(crate) fn parse_mlx_affine_dtype(dtype: &str) -> Option<(u8, u32)> {
+    let mut parts = dtype.strip_prefix("MLX_AFFINE:")?.split(':');
+    let bits = parts.next()?.parse().ok()?;
+    let group_size = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) || group_size == 0 {
+        return None;
+    }
+    Some((bits, group_size))
+}
+
 /// Reinterpret an MLX quantized tensor as the byte-level representation that
 /// COLI stores. Safetensors U32 payloads are little-endian packed words; no
-/// byte shuffle is needed on disk.
-fn mlx_tensor_view(source: &SourceInventory, name: &str, tensor: &TensorRef) -> Result<TensorRef> {
+/// byte shuffle is needed on disk. For affine weights the pseudo dtype carries
+/// the MLX bit width and group size while `shape` is restored to logical matrix
+/// dimensions; `len` remains the exact packed source byte count.
+fn mlx_tensor_view(
+    source: &SourceInventory,
+    config: &Value,
+    name: &str,
+    tensor: &TensorRef,
+) -> Result<TensorRef> {
     match tensor.dtype.as_str() {
         "U32" => {
             let base = name
@@ -607,46 +708,132 @@ fn mlx_tensor_view(source: &SourceInventory, name: &str, tensor: &TensorRef) -> 
                 })?;
             let scale_name = format!("{base}.scales");
             let scale = tensor_by_name(source, &scale_name)?;
-            let dtype = match scale.dtype.as_str() {
-                // MLX MXFP4: eight 4-bit E2M1 values per U32 word.
-                "U8" => "I8",
-                // MLX affine 8-bit group quantization: four bytes per U32 word.
-                "BF16" => "U8",
-                other => {
-                    return invalid(
-                        &source.root,
-                        format!("packed tensor `{name}` has unsupported scale dtype `{other}`"),
-                    );
+            match mlx_weight_quant(source, config, base)? {
+                MlxWeightQuant::Mxfp4 => {
+                    let mut shape = tensor.shape.clone();
+                    let last = shape.last_mut().ok_or_else(|| ColicError::InvalidSource {
+                        path: source.root.clone(),
+                        detail: format!("packed tensor `{name}` has scalar shape"),
+                    })?;
+                    *last = last
+                        .checked_mul(4)
+                        .ok_or_else(|| ColicError::InvalidSource {
+                            path: source.root.clone(),
+                            detail: format!("packed tensor `{name}` byte shape overflows u64"),
+                        })?;
+                    let dtype = match scale.dtype.as_str() {
+                        // Normal MXFP4 matrices: E2M1 nibbles plus E8M0 scales.
+                        "U8" => "I8",
+                        // mlx-community Qwen3.5 MXFP4 checkpoints keep tiny router
+                        // matrices as affine-8 even though the checkpoint-level
+                        // quantization mode is MXFP4. Their BF16 scales/biases are
+                        // authoritative for this per-tensor exception.
+                        "BF16" => {
+                            let bias_name = format!("{base}.biases");
+                            let bias = tensor_by_name(source, &bias_name)?;
+                            if bias.dtype != "BF16" || bias.shape != scale.shape {
+                                return invalid(
+                                    &source.root,
+                                    format!(
+                                        "affine-8 tensor `{name}` requires matching BF16 scales/biases"
+                                    ),
+                                );
+                            }
+                            "U8"
+                        }
+                        other => {
+                            return invalid(
+                                &source.root,
+                                format!(
+                                    "MXFP4 tensor `{name}` has unsupported scale dtype `{other}`"
+                                ),
+                            );
+                        }
+                    };
+                    Ok(TensorRef {
+                        source: tensor.source.clone(),
+                        offset: tensor.offset,
+                        len: tensor.len,
+                        dtype: dtype.into(),
+                        shape,
+                    })
                 }
-            };
-            let mut shape = tensor.shape.clone();
-            let last = shape.last_mut().ok_or_else(|| ColicError::InvalidSource {
-                path: source.root.clone(),
-                detail: format!("packed tensor `{name}` has scalar shape"),
-            })?;
-            *last = last
-                .checked_mul(4)
-                .ok_or_else(|| ColicError::InvalidSource {
-                    path: source.root.clone(),
-                    detail: format!("packed tensor `{name}` byte shape overflows u64"),
-                })?;
-            Ok(TensorRef {
-                source: tensor.source.clone(),
-                offset: tensor.offset,
-                len: tensor.len,
-                dtype: dtype.into(),
-                shape,
-            })
+                MlxWeightQuant::Affine { bits, group_size } => {
+                    let bias_name = format!("{base}.biases");
+                    let bias = tensor_by_name(source, &bias_name)?;
+                    if scale.dtype != "BF16" || bias.dtype != "BF16" || scale.shape != bias.shape {
+                        return invalid(
+                            &source.root,
+                            format!(
+                                "MLX affine tensor `{name}` requires matching BF16 scales/biases"
+                            ),
+                        );
+                    }
+                    let mut shape = tensor.shape.clone();
+                    let words = *shape.last().ok_or_else(|| ColicError::InvalidSource {
+                        path: source.root.clone(),
+                        detail: format!("packed tensor `{name}` has scalar shape"),
+                    })?;
+                    let logical_bits =
+                        words
+                            .checked_mul(32)
+                            .ok_or_else(|| ColicError::InvalidSource {
+                                path: source.root.clone(),
+                                detail: format!(
+                                    "packed tensor `{name}` logical width overflows u64"
+                                ),
+                            })?;
+                    if logical_bits % u64::from(bits) != 0 {
+                        return invalid(
+                            &source.root,
+                            format!("packed tensor `{name}` width is not divisible by {bits} bits"),
+                        );
+                    }
+                    let columns = logical_bits / u64::from(bits);
+                    if columns % u64::from(group_size) != 0 {
+                        return invalid(
+                            &source.root,
+                            format!(
+                                "MLX affine tensor `{name}` columns={columns} not divisible by group_size={group_size}"
+                            ),
+                        );
+                    }
+                    let mut expected_params = shape.clone();
+                    *expected_params.last_mut().unwrap() = columns / u64::from(group_size);
+                    if scale.shape != expected_params {
+                        return invalid(
+                            &source.root,
+                            format!(
+                                "MLX affine params `{scale_name}` have {:?}, expected {:?}",
+                                scale.shape, expected_params
+                            ),
+                        );
+                    }
+                    *shape.last_mut().unwrap() = columns;
+                    Ok(TensorRef {
+                        source: tensor.source.clone(),
+                        offset: tensor.offset,
+                        len: tensor.len,
+                        dtype: mlx_affine_dtype(bits, group_size),
+                        shape,
+                    })
+                }
+            }
         }
-        // MLX stores E8M0 scale codes as raw U8. Retagging them makes the
-        // physical quantization contract explicit in COLI metadata.
-        "U8" if name.ends_with(".scales") => Ok(TensorRef {
-            source: tensor.source.clone(),
-            offset: tensor.offset,
-            len: tensor.len,
-            dtype: "F8_E8M0".into(),
-            shape: tensor.shape.clone(),
-        }),
+        "U8" if name.ends_with(".scales") => {
+            let base = name.trim_end_matches(".scales");
+            if mlx_weight_quant(source, config, base)? == MlxWeightQuant::Mxfp4 {
+                Ok(TensorRef {
+                    source: tensor.source.clone(),
+                    offset: tensor.offset,
+                    len: tensor.len,
+                    dtype: "F8_E8M0".into(),
+                    shape: tensor.shape.clone(),
+                })
+            } else {
+                Ok(tensor.clone())
+            }
+        }
         _ => Ok(tensor.clone()),
     }
 }
@@ -654,6 +841,7 @@ fn mlx_tensor_view(source: &SourceInventory, name: &str, tensor: &TensorRef) -> 
 fn build_mlx_switch_experts(
     source: &SourceInventory,
     geometry: &ModelGeometry,
+    config: &Value,
     consumed: &mut BTreeSet<String>,
 ) -> Result<BTreeMap<(u32, u32), RoutedExpert>> {
     let mut routed = BTreeMap::new();
@@ -661,11 +849,16 @@ fn build_mlx_switch_experts(
         let prefix = format!("language_model.model.layers.{layer}.mlp.switch_mlp");
         let gate_w = format!("{prefix}.gate_proj.weight");
         let gate_s = format!("{prefix}.gate_proj.scales");
+        let gate_b = format!("{prefix}.gate_proj.biases");
         let up_w = format!("{prefix}.up_proj.weight");
         let up_s = format!("{prefix}.up_proj.scales");
+        let up_b = format!("{prefix}.up_proj.biases");
         let down_w = format!("{prefix}.down_proj.weight");
         let down_s = format!("{prefix}.down_proj.scales");
-        for name in [&gate_w, &gate_s, &up_w, &up_s, &down_w, &down_s] {
+        let down_b = format!("{prefix}.down_proj.biases");
+        for name in [
+            &gate_w, &gate_s, &gate_b, &up_w, &up_s, &up_b, &down_w, &down_s, &down_b,
+        ] {
             consumed.insert(name.clone());
         }
         for expert in 0..geometry.routed_experts_per_layer {
@@ -674,8 +867,9 @@ fn build_mlx_switch_experts(
                 RoutedExpert {
                     layer,
                     expert,
-                    gate: slice_mlx_mxfp4_bank(
+                    gate: slice_mlx_switch_bank(
                         source,
+                        config,
                         &gate_w,
                         &gate_s,
                         expert,
@@ -683,8 +877,9 @@ fn build_mlx_switch_experts(
                         geometry.moe_intermediate_size,
                         geometry.hidden_size,
                     )?,
-                    up: slice_mlx_mxfp4_bank(
+                    up: slice_mlx_switch_bank(
                         source,
+                        config,
                         &up_w,
                         &up_s,
                         expert,
@@ -692,8 +887,9 @@ fn build_mlx_switch_experts(
                         geometry.moe_intermediate_size,
                         geometry.hidden_size,
                     )?,
-                    down: slice_mlx_mxfp4_bank(
+                    down: slice_mlx_switch_bank(
                         source,
+                        config,
                         &down_w,
                         &down_s,
                         expert,
@@ -706,6 +902,184 @@ fn build_mlx_switch_experts(
         }
     }
     Ok(routed)
+}
+
+fn slice_mlx_switch_bank(
+    source: &SourceInventory,
+    config: &Value,
+    weight_name: &str,
+    scale_name: &str,
+    expert: u32,
+    experts: u32,
+    rows: u32,
+    columns: u32,
+) -> Result<Matrix> {
+    let base = weight_name
+        .strip_suffix(".weight")
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("packed expert tensor `{weight_name}` is not a weight tensor"),
+        })?;
+    match mlx_weight_quant(source, config, base)? {
+        MlxWeightQuant::Mxfp4 => slice_mlx_mxfp4_bank(
+            source,
+            weight_name,
+            scale_name,
+            expert,
+            experts,
+            rows,
+            columns,
+        ),
+        MlxWeightQuant::Affine { bits, group_size } => slice_mlx_affine_bank(
+            source,
+            weight_name,
+            scale_name,
+            expert,
+            experts,
+            rows,
+            columns,
+            bits,
+            group_size,
+        ),
+    }
+}
+
+fn slice_mlx_affine_bank(
+    source: &SourceInventory,
+    weight_name: &str,
+    scale_name: &str,
+    expert: u32,
+    experts: u32,
+    rows: u32,
+    columns: u32,
+    bits: u8,
+    group_size: u32,
+) -> Result<Matrix> {
+    if columns % group_size != 0 {
+        return invalid(
+            &source.root,
+            format!(
+                "MLX affine matrix `{weight_name}` has columns={columns}, not divisible by group_size={group_size}"
+            ),
+        );
+    }
+    let packed_bits = u64::from(columns)
+        .checked_mul(u64::from(bits))
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX affine matrix `{weight_name}` packed width overflows u64"),
+        })?;
+    if packed_bits % 32 != 0 {
+        return invalid(
+            &source.root,
+            format!(
+                "MLX affine matrix `{weight_name}` needs a non-integral U32 row for {columns}x{bits}-bit"
+            ),
+        );
+    }
+    let weight = tensor_by_name(source, weight_name)?;
+    let scale = tensor_by_name(source, scale_name)?;
+    let bias_name = format!("{}.biases", weight_name.trim_end_matches(".weight"));
+    let bias = tensor_by_name(source, &bias_name)?;
+    let packed_words = packed_bits / 32;
+    let groups = u64::from(columns / group_size);
+    let expected_weight_shape = [u64::from(experts), u64::from(rows), packed_words];
+    let expected_param_shape = [u64::from(experts), u64::from(rows), groups];
+    if weight.dtype != "U32" || weight.shape != expected_weight_shape {
+        return invalid(
+            &source.root,
+            format!(
+                "MLX affine weight `{weight_name}` has {}/{:?}, expected U32/{expected_weight_shape:?}",
+                weight.dtype, weight.shape
+            ),
+        );
+    }
+    for (name, tensor) in [(scale_name, scale), (bias_name.as_str(), bias)] {
+        if tensor.dtype != "BF16" || tensor.shape != expected_param_shape {
+            return invalid(
+                &source.root,
+                format!(
+                    "MLX affine params `{name}` have {}/{:?}, expected BF16/{expected_param_shape:?}",
+                    tensor.dtype, tensor.shape
+                ),
+            );
+        }
+    }
+    let weight_bytes = u64::from(rows)
+        .checked_mul(packed_words)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX affine weight slice `{weight_name}` overflows u64"),
+        })?;
+    let param_bytes = u64::from(rows)
+        .checked_mul(groups)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX affine parameter slice `{scale_name}` overflows u64"),
+        })?;
+    let weight_offset = weight
+        .offset
+        .checked_add(u64::from(expert).checked_mul(weight_bytes).ok_or_else(|| {
+            ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("MLX affine expert offset `{weight_name}` overflows u64"),
+            }
+        })?)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX affine expert offset `{weight_name}` overflows u64"),
+        })?;
+    let scale_offset = scale
+        .offset
+        .checked_add(u64::from(expert).checked_mul(param_bytes).ok_or_else(|| {
+            ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("MLX affine expert offset `{scale_name}` overflows u64"),
+            }
+        })?)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX affine expert offset `{scale_name}` overflows u64"),
+        })?;
+    let bias_offset = bias
+        .offset
+        .checked_add(u64::from(expert).checked_mul(param_bytes).ok_or_else(|| {
+            ColicError::InvalidSource {
+                path: source.root.clone(),
+                detail: format!("MLX affine expert offset `{bias_name}` overflows u64"),
+            }
+        })?)
+        .ok_or_else(|| ColicError::InvalidSource {
+            path: source.root.clone(),
+            detail: format!("MLX affine expert offset `{bias_name}` overflows u64"),
+        })?;
+    Ok(Matrix {
+        source: TensorRef {
+            source: weight.source.clone(),
+            offset: weight_offset,
+            len: weight_bytes,
+            dtype: mlx_affine_dtype(bits, group_size),
+            shape: vec![u64::from(rows), u64::from(columns)],
+        },
+        rows,
+        columns,
+        scale: Some(TensorRef {
+            source: scale.source.clone(),
+            offset: scale_offset,
+            len: param_bytes,
+            dtype: "BF16".into(),
+            shape: vec![u64::from(rows), groups],
+        }),
+        bias: Some(TensorRef {
+            source: bias.source.clone(),
+            offset: bias_offset,
+            len: param_bytes,
+            dtype: "BF16".into(),
+            shape: vec![u64::from(rows), groups],
+        }),
+    })
 }
 
 fn slice_mlx_mxfp4_bank(
@@ -803,6 +1177,7 @@ fn slice_mlx_mxfp4_bank(
             dtype: "F8_E8M0".into(),
             shape: vec![u64::from(rows), groups],
         }),
+        bias: None,
     })
 }
 
@@ -856,6 +1231,7 @@ fn slice_fused(
         rows: row_len,
         columns: k,
         scale: None,
+        bias: None,
     })
 }
 

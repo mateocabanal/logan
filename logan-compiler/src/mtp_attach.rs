@@ -585,6 +585,7 @@ fn slice_bank_rows(
         rows,
         columns,
         scale: None,
+        bias: None,
     })
 }
 

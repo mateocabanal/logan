@@ -41,6 +41,9 @@ pub struct Matrix {
     pub rows: u32,
     pub columns: u32,
     pub scale: Option<TensorRef>,
+    /// Optional affine zero-point/bias parameters paired with `scale`.
+    /// Quantized formats without an additive term leave this absent.
+    pub bias: Option<TensorRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
