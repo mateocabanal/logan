@@ -128,6 +128,61 @@ fn main() {
             std::process::exit(1);
         })
     };
+
+    // A model WITHOUT ref.json is a real checkpoint, not a fixture: there is no
+    // oracle to gate against, and the fixture cases below would panic on the
+    // missing file. Run it on QWEN_PROMPT instead -- the same entry point the
+    // .coli branch uses -- so a sharded FP8 checkpoint can actually generate.
+    //
+    // This is the path the anchor takes: Qwen3.8-Flash-Next-FP8 is 131 shards
+    // with no ref.json, and before this it loaded the whole model and then died
+    // demanding a fixture file.
+    if !ref_path.exists() {
+        let prompt: Vec<u32> = std::env::var("QWEN_PROMPT")
+            .unwrap_or_else(|_| "1 2 3 4 5".into())
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        let max_new: usize = std::env::var("QWEN_MAX_NEW")
+            .unwrap_or_else(|_| "8".into())
+            .parse()
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let mut model = model;
+        // Prompt tokens except the last are prefilled without logits; the final
+        // prompt forward is what predicts the first new token. Refeeding it
+        // would append it to the recurrent/KV state twice.
+        for (i, &t) in prompt.iter().enumerate() {
+            if i + 1 == prompt.len() {
+                break;
+            }
+            model.prefill_token(t as usize, i);
+        }
+        let mut logits = model.forward_token(*prompt.last().unwrap() as usize, prompt.len() - 1);
+        let mut out: Vec<u32> = Vec::with_capacity(max_new);
+        for step in 0..max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            out.push(next);
+            if step + 1 < max_new {
+                logits = model.forward_token(next as usize, prompt.len() + step);
+            }
+        }
+        if logan_core::telemetry::enabled() {
+            eprintln!(
+                "logan qwen4: tokens={} total={:.1} ms/tok",
+                out.len(),
+                t0.elapsed().as_secs_f64() * 1e3 / out.len().max(1) as f64
+            );
+        }
+        println!("generated: {out:?}");
+        return;
+    }
+
     let ref_json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ref_path).expect("ref.json"))
             .expect("ref.json parse");
