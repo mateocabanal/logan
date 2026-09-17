@@ -46,11 +46,23 @@ fn main() {
         eprintln!("config error: {e}");
         std::process::exit(1);
     });
-    // .coli package mode: no model.safetensors -> load via colibri-format.
-    // QWEN_SCHED=1 routes execution through the scheduler driver (issue
-    // #53); DEFAULT OFF this session — the canonical direct path stays the
-    // correctness reference and A/B oracle.
-    let is_coli = !dir.join("model.safetensors").exists();
+    // Three layouts, and the order matters:
+    //   * a sharded safetensors checkpoint (model.safetensors.index.json)
+    //   * a single-file safetensors fixture (model.safetensors)
+    //   * a compiled .coli package
+    //
+    // The test was `!model.safetensors.exists()`, which misreads a SHARDED
+    // checkpoint as a .coli package: a 131-shard export has no single
+    // model.safetensors, so it took the .coli branch and died looking for
+    // `manifest.coli`. That is the exact model this anchor exists to serve
+    // (Qwen3.8-Flash-Next-FP8), so the bug read as "no loadable model on the
+    // anchor host". `StFile::open_dir` already handles the sharded case --
+    // including the HF backbone prefix alias -- so the fix is to ask whether
+    // either safetensors layout is present.
+    let has_sharded = dir.join("model.safetensors.index.json").exists();
+    let has_single = dir.join("model.safetensors").exists();
+    let is_safetensors = has_sharded || has_single;
+    let is_coli = !is_safetensors;
     let ref_path = dir.join("ref.json");
     if is_coli && !ref_path.exists() {
         let prompt: Vec<u32> = std::env::var("QWEN_PROMPT")
@@ -105,7 +117,9 @@ fn main() {
             std::process::exit(1);
         })
     } else {
-        let st = StFile::open(&dir.join("model.safetensors")).unwrap_or_else(|e| {
+        // `open_dir` subsumes both safetensors layouts: it reads the index when
+        // one exists and falls back to model.safetensors otherwise.
+        let st = StFile::open_dir(dir).unwrap_or_else(|e| {
             eprintln!("safetensors error: {e}");
             std::process::exit(1);
         });
@@ -141,7 +155,7 @@ fn main() {
             let src = logan_qwen4::colisource::ColiSource::open(dir).unwrap();
             Model::load_coli(&src, &cfg).unwrap()
         } else {
-            let st = StFile::open(&dir.join("model.safetensors")).unwrap();
+            let st = StFile::open_dir(dir).unwrap();
             Model::load(&st, &cfg).unwrap()
         };
         let mut model = model;
