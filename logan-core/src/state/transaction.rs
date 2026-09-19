@@ -1,172 +1,149 @@
-//! Generic transactional state operations.
+//! Generation-safe causal-state transactions.
 //!
-//! Provides checkpoint/commit/rollback for causal state with:
-//! - COW isolation between live and transactional pages
-//! - Safe rollback of partial speculative blocks
-//! - Stale generation rejection
-//! - Two-session isolation
-//! - Cancellation cleanup
+//! A transaction checkpoint belongs to exactly one manager/session. Rollback
+//! restores the captured state; commit accepts the caller's live state and
+//! invalidates older checkpoints.
 
-use crate::state::{CausalState, StateSchemaId};
+use super::{CausalState, StateSchemaId};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Generation counter for transaction safety
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
 
-/// A checkpoint reference returned when a transaction begins.
-/// Used to validate and restore transaction state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionCheckpoint {
+    pub manager_id: u64,
     pub generation: Generation,
     pub transaction_id: u64,
     pub schema_id: StateSchemaId,
 }
 
-/// A transactional state operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionResult {
-    /// Transaction committed successfully
     Committed,
-    /// Transaction rolled back (partial or full)
     RolledBack,
-    /// Checkpoint was stale - cannot commit or rollback
     StaleCheckpoint,
-    /// Wrong generation - checkpoint belongs to another session
-    WrongGeneration,
-    /// Cancelled before completion
+    WrongSession,
     Cancelled,
-}
-
-/// Transaction state for checkpoint/commit/rollback operations.
-pub struct TransactionManager {
-    current_generation: Generation,
-    active_transactions: Vec<TransactionInfo>,
 }
 
 #[derive(Debug, Clone)]
 struct TransactionInfo {
-    id: u64,
-    generation: Generation,
-    checkpoint: CausalState,
+    checkpoint: TransactionCheckpoint,
+    state: CausalState,
 }
+
+pub struct TransactionManager {
+    manager_id: u64,
+    schema_id: StateSchemaId,
+    current_generation: Generation,
+    next_transaction_id: u64,
+    active: Vec<TransactionInfo>,
+}
+
+static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 
 impl TransactionManager {
     pub fn new(schema_id: StateSchemaId) -> Self {
-        TransactionManager {
-            current_generation: Generation(0),
-            active_transactions: Vec::new(),
-        }
-    }
-
-    /// Begin a new transaction by creating a checkpoint of the current state.
-    /// Returns a TransactionCheckpoint that can be used to validate/commit/rollback.
-    pub fn begin(
-        &mut self,
-        current_state: &CausalState,
-    ) -> TransactionCheckpoint {
-        let id = self.active_transactions.len() as u64 + 1;
-        let checkpoint = current_state.clone();
-        let schema_id = StateSchemaId {
-            engine: "generic".to_string(),
-            version: 1,
-            sub_version: 0,
-        };
-
-        self.active_transactions.push(TransactionInfo {
-            id,
-            generation: self.current_generation,
-            checkpoint,
-        });
-
-        TransactionCheckpoint {
-            generation: self.current_generation,
-            transaction_id: id,
+        Self {
+            manager_id: NEXT_MANAGER_ID.fetch_add(1, Ordering::Relaxed).max(1),
             schema_id,
+            current_generation: Generation(0),
+            next_transaction_id: 1,
+            active: Vec::new(),
         }
     }
 
-    /// Commit a transaction: accept its changes as the new committed state.
-    /// Returns TransactionResult indicating success/failure.
-    pub fn commit(
-        &mut self,
-        checkpoint: &TransactionCheckpoint,
-    ) -> TransactionResult {
-        if checkpoint.generation != self.current_generation {
-            return TransactionResult::WrongGeneration;
-        }
-
-        let idx = self.active_transactions.iter().position(|t| {
-            t.transaction_id == checkpoint.transaction_id
-                && t.generation == checkpoint.generation
+    pub fn begin(&mut self, current_state: &CausalState) -> TransactionCheckpoint {
+        let checkpoint = TransactionCheckpoint {
+            manager_id: self.manager_id,
+            generation: self.current_generation,
+            transaction_id: self.next_transaction_id,
+            schema_id: self.schema_id.clone(),
+        };
+        self.next_transaction_id = self.next_transaction_id.wrapping_add(1).max(1);
+        self.active.push(TransactionInfo {
+            checkpoint: checkpoint.clone(),
+            state: current_state.clone(),
         });
+        checkpoint
+    }
 
-        if let Some(idx) = idx {
-            // Remove committed transaction, increment generation
-            self.active_transactions.remove(idx);
-            self.current_generation.0 += 1;
-            TransactionResult::Committed
-        } else {
-            TransactionResult::StaleCheckpoint
+    /// Accept the caller's live state. Advancing the generation invalidates
+    /// every checkpoint captured from the previous committed state.
+    pub fn commit(&mut self, checkpoint: &TransactionCheckpoint) -> TransactionResult {
+        match self.validate(checkpoint) {
+            Ok(index) => {
+                self.active.remove(index);
+                self.advance_generation();
+                TransactionResult::Committed
+            }
+            Err(result) => result,
         }
     }
 
-    /// Rollback a transaction: discard its changes.
-    /// Returns TransactionResult indicating success/failure.
+    /// Restore the exact state captured by begin.
     pub fn rollback(
         &mut self,
         checkpoint: &TransactionCheckpoint,
+        current_state: &mut CausalState,
     ) -> TransactionResult {
-        if checkpoint.generation != self.current_generation {
-            // Stale checkpoint from another generation/session
-            return TransactionResult::StaleCheckpoint;
-        }
-
-        let idx = self.active_transactions.iter().position(|t| {
-            t.transaction_id == checkpoint.transaction_id
-                && t.generation == checkpoint.generation
-        });
-
-        if let Some(idx) = idx {
-            self.active_transactions.remove(idx);
-            TransactionResult::RolledBack
-        } else {
-            TransactionResult::StaleCheckpoint
+        match self.validate(checkpoint) {
+            Ok(index) => {
+                *current_state = self.active[index].state.clone();
+                self.active.remove(index);
+                self.advance_generation();
+                TransactionResult::RolledBack
+            }
+            Err(result) => result,
         }
     }
 
-    /// Retain a prefix checkpoint, releasing later entries.
-    /// This is used after prefix cache persistence to discard later entries.
-    pub fn retain_prefix(&mut self, checkpoint: &TransactionCheckpoint) -> bool {
-        self.active_transactions.retain(|t| {
-            t.generation == checkpoint.generation
-                && t.transaction_id == checkpoint.transaction_id
-        });
-        !self.active_transactions.is_empty()
+    /// Restore a checkpoint and retain that verified prefix as the live state.
+    pub fn retain_prefix(
+        &mut self,
+        checkpoint: &TransactionCheckpoint,
+        current_state: &mut CausalState,
+    ) -> TransactionResult {
+        self.rollback(checkpoint, current_state)
     }
 
-    /// Cancel all active transactions (used for cancellation).
-    pub fn cancel(&mut self) {
-        self.active_transactions.clear();
-        self.current_generation.0 += 1;
+    pub fn cancel(&mut self) -> TransactionResult {
+        self.active.clear();
+        self.current_generation.0 = self.current_generation.0.wrapping_add(1);
+        TransactionResult::Cancelled
     }
 
-    /// Get the current generation for validation
     pub fn current_generation(&self) -> Generation {
         self.current_generation
     }
 
-    /// Check if a checkpoint is valid for the current generation
-    pub fn is_valid_checkpoint(&self, checkpoint: &TransactionCheckpoint) -> bool {
-        checkpoint.generation == self.current_generation
-            || self.active_transactions.iter().any(|t| {
-                t.transaction_id == checkpoint.transaction_id
-                    && t.generation == checkpoint.generation
-            })
+    pub fn active_count(&self) -> usize {
+        self.active.len()
     }
 
-    /// Get number of active transactions
-    pub fn active_count(&self) -> usize {
-        self.active_transactions.len()
+    pub fn is_valid_checkpoint(&self, checkpoint: &TransactionCheckpoint) -> bool {
+        self.validate(checkpoint).is_ok()
+    }
+
+    fn validate(&self, checkpoint: &TransactionCheckpoint) -> Result<usize, TransactionResult> {
+        if checkpoint.manager_id != self.manager_id || checkpoint.schema_id != self.schema_id {
+            return Err(TransactionResult::WrongSession);
+        }
+        if checkpoint.generation != self.current_generation {
+            return Err(TransactionResult::StaleCheckpoint);
+        }
+        self.active
+            .iter()
+            .position(|info| info.checkpoint == *checkpoint)
+            .ok_or(TransactionResult::StaleCheckpoint)
+    }
+
+    fn advance_generation(&mut self) {
+        self.current_generation.0 = self.current_generation.0.wrapping_add(1);
+        // Any concurrently captured checkpoint refers to the previous state and
+        // must not become accidentally valid after a commit/rollback.
+        self.active.clear();
     }
 }
 
@@ -174,92 +151,49 @@ impl TransactionManager {
 mod tests {
     use super::*;
 
-    fn setup() -> (TransactionManager, TransactionCheckpoint) {
-        let mut tm = TransactionManager::new(StateSchemaId {
-            engine: "test".to_string(),
-            version: 1,
-            sub_version: 0,
-        });
-        let state = CausalState::append_only(2, 4, 8);
-        let checkpoint = tm.begin(&state);
-        (tm, checkpoint)
+    fn schema() -> StateSchemaId {
+        StateSchemaId::new("test", 1, 0)
     }
 
     #[test]
-    fn test_begin_creates_checkpoint() {
-        let (tm, cp) = setup();
-        assert_eq!(tm.active_count(), 1);
-        assert!(tm.is_valid_checkpoint(&cp));
+    fn rollback_restores_exact_state() {
+        let mut manager = TransactionManager::new(schema());
+        let mut state = CausalState::Opaque(vec![1, 2, 3]);
+        let checkpoint = manager.begin(&state);
+        state = CausalState::Opaque(vec![9, 9]);
+        assert_eq!(
+            manager.rollback(&checkpoint, &mut state),
+            TransactionResult::RolledBack
+        );
+        assert_eq!(state, CausalState::Opaque(vec![1, 2, 3]));
+        assert_eq!(manager.active_count(), 0);
     }
 
     #[test]
-    fn test_commit_succeeds() {
-        let (mut tm, cp) = setup();
-        let result = tm.commit(&cp);
-        assert_eq!(result, TransactionResult::Committed);
-        assert_eq!(tm.active_count(), 0);
+    fn commit_invalidates_other_same_generation_checkpoints() {
+        let mut manager = TransactionManager::new(schema());
+        let state = CausalState::Opaque(vec![1]);
+        let first = manager.begin(&state);
+        let second = manager.begin(&state);
+        assert_eq!(manager.commit(&first), TransactionResult::Committed);
+        assert_eq!(manager.commit(&second), TransactionResult::StaleCheckpoint);
     }
 
     #[test]
-    fn test_rollback_succeeds() {
-        let (mut tm, cp) = setup();
-        let result = tm.rollback(&cp);
-        assert_eq!(result, TransactionResult::RolledBack);
-        assert_eq!(tm.active_count(), 0);
+    fn checkpoints_cannot_cross_sessions() {
+        let mut a = TransactionManager::new(schema());
+        let mut b = TransactionManager::new(schema());
+        let state = CausalState::Opaque(vec![1]);
+        let checkpoint = a.begin(&state);
+        assert_eq!(b.commit(&checkpoint), TransactionResult::WrongSession);
     }
 
     #[test]
-    fn test_stale_checkpoint_rejected() {
-        let (mut tm, cp) = setup();
-        // Advance generation without committing
-        tm.cancel();
-
-        let result = tm.commit(&cp);
-        assert_eq!(result, TransactionResult::WrongGeneration);
-    }
-
-    #[test]
-    fn test_cancellation_cleanup() {
-        let (mut tm, cp) = setup();
-        tm.cancel();
-        assert_eq!(tm.active_count(), 0);
-        // Checkpoint should be invalid after cancel
-        assert!(!tm.is_valid_checkpoint(&cp));
-    }
-
-    #[test]
-    fn test_two_sessions_isolation() {
-        let mut tm1 = TransactionManager::new(StateSchemaId {
-            engine: "test".to_string(),
-            version: 1,
-            sub_version: 0,
-        });
-        let mut tm2 = TransactionManager::new(StateSchemaId {
-            engine: "test".to_string(),
-            version: 1,
-            sub_version: 0,
-        });
-
-        let state = CausalState::append_only(2, 4, 8);
-        let cp1 = tm1.begin(&state);
-        let cp2 = tm2.begin(&state);
-
-        // Each session's checkpoint is valid in its own context
-        assert!(tm1.is_valid_checkpoint(&cp1));
-        assert!(tm2.is_valid_checkpoint(&cp2));
-
-        // Committing in tm1 should not affect tm2
-        let r1 = tm1.commit(&cp1);
-        assert_eq!(r1, TransactionResult::Committed);
-
-        // cp2 still valid in its session
-        assert!(tm2.is_valid_checkpoint(&cp2));
-    }
-
-    #[test]
-    fn test_retain_prefix() {
-        let (mut tm, cp) = setup();
-        let result = tm.retain_prefix(&cp);
-        assert!(!result); // no more active transactions after retain
+    fn cancellation_invalidates_checkpoint() {
+        let mut manager = TransactionManager::new(schema());
+        let state = CausalState::Opaque(vec![]);
+        let checkpoint = manager.begin(&state);
+        assert_eq!(manager.cancel(), TransactionResult::Cancelled);
+        assert!(!manager.is_valid_checkpoint(&checkpoint));
     }
 }

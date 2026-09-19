@@ -41,7 +41,9 @@ fn main() {
         let w = fill(o * i, 7);
         let x = fill(i, 11);
         let mut y = vec![0.0f32; o];
-        for _ in 0..5 { logan_qwen4::matmul_exposed(&mut y, &x, &w, o, i); }
+        for _ in 0..5 {
+            logan_qwen4::matmul_exposed(&mut y, &x, &w, o, i);
+        }
         for _ in 0..reps {
             let t0 = Instant::now();
             logan_qwen4::matmul_exposed(&mut y, &x, &w, o, i);
@@ -55,7 +57,9 @@ fn main() {
         let scales: Vec<u8> = (0..o * ng).map(|k| ((k % 100) + 100) as u8).collect();
         let x = fill(i, 9);
         let mut y = vec![0.0f32; o];
-        for _ in 0..5 { logan_qwen4::matmul_mxfp4_exposed(&mut y, &x, &weights, &scales, o, i); }
+        for _ in 0..5 {
+            logan_qwen4::matmul_mxfp4_exposed(&mut y, &x, &weights, &scales, o, i);
+        }
         for _ in 0..reps {
             let t0 = Instant::now();
             logan_qwen4::matmul_mxfp4_exposed(&mut y, &x, &weights, &scales, o, i);

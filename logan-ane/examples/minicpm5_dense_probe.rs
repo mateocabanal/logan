@@ -4,7 +4,7 @@
 //! is not treated as native support: the current dynamic-weight ABI can still
 //! decline evaluation, in which case the caller remains on CPU/Metal.
 
-use logan_ane::{mil, AneRuntime, CompileOptions};
+use logan_ane::{AneRuntime, CompileOptions, mil};
 
 fn main() {
     let widths = [1usize, 7, 16, 64, 128, 256];
@@ -35,20 +35,26 @@ fn main() {
         ) {
             Ok(shape) => shape,
             Err(error) => {
-                println!("width logical={logical_width} padded={padded_width}: invalid shape ({error}); fallback");
+                println!(
+                    "width logical={logical_width} padded={padded_width}: invalid shape ({error}); fallback"
+                );
                 continue;
             }
         };
         let program = match mil::minicpm5_dense_ffn_fp16_f32_io(shape) {
             Ok(program) => program,
             Err(error) => {
-                println!("width logical={logical_width} padded={padded_width}: MIL rejected ({error}); fallback");
+                println!(
+                    "width logical={logical_width} padded={padded_width}: MIL rejected ({error}); fallback"
+                );
                 continue;
             }
         };
 
         let Some(runtime) = runtime.as_ref() else {
-            println!("width logical={logical_width} padded={padded_width}: MIL generated; native unavailable; fallback");
+            println!(
+                "width logical={logical_width} padded={padded_width}: MIL generated; native unavailable; fallback"
+            );
             continue;
         };
         match runtime.compile(&program, CompileOptions::default()) {

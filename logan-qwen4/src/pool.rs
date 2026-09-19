@@ -165,7 +165,6 @@ impl ExpertSource for HttpPoolSource {
     }
 }
 
-
 /// POST a body to `path` on the coordinator and return the response body.
 ///
 /// Deliberately a hand-rolled HTTP/1.1 client: this crate takes no HTTP
@@ -265,8 +264,9 @@ fn request(cfg: &PoolConfig, method: &str, path: &str, body: &str) -> Result<Str
 /// Small and unbounded-free: a caller talks to one coordinator, and the cap
 /// keeps a misconfigured caller from accumulating sockets.
 fn pool_conns() -> &'static std::sync::Mutex<std::collections::HashMap<String, TcpStream>> {
-    static CELL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, TcpStream>>> =
-        std::sync::OnceLock::new();
+    static CELL: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, TcpStream>>,
+    > = std::sync::OnceLock::new();
     CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -314,10 +314,17 @@ fn read_response(stream: &mut TcpStream) -> Result<(String, String), PoolError> 
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let len = header_value(&head, "content-length")
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .ok_or_else(|| format!("response has no Content-Length: {}", head.lines().next().unwrap_or("")))?;
+        .ok_or_else(|| {
+            format!(
+                "response has no Content-Length: {}",
+                head.lines().next().unwrap_or("")
+            )
+        })?;
     while buf.len() - head_end < len {
         let mut chunk = [0u8; 8192];
-        let n = stream.read(&mut chunk).map_err(|e| format!("read body: {e}"))?;
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read body: {e}"))?;
         if n == 0 {
             return Err(format!(
                 "connection closed after {} of {len} body bytes",
@@ -326,7 +333,10 @@ fn read_response(stream: &mut TcpStream) -> Result<(String, String), PoolError> 
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    Ok((head, String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string()))
+    Ok((
+        head,
+        String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string(),
+    ))
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -576,11 +586,7 @@ pub fn encode_batch_request(
     // Capacity is estimated from the inputs so the buffer usually does not
     // reallocate: a float prints in at most ~14 bytes, plus ~48 of framing per
     // item.
-    let est: usize = calls
-        .iter()
-        .map(|c| c.input.len() * 14 + 48)
-        .sum::<usize>()
-        + 256;
+    let est: usize = calls.iter().map(|c| c.input.len() * 14 + 48).sum::<usize>() + 256;
     let mut out = String::with_capacity(est);
 
     let _ = write!(
@@ -605,7 +611,11 @@ pub fn encode_batch_request(
         if i > 0 {
             out.push(',');
         }
-        let _ = write!(out, "{{\"layer\":{},\"expert\":{},\"input\":[", c.layer, c.expert);
+        let _ = write!(
+            out,
+            "{{\"layer\":{},\"expert\":{},\"input\":[",
+            c.layer, c.expert
+        );
         for (j, v) in c.input.iter().enumerate() {
             if j > 0 {
                 out.push(',');
@@ -859,6 +869,9 @@ mod tests {
             out.iter().map(|v| v[0] as u32).collect::<Vec<_>>(),
             vec![7, 3, 11]
         );
-        assert!(out.iter().all(|v| v.len() == 4), "each output is d_model long");
+        assert!(
+            out.iter().all(|v| v.len() == 4),
+            "each output is d_model long"
+        );
     }
 }

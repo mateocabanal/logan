@@ -609,7 +609,7 @@ fn verify_payload_checksum(file: &mut File, h: &Header) -> Result<(), String> {
     Ok(())
 }
 
-fn visit_live_payload(
+pub(crate) fn visit_live_payload(
     model: &Model,
     prefix_len: usize,
     mut visit: impl FnMut(&[u8]) -> Result<(), String>,
@@ -680,7 +680,7 @@ fn visit_live_payload(
     Ok(())
 }
 
-fn restore_payload_into(
+pub(crate) fn restore_payload_into(
     model: &mut Model,
     prefix_len: usize,
     file: &mut File,
@@ -765,6 +765,175 @@ fn restore_payload_into(
         .map_err(|e| format!("read PLE conv: {e}"))?;
     model.sched_blocked = None;
     model.sched_pause = None;
+    Ok(())
+}
+pub(crate) fn restore_payload_from_bytes(
+    model: &mut Model,
+    prefix_len: usize,
+    bytes: &[u8],
+) -> Result<(), String> {
+    ensure_little_endian()?;
+    let expected_payload = usize::try_from(prefix_state_payload_bytes(model, prefix_len)?)
+        .map_err(|_| "prefix payload exceeds host address space".to_string())?;
+    if bytes.len() != expected_payload {
+        return Err(format!(
+            "prefix payload length {} does not match expected {expected_payload}",
+            bytes.len()
+        ));
+    }
+
+    // gdn_token lazily builds these aligned buffers before it checks the
+    // QWEN_GDN_METAL gate, and build_gdn_metal starts recurrent state at zero.
+    // A restore must therefore build them first whenever the direct backend
+    // exists, then overwrite both CPU and aligned state with the checkpoint.
+    if crate::ffi::direct_available() {
+        let cfg = &model.cfg;
+        for li in 0..cfg.layers {
+            if cfg.gdn_layers[li] && model.gdn_metal[li].is_none() {
+                let gm = Model::build_gdn_metal(&mut model.layers[li], cfg).ok_or_else(|| {
+                    format!("layer {li}: failed to initialize aligned GDN state for restore")
+                })?;
+                model.gdn_metal[li] = Some(gm);
+            }
+        }
+    }
+
+    let cfg = &model.cfg;
+    let state_len = cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim;
+    let cdim = cfg.lin_k_dim * cfg.lin_k_heads * 2 + cfg.lin_v_dim * cfg.lin_v_heads;
+    let conv_len = cdim * cfg.conv_kernel.saturating_sub(1);
+    let mut off = 0usize;
+
+    for li in 0..cfg.layers {
+        if !cfg.gdn_layers[li] {
+            continue;
+        }
+        if model.gdn_s[li].len() != state_len || model.gdn_conv[li].len() != conv_len {
+            return Err(format!("layer {li}: incompatible GDN target"));
+        }
+        copy_f32_from_le(bytes, &mut off, &mut model.gdn_s[li])?;
+        copy_f32_from_le(bytes, &mut off, &mut model.gdn_conv[li])?;
+        if let Some(gm) = model.gdn_metal[li].as_ref() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(model.gdn_s[li].as_ptr(), gm.state, state_len);
+                std::ptr::copy_nonoverlapping(model.gdn_conv[li].as_ptr(), gm.conv_state, conv_len);
+            }
+        }
+    }
+
+    let active = prefix_len * cfg.head_dim;
+    let kv_stride = cfg.max_t * cfg.head_dim;
+    for li in 0..cfg.layers {
+        if cfg.gdn_layers[li] {
+            continue;
+        }
+        let expected = cfg.kv_heads * kv_stride;
+        if model.kv_k[li].len() != expected || model.kv_v[li].len() != expected {
+            return Err(format!("layer {li}: incompatible KV target"));
+        }
+        copy_head_major_prefix_from_le(
+            bytes,
+            &mut off,
+            &mut model.kv_k[li],
+            cfg.kv_heads,
+            kv_stride,
+            active,
+        )?;
+        copy_head_major_prefix_from_le(
+            bytes,
+            &mut off,
+            &mut model.kv_v[li],
+            cfg.kv_heads,
+            kv_stride,
+            active,
+        )?;
+    }
+
+    let idx_active = prefix_len * cfg.idx_kv_heads * cfg.idx_head_dim;
+    for li in 0..cfg.layers {
+        if !cfg.qsa_layers[li] {
+            continue;
+        }
+        if model.idx_cache[li].len() < idx_active {
+            return Err(format!("layer {li}: incompatible QSA target"));
+        }
+        copy_f32_from_le(bytes, &mut off, &mut model.idx_cache[li][..idx_active])?;
+    }
+
+    copy_i64_from_le(bytes, &mut off, &mut model.ple_ring)?;
+    copy_f32_from_le(bytes, &mut off, &mut model.ple_conv_state)?;
+    if off != bytes.len() {
+        return Err(format!(
+            "prefix payload parser consumed {off} bytes, payload has {}",
+            bytes.len()
+        ));
+    }
+
+    model.sched_blocked = None;
+    model.sched_pause = None;
+    Ok(())
+}
+
+fn copy_f32_from_le(bytes: &[u8], off: &mut usize, dst: &mut [f32]) -> Result<(), String> {
+    let byte_len = dst
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "f32 prefix slice size overflow".to_string())?;
+    let end = off
+        .checked_add(byte_len)
+        .ok_or_else(|| "prefix payload offset overflow".to_string())?;
+    let src = bytes
+        .get(*off..end)
+        .ok_or_else(|| "truncated f32 prefix payload".to_string())?;
+    for (value, raw) in dst.iter_mut().zip(src.chunks_exact(4)) {
+        *value = f32::from_le_bytes(raw.try_into().unwrap());
+    }
+    *off = end;
+    Ok(())
+}
+
+fn copy_head_major_prefix_from_le(
+    bytes: &[u8],
+    off: &mut usize,
+    dst: &mut [f32],
+    heads: usize,
+    stride: usize,
+    active: usize,
+) -> Result<(), String> {
+    if active > stride {
+        return Err("active KV prefix exceeds head stride".into());
+    }
+    let expected = heads
+        .checked_mul(stride)
+        .ok_or_else(|| "KV destination size overflow".to_string())?;
+    if dst.len() != expected {
+        return Err(format!(
+            "KV destination has {} values, expected {expected}",
+            dst.len()
+        ));
+    }
+    for head in 0..heads {
+        let start = head * stride;
+        copy_f32_from_le(bytes, off, &mut dst[start..start + active])?;
+    }
+    Ok(())
+}
+
+fn copy_i64_from_le(bytes: &[u8], off: &mut usize, dst: &mut [i64]) -> Result<(), String> {
+    let byte_len = dst
+        .len()
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| "i64 prefix slice size overflow".to_string())?;
+    let end = off
+        .checked_add(byte_len)
+        .ok_or_else(|| "prefix payload offset overflow".to_string())?;
+    let src = bytes
+        .get(*off..end)
+        .ok_or_else(|| "truncated i64 prefix payload".to_string())?;
+    for (value, raw) in dst.iter_mut().zip(src.chunks_exact(8)) {
+        *value = i64::from_le_bytes(raw.try_into().unwrap());
+    }
+    *off = end;
     Ok(())
 }
 
@@ -864,5 +1033,40 @@ mod tests {
         put_u64(&mut b, 80, 0x0123_4567_89ab_cdef);
         assert_eq!(get_u32(&b, 44), 0x1234_5678);
         assert_eq!(get_u64(&b, 80), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn head_major_restore_uses_per_head_stride_and_preserves_tail() {
+        let values = [1.0f32, 2.0, 3.0, 4.0];
+        let mut encoded = Vec::new();
+        for value in values {
+            encoded.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut dst = vec![-1.0f32; 2 * 5];
+        let mut off = 0;
+        copy_head_major_prefix_from_le(&encoded, &mut off, &mut dst, 2, 5, 2).unwrap();
+
+        assert_eq!(&dst[0..2], &[1.0, 2.0]);
+        assert_eq!(&dst[2..5], &[-1.0, -1.0, -1.0]);
+        assert_eq!(&dst[5..7], &[3.0, 4.0]);
+        assert_eq!(&dst[7..10], &[-1.0, -1.0, -1.0]);
+        assert_eq!(off, encoded.len());
+    }
+
+    #[test]
+    fn byte_restore_does_not_require_source_alignment() {
+        let values = [1.25f32, -7.5];
+        let mut storage = vec![0xa5];
+        for value in values {
+            storage.extend_from_slice(&value.to_le_bytes());
+        }
+        let unaligned = &storage[1..];
+
+        let mut dst = [0.0f32; 2];
+        let mut off = 0;
+        copy_f32_from_le(unaligned, &mut off, &mut dst).unwrap();
+        assert_eq!(dst, values);
+        assert_eq!(off, unaligned.len());
     }
 }

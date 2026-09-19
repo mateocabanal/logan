@@ -82,7 +82,9 @@ impl<V: Slot> ExpertStore<V> {
         }
     }
 
-    pub fn capacity(&self) -> usize { self.cap }
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
 
     /// Get a cached expert, promoting it to MRU. None on miss.
     pub fn get(&mut self, key: (u32, u32)) -> Option<&V> {
@@ -105,7 +107,9 @@ impl<V: Slot> ExpertStore<V> {
     /// top-k route are protected from being evicted by earlier misses in the
     /// same issue batch. Returns false when the key is not resident.
     pub fn promote_if_present(&mut self, key: (u32, u32)) -> bool {
-        let Some(&idx) = self.map.get(&key) else { return false; };
+        let Some(&idx) = self.map.get(&key) else {
+            return false;
+        };
         self.unlink(idx);
         self.push_front(idx);
         true
@@ -171,11 +175,21 @@ impl<V: Slot> ExpertStore<V> {
         };
 
         let idx = if let Some(idx) = reuse_idx {
-            self.slab[idx] = Some(Node { key, value, prev: None, next: None });
+            self.slab[idx] = Some(Node {
+                key,
+                value,
+                prev: None,
+                next: None,
+            });
             idx
         } else {
             let idx = self.slab.len();
-            self.slab.push(Some(Node { key, value, prev: None, next: None }));
+            self.slab.push(Some(Node {
+                key,
+                value,
+                prev: None,
+                next: None,
+            }));
             idx
         };
         self.map.insert(key, idx);
@@ -257,11 +271,29 @@ mod tests {
     #[test]
     fn lru_evicts_least_recently_used() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
         // touch (0,0) so (0,1) becomes LRU
         assert!(s.get((0, 0)).is_some());
-        let (evicted, _) = s.insert((1, 0), FakeSlot { key: (1, 0), released: false });
+        let (evicted, _) = s.insert(
+            (1, 0),
+            FakeSlot {
+                key: (1, 0),
+                released: false,
+            },
+        );
         let mut ev = evicted.unwrap();
         assert_eq!(ev.key, (0, 1));
         // eviction returns the value; the caller releases it (engine frees
@@ -277,47 +309,119 @@ mod tests {
     #[test]
     fn replace_promotes_and_releases_old() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
         // replace (0,0) in place: old released internally, (0,0) promoted
-        let (old, _) = s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        let (old, _) = s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
         assert!(old.is_none());
         // (0,0) is now MRU; (0,1) is LRU; cap 2 -> inserting (1,1) evicts (0,1)
-        let (evicted, _) = s.insert((1, 1), FakeSlot { key: (1, 1), released: false });
+        let (evicted, _) = s.insert(
+            (1, 1),
+            FakeSlot {
+                key: (1, 1),
+                released: false,
+            },
+        );
         assert_eq!(evicted.unwrap().key, (0, 1));
     }
 
     #[test]
     fn peek_does_not_bump_hits_or_promote() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
         assert!(s.peek((0, 0)).is_some());
         assert_eq!(s.hits, 0); // peek is not a hit
         // Peek must NOT promote: (0,1) was inserted second so it is MRU;
         // (0,0) is still LRU. Inserting a third key evicts (0,0), proving
         // the peek didn't touch the recency order.
-        let (evicted, _) = s.insert((2, 0), FakeSlot { key: (2, 0), released: false });
+        let (evicted, _) = s.insert(
+            (2, 0),
+            FakeSlot {
+                key: (2, 0),
+                released: false,
+            },
+        );
         assert_eq!(evicted.unwrap().key, (0, 0));
     }
 
     #[test]
     fn promote_if_present_is_telemetry_neutral_and_protects_lru() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
         assert!(s.promote_if_present((0, 0)));
         assert_eq!(s.hits, 0);
         assert!(!s.promote_if_present((0, 9)));
-        let (evicted, _) = s.insert((0, 2), FakeSlot { key: (0, 2), released: false });
+        let (evicted, _) = s.insert(
+            (0, 2),
+            FakeSlot {
+                key: (0, 2),
+                released: false,
+            },
+        );
         assert_eq!(evicted.unwrap().key, (0, 1));
     }
 
     #[test]
     fn insert_does_not_bump_hits() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
         // insert returns the value ref WITHOUT a hit — hits stay 0
         assert_eq!(s.hits, 0);
         assert!(s.get((0, 1)).is_some()); // genuine reuse -> 1 hit
@@ -327,13 +431,43 @@ mod tests {
     #[test]
     fn layered_lru_evicts_within_layer() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new_layered(2, 2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
-        s.insert((1, 0), FakeSlot { key: (1, 0), released: false });
-        s.insert((1, 1), FakeSlot { key: (1, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
+        s.insert(
+            (1, 0),
+            FakeSlot {
+                key: (1, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (1, 1),
+            FakeSlot {
+                key: (1, 1),
+                released: false,
+            },
+        );
         // Layer 1 was touched later globally, but a new layer-0 expert must
         // evict layer 0's own LRU, never an entry from layer 1.
-        let (evicted, _) = s.insert((0, 2), FakeSlot { key: (0, 2), released: false });
+        let (evicted, _) = s.insert(
+            (0, 2),
+            FakeSlot {
+                key: (0, 2),
+                released: false,
+            },
+        );
         assert_eq!(evicted.unwrap().key, (0, 0));
         assert!(s.peek((1, 0)).is_some());
         assert!(s.peek((1, 1)).is_some());
@@ -344,10 +478,28 @@ mod tests {
     #[test]
     fn layered_lru_respects_recency_inside_layer() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new_layered(2, 2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
-        s.insert((0, 1), FakeSlot { key: (0, 1), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
+        s.insert(
+            (0, 1),
+            FakeSlot {
+                key: (0, 1),
+                released: false,
+            },
+        );
         assert!(s.get((0, 0)).is_some());
-        let (evicted, _) = s.insert((0, 2), FakeSlot { key: (0, 2), released: false });
+        let (evicted, _) = s.insert(
+            (0, 2),
+            FakeSlot {
+                key: (0, 2),
+                released: false,
+            },
+        );
         assert_eq!(evicted.unwrap().key, (0, 1));
         assert!(s.peek((0, 0)).is_some());
     }
@@ -355,7 +507,13 @@ mod tests {
     #[test]
     fn hit_rate_counts() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(2);
-        s.insert((0, 0), FakeSlot { key: (0, 0), released: false });
+        s.insert(
+            (0, 0),
+            FakeSlot {
+                key: (0, 0),
+                released: false,
+            },
+        );
         s.get((0, 0));
         s.get((0, 0));
         s.get((9, 9)); // miss
@@ -368,7 +526,13 @@ mod tests {
     fn drop_releases_all() {
         let mut s: ExpertStore<FakeSlot> = ExpertStore::new(4);
         for i in 0..3 {
-            s.insert((0, i), FakeSlot { key: (0, i), released: false });
+            s.insert(
+                (0, i),
+                FakeSlot {
+                    key: (0, i),
+                    released: false,
+                },
+            );
         }
         drop(s);
         // can't observe after drop; just ensure no panic + len was 3

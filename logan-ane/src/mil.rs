@@ -1132,22 +1132,26 @@ mod tests {
     #[test]
     fn qwen4_mtp_input_projections_reject_bad_geometry() {
         let good = vec![0x3c00; 16 * 16];
-        assert!(qwen4_mtp_input_projections_fp16_f32_io(
-            16,
-            15,
-            4,
-            DenseProjection::new("fc_embedding", 16, good.clone()),
-            DenseProjection::new("fc_hidden", 16, good.clone()),
-        )
-        .is_err());
-        assert!(qwen4_mtp_input_projections_fp16_f32_io(
-            16,
-            16,
-            0,
-            DenseProjection::new("fc_embedding", 16, good.clone()),
-            DenseProjection::new("fc_hidden", 16, good),
-        )
-        .is_err());
+        assert!(
+            qwen4_mtp_input_projections_fp16_f32_io(
+                16,
+                15,
+                4,
+                DenseProjection::new("fc_embedding", 16, good.clone()),
+                DenseProjection::new("fc_hidden", 16, good.clone()),
+            )
+            .is_err()
+        );
+        assert!(
+            qwen4_mtp_input_projections_fp16_f32_io(
+                16,
+                16,
+                0,
+                DenseProjection::new("fc_embedding", 16, good.clone()),
+                DenseProjection::new("fc_hidden", 16, good),
+            )
+            .is_err()
+        );
     }
 
     #[test]

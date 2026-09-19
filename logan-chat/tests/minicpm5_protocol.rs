@@ -1,9 +1,9 @@
-use logan_chat::openai::{normalize_openai_string_argument, render_minicpm5_prompt, ApiMessage};
+use logan_chat::openai::{ApiMessage, normalize_openai_string_argument, render_minicpm5_prompt};
 use logan_chat::protocol::minicpm5::{
-    MiniCpm5Delta, MiniCpm5ParseError, MiniCpm5StreamParser, MINICPM5_EOS_IDS,
+    MINICPM5_EOS_IDS, MiniCpm5Delta, MiniCpm5ParseError, MiniCpm5StreamParser,
 };
 use logan_chat::runtime::{
-    prompt_adapter, select_model_family, ModelFamily, PromptAdapter, ProtocolOptions,
+    ModelFamily, PromptAdapter, ProtocolOptions, prompt_adapter, select_model_family,
 };
 use serde_json::json;
 
@@ -37,14 +37,16 @@ fn parser_handles_arbitrary_byte_splits_unicode_cdata_and_multiple_calls() {
         name: "text".into(),
         value: "héllo <world>".into(),
     }));
-    assert!(deltas.contains(&MiniCpm5Delta::ToolCallFinished(
-        logan_chat::protocol::minicpm5::ToolCall {
-            name: "echo".into(),
-            arguments: [("text".into(), "héllo <world>".into())]
-                .into_iter()
-                .collect(),
-        },
-    )));
+    assert!(
+        deltas.contains(&MiniCpm5Delta::ToolCallFinished(
+            logan_chat::protocol::minicpm5::ToolCall {
+                name: "echo".into(),
+                arguments: [("text".into(), "héllo <world>".into())]
+                    .into_iter()
+                    .collect(),
+            },
+        ))
+    );
     assert!(
         deltas
             .iter()

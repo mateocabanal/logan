@@ -1,18 +1,19 @@
 use crate::{
+    DType, LlamaConfig, TensorInfo,
     config::load_config,
     inspect_weights,
     kv::{KvCache, KvCheckpoint},
     metal::{self, BackendPreference, BackendReport, BackendUsed},
-    DType, LlamaConfig, TensorInfo,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
     },
 };
 
@@ -106,6 +107,7 @@ pub struct DenseModel {
     pub root: Option<PathBuf>,
     identity: ModelIdentity,
     weights: Arc<Weights>,
+    cache_fingerprint: Arc<OnceLock<[u8; 32]>>,
 }
 
 impl DenseModel {
@@ -167,6 +169,16 @@ impl DenseModel {
     pub fn identity(&self) -> &ModelIdentity {
         &self.identity
     }
+
+    /// Stable identity for causal-state caches. This hashes the effective
+    /// resident model (geometry + exact dense/quantized weight payloads) once
+    /// and shares the result across cloned model handles.
+    pub fn cache_fingerprint(&self) -> [u8; 32] {
+        *self
+            .cache_fingerprint
+            .get_or_init(|| dense_model_fingerprint(&self.config, &self.weights))
+    }
+
     pub fn new_session(self: &Arc<Self>) -> DenseSession {
         DenseSession::new(self.clone())
     }
@@ -306,7 +318,86 @@ impl DenseModel {
                 final_norm,
                 layers,
             }),
+            cache_fingerprint: Arc::new(OnceLock::new()),
         })
+    }
+}
+
+fn dense_model_fingerprint(config: &LlamaConfig, weights: &Weights) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"logan-dense-model-v1\0");
+    h.update(config.model_type.as_bytes());
+    h.update([0]);
+    h.update(config.vocab_size.to_le_bytes());
+    h.update(config.hidden_size.to_le_bytes());
+    h.update(config.intermediate_size.to_le_bytes());
+    h.update(config.num_hidden_layers.to_le_bytes());
+    h.update(config.num_attention_heads.to_le_bytes());
+    h.update(config.num_key_value_heads.to_le_bytes());
+    h.update(config.head_dim.to_le_bytes());
+    h.update(config.max_position_embeddings.to_le_bytes());
+    h.update(config.rms_norm_eps.to_bits().to_le_bytes());
+    h.update(config.rope_theta.to_bits().to_le_bytes());
+    h.update(config.bos_token_id.unwrap_or(u32::MAX).to_le_bytes());
+    h.update((config.eos_token_ids.len() as u64).to_le_bytes());
+    for token in &config.eos_token_ids {
+        h.update(token.to_le_bytes());
+    }
+    h.update([config.tie_word_embeddings as u8]);
+    h.update([match config.torch_dtype {
+        Some(DType::F16) => 1,
+        Some(DType::BF16) => 2,
+        None => 0,
+    }]);
+
+    hash_matrix(&mut h, b"embedding", &weights.embedding);
+    hash_matrix(&mut h, b"head", &weights.head);
+    hash_f32_slice(&mut h, b"final_norm", &weights.final_norm);
+    h.update((weights.layers.len() as u64).to_le_bytes());
+    for (index, layer) in weights.layers.iter().enumerate() {
+        h.update((index as u64).to_le_bytes());
+        hash_f32_slice(&mut h, b"input_norm", &layer.input_norm);
+        hash_matrix(&mut h, b"q", &layer.q);
+        hash_matrix(&mut h, b"k", &layer.k);
+        hash_matrix(&mut h, b"v", &layer.v);
+        hash_matrix(&mut h, b"o", &layer.o);
+        hash_f32_slice(&mut h, b"post_norm", &layer.post_norm);
+        hash_matrix(&mut h, b"gate", &layer.gate);
+        hash_matrix(&mut h, b"up", &layer.up);
+        hash_matrix(&mut h, b"down", &layer.down);
+    }
+    h.finalize().into()
+}
+
+fn hash_matrix(h: &mut Sha256, label: &[u8], matrix: &Matrix) {
+    h.update((label.len() as u64).to_le_bytes());
+    h.update(label);
+    h.update([match matrix.dtype {
+        DType::F16 => 1,
+        DType::BF16 => 2,
+    }]);
+    h.update((matrix.rows as u64).to_le_bytes());
+    h.update((matrix.cols as u64).to_le_bytes());
+    h.update((matrix.bytes.len() as u64).to_le_bytes());
+    h.update(&matrix.bytes);
+    if let Some(quantized) = &matrix.quantized {
+        h.update([1, quantized.bits]);
+        h.update((quantized.group_size as u64).to_le_bytes());
+        h.update((quantized.weights.len() as u64).to_le_bytes());
+        h.update(&quantized.weights);
+        h.update((quantized.aux.len() as u64).to_le_bytes());
+        h.update(&quantized.aux);
+    } else {
+        h.update([0]);
+    }
+}
+
+fn hash_f32_slice(h: &mut Sha256, label: &[u8], values: &[f32]) {
+    h.update((label.len() as u64).to_le_bytes());
+    h.update(label);
+    h.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        h.update(value.to_bits().to_le_bytes());
     }
 }
 
@@ -423,6 +514,17 @@ impl DenseSession {
     }
     pub fn restore_snapshot(&mut self, checkpoint: KvCheckpoint) -> Result<(), String> {
         self.restore(checkpoint)
+    }
+
+    /// Export only committed KV state for a persistent prefix checkpoint.
+    pub fn export_prefix_state(&self) -> Vec<u8> {
+        self.kv.serialize_state()
+    }
+
+    /// Import a validated prefix checkpoint into this session.
+    pub fn import_prefix_state(&mut self, data: &[u8]) -> Result<(), String> {
+        metal::llama_drop_model(self.gpu_model_id);
+        self.kv.deserialize_state(data).map_err(|e| e.to_string())
     }
     pub fn retain_verified(&mut self, checkpoint: KvCheckpoint) -> Result<(), String> {
         metal::llama_drop_model(self.gpu_model_id);

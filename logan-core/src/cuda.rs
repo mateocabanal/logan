@@ -436,7 +436,12 @@ fn runtime_lib_names() -> &'static [&'static str] {
     }
     #[cfg(not(windows))]
     {
-        &["libnvrtc.so", "libnvrtc.so.12", "libcudart.so", "libcudart.so.12"]
+        &[
+            "libnvrtc.so",
+            "libnvrtc.so.12",
+            "libcudart.so",
+            "libcudart.so.12",
+        ]
     }
 }
 
@@ -775,11 +780,7 @@ fn compile_inner(c: &Cuda, source: &str, entry: &str) -> Option<Kernel> {
     // JITs it for the actual card, which keeps the same binary working across
     // cards of the same or newer architecture. Note the digits are
     // concatenated -- NVRTC rejects "compute_6.1".
-    let arch = CString::new(format!(
-        "--gpu-architecture=compute_{}{}",
-        c.cap.0, c.cap.1
-    ))
-    .ok()?;
+    let arch = CString::new(format!("--gpu-architecture=compute_{}{}", c.cap.0, c.cap.1)).ok()?;
     let src = CString::new(source).ok()?;
     let fname = CString::new(format!("{entry}.cu")).ok()?;
 
@@ -927,9 +928,8 @@ impl DeviceBuf {
         self.ensure(data.len())?;
         let dst = self.ptr()?;
         with_device(|c| {
-            let rc = unsafe {
-                (c.api.cuMemcpyHtoD_v2)(dst, data.as_ptr() as *const c_void, data.len())
-            };
+            let rc =
+                unsafe { (c.api.cuMemcpyHtoD_v2)(dst, data.as_ptr() as *const c_void, data.len()) };
             if rc != 0 {
                 note_error(error_name(c, rc));
                 return None;

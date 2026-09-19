@@ -164,38 +164,99 @@ fn read_column(surface: &AneSurface, rows: usize, dst: &mut [f32]) -> Result<(),
 }
 
 fn main() -> Result<(), String> {
-    let package=std::env::args().nth(1).unwrap_or_else(||"/Users/mateo/models/Qwen3.8-Flash-Next-REAP-288-MXFP4-Apple8.coli".into());
-    let layer:usize=std::env::args().nth(2).and_then(|s|s.parse().ok()).unwrap_or(0);
-    let mode=std::env::args().nth(3).unwrap_or_else(||"qkv".into());
-    let pn=format!("layers.{layer}.linear_attn"); let src=ColiSource::open(Path::new(&package))?;
-    let qkv=load_bf16(&src,&format!("{pn}.in_proj_qkv.weight"),QKV)?;
-    let z=load_bf16(&src,&format!("{pn}.in_proj_z.weight"),Z)?;
-    let a=load_bf16(&src,&format!("{pn}.in_proj_a.weight"),A)?;
-    let b=load_bf16(&src,&format!("{pn}.in_proj_b.weight"),B)?;
-    let selected:Vec<(&str,&ColiWt,usize)>=match mode.as_str(){
-        "qkv"=>vec![("qkv",&qkv,QKV)],
-        "aux"=>vec![("z",&z,Z),("a",&a,A),("b",&b,B)],
-        _=>return Err("mode must be qkv or aux".into()),
+    let package = std::env::args().nth(1).unwrap_or_else(|| {
+        "/Users/mateo/models/Qwen3.8-Flash-Next-REAP-288-MXFP4-Apple8.coli".into()
+    });
+    let layer: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mode = std::env::args().nth(3).unwrap_or_else(|| "qkv".into());
+    let pn = format!("layers.{layer}.linear_attn");
+    let src = ColiSource::open(Path::new(&package))?;
+    let qkv = load_bf16(&src, &format!("{pn}.in_proj_qkv.weight"), QKV)?;
+    let z = load_bf16(&src, &format!("{pn}.in_proj_z.weight"), Z)?;
+    let a = load_bf16(&src, &format!("{pn}.in_proj_a.weight"), A)?;
+    let b = load_bf16(&src, &format!("{pn}.in_proj_b.weight"), B)?;
+    let selected: Vec<(&str, &ColiWt, usize)> = match mode.as_str() {
+        "qkv" => vec![("qkv", &qkv, QKV)],
+        "aux" => vec![("z", &z, Z), ("a", &a, A), ("b", &b, B)],
+        _ => return Err("mode must be qkv or aux".into()),
     };
-    let outs:Vec<usize>=selected.iter().map(|x|x.2).collect();
-    let (program,layout)=logan_ane::mil::parallel_dense_packed_dynamic_f32_io(HIDDEN,SPATIAL,&outs).map_err(|e|e.to_string())?;
-    println!("mode={mode} layer={layer} packed_spatial={} packed_mib={:.2}",layout.total_spatial,(HIDDEN*layout.total_spatial*4) as f64/1048576.0);
-    let runtime=AneRuntime::load().map_err(|e|e.to_string())?;let opts=CompileOptions{reuse_compiled_model:false,keep_temporary_files:true,..CompileOptions::default()};
-    let t=Instant::now();let mut model=runtime.compile(&program,opts).map_err(|e|e.to_string())?;println!("compile_ms={:.3}",t.elapsed().as_secs_f64()*1e3);model.load().map_err(|e|e.to_string())?;
-    let x:Vec<f32>=(0..HIDDEN).map(|i|((i as f32*0.0137).sin()+(i as f32*0.0031).cos())*0.25).collect();
-    let mut refs:Vec<Vec<f32>>=selected.iter().map(|x|vec![0f32;x.2]).collect();
-    for (idx,(_,wt,o)) in selected.iter().enumerate(){if !logan_metal::bnns_bf16_matmul(&wt.bytes,&x,&mut refs[idx],*o,HIDDEN){return Err("BNNS unavailable".into())}}
-    let mut input=AneSurface::new(HIDDEN*layout.total_spatial*4).map_err(|e|e.to_string())?;
-    let t=Instant::now();
-    for (k,(_,wt,o)) in selected.iter().enumerate() {
-        input.pack_bf16_transposed_f32(layout.total_spatial, layout.weight_offsets[k], &wt.bytes, HIDDEN, *o)
-            .map_err(|e|e.to_string())?;
+    let outs: Vec<usize> = selected.iter().map(|x| x.2).collect();
+    let (program, layout) =
+        logan_ane::mil::parallel_dense_packed_dynamic_f32_io(HIDDEN, SPATIAL, &outs)
+            .map_err(|e| e.to_string())?;
+    println!(
+        "mode={mode} layer={layer} packed_spatial={} packed_mib={:.2}",
+        layout.total_spatial,
+        (HIDDEN * layout.total_spatial * 4) as f64 / 1048576.0
+    );
+    let runtime = AneRuntime::load().map_err(|e| e.to_string())?;
+    let opts = CompileOptions {
+        reuse_compiled_model: false,
+        keep_temporary_files: true,
+        ..CompileOptions::default()
+    };
+    let t = Instant::now();
+    let mut model = runtime.compile(&program, opts).map_err(|e| e.to_string())?;
+    println!("compile_ms={:.3}", t.elapsed().as_secs_f64() * 1e3);
+    model.load().map_err(|e| e.to_string())?;
+    let x: Vec<f32> = (0..HIDDEN)
+        .map(|i| ((i as f32 * 0.0137).sin() + (i as f32 * 0.0031).cos()) * 0.25)
+        .collect();
+    let mut refs: Vec<Vec<f32>> = selected.iter().map(|x| vec![0f32; x.2]).collect();
+    for (idx, (_, wt, o)) in selected.iter().enumerate() {
+        if !logan_metal::bnns_bf16_matmul(&wt.bytes, &x, &mut refs[idx], *o, HIDDEN) {
+            return Err("BNNS unavailable".into());
+        }
     }
-    println!("neon_weight_pack_ms={:.3}",t.elapsed().as_secs_f64()*1e3);
-    let t=Instant::now(); input.write_repeated_f32(layout.total_spatial, SPATIAL, &x).map_err(|e|e.to_string())?;
-    println!("activation_write_ms={:.3}",t.elapsed().as_secs_f64()*1e3);
-    let ys:Vec<AneSurface>=outs.iter().map(|o|AneSurface::new(o*SPATIAL*4).unwrap()).collect();let yrefs:Vec<&AneSurface>=ys.iter().collect();let req=AneRequest::new(&[&input],&yrefs,0).map_err(|e|e.to_string())?;
-    for _ in 0..3{model.evaluate(&req).map_err(|e|e.to_string())?;}let mut samples=Vec::new();for _ in 0..20{let t=Instant::now();model.evaluate(&req).map_err(|e|e.to_string())?;samples.push(t.elapsed().as_secs_f64()*1e3);}println!("eval_median_ms={:.3} samples={samples:?}",median_ms(samples.clone()));
-    for (k,(name,_,_)) in selected.iter().enumerate(){let got=ys[k].read_f32().map_err(|e|e.to_string())?;let q=quality(&refs[k],&got,SPATIAL);println!("{name} rmse={:.6} rel={:.6} max={:.6} cos={:.9}",q.rmse,q.rel_rmse,q.max_abs,q.cosine);}
+    let mut input =
+        AneSurface::new(HIDDEN * layout.total_spatial * 4).map_err(|e| e.to_string())?;
+    let t = Instant::now();
+    for (k, (_, wt, o)) in selected.iter().enumerate() {
+        input
+            .pack_bf16_transposed_f32(
+                layout.total_spatial,
+                layout.weight_offsets[k],
+                &wt.bytes,
+                HIDDEN,
+                *o,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    println!("neon_weight_pack_ms={:.3}", t.elapsed().as_secs_f64() * 1e3);
+    let t = Instant::now();
+    input
+        .write_repeated_f32(layout.total_spatial, SPATIAL, &x)
+        .map_err(|e| e.to_string())?;
+    println!("activation_write_ms={:.3}", t.elapsed().as_secs_f64() * 1e3);
+    let ys: Vec<AneSurface> = outs
+        .iter()
+        .map(|o| AneSurface::new(o * SPATIAL * 4).unwrap())
+        .collect();
+    let yrefs: Vec<&AneSurface> = ys.iter().collect();
+    let req = AneRequest::new(&[&input], &yrefs, 0).map_err(|e| e.to_string())?;
+    for _ in 0..3 {
+        model.evaluate(&req).map_err(|e| e.to_string())?;
+    }
+    let mut samples = Vec::new();
+    for _ in 0..20 {
+        let t = Instant::now();
+        model.evaluate(&req).map_err(|e| e.to_string())?;
+        samples.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "eval_median_ms={:.3} samples={samples:?}",
+        median_ms(samples.clone())
+    );
+    for (k, (name, _, _)) in selected.iter().enumerate() {
+        let got = ys[k].read_f32().map_err(|e| e.to_string())?;
+        let q = quality(&refs[k], &got, SPATIAL);
+        println!(
+            "{name} rmse={:.6} rel={:.6} max={:.6} cos={:.9}",
+            q.rmse, q.rel_rmse, q.max_abs, q.cosine
+        );
+    }
     Ok(())
 }

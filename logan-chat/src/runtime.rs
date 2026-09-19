@@ -7,8 +7,8 @@
 
 use crate::openai::ApiMessage;
 use crate::protocol::minicpm5::{
-    MiniCpm5Delta, MiniCpm5StreamParser, MiniCpm5TemplateOptions, ThinkingMode, ToolDefinition,
-    MINICPM5_EOS_IDS,
+    MINICPM5_EOS_IDS, MiniCpm5Delta, MiniCpm5StreamParser, MiniCpm5TemplateOptions, ThinkingMode,
+    ToolDefinition,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

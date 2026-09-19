@@ -17,9 +17,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compile_t0 = Instant::now();
     let mut model = runtime.compile(&program, CompileOptions::default())?;
     let compile_ms = compile_t0.elapsed().as_secs_f64() * 1e3;
-    println!("compiled_model_exists_after_compile={:?}", model.compiled_model_exists());
-    println!("local_model_path_after_compile={:?}", model.local_model_path());
-    println!("temporary_directory={}", model.temporary_directory().display());
+    println!(
+        "compiled_model_exists_after_compile={:?}",
+        model.compiled_model_exists()
+    );
+    println!(
+        "local_model_path_after_compile={:?}",
+        model.local_model_path()
+    );
+    println!(
+        "temporary_directory={}",
+        model.temporary_directory().display()
+    );
 
     let load_t0 = Instant::now();
     model.load()?;

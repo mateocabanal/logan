@@ -1,299 +1,209 @@
-//! Prefix index for efficient lookup of cached prefixes.
+//! Metadata-only prefix index with exact token-prefix validation.
 
 use crate::prefix::{PrefixFingerprint, PrefixKey};
 use std::collections::BTreeMap;
 
-/// Prefix index manages cached prefixes and their metadata.
-#[derive(Debug)]
-pub struct PrefixIndex {
-    /// Index of prefix fingerprints to their metadata
-    entries: BTreeMap<PrefixFingerprint, PrefixMetadata>,
-    /// LRU ordering (timestamp for LRU eviction)
-    lru_order: Vec<(u64, PrefixFingerprint)>,
-    /// Total bytes in cache
-    total_bytes: usize,
-    /// Maximum cache size (in bytes)
-    max_bytes: usize,
-    /// Current LRU timestamp
-    next_timestamp: u64,
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CacheStats {
+    pub total_entries: usize,
+    pub total_bytes: usize,
+    pub max_bytes: usize,
+    pub total_lookups: usize,
+    pub total_hits: u64,
+    pub total_misses: u64,
+    pub hit_rate: f64,
 }
 
 #[derive(Debug, Clone)]
-struct PrefixMetadata {
-    /// Size of this prefix in bytes
+struct IndexedPrefix {
+    key: PrefixKey,
     size: usize,
-    /// Timestamp when last accessed
-    last_access: u64,
-    /// Timestamp when last updated
-    last_update: u64,
-    /// Number of hits
-    hits: u64,
-    /// Number of misses
-    misses: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrefixIndex {
+    entries: BTreeMap<PrefixFingerprint, IndexedPrefix>,
+    lru: Vec<PrefixFingerprint>,
+    total_bytes: usize,
+    max_bytes: usize,
+    total_lookups: u64,
+    total_hits: u64,
+    total_misses: u64,
 }
 
 impl PrefixIndex {
-    /// Create a new prefix index
     pub fn new(max_bytes: usize) -> Self {
-        PrefixIndex {
+        Self {
             entries: BTreeMap::new(),
-            lru_order: Vec::new(),
+            lru: Vec::new(),
             total_bytes: 0,
             max_bytes,
-            next_timestamp: 0,
+            total_lookups: 0,
+            total_hits: 0,
+            total_misses: 0,
         }
     }
 
-    /// Insert or update a prefix entry
-    pub fn insert(&mut self, key: PrefixKey, metadata: PrefixMetadata) -> Result<(), String> {
-        let fingerprint = PrefixFingerprint::new(
-            key.model_fingerprint,
-            key.state_schema_fingerprint,
-            key.tokenizer_fingerprint,
-            key.plan_fingerprint,
-            key.prefix_token_hash,
-            key.prefix_len,
-        );
-
-        // Remove old entry if updating
-        if let Some(old_fingerprint) = self.entries
-            .range(..=fingerprint)
-            .next_back()
-            .filter(|(f, _)| **f == fingerprint)
-            .map(|(f, _)| *f)
-        {
-            self.remove_entry(&old_fingerprint);
-        }
-
-        // Check if we need to evict
-        let metadata_size = metadata.size;
-        if self.total_bytes + metadata_size > self.max_bytes {
-            // Evict LRU entries
-            self.evict_until(self.max_bytes - metadata_size);
-        }
-
-        // Insert new entry
-        let metadata_size = metadata.size;
-        self.entries.insert(fingerprint.clone(), metadata);
-        self.lru_order.push((self.next_timestamp, fingerprint.clone()));
-        self.total_bytes += metadata_size;
-        self.next_timestamp += 1;
-
-        Ok(())
+    pub fn insert(&mut self, key: PrefixKey, size: usize) -> Result<(), String> {
+        self.insert_with_evictions(key, size).map(|_| ())
     }
 
-    /// Look up the best matching prefix for a query
-    pub fn lookup(&mut self, key: &PrefixKey) -> Option<PrefixFingerprint> {
-        let query_fingerprint = PrefixFingerprint::new(
-            key.model_fingerprint,
-            key.state_schema_fingerprint,
-            key.tokenizer_fingerprint,
-            key.plan_fingerprint,
-            key.prefix_token_hash,
-            key.prefix_len,
-        );
+    pub fn insert_with_evictions(
+        &mut self,
+        key: PrefixKey,
+        size: usize,
+    ) -> Result<Vec<PrefixFingerprint>, String> {
+        if size > self.max_bytes {
+            return Err(format!(
+                "prefix entry of {size} bytes exceeds cache budget {}",
+                self.max_bytes
+            ));
+        }
+        let fingerprint = key.fingerprint();
+        self.remove(&fingerprint);
+        let evicted = self.evict_for(size);
+        self.total_bytes += size;
+        self.lru.push(fingerprint);
+        self.entries
+            .insert(fingerprint, IndexedPrefix { key, size });
+        Ok(evicted)
+    }
 
-        // Find all compatible prefixes (same model, state, tokenizer, plan)
-        let mut compatible = self.entries
+    pub fn lookup(&mut self, query: &PrefixKey) -> Option<PrefixFingerprint> {
+        self.total_lookups = self.total_lookups.saturating_add(1);
+        let best = self
+            .entries
             .iter()
-            .filter(|(f, _)| f.is_compatible_prefix(&query_fingerprint))
-            .map(|(f, _)| *f)
-            .collect::<Vec<_>>();
+            .filter(|(_, entry)| entry.key.is_prefix_of(query))
+            .max_by_key(|(_, entry)| entry.key.prefix_len())
+            .map(|(fingerprint, _)| *fingerprint);
 
-        compatible.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len)); // Longest first
-
-        if let Some(best) = compatible.first() {
-            // Update LRU
-            if let Some(idx) = self.lru_order.iter().position(|(_, f)| f == best) {
-                let (ts, f) = self.lru_order.remove(idx);
-                self.lru_order.push((self.next_timestamp, f));
-                self.next_timestamp += 1;
-            }
-
-            // Update stats
-            if let Some(meta) = self.entries.get_mut(best) {
-                meta.hits += 1;
-                meta.last_access = self.next_timestamp;
-            }
-
-            Some(*best)
+        if let Some(fingerprint) = best {
+            self.total_hits = self.total_hits.saturating_add(1);
+            self.touch(fingerprint);
+            Some(fingerprint)
         } else {
-            // No match
+            self.total_misses = self.total_misses.saturating_add(1);
             None
         }
     }
 
-    /// Remove an entry from the index
-    fn remove_entry(&mut self, fingerprint: &PrefixFingerprint) {
-        if let Some(meta) = self.entries.remove(fingerprint) {
-            self.total_bytes -= meta.size;
-
-            // Remove from LRU order
-            self.lru_order.retain(|(_, f)| f != fingerprint);
-        }
+    pub fn remove(&mut self, fingerprint: &PrefixFingerprint) -> bool {
+        let Some(entry) = self.entries.remove(fingerprint) else {
+            return false;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(entry.size);
+        self.lru.retain(|candidate| candidate != fingerprint);
+        true
     }
 
-    /// Evict entries until total bytes is under the target
-    fn evict_until(&mut self, target: usize) {
-        while self.total_bytes > target && !self.lru_order.is_empty() {
-            let (_, fingerprint) = self.lru_order.remove(0);
-            let meta = self.entries.remove(&fingerprint).unwrap();
-            self.total_bytes -= meta.size;
-        }
-    }
-
-    /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
-        let total_lookups = self.lru_order.len();
-        let total_hits: u64 = self.entries.values()
-            .map(|m| m.hits)
-            .sum();
-        let total_misses: u64 = self.entries.values()
-            .map(|m| m.misses)
-            .sum();
-
         CacheStats {
             total_entries: self.entries.len(),
             total_bytes: self.total_bytes,
             max_bytes: self.max_bytes,
-            total_lookups,
-            total_hits,
-            total_misses,
-            hit_rate: if total_lookups > 0 {
-                total_hits as f64 / (total_hits + total_misses) as f64
-            } else {
+            total_lookups: self.total_lookups as usize,
+            total_hits: self.total_hits,
+            total_misses: self.total_misses,
+            hit_rate: if self.total_lookups == 0 {
                 0.0
+            } else {
+                self.total_hits as f64 / self.total_lookups as f64
             },
         }
     }
+
+    fn touch(&mut self, fingerprint: PrefixFingerprint) {
+        self.lru.retain(|candidate| *candidate != fingerprint);
+        self.lru.push(fingerprint);
+    }
+
+    fn evict_for(&mut self, incoming: usize) -> Vec<PrefixFingerprint> {
+        let mut evicted = Vec::new();
+        while self.total_bytes.saturating_add(incoming) > self.max_bytes {
+            let Some(oldest) = self.lru.first().copied() else {
+                break;
+            };
+            if self.remove(&oldest) {
+                evicted.push(oldest);
+            }
+        }
+        evicted
+    }
 }
 
-/// Prefix lookup trait for integration with runtime
 pub trait PrefixLookup {
     fn lookup(&mut self, key: &PrefixKey) -> Option<PrefixFingerprint>;
     fn insert(&mut self, key: PrefixKey, size: usize) -> Result<(), String>;
     fn stats(&self) -> CacheStats;
 }
 
-/// Cache statistics
-#[derive(Debug, Clone, Default)]
-pub struct CacheStats {
-    /// Total number of entries in cache
-    pub total_entries: usize,
-    /// Total bytes used by cache
-    pub total_bytes: usize,
-    /// Maximum cache size in bytes
-    pub max_bytes: usize,
-    /// Total number of lookups performed
-    pub total_lookups: usize,
-    /// Total number of cache hits
-    pub total_hits: u64,
-    /// Total number of cache misses
-    pub total_misses: u64,
-    /// Cache hit rate (0.0 to 1.0)
-    pub hit_rate: f64,
+impl PrefixLookup for PrefixIndex {
+    fn lookup(&mut self, key: &PrefixKey) -> Option<PrefixFingerprint> {
+        PrefixIndex::lookup(self, key)
+    }
+
+    fn insert(&mut self, key: PrefixKey, size: usize) -> Result<(), String> {
+        PrefixIndex::insert(self, key, size)
+    }
+
+    fn stats(&self) -> CacheStats {
+        PrefixIndex::stats(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prefix::{ModelFingerprint, StateSchemaFingerprint, TokenizerFingerprint, PlanFingerprint};
+    use crate::prefix::{
+        ModelFingerprint, PlanFingerprint, StateSchemaFingerprint, TokenizerFingerprint,
+    };
 
-    fn create_fingerprint(id: u8, prefix_len: usize) -> PrefixFingerprint {
-        PrefixFingerprint::new(
+    fn key(id: u8, tokens: &[u32]) -> PrefixKey {
+        PrefixKey::new(
             ModelFingerprint { digest: [id; 32] },
-            StateSchemaFingerprint { digest: [(id + 1) as u8; 32] },
-            TokenizerFingerprint { digest: [(id + 2) as u8; 32] },
-            PlanFingerprint { digest: [(id + 3) as u8; 32] },
-            0xabc123,
-            prefix_len,
+            StateSchemaFingerprint { digest: [2; 32] },
+            TokenizerFingerprint { digest: [3; 32] },
+            PlanFingerprint { digest: [4; 32] },
+            tokens.to_vec(),
         )
     }
 
     #[test]
-    fn test_prefix_index_insert_lookup() {
+    fn lookup_returns_longest_actual_token_prefix() {
         let mut index = PrefixIndex::new(1024);
-
-        // Insert entries
-        let key1 = PrefixKey {
-            model_fingerprint: ModelFingerprint { digest: [1; 32] },
-            state_schema_fingerprint: StateSchemaFingerprint { digest: [2; 32] },
-            tokenizer_fingerprint: TokenizerFingerprint { digest: [3; 32] },
-            plan_fingerprint: PlanFingerprint { digest: [4; 32] },
-            prefix_token_hash: 0xabc123,
-            prefix_len: 100,
-        };
-
-        let metadata = PrefixMetadata {
-            size: 500,
-            last_access: 0,
-            last_update: 0,
-            hits: 0,
-            misses: 0,
-        };
-
-        let result = index.insert(key1.clone(), metadata);
-        assert!(result.is_ok());
-
-        // Lookup existing entry
-        let result = index.lookup(&key1);
-        assert!(result.is_some());
-
-        // Lookup non-existent entry
-        let key2 = PrefixKey {
-            model_fingerprint: ModelFingerprint { digest: [5; 32] },
-            state_schema_fingerprint: StateSchemaFingerprint { digest: [6; 32] },
-            tokenizer_fingerprint: TokenizerFingerprint { digest: [7; 32] },
-            plan_fingerprint: PlanFingerprint { digest: [8; 32] },
-            prefix_token_hash: 0xdef456,
-            prefix_len: 200,
-        };
-
-        let result = index.lookup(&key2);
-        assert!(result.is_none());
+        index.insert(key(1, &[1, 2]), 100).unwrap();
+        index.insert(key(1, &[1, 2, 3]), 100).unwrap();
+        let hit = index.lookup(&key(1, &[1, 2, 3, 4])).unwrap();
+        assert_eq!(hit.prefix_len, 3);
+        assert_eq!(index.stats().total_hits, 1);
     }
 
     #[test]
-    fn test_prefix_index_eviction() {
-        let mut index = PrefixIndex::new(30);
-
-        // Insert small entries until we reach capacity
-        for i in 0..5 {
-            let key = PrefixKey {
-                model_fingerprint: ModelFingerprint { digest: [i as u8; 32] },
-                state_schema_fingerprint: StateSchemaFingerprint { digest: [(i + 1) as u8; 32] },
-                tokenizer_fingerprint: TokenizerFingerprint { digest: [(i + 2) as u8; 32] },
-                plan_fingerprint: PlanFingerprint { digest: [(i + 3) as u8; 32] },
-                prefix_token_hash: i as u64 * 0xabc123,
-                prefix_len: 10,
-            };
-
-            let metadata = PrefixMetadata {
-                size: i + 10, // 10, 11, 12, 13, 14 bytes
-                last_access: i as u64,
-                last_update: i as u64,
-                hits: 0,
-                misses: 0,
-            };
-
-            let result = index.insert(key, metadata);
-            assert!(result.is_ok());
-        }
-
-        // Should have evicted earliest entries
-        assert!(index.stats().total_entries <= 3); // May have fewer due to capacity
-        assert!(index.stats().total_bytes <= 100);
+    fn mismatch_counts_as_miss() {
+        let mut index = PrefixIndex::new(1024);
+        index.insert(key(1, &[1, 2]), 100).unwrap();
+        assert!(index.lookup(&key(2, &[1, 2, 3])).is_none());
+        assert_eq!(index.stats().total_misses, 1);
     }
 
     #[test]
-    fn test_prefix_compatibility() {
-        let a = create_fingerprint(1, 100);
-        let b = create_fingerprint(1, 200); // Same prefix hash, different length
-        let c = create_fingerprint(2, 100); // Different model
+    fn oversized_insert_fails_without_underflow() {
+        let mut index = PrefixIndex::new(32);
+        assert!(index.insert(key(1, &[1]), 64).is_err());
+        assert_eq!(index.stats().total_bytes, 0);
+    }
 
-        assert!(a.is_compatible_prefix(&b));
-        assert!(!a.is_compatible_with(&b));
-        assert!(!a.is_compatible_prefix(&c));
-        assert!(!a.is_compatible_with(&c));
+    #[test]
+    fn eviction_is_lru() {
+        let mut index = PrefixIndex::new(20);
+        let a = key(1, &[1]);
+        let b = key(1, &[2]);
+        let c = key(1, &[3]);
+        index.insert(a.clone(), 10).unwrap();
+        index.insert(b.clone(), 10).unwrap();
+        assert!(index.lookup(&a).is_some());
+        index.insert(c, 10).unwrap();
+        assert!(index.lookup(&b).is_none());
     }
 }

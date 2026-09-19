@@ -27,7 +27,6 @@
 //! Nothing here advertises a path it did not take: `matmul` returns without
 //! touching a kernel unless the corresponding probe passed.
 
-
 /// BF16 dot: y[o] = x[.] · w[o,.], weights BF16 (u16<<16 = f32).
 /// 4-lane NEON fma; fp-order differs from scalar (the gate decides).
 #[cfg(target_arch = "aarch64")]
@@ -296,6 +295,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn bf16_round_trip() {
         for v in [0.0f32, 1.0, -1.0, 0.5, 3.14159, 1e-5, 1e5] {
             let u = f32_to_bf16(v);
@@ -334,7 +334,16 @@ mod tests {
             .flat_map(|&v| bf16_bytes(v))
             .collect();
         let mut y = [0.0f32; 1];
-        matmul(&mut y, &x, &Wt { f: vec![], bytes: Some(w), o: 1, i: 3 });
+        matmul(
+            &mut y,
+            &x,
+            &Wt {
+                f: vec![],
+                bytes: Some(w),
+                o: 1,
+                i: 3,
+            },
+        );
         // 1*1 + 2*0.5 + 3*2 = 8 (bf16 rounding ~1e-3)
         assert!((y[0] - 8.0).abs() < 0.01);
     }
@@ -342,7 +351,12 @@ mod tests {
     #[test]
     fn matmul_f32_path() {
         let x = [1.0f32, 2.0];
-        let w = Wt { f: vec![1.0, 0.0, 0.0, 1.0], bytes: None, o: 2, i: 2 };
+        let w = Wt {
+            f: vec![1.0, 0.0, 0.0, 1.0],
+            bytes: None,
+            o: 2,
+            i: 2,
+        };
         let mut y = [0.0f32; 2];
         matmul(&mut y, &x, &w);
         assert_eq!(y, [1.0, 2.0]);
@@ -422,7 +436,12 @@ mod tests {
             matmul(
                 &mut got,
                 &x,
-                &Wt { f: vec![], bytes: Some(bfw.clone()), o, i },
+                &Wt {
+                    f: vec![],
+                    bytes: Some(bfw.clone()),
+                    o,
+                    i,
+                },
             );
             scalar_bf16(&mut want, &x, &bfw, o, i);
             assert_close(&got, &want, &format!("bf16 {o}x{i}"));
@@ -433,7 +452,12 @@ mod tests {
             matmul(
                 &mut gotf,
                 &x,
-                &Wt { f: f32w.clone(), bytes: None, o, i },
+                &Wt {
+                    f: f32w.clone(),
+                    bytes: None,
+                    o,
+                    i,
+                },
             );
             scalar_f32(&mut wantf, &x, &f32w, o, i);
             assert_close(&gotf, &wantf, &format!("f32 {o}x{i}"));
@@ -471,7 +495,16 @@ mod tests {
 
             let before = crate::math_x86::bf16_calls();
             let mut got = vec![0.0f32; o];
-            matmul(&mut got, &x, &Wt { f: vec![], bytes: Some(bfw.clone()), o, i });
+            matmul(
+                &mut got,
+                &x,
+                &Wt {
+                    f: vec![],
+                    bytes: Some(bfw.clone()),
+                    o,
+                    i,
+                },
+            );
             let calls = crate::math_x86::bf16_calls() - before;
             assert!(
                 calls > 0,
@@ -517,7 +550,11 @@ mod tests {
     /// ~100x this bound.
     #[cfg(target_arch = "x86_64")]
     fn assert_close(got: &[f32], want: &[f32], what: &str) {
-        let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+        let scale = want
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-30);
         let bound = 1e-5 * scale;
         for (k, (g, w)) in got.iter().zip(want).enumerate() {
             let d = (g - w).abs();
@@ -547,7 +584,16 @@ mod tests {
 
         let mut got = vec![0.0f32; o];
         let mut want = vec![0.0f32; o];
-        matmul(&mut got, &x, &Wt { f: vec![], bytes: Some(bfw.clone()), o, i });
+        matmul(
+            &mut got,
+            &x,
+            &Wt {
+                f: vec![],
+                bytes: Some(bfw.clone()),
+                o,
+                i,
+            },
+        );
         scalar_bf16(&mut want, &x, &bfw, o, i);
         assert_eq!(
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -557,7 +603,16 @@ mod tests {
 
         let mut gotf = vec![0.0f32; o];
         let mut wantf = vec![0.0f32; o];
-        matmul(&mut gotf, &x, &Wt { f: f32w.clone(), bytes: None, o, i });
+        matmul(
+            &mut gotf,
+            &x,
+            &Wt {
+                f: f32w.clone(),
+                bytes: None,
+                o,
+                i,
+            },
+        );
         scalar_f32(&mut wantf, &x, &f32w, o, i);
         assert_eq!(
             gotf.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

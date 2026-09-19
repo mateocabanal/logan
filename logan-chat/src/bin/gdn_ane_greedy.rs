@@ -1,6 +1,6 @@
 use std::{path::Path, time::Instant};
 
-use logan_qwen4::{colisource::ColiSource, load_cfg, Model};
+use logan_qwen4::{Model, colisource::ColiSource, load_cfg};
 use tokenizers::Tokenizer;
 
 fn argmax(values: &[f32]) -> Result<u32, String> {

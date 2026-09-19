@@ -482,7 +482,11 @@ fn generate_from_logits(
 ///
 /// Requires a drafter to be attached (`model.mtp_enabled()`); callers decide
 /// whether to take this path or plain decode.
-pub fn run_greedy_mtp(model: &mut Model, prompt: &[u32], max_new: usize) -> Result<Vec<u32>, String> {
+pub fn run_greedy_mtp(
+    model: &mut Model,
+    prompt: &[u32],
+    max_new: usize,
+) -> Result<Vec<u32>, String> {
     if prompt.is_empty() || max_new == 0 {
         return Ok(Vec::new());
     }

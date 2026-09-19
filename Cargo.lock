@@ -967,11 +967,13 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "libc",
+ "logan-core",
  "logan-llama",
  "logan-qwen4",
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers",
 ]
 
@@ -994,8 +996,11 @@ dependencies = [
 name = "logan-core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "hex",
  "logan-ir",
  "serde",
+ "sha2",
 ]
 
 [[package]]
@@ -1019,9 +1024,11 @@ name = "logan-llama"
 version = "0.1.0"
 dependencies = [
  "logan-ane",
+ "logan-core",
  "logan-metal",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

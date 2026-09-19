@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn test_page_pin_unpin() {
         let mut page = StatePage::new(PageId::new(0, 0), 64, 1);
-        assert!(!page.is_evictable()); // refs=1, but pinned=false so evictable
+        assert!(page.is_evictable());
         page.pin();
         assert!(!page.is_evictable());
         page.unpin();

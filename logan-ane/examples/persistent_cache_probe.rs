@@ -21,7 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model.evaluate(&request)?;
         let got = output.read_f32()?;
         assert!(got.iter().zip(&values).all(|(&a, &b)| a == b.max(0.0)));
-        println!("reuse={reuse} native_cache_hit={} exact_relu=true", model.native_cache_hit());
+        println!(
+            "reuse={reuse} native_cache_hit={} exact_relu=true",
+            model.native_cache_hit()
+        );
     }
     Ok(())
 }

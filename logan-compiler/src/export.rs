@@ -1689,6 +1689,7 @@ mod tests {
     /// The block scale must actually be multiplied in.
     ///
     /// This is the failure that would be invisible: a block-scaled FP8
+    #[allow(clippy::erasing_op)]
     /// checkpoint's stored values are per-block normalized, so dropping the
     /// scale yields a well-formed file whose weights are all wrong by a
     /// per-block factor. Asserted through the real decode path rather than by
