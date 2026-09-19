@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -19,16 +20,105 @@ use logan_chat::engine::{
 };
 use logan_chat::openai::{
     ApiMessage, ChatCompletionRequest, ResponsesRequest, normalize_chat_messages,
-    normalize_responses_input, render_qwen_prompt, settings_from_chat, settings_from_responses,
+    normalize_responses_input, settings_from_chat, settings_from_responses,
 };
+use logan_chat::runtime::{self, ModelFamily};
 use logan_qwen4::plan::{PrefixCacheStore, RuntimeFeatures, RuntimeStats};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_stream::wrappers::ReceiverStream;
 
-const DASHBOARD: &str = include_str!("../dashboard.html");
+const DASHBOARD: &str = include_str!("dashboard.html");
 const DEFAULT_PORT: u16 = 11435;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are an effective, careful assistant. Infer intent from the conversation, complete authorized work, and communicate directly. Ask only when missing information materially changes the result.";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelSettings {
+    system_prompt: String,
+    max_new: usize,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    repeat_penalty: f32,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
+            max_new: 256,
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            repeat_penalty: 1.0,
+        }
+    }
+}
+
+impl ModelSettings {
+    fn generation(&self) -> GenerationSettings {
+        GenerationSettings {
+            max_new: self.max_new,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            repeat_penalty: self.repeat_penalty,
+        }
+    }
+}
+
+struct SettingsStore {
+    path: PathBuf,
+    models: HashMap<String, ModelSettings>,
+}
+
+impl SettingsStore {
+    fn load(path: PathBuf) -> Self {
+        let models = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        Self { path, models }
+    }
+
+    fn get(&self, path: &Path) -> ModelSettings {
+        self.models
+            .get(&path.display().to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set(&mut self, path: &Path, settings: ModelSettings) -> Result<(), String> {
+        self.models.insert(path.display().to_string(), settings);
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "settings path has no parent".to_string())?;
+        fs::create_dir_all(parent).map_err(|e| format!("create settings directory: {e}"))?;
+        let temporary = self.path.with_extension("json.tmp");
+        let body = serde_json::to_vec_pretty(&self.models)
+            .map_err(|e| format!("encode model settings: {e}"))?;
+        fs::write(&temporary, body).map_err(|e| format!("write model settings: {e}"))?;
+        fs::rename(&temporary, &self.path).map_err(|e| format!("publish model settings: {e}"))
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelJob {
+    id: String,
+    kind: String,
+    status: String,
+    phase: String,
+    repo_id: Option<String>,
+    source: Option<String>,
+    output: Option<String>,
+    message: Option<String>,
+    error: Option<String>,
+    started_at_ms: u128,
+    updated_at_ms: u128,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -37,13 +127,15 @@ struct AppState {
     model_root: PathBuf,
     responses: Arc<Mutex<HashMap<String, Vec<ApiMessage>>>>,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
+    settings: Arc<Mutex<SettingsStore>>,
+    jobs: Arc<Mutex<Vec<ModelJob>>>,
 }
 
 #[derive(Clone, Debug)]
 enum Control {
     Load {
         package: PathBuf,
-        system_prompt: String,
+        settings: ModelSettings,
     },
     Unload,
     Generate {
@@ -69,8 +161,8 @@ struct ModelView {
     name: String,
     path: String,
     context_limit: usize,
+    settings: ModelSettings,
 }
-
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PerformanceView {
@@ -288,6 +380,7 @@ struct ModelCandidate {
     name: String,
     path: String,
     size_bytes: u64,
+    settings: ModelSettings,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +407,42 @@ struct ResetRequest {
     system_prompt: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSettingsRequest {
+    path: String,
+    system_prompt: Option<String>,
+    max_new: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadRequest {
+    repo_id: String,
+    destination: Option<String>,
+    revision: Option<String>,
+    include: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuantizeRequest {
+    source: String,
+    output: String,
+    max_context: Option<usize>,
+    target: Option<String>,
+    quant: Option<String>,
+    quant_floor: Option<String>,
+    codec: Option<String>,
+    optimization: Option<String>,
+    verify: Option<bool>,
+    force: Option<bool>,
+}
+
 #[tokio::main]
 async fn main() {
     let (host, port, model_root) = match parse_args() {
@@ -330,6 +459,8 @@ async fn main() {
         .unwrap_or_default();
     let snapshot = Arc::new(Mutex::new(DaemonSnapshot::idle(cache_dir)));
     let logs = Arc::new(Mutex::new(VecDeque::new()));
+    let settings = Arc::new(Mutex::new(SettingsStore::load(settings_file_path())));
+    let jobs = Arc::new(Mutex::new(Vec::new()));
     push_log(&logs, "info", "daemon", "logand starting");
     let (control_tx, control_rx) = mpsc::channel();
     spawn_supervisor(Arc::clone(&snapshot), Arc::clone(&logs), control_rx);
@@ -340,6 +471,8 @@ async fn main() {
         model_root,
         responses: Arc::new(Mutex::new(HashMap::new())),
         logs,
+        settings,
+        jobs,
     };
 
     let app = Router::new()
@@ -351,8 +484,12 @@ async fn main() {
         .route("/api/state", get(api_state))
         .route("/api/logs", get(api_logs))
         .route("/api/models", get(api_models))
+        .route("/api/jobs", get(api_jobs))
         .route("/api/model/load", post(api_load_model))
         .route("/api/model/unload", post(api_unload_model))
+        .route("/api/model/settings", post(api_save_settings))
+        .route("/api/models/download", post(api_download_model))
+        .route("/api/models/quantize", post(api_quantize_model))
         .route("/api/generate", post(api_generate))
         .route("/api/cancel", post(api_cancel))
         .route("/api/reset", post(api_reset))
@@ -437,11 +574,11 @@ async fn chat_completions(
         Ok(messages) => messages,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, "invalid_request_error"),
     };
-    let prompt = match render_qwen_prompt(&messages, None) {
+    let prompt = match render_loaded_prompt(&state, &messages, None) {
         Ok(prompt) => prompt,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, "invalid_request_error"),
     };
-    let settings = match settings_from_chat(&request) {
+    let settings = match chat_generation_settings(&state, &request) {
         Ok(settings) => settings,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, "invalid_request_error"),
     };
@@ -509,7 +646,7 @@ async fn responses_create(
         Ok(model) => model,
         Err(response) => return response,
     };
-    let settings = match settings_from_responses(&request) {
+    let settings = match responses_generation_settings(&state, &request) {
         Ok(settings) => settings,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, "invalid_request_error"),
     };
@@ -542,7 +679,7 @@ async fn responses_create(
         );
     }
     history.extend(new_input);
-    let prompt = match render_qwen_prompt(&history, request.instructions.as_deref()) {
+    let prompt = match render_loaded_prompt(&state, &history, request.instructions.as_deref()) {
         Ok(prompt) => prompt,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, "invalid_request_error"),
     };
@@ -616,6 +753,88 @@ fn queue_completion(
             )
         })?;
     Ok(updates_rx)
+}
+
+fn loaded_model_settings(state: &AppState) -> ModelSettings {
+    state
+        .snapshot
+        .lock()
+        .unwrap()
+        .model
+        .as_ref()
+        .map(|model| model.settings.clone())
+        .unwrap_or_default()
+}
+
+fn chat_generation_settings(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+) -> Result<GenerationSettings, String> {
+    let parsed = settings_from_chat(request)?;
+    let defaults = loaded_model_settings(state);
+    let mut settings = defaults.generation();
+    if request.max_completion_tokens.is_some() || request.max_tokens.is_some() {
+        settings.max_new = parsed.max_new;
+    }
+    if request.temperature.is_some() {
+        settings.temperature = parsed.temperature;
+    }
+    if request.top_p.is_some() {
+        settings.top_p = parsed.top_p;
+    }
+    if request.top_k.is_some() {
+        settings.top_k = parsed.top_k;
+    }
+    Ok(settings)
+}
+
+fn responses_generation_settings(
+    state: &AppState,
+    request: &ResponsesRequest,
+) -> Result<GenerationSettings, String> {
+    let parsed = settings_from_responses(request)?;
+    let defaults = loaded_model_settings(state);
+    let mut settings = defaults.generation();
+    if request.max_output_tokens.is_some() {
+        settings.max_new = parsed.max_new;
+    }
+    if request.temperature.is_some() {
+        settings.temperature = parsed.temperature;
+    }
+    if request.top_p.is_some() {
+        settings.top_p = parsed.top_p;
+    }
+    if request.top_k.is_some() {
+        settings.top_k = parsed.top_k;
+    }
+    Ok(settings)
+}
+
+fn render_loaded_prompt(
+    state: &AppState,
+    messages: &[ApiMessage],
+    instructions: Option<&str>,
+) -> Result<String, String> {
+    let (family, default_system) = {
+        let snapshot = state.snapshot.lock().unwrap();
+        let Some(model) = snapshot.model.as_ref() else {
+            return Err("no Logan model is loaded".into());
+        };
+        let config = Path::new(&model.path).join("config.json");
+        let family = if logan_llama::load_config(config).is_ok() {
+            ModelFamily::MiniCpm5
+        } else {
+            ModelFamily::Qwen4
+        };
+        (family, model.settings.system_prompt.clone())
+    };
+    let instructions = instructions
+        .or_else(|| (family == ModelFamily::MiniCpm5).then_some(default_system.as_str()));
+    runtime::render_prompt(
+        &runtime::PromptAdapter::for_family(family),
+        messages,
+        instructions,
+    )
 }
 
 async fn wait_completion(
@@ -1095,7 +1314,19 @@ async fn api_logs(State(state): State<AppState>) -> Json<Vec<LogEntry>> {
 }
 
 async fn api_models(State(state): State<AppState>) -> Json<Vec<ModelCandidate>> {
-    Json(discover_models(&state.model_root))
+    let settings = state.settings.lock().unwrap();
+    let models = discover_models(&state.model_root)
+        .into_iter()
+        .map(|mut model| {
+            model.settings = settings.get(Path::new(&model.path));
+            model
+        })
+        .collect();
+    Json(models)
+}
+
+async fn api_jobs(State(state): State<AppState>) -> Json<Vec<ModelJob>> {
+    Json(state.jobs.lock().unwrap().clone())
 }
 
 async fn api_load_model(
@@ -1113,18 +1344,83 @@ async fn api_load_model(
             ),
         );
     }
-    let system_prompt = req
-        .system_prompt
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    send_control(
-        &state,
-        Control::Load {
-            package,
-            system_prompt,
-        },
-        "loading model",
+    let mut settings = state.settings.lock().unwrap().get(&package);
+    if let Some(system_prompt) = req.system_prompt.filter(|v| !v.trim().is_empty()) {
+        settings.system_prompt = system_prompt;
+    }
+    send_control(&state, Control::Load { package, settings }, "loading model")
+}
+async fn api_save_settings(
+    State(state): State<AppState>,
+    Json(req): Json<SaveSettingsRequest>,
+) -> impl IntoResponse {
+    let package = expand_home(&req.path);
+    if !is_loadable_model(&package) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "settings target is not a loadable model",
+        );
+    }
+    let mut settings = state.settings.lock().unwrap().get(&package);
+    if let Some(value) = req.system_prompt.filter(|v| !v.trim().is_empty()) {
+        settings.system_prompt = value;
+    }
+    if let Some(value) = req.max_new {
+        settings.max_new = value.clamp(1, 65_536);
+    }
+    if let Some(value) = req.temperature {
+        if !(0.0..=2.0).contains(&value) {
+            return api_error(StatusCode::BAD_REQUEST, "temperature must be in 0..=2");
+        }
+        settings.temperature = value;
+    }
+    if let Some(value) = req.top_p {
+        if !(0.01..=1.0).contains(&value) {
+            return api_error(StatusCode::BAD_REQUEST, "top-p must be in 0.01..=1");
+        }
+        settings.top_p = value;
+    }
+    if let Some(value) = req.top_k {
+        settings.top_k = value;
+    }
+    if let Some(value) = req.repeat_penalty {
+        if !(1.0..=2.0).contains(&value) {
+            return api_error(StatusCode::BAD_REQUEST, "repeat penalty must be in 1..=2");
+        }
+        settings.repeat_penalty = value;
+    }
+    if let Err(error) = state
+        .settings
+        .lock()
+        .unwrap()
+        .set(&package, settings.clone())
+    {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+
+    let mut reset = false;
+    {
+        let mut snapshot = state.snapshot.lock().unwrap();
+        if let Some(model) = snapshot.model.as_mut() {
+            if model.path == package.display().to_string() {
+                reset = model.settings.system_prompt != settings.system_prompt;
+                model.settings = settings.clone();
+            }
+        }
+    }
+    if reset {
+        let _ = state.control.send(Control::Reset {
+            system_prompt: Some(settings.system_prompt.clone()),
+        });
+    }
+    (
+        StatusCode::OK,
+        Json(ApiReply {
+            ok: true,
+            message: "model settings saved".into(),
+        }),
     )
+        .into_response()
 }
 
 async fn api_unload_model(State(state): State<AppState>) -> impl IntoResponse {
@@ -1138,7 +1434,7 @@ async fn api_generate(
     if req.text.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "prompt is empty");
     }
-    let mut settings = GenerationSettings::default();
+    let mut settings = loaded_model_settings(&state).generation();
     if let Some(v) = req.max_new {
         settings.max_new = v.clamp(1, 8192);
     }
@@ -1187,6 +1483,402 @@ async fn api_clear_hot(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn api_clear_cold(State(state): State<AppState>) -> impl IntoResponse {
     send_control(&state, Control::ClearCold, "cold cache clear requested")
+}
+fn settings_file_path() -> PathBuf {
+    std::env::var_os("LOGAN_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join("Library/Application Support/Logan"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".logan"))
+        .join("model-settings.json")
+}
+
+fn repo_leaf(repo_id: &str) -> Option<&str> {
+    let mut parts = repo_id.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some()
+        || owner.is_empty()
+        || name.is_empty()
+        || matches!(owner, "." | "..")
+        || matches!(name, "." | "..")
+        || !owner
+            .chars()
+            .chain(name.chars())
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn safe_model_path(root: &Path, raw: Option<&str>, default_name: &str) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(root).map_err(|e| format!("model root is unavailable: {e}"))?;
+    if raw.is_some_and(|value| value.trim().is_empty()) {
+        return Err("model path must not be empty".into());
+    }
+    let raw = raw.filter(|value| !value.trim().is_empty());
+
+    let candidate = match raw {
+        Some(value) => {
+            let value = expand_home(value);
+            if value.is_absolute() {
+                value
+            } else {
+                root.join(value)
+            }
+        }
+        None => root.join(default_name),
+    };
+    let resolved = if candidate.exists() {
+        fs::canonicalize(&candidate).map_err(|e| format!("resolve model path: {e}"))?
+    } else {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| "model path has no parent".to_string())?;
+        let parent = fs::canonicalize(parent)
+            .map_err(|e| format!("model path parent is unavailable: {e}"))?;
+        parent.join(
+            candidate
+                .file_name()
+                .ok_or_else(|| "model path has no filename".to_string())?,
+        )
+    };
+    if !resolved.starts_with(&root) {
+        return Err(format!("model path must remain inside {}", root.display()));
+    }
+    Ok(resolved)
+}
+
+fn resolve_tool(name: &str) -> Result<PathBuf, String> {
+    if name == "logan" {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(path) = exe.parent().map(|parent| parent.join(name)) {
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|path| path.join(name))
+        .find(|path| path.is_file())
+    {
+        return Ok(path);
+    }
+    if name == "hf" {
+        for path in [
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/hf")),
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pyenv/shims/hf")),
+            Some(PathBuf::from("/opt/homebrew/bin/hf")),
+            Some(PathBuf::from("/usr/local/bin/hf")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!(
+        "could not find `{name}`; install it or put it on the daemon PATH"
+    ))
+}
+
+fn output_tail(output: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut lines = text.lines().rev().take(12).collect::<Vec<_>>();
+    lines.reverse();
+    let text = lines.join("\n");
+    if text.len() > 2_000 {
+        text.chars()
+            .rev()
+            .take(2_000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect()
+    } else {
+        text
+    }
+}
+
+fn push_job(jobs: &Arc<Mutex<Vec<ModelJob>>>, job: ModelJob) {
+    let mut jobs = jobs.lock().unwrap();
+    jobs.push(job);
+    if jobs.len() > 32 {
+        let remove = jobs
+            .iter()
+            .position(|job| job.status == "completed" || job.status == "failed");
+        if let Some(index) = remove {
+            jobs.remove(index);
+        }
+    }
+}
+
+fn update_job(
+    jobs: &Arc<Mutex<Vec<ModelJob>>>,
+    id: &str,
+    status: &str,
+    phase: &str,
+    message: Option<String>,
+    error: Option<String>,
+) {
+    if let Some(job) = jobs.lock().unwrap().iter_mut().find(|job| job.id == id) {
+        job.status = status.into();
+        job.phase = phase.into();
+        job.message = message;
+        job.error = error;
+        job.updated_at_ms = now_ms();
+    }
+}
+
+async fn api_download_model(
+    State(state): State<AppState>,
+    Json(req): Json<DownloadRequest>,
+) -> impl IntoResponse {
+    let repo_id = req.repo_id.trim().to_string();
+    let Some(leaf) = repo_leaf(&repo_id) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "repoId must be an owner/name Hugging Face model id",
+        );
+    };
+    let destination = match safe_model_path(&state.model_root, req.destination.as_deref(), leaf) {
+        Ok(path) => path,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    let job = ModelJob {
+        id: new_id("download"),
+        kind: "download".into(),
+        status: "queued".into(),
+        phase: "Queued".into(),
+        repo_id: Some(repo_id.clone()),
+        source: None,
+        output: Some(destination.display().to_string()),
+        message: None,
+        error: None,
+        started_at_ms: now_ms(),
+        updated_at_ms: now_ms(),
+    };
+    let job_id = job.id.clone();
+    push_job(&state.jobs, job);
+    let jobs = Arc::clone(&state.jobs);
+    let revision = req.revision.filter(|value| !value.trim().is_empty());
+    let include = req.include.filter(|value| !value.trim().is_empty());
+    let thread_job_id = job_id.clone();
+    thread::spawn(move || {
+        let job_id = thread_job_id;
+        update_job(
+            &jobs,
+            &job_id,
+            "running",
+            "Downloading from Hugging Face",
+            None,
+            None,
+        );
+        let result = (|| {
+            let executable = resolve_tool("hf")?;
+            fs::create_dir_all(&destination)
+                .map_err(|e| format!("create download directory: {e}"))?;
+            let mut command = Command::new(executable);
+            command
+                .arg("download")
+                .arg(&repo_id)
+                .arg("--type")
+                .arg("model")
+                .arg("--local-dir")
+                .arg(&destination);
+            if let Some(revision) = revision {
+                command.arg("--revision").arg(revision);
+            }
+            if let Some(include) = include {
+                command.arg("--include").arg(include);
+            }
+            let output = command
+                .output()
+                .map_err(|e| format!("run hf download: {e}"))?;
+            if !output.status.success() {
+                return Err(format!("hf download failed: {}", output_tail(&output)));
+            }
+            Ok(output_tail(&output))
+        })();
+        match result {
+            Ok(message) => update_job(
+                &jobs,
+                &job_id,
+                "completed",
+                "Download complete",
+                Some(if message.is_empty() {
+                    "model downloaded".into()
+                } else {
+                    message
+                }),
+                None,
+            ),
+            Err(error) => update_job(
+                &jobs,
+                &job_id,
+                "failed",
+                "Download failed",
+                None,
+                Some(error),
+            ),
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"ok":true,"jobId":job_id,"message":"download queued"})),
+    )
+        .into_response()
+}
+
+async fn api_quantize_model(
+    State(state): State<AppState>,
+    Json(req): Json<QuantizeRequest>,
+) -> impl IntoResponse {
+    let source = match safe_model_path(&state.model_root, Some(&req.source), "") {
+        Ok(path) => path,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    if !source.is_dir() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "quantization source is not a directory",
+        );
+    }
+    let output = match safe_model_path(&state.model_root, Some(&req.output), "") {
+        Ok(path) => path,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    if source == output {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "quantization output must differ from source",
+        );
+    }
+    let max_context = req.max_context.unwrap_or(131_072).clamp(1, 1_000_000);
+    let target = req.target.unwrap_or_else(|| "native".into());
+    let quant = req.quant.unwrap_or_else(|| "exact".into());
+    let quant_floor = req.quant_floor.unwrap_or_else(|| "bf16".into());
+    let codec = req.codec.unwrap_or_else(|| "none".into());
+    let optimization = req.optimization.unwrap_or_else(|| "default".into());
+    for (label, value) in [
+        ("target", &target),
+        ("quant", &quant),
+        ("quantFloor", &quant_floor),
+        ("codec", &codec),
+        ("optimization", &optimization),
+    ] {
+        if value.is_empty()
+            || value.len() > 64
+            || !value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("{label} contains unsupported characters"),
+            );
+        }
+    }
+    let job = ModelJob {
+        id: new_id("quantize"),
+        kind: "quantize".into(),
+        status: "queued".into(),
+        phase: "Queued".into(),
+        repo_id: None,
+        source: Some(source.display().to_string()),
+        output: Some(output.display().to_string()),
+        message: None,
+        error: None,
+        started_at_ms: now_ms(),
+        updated_at_ms: now_ms(),
+    };
+    let job_id = job.id.clone();
+    push_job(&state.jobs, job);
+    let jobs = Arc::clone(&state.jobs);
+    let verify = req.verify.unwrap_or(true);
+    let force = req.force.unwrap_or(false);
+    let thread_job_id = job_id.clone();
+    thread::spawn(move || {
+        let job_id = thread_job_id;
+        update_job(
+            &jobs,
+            &job_id,
+            "running",
+            "Compiling and quantizing",
+            None,
+            None,
+        );
+        let result = (|| {
+            let executable = resolve_tool("logan")?;
+            let mut command = Command::new(executable);
+            command
+                .arg("compile")
+                .arg(&source)
+                .arg("--max-context")
+                .arg(max_context.to_string())
+                .arg("--target")
+                .arg(target)
+                .arg("--quant")
+                .arg(quant)
+                .arg("--quant-floor")
+                .arg(quant_floor)
+                .arg("--codec")
+                .arg(codec)
+                .arg("--opt")
+                .arg(optimization)
+                .arg("-o")
+                .arg(&output);
+            if verify {
+                command.arg("--verify");
+            }
+            if force {
+                command.arg("--force");
+            }
+            let output = command
+                .output()
+                .map_err(|e| format!("run Logan compiler: {e}"))?;
+            if !output.status.success() {
+                return Err(format!("Logan compile failed: {}", output_tail(&output)));
+            }
+            Ok(output_tail(&output))
+        })();
+        match result {
+            Ok(message) => update_job(
+                &jobs,
+                &job_id,
+                "completed",
+                "Quantization complete",
+                Some(if message.is_empty() {
+                    "model compiled".into()
+                } else {
+                    message
+                }),
+                None,
+            ),
+            Err(error) => update_job(
+                &jobs,
+                &job_id,
+                "failed",
+                "Quantization failed",
+                None,
+                Some(error),
+            ),
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"ok":true,"jobId":job_id,"message":"quantization queued"})),
+    )
+        .into_response()
 }
 
 fn send_control(
@@ -1246,10 +1938,7 @@ fn supervisor_loop(
     loop {
         while let Ok(control) = control_rx.try_recv() {
             match control {
-                Control::Load {
-                    package,
-                    system_prompt: new_system,
-                } => {
+                Control::Load { package, settings } => {
                     push_log(
                         &logs,
                         "info",
@@ -1259,7 +1948,7 @@ fn supervisor_loop(
                     if let Some(old) = handle.take() {
                         let _ = old.tx.send(EngineCommand::Shutdown);
                     }
-                    system_prompt = new_system;
+                    system_prompt = settings.system_prompt.clone();
                     loaded_path = Some(package.clone());
                     {
                         let mut s = snapshot.lock().unwrap();
@@ -1273,6 +1962,7 @@ fn supervisor_loop(
                                 .to_string(),
                             path: package.display().to_string(),
                             context_limit: 0,
+                            settings: settings.clone(),
                         });
                         s.performance = PerformanceView::default();
                         s.runtime = RuntimeView::default();
@@ -1492,6 +2182,11 @@ fn apply_engine_event(
                 "model",
                 format!("{model_name} ready; context={context_limit}"),
             );
+            let settings = s
+                .model
+                .as_ref()
+                .map(|model| model.settings.clone())
+                .unwrap_or_default();
             s.status = "ready".into();
             s.phase = "Model ready".into();
             s.model = Some(ModelView {
@@ -1501,6 +2196,7 @@ fn apply_engine_event(
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
                 context_limit,
+                settings,
             });
             s.performance.context_limit = context_limit;
             s.runtime.features = FeaturesView::from(&features);
@@ -1734,6 +2430,7 @@ fn discover_models_inner(path: &Path, depth: usize, out: &mut Vec<ModelCandidate
                 .to_string(),
             path: path.display().to_string(),
             size_bytes: directory_size(path),
+            settings: ModelSettings::default(),
         });
         return;
     }

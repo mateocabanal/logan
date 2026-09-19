@@ -1,0 +1,687 @@
+use std::path::PathBuf;
+
+use logan_ir::ContextConstraint;
+
+use crate::{
+    error::{ColicError, Result},
+    pipeline::{
+        CodecRequest, CompileRequest, OptimizationProfile, QuantFloor, QuantRequest, TargetRequest,
+    },
+    recompile::{
+        CodecMode as RecompileCodecMode, QuantMode as RecompileQuantMode, QuantRule,
+        RecompileRequest,
+    },
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    InspectSource {
+        source: PathBuf,
+    },
+    Verify {
+        package: PathBuf,
+    },
+    AttachMtp {
+        package: PathBuf,
+        drafter: PathBuf,
+    },
+    /// Quantize routed experts and emit portable safetensors, one file per
+    /// layer.
+    ExportExperts {
+        source: PathBuf,
+        /// Directory the per-layer files are written into.
+        output_dir: PathBuf,
+        /// Verify each emitted file by decoding it back after writing.
+        verify: bool,
+        /// Reuse layer files already complete in `output_dir`.
+        resume: bool,
+    },
+    Compile(CompileRequest),
+    Recompile(RecompileRequest),
+    Run {
+        package: std::path::PathBuf,
+        prompt: String,
+        max_new: usize,
+    },
+    Help,
+}
+
+pub const USAGE: &str = "Usage:\n  logan inspect-source MODEL_DIR\n  logan verify PACKAGE_DIR\n  logan attach-mtp PACKAGE_DIR DRAFTER_DIR\n  logan export-experts MODEL_DIR -o OUTPUT_DIR [--verify] [--resume]\n  logan run MODEL_OR_PACKAGE [--prompt \"TOKEN_IDS\"] [--max-new N]\n  logan compile MODEL_DIR (--max-context N | --require-context N) [--optimize [--plan-choice NAME|ID] [--calibration FILE]] --target auto|native|PROFILE --quant exact|PROFILE --quant-floor bf16|exact --codec none|auto|PROFILE --opt default|size|latency -o OUTPUT [--plan PLAN_PATH] [--dry-run] [--verify] [--force]\n  logan recompile PACKAGE_DIR (-o OUTPUT | --in-place) [--target source|auto|native|PROFILE] [--optimize (--max-context N | --require-context N) [--plan-choice NAME|ID] [--calibration FILE]] [--quant keep|mxfp4] [--quant-rule SELECTOR=keep|mxfp4]... [--codec keep|none] [--allow-requantize] [--repack] [--verify] [--force]";
+
+pub fn parse<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let Some(command) = args.next() else {
+        return Ok(Command::Help);
+    };
+    match command.as_str() {
+        "help" | "--help" | "-h" => Ok(Command::Help),
+        "inspect-source" => {
+            let source = args
+                .next()
+                .ok_or_else(|| ColicError::Usage("inspect-source requires MODEL_DIR".into()))?;
+            if args.next().is_some() {
+                return Err(ColicError::Usage(
+                    "inspect-source accepts exactly one MODEL_DIR".into(),
+                ));
+            }
+            Ok(Command::InspectSource {
+                source: PathBuf::from(source),
+            })
+        }
+        "compile" => parse_compile(args),
+        "export-experts" => parse_export_experts(args),
+        "recompile" => parse_recompile(args),
+        "attach-mtp" => {
+            let package = args.next().ok_or_else(|| {
+                ColicError::Usage("attach-mtp requires PACKAGE_DIR DRAFTER_DIR".into())
+            })?;
+            let drafter = args.next().ok_or_else(|| {
+                ColicError::Usage("attach-mtp requires PACKAGE_DIR DRAFTER_DIR".into())
+            })?;
+            if args.next().is_some() {
+                return Err(ColicError::Usage(
+                    "attach-mtp accepts exactly PACKAGE_DIR DRAFTER_DIR".into(),
+                ));
+            }
+            Ok(Command::AttachMtp {
+                package: PathBuf::from(package),
+                drafter: PathBuf::from(drafter),
+            })
+        }
+        "run" => {
+            let package = std::path::PathBuf::from(
+                args.next()
+                    .ok_or_else(|| ColicError::Usage("run requires PACKAGE_DIR".into()))?,
+            );
+            let mut prompt = String::from("1 2 3 4 5");
+            let mut max_new = 16;
+            let mut it = args;
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--prompt" => {
+                        prompt = it
+                            .next()
+                            .ok_or_else(|| ColicError::Usage("--prompt needs a value".into()))?
+                    }
+                    "--max-new" => {
+                        max_new = it
+                            .next()
+                            .ok_or_else(|| ColicError::Usage("--max-new needs a value".into()))?
+                            .parse()
+                            .map_err(|_| ColicError::Usage("--max-new must be a number".into()))?
+                    }
+                    other => return Err(ColicError::Usage(format!("unknown run flag {other}"))),
+                }
+            }
+            Ok(Command::Run {
+                package,
+                prompt,
+                max_new,
+            })
+        }
+        "verify" => {
+            let package = args
+                .next()
+                .ok_or_else(|| ColicError::Usage("verify requires PACKAGE_DIR".into()))?;
+            if args.next().is_some() {
+                return Err(ColicError::Usage(
+                    "verify accepts exactly one PACKAGE_DIR".into(),
+                ));
+            }
+            Ok(Command::Verify {
+                package: PathBuf::from(package),
+            })
+        }
+        other => Err(ColicError::Usage(format!("unknown command `{other}`"))),
+    }
+}
+
+fn parse_export_experts<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let source = args
+        .next()
+        .ok_or_else(|| ColicError::Usage("export-experts requires MODEL_DIR".into()))?;
+    let mut output: Option<PathBuf> = None;
+    let mut verify = false;
+    let mut resume = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-o" | "--output" => {
+                output = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    ColicError::Usage("export-experts -o requires a path".into())
+                })?));
+            }
+            "--verify" => verify = true,
+            // Reuses layer files already complete in the output directory.
+            // Off by default so a re-run reproduces the whole output.
+            "--resume" => resume = true,
+            other => {
+                return Err(ColicError::Usage(format!(
+                    "export-experts does not accept `{other}`"
+                )));
+            }
+        }
+    }
+    let output =
+        output.ok_or_else(|| ColicError::Usage("export-experts requires -o OUTPUT_DIR".into()))?;
+    Ok(Command::ExportExperts {
+        source: PathBuf::from(source),
+        output_dir: output,
+        verify,
+        resume,
+    })
+}
+
+fn parse_compile<I>(args: I) -> Result<Command>
+where
+    I: Iterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let source = PathBuf::from(
+        args.next()
+            .ok_or_else(|| ColicError::Usage("compile requires MODEL_DIR".into()))?,
+    );
+    let mut request = CompileRequest::new(source);
+    while let Some(flag) = args.next() {
+        let value = |args: &mut I, flag: &str| {
+            args.next()
+                .ok_or_else(|| ColicError::Usage(format!("{flag} requires a value")))
+        };
+        match flag.as_str() {
+            "--target" => request.target = TargetRequest::parse(&value(&mut args, "--target")?)?,
+            "--quant" => request.quant = QuantRequest::parse(&value(&mut args, "--quant")?)?,
+            "--quant-floor" => {
+                request.quant_floor = QuantFloor::parse(&value(&mut args, "--quant-floor")?)?
+            }
+            "--codec" => request.codec = CodecRequest::parse(&value(&mut args, "--codec")?)?,
+            "--opt" => {
+                request.optimization = OptimizationProfile::parse(&value(&mut args, "--opt")?)?;
+            }
+            "--optimize" => request.optimize = true,
+            "--plan-choice" => request.plan_choice = Some(value(&mut args, "--plan-choice")?),
+            "--calibration" => {
+                request.calibration = Some(PathBuf::from(value(&mut args, "--calibration")?))
+            }
+            "--max-context" => {
+                if request.context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                request.context = Some(ContextConstraint::maximum(parse_context_tokens(
+                    &value(&mut args, "--max-context")?,
+                    "--max-context",
+                )?));
+            }
+            "--require-context" => {
+                if request.context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                request.context = Some(ContextConstraint::required(parse_context_tokens(
+                    &value(&mut args, "--require-context")?,
+                    "--require-context",
+                )?));
+            }
+            "--plan" => request.plan = Some(PathBuf::from(value(&mut args, "--plan")?)),
+            "-o" | "--output" => {
+                request.output = Some(PathBuf::from(value(&mut args, "--output")?))
+            }
+            "--dry-run" => request.dry_run = true,
+            "--verify" => request.verify = true,
+            "--force" => request.force = true,
+            other => {
+                return Err(ColicError::Usage(format!(
+                    "unknown compile option `{other}`"
+                )));
+            }
+        }
+    }
+    if !request.dry_run && request.output.is_none() {
+        return Err(ColicError::Usage(
+            "compile requires -o/--output unless --dry-run is set".into(),
+        ));
+    }
+    if request.context.is_none() {
+        return Err(ColicError::Usage(
+            "compile requires exactly one of --max-context N or --require-context N".into(),
+        ));
+    }
+    if !request.optimize && (request.plan_choice.is_some() || request.calibration.is_some()) {
+        return Err(ColicError::Usage(
+            "--plan-choice and --calibration require --optimize".into(),
+        ));
+    }
+    Ok(Command::Compile(request))
+}
+
+fn parse_context_tokens(value: &str, flag: &str) -> Result<u64> {
+    let tokens = value
+        .parse::<u64>()
+        .map_err(|_| ColicError::Usage(format!("{flag} must be a positive integer")))?;
+    if tokens == 0 {
+        return Err(ColicError::Usage(format!(
+            "{flag} must be greater than zero"
+        )));
+    }
+    Ok(tokens)
+}
+
+fn parse_recompile<I>(args: I) -> Result<Command>
+where
+    I: Iterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let source = PathBuf::from(
+        args.next()
+            .ok_or_else(|| ColicError::Usage("recompile requires PACKAGE_DIR".into()))?,
+    );
+    let mut output = None;
+    let mut target = "source".to_owned();
+    let mut target_explicit = false;
+    let mut context = None;
+    let mut optimize = false;
+    let mut plan_choice = None;
+    let mut calibration = None;
+    let mut quant = RecompileQuantMode::Keep;
+    let mut quant_rules = Vec::new();
+    let mut codec = RecompileCodecMode::Keep;
+    let mut allow_requantize = false;
+    let mut repack = false;
+    let mut verify = false;
+    let mut force = false;
+    let mut in_place = false;
+
+    while let Some(flag) = args.next() {
+        let value = |args: &mut I, flag: &str| {
+            args.next()
+                .ok_or_else(|| ColicError::Usage(format!("{flag} requires a value")))
+        };
+        match flag.as_str() {
+            "-o" | "--output" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--target" => {
+                target = value(&mut args, "--target")?;
+                target_explicit = true;
+            }
+            "--optimize" => optimize = true,
+            "--plan-choice" => plan_choice = Some(value(&mut args, "--plan-choice")?),
+            "--calibration" => {
+                calibration = Some(PathBuf::from(value(&mut args, "--calibration")?))
+            }
+            "--max-context" => {
+                if context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                context = Some(ContextConstraint::maximum(parse_context_tokens(
+                    &value(&mut args, "--max-context")?,
+                    "--max-context",
+                )?));
+            }
+            "--require-context" => {
+                if context.is_some() {
+                    return Err(ColicError::Usage(
+                        "--max-context and --require-context are mutually exclusive".into(),
+                    ));
+                }
+                context = Some(ContextConstraint::required(parse_context_tokens(
+                    &value(&mut args, "--require-context")?,
+                    "--require-context",
+                )?));
+            }
+            "--quant" => quant = RecompileQuantMode::parse(&value(&mut args, "--quant")?)?,
+            "--quant-rule" => {
+                quant_rules.push(QuantRule::parse(&value(&mut args, "--quant-rule")?)?)
+            }
+            "--codec" => codec = RecompileCodecMode::parse(&value(&mut args, "--codec")?)?,
+            "--allow-requantize" => allow_requantize = true,
+            "--repack" => repack = true,
+            "--verify" => verify = true,
+            "--force" => force = true,
+            "--in-place" => in_place = true,
+            other => {
+                return Err(ColicError::Usage(format!(
+                    "unknown recompile option `{other}`"
+                )));
+            }
+        }
+    }
+
+    if optimize && context.is_none() {
+        return Err(ColicError::Usage(
+            "recompile --optimize requires exactly one of --max-context N or --require-context N"
+                .into(),
+        ));
+    }
+    if !optimize && context.is_some() {
+        return Err(ColicError::Usage(
+            "recompile context options require --optimize so they cannot be silently ignored"
+                .into(),
+        ));
+    }
+    if !optimize && (plan_choice.is_some() || calibration.is_some()) {
+        return Err(ColicError::Usage(
+            "recompile --plan-choice and --calibration require --optimize".into(),
+        ));
+    }
+    if optimize && !target_explicit {
+        target = "auto".to_owned();
+    }
+
+    if in_place && output.is_some() {
+        return Err(ColicError::Usage(
+            "recompile --in-place cannot be combined with -o/--output".into(),
+        ));
+    }
+    let output = if in_place {
+        source.clone()
+    } else {
+        output.ok_or_else(|| {
+            ColicError::Usage("recompile requires -o/--output or --in-place".into())
+        })?
+    };
+    Ok(Command::Recompile(RecompileRequest {
+        source,
+        output,
+        target,
+        quant,
+        quant_rules,
+        codec,
+        context,
+        optimize,
+        plan_choice,
+        calibration,
+        allow_requantize,
+        repack,
+        verify,
+        force: force || in_place,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_deterministic_compile_request() {
+        let command = parse(
+            [
+                "compile",
+                "fixture",
+                "--target",
+                "native",
+                "--quant",
+                "exact",
+                "--codec",
+                "none",
+                "--opt",
+                "latency",
+                "--max-context",
+                "65536",
+                "-o",
+                "out.coli",
+                "--verify",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Compile(request) = command else {
+            panic!("expected compile")
+        };
+        assert_eq!(request.target, TargetRequest::Native);
+        assert_eq!(request.quant, QuantRequest::Exact);
+        assert_eq!(request.codec, CodecRequest::None);
+        assert_eq!(request.optimization, OptimizationProfile::Latency);
+        assert_eq!(request.context, Some(ContextConstraint::maximum(65_536)));
+        assert!(request.verify);
+    }
+
+    #[test]
+    fn parses_recompile_request_with_explicit_requantization() {
+        let command = parse(
+            [
+                "recompile",
+                "old.coli",
+                "-o",
+                "new.coli",
+                "--target",
+                "macos-arm64-metal-apple8-v1",
+                "--quant",
+                "mxfp4",
+                "--codec",
+                "none",
+                "--allow-requantize",
+                "--repack",
+                "--verify",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(request) = command else {
+            panic!("expected recompile")
+        };
+        assert_eq!(request.source, PathBuf::from("old.coli"));
+        assert_eq!(request.output, PathBuf::from("new.coli"));
+        assert_eq!(request.target, "macos-arm64-metal-apple8-v1");
+        assert_eq!(request.quant, RecompileQuantMode::Mxfp4);
+        assert_eq!(request.codec, RecompileCodecMode::None);
+        assert!(request.allow_requantize);
+        assert!(request.repack);
+        assert!(request.verify);
+    }
+
+    #[test]
+    fn parses_mixed_quant_rules_and_in_place() {
+        let command = parse(
+            [
+                "recompile",
+                "model.coli",
+                "--in-place",
+                "--quant",
+                "keep",
+                "--quant-rule",
+                "layer:0-7=mxfp4",
+                "--quant-rule",
+                "expert:0=keep",
+                "--allow-requantize",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(request) = command else {
+            panic!("expected recompile")
+        };
+        assert_eq!(request.source, PathBuf::from("model.coli"));
+        assert_eq!(request.output, request.source);
+        assert_eq!(request.quant_rules.len(), 2);
+        assert!(request.allow_requantize);
+        assert!(request.force);
+    }
+
+    #[test]
+    fn parses_optimized_recompile_with_same_context_contract() {
+        let command = parse(
+            [
+                "recompile",
+                "model.coli",
+                "--in-place",
+                "--optimize",
+                "--require-context",
+                "131072",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(request) = command else {
+            panic!("expected recompile")
+        };
+        assert!(request.optimize);
+        assert_eq!(request.target, "auto");
+        assert_eq!(request.context, Some(ContextConstraint::required(131_072)));
+    }
+
+    #[test]
+    fn optimized_requests_parse_plan_choice_and_calibration() {
+        let compile = parse(
+            [
+                "compile",
+                "fixture",
+                "--optimize",
+                "--max-context",
+                "65536",
+                "--plan-choice",
+                "balanced",
+                "--calibration",
+                "scores.json",
+                "--dry-run",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Compile(compile) = compile else {
+            panic!("expected compile")
+        };
+        assert_eq!(compile.plan_choice.as_deref(), Some("balanced"));
+        assert_eq!(compile.calibration, Some(PathBuf::from("scores.json")));
+
+        let recompile = parse(
+            [
+                "recompile",
+                "model.coli",
+                "--in-place",
+                "--optimize",
+                "--require-context",
+                "32768",
+                "--plan-choice",
+                "p-0123456789abcdef",
+                "--calibration",
+                "scores.json",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Recompile(recompile) = recompile else {
+            panic!("expected recompile")
+        };
+        assert_eq!(recompile.plan_choice.as_deref(), Some("p-0123456789abcdef"));
+        assert_eq!(recompile.calibration, Some(PathBuf::from("scores.json")));
+    }
+
+    #[test]
+    fn compile_and_recompile_reject_ambiguous_context_constraints() {
+        assert!(
+            parse(
+                [
+                    "compile",
+                    "fixture",
+                    "--max-context",
+                    "32768",
+                    "--require-context",
+                    "65536",
+                    "--dry-run",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                [
+                    "recompile",
+                    "model.coli",
+                    "--in-place",
+                    "--optimize",
+                    "--max-context",
+                    "32768",
+                    "--require-context",
+                    "65536",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn optimized_recompile_requires_context() {
+        assert!(
+            parse(["recompile", "model.coli", "--in-place", "--optimize"].map(str::to_owned))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recompile_rejects_output_with_in_place() {
+        assert!(
+            parse(["recompile", "model.coli", "--in-place", "-o", "other.coli"].map(str::to_owned))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recompile_requires_an_output_argument() {
+        assert!(parse(["recompile", "old.coli"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn portable_target_is_rejected() {
+        assert!(
+            parse(
+                ["compile", "fixture", "--target", "portable-v1", "--dry-run"].map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_run_command() {
+        assert_eq!(
+            parse(
+                [
+                    "run",
+                    "spark.coli",
+                    "--prompt",
+                    "1 2 3 4 5",
+                    "--max-new",
+                    "4",
+                ]
+                .map(str::to_owned)
+            )
+            .unwrap(),
+            Command::Run {
+                package: PathBuf::from("spark.coli"),
+                prompt: "1 2 3 4 5".to_owned(),
+                max_new: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_attach_mtp_command() {
+        assert_eq!(
+            parse(["attach-mtp", "target.coli", "drafter"].map(str::to_owned)).unwrap(),
+            Command::AttachMtp {
+                package: PathBuf::from("target.coli"),
+                drafter: PathBuf::from("drafter"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_standalone_verify_command() {
+        assert_eq!(
+            parse(["verify", "package.coli"].map(str::to_owned)).unwrap(),
+            Command::Verify {
+                package: PathBuf::from("package.coli")
+            }
+        );
+    }
+}

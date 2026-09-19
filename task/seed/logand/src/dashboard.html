@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logan</title>
+<style>
+:root{color-scheme:dark;--bg:#0c0d0f;--panel:#14161a;--panel2:#191c21;--line:#272b33;--muted:#8d95a3;--text:#f2f4f7;--soft:#c8cdd6;--accent:#8fb5ff;--good:#7bd99a;--warn:#f1c77b;--bad:#ef8585;--radius:14px}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text",Inter,system-ui,sans-serif;background:var(--bg);color:var(--text)}button,input,textarea,select{font:inherit}.shell{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100vh}.sidebar{border-right:1px solid var(--line);padding:22px 16px;position:sticky;top:0;height:100vh;background:#0f1013}.brand{display:flex;align-items:center;gap:11px;font-weight:700;font-size:18px;padding:0 8px 22px}.mark{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:linear-gradient(145deg,#a9c7ff,#6d86ff);color:#0b1020;font-weight:900}.nav button{width:100%;text-align:left;background:none;border:0;color:var(--muted);padding:9px 10px;border-radius:9px;cursor:pointer;margin:2px 0}.nav button.active,.nav button:hover{background:#1a1d23;color:var(--text)}.sidefoot{position:absolute;left:16px;right:16px;bottom:18px;color:var(--muted);font-size:12px}.statusline{display:flex;align-items:center;gap:7px}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.dot.ready{background:var(--good);box-shadow:0 0 0 4px #7bd99a15}.dot.generating{background:var(--accent);box-shadow:0 0 0 4px #8fb5ff15}.dot.loading{background:var(--warn)}.dot.error{background:var(--bad)}main{padding:30px 34px 60px;max-width:1500px;width:100%}.topbar{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:26px}.topbar h1{font-size:25px;margin:0 0 5px;letter-spacing:-.02em}.subtitle{color:var(--muted)}.badge{border:1px solid var(--line);background:var(--panel);padding:7px 10px;border-radius:999px;color:var(--soft)}.grid{display:grid;gap:14px}.kpis{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:17px}.kpi .label,.eyebrow{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.kpi .value{font-size:27px;font-weight:650;letter-spacing:-.035em;margin-top:7px}.kpi .detail{color:var(--muted);font-size:12px;margin-top:3px}.two{grid-template-columns:minmax(0,1.25fr) minmax(330px,.75fr)}.section-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.section-title h2{font-size:15px;margin:0}.controls{display:flex;gap:8px;flex-wrap:wrap}button.primary,button.secondary,button.danger{border-radius:9px;padding:8px 12px;border:1px solid var(--line);cursor:pointer}button.primary{background:#e7edff;color:#121722;border-color:#e7edff;font-weight:650}button.secondary{background:#1a1d23;color:var(--text)}button.danger{background:#24191b;color:#ef9a9a;border-color:#4a292f}button:disabled{opacity:.45;cursor:not-allowed}.model-row{display:grid;grid-template-columns:1fr auto;gap:9px}select,input,textarea{width:100%;background:#0f1115;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 10px;outline:none}textarea{min-height:110px;resize:vertical}select:focus,input:focus,textarea:focus{border-color:#506482}.meta{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:14px}.meta .item{padding:10px 11px;background:#111318;border:1px solid #22262d;border-radius:10px}.meta .name{color:var(--muted);font-size:12px}.meta .val{margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cache-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.cachebox{background:#111318;border:1px solid #232730;border-radius:11px;padding:14px}.cachehead{display:flex;justify-content:space-between;align-items:center}.cachetype{font-weight:650}.cachehint{color:var(--muted);font-size:12px}.big{font-size:25px;font-weight:650;margin:12px 0 2px}.row{display:flex;justify-content:space-between;gap:16px;padding:7px 0;border-bottom:1px solid #22262c}.row:last-child{border-bottom:0}.row span:first-child{color:var(--muted)}.runtime{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.runtime .metric{background:#111318;border:1px solid #22262d;border-radius:10px;padding:10px}.runtime .metric b{display:block;font-size:16px;margin-top:3px}.runtime .metric span{color:var(--muted);font-size:12px}.feature-wrap{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px}.feature{font-size:11px;padding:5px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}.feature.on{color:#a7e9bb;border-color:#2f5940;background:#14251a}.chat-output{margin-top:12px;min-height:140px;max-height:360px;overflow:auto;background:#0f1115;border:1px solid var(--line);border-radius:10px;padding:14px;white-space:pre-wrap;color:#dfe4ed}.alert{display:none;margin-bottom:14px;padding:10px 12px;border-radius:10px;border:1px solid #5c3434;background:#241819;color:#efb0b0}.alert.show{display:block}.warn{border-color:#5c4c34;background:#241f18;color:#ead0a1}.tab{display:none}.tab.active{display:block}.footnote{color:var(--muted);font-size:12px;margin-top:10px}.path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;word-break:break-all}.progress{height:7px;background:#20232a;border-radius:999px;overflow:hidden;margin-top:8px}.progress>i{display:block;height:100%;width:0;background:#8fb5ff;transition:width .2s ease}.sparkline{height:54px;width:100%;margin-top:8px}canvas{width:100%;height:54px}.chat-layout{grid-template-columns:minmax(0,1fr) 370px;align-items:start}.conversation{min-height:440px;max-height:62vh;overflow:auto;padding:4px 2px 12px}.chat-empty{display:grid;place-items:center;min-height:420px;color:var(--muted);text-align:center}.message{max-width:86%;margin:10px 0;padding:12px 14px;border:1px solid var(--line);border-radius:13px;white-space:pre-wrap;word-break:break-word}.message.user{margin-left:auto;background:#1b2330;border-color:#293a52}.message.assistant{background:#111318}.message .who{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:6px}.message-meta{margin-top:9px;padding-top:8px;border-top:1px solid #272b33;color:var(--muted);font-size:11px}.composer{border-top:1px solid var(--line);padding-top:14px}.composer textarea{min-height:86px}.chat-settings{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}.chat-settings label{font-size:11px;color:var(--muted)}.chat-settings input{margin-top:4px;padding:7px 8px}.chat-actions{display:flex;justify-content:space-between;gap:8px;align-items:center}.chat-actions .right{display:flex;gap:8px}.stat-stack{display:grid;grid-template-columns:1fr 1fr;gap:8px}.stat-stack .metric{background:#111318;border:1px solid #22262d;border-radius:10px;padding:10px}.stat-stack .metric span{display:block;color:var(--muted);font-size:11px}.stat-stack .metric b{display:block;margin-top:3px;font-size:15px}.sticky{position:sticky;top:20px}.logs-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.logs-toolbar select{width:auto;min-width:120px}.log-view{margin-top:12px;background:#0b0d10;border:1px solid var(--line);border-radius:10px;min-height:430px;max-height:68vh;overflow:auto;padding:8px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.log-line{display:grid;grid-template-columns:155px 58px 90px minmax(0,1fr);gap:10px;padding:5px 7px;border-bottom:1px solid #191c21}.log-line:last-child{border-bottom:0}.log-time,.log-source{color:var(--muted)}.log-level{text-transform:uppercase;font-weight:700}.log-level.info{color:#9fb9e8}.log-level.warn{color:var(--warn)}.log-level.error{color:var(--bad)}.log-message{white-space:pre-wrap;word-break:break-word}.report-note{margin-top:10px;color:var(--muted);font-size:12px}
+@media(max-width:1100px){.chat-layout{grid-template-columns:1fr}.sticky{position:static}}
+@media(max-width:980px){.shell{grid-template-columns:1fr}.sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px}.brand{padding:0}.nav{display:flex}.nav button{width:auto}.sidefoot{display:none}main{padding:22px}.kpis{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}}
+@media(max-width:620px){.kpis,.cache-grid,.runtime,.meta{grid-template-columns:1fr}.sidebar{overflow-x:auto}.topbar{gap:12px}.badge{display:none}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="mark">L</div>Logan</div>
+    <div class="nav">
+      <button class="active" data-tab="overview">Overview</button>
+      <button data-tab="chat">Chat</button>
+      <button data-tab="cache">Prompt Cache</button>
+      <button data-tab="runtime">Runtime</button>
+      <button data-tab="logs">Logs</button>
+      <button data-tab="models">Models</button>
+    </div>
+    <div class="sidefoot">
+      <div class="statusline"><span id="sideDot" class="dot"></span><span id="sideStatus">Connecting…</span></div>
+      <div style="margin-top:5px">logand · localhost</div>
+    </div>
+  </aside>
+  <main>
+    <div class="topbar">
+      <div><h1 id="title">Inference dashboard</h1><div class="subtitle" id="phase">Connecting to logand…</div></div>
+      <div class="badge" id="uptime">uptime —</div>
+    </div>
+    <div id="errorBox" class="alert"></div>
+    <div id="warningBox" class="alert warn"></div>
+
+    <section id="overview" class="tab active">
+      <div class="grid kpis">
+        <div class="card kpi"><div class="label">Generation</div><div class="value" id="genTps">—</div><div class="detail">tokens / second</div><canvas id="speedChart"></canvas></div>
+        <div class="card kpi"><div class="label">Prompt</div><div class="value" id="promptTps">—</div><div class="detail">tokens / second</div></div>
+        <div class="card kpi"><div class="label">TTFT</div><div class="value" id="ttft">—</div><div class="detail">first token latency</div></div>
+        <div class="card kpi"><div class="label">Context</div><div class="value" id="context">—</div><div class="detail" id="contextDetail">tokens</div><div class="progress"><i id="contextBar"></i></div></div>
+      </div>
+
+      <div class="grid two">
+        <div class="card">
+          <div class="section-title"><h2>Model</h2><div class="controls"><button id="refreshModels" class="secondary">Refresh</button><button id="unloadBtn" class="danger">Unload</button></div></div>
+          <div class="model-row"><select id="modelSelect"><option>Scanning ~/models…</option></select><button id="loadBtn" class="primary">Load</button></div>
+          <div class="meta">
+            <div class="item"><div class="name">Loaded model</div><div class="val" id="modelName">None</div></div>
+            <div class="item"><div class="name">Peak process RAM</div><div class="val" id="rss">—</div></div>
+            <div class="item"><div class="name">Status</div><div class="val" id="status">Idle</div></div>
+            <div class="item"><div class="name">Model path</div><div class="val path" id="modelPath">—</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="section-title"><h2>Prompt cache</h2></div>
+          <div class="cache-grid">
+            <div class="cachebox"><div class="cachehead"><div><div class="cachetype">RAM</div><div class="cachehint">Hot · reusable prefix LRU</div></div><span id="hotEntries">0</span></div><div class="big" id="hotSize">0 B</div><div class="row"><span>Cached tokens</span><b id="hotTokens">0</b></div><div class="row"><span>Last RAM hit</span><b id="hotReuse">0</b></div><div class="row"><span>Active state</span><b id="activeState">0 B</b></div></div>
+            <div class="cachebox"><div class="cachehead"><div><div class="cachetype">SSD</div><div class="cachehint">Cold · persistent .lpfx</div></div><span id="coldEntries">0</span></div><div class="big" id="coldSize">0 B</div><div class="row"><span>Last restore</span><b id="coldHit">0 tok</b></div><div class="row"><span>Restore time</span><b id="restoreMs">0 ms</b></div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="section-title"><h2>Test generation</h2><div class="controls"><button id="cancelBtn" class="secondary">Cancel</button><button id="generateBtn" class="primary">Generate</button></div></div>
+        <textarea id="prompt" placeholder="Send a prompt through the resident Logan model…"></textarea>
+        <div class="chat-output" id="output">Load a model, then send a prompt.</div>
+      </div>
+    </section>
+    <section id="models" class="tab">
+      <div class="grid two">
+        <div class="card">
+          <div class="section-title"><div><h2>Model settings</h2><div class="footnote">Per-model defaults, persisted by path. Similar to Ollama model options, without hiding the runtime knobs.</div></div><button id="saveSettings" class="primary">Save settings</button></div>
+          <label>Model<select id="settingsModel"></select></label>
+          <label style="display:block;margin-top:10px">System prompt<textarea id="settingsSystemPrompt" style="min-height:120px"></textarea></label>
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:10px">
+            <label>Max new tokens<input id="settingsMaxNew" type="number" min="1" max="65536"></label>
+            <label>Temperature<input id="settingsTemperature" type="number" min="0" max="2" step="0.05"></label>
+            <label>Top-p<input id="settingsTopP" type="number" min="0.01" max="1" step="0.01"></label>
+            <label>Top-k<input id="settingsTopK" type="number" min="0" max="65536"></label>
+            <label>Repeat penalty<input id="settingsRepeatPenalty" type="number" min="1" max="2" step="0.01"></label>
+          </div>
+          <div class="controls" style="margin-top:12px"><button id="loadSettingsModel" class="secondary">Load selected model</button></div>
+        </div>
+        <div class="card">
+          <div class="section-title"><div><h2>Download from Hugging Face</h2><div class="footnote">Uses the installed <code>hf</code> CLI. Downloads stay inside the daemon model root.</div></div><button id="downloadModel" class="primary">Download</button></div>
+          <label>Repository ID<input id="hfRepo" placeholder="owner/model"></label>
+          <label style="display:block;margin-top:10px">Destination relative to model root<input id="hfDestination" placeholder="model-name"></label>
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:10px">
+            <label>Revision<input id="hfRevision" placeholder="main"></label>
+            <label>Include pattern<input id="hfInclude" placeholder="*.safetensors"></label>
+          </div>
+          <div class="footnote">Authentication remains in Hugging Face CLI configuration; tokens never enter the daemon API or process arguments.</div>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card">
+          <div class="section-title"><div><h2>Quantize / compile</h2><div class="footnote">Build a Logan package with the sibling <code>logan</code> compiler.</div></div><button id="quantizeModel" class="primary">Quantize</button></div>
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px">
+            <label>Source directory<input id="quantSource" placeholder="source-model"></label>
+            <label>Output directory<input id="quantOutput" placeholder="source-model-logan"></label>
+            <label>Max context<input id="quantContext" type="number" min="1" value="131072"></label>
+            <label>Target<select id="quantTarget"><option>native</option><option>auto</option></select></label>
+            <label>Quantization<select id="quantQuant"><option>exact</option><option>mxfp4</option></select></label>
+            <label>Quant floor<select id="quantFloor"><option>bf16</option><option>exact</option></select></label>
+            <label>Codec<select id="quantCodec"><option>none</option><option>auto</option></select></label>
+            <label>Optimization<select id="quantOptimization"><option>default</option><option>size</option><option>latency</option></select></label>
+          </div>
+          <div style="display:flex;gap:14px;margin-top:12px;color:var(--soft)">
+            <label><input id="quantVerify" type="checkbox" checked style="width:auto"> Verify output</label>
+            <label><input id="quantForce" type="checkbox" style="width:auto"> Overwrite output</label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="section-title"><div><h2>Jobs</h2><div class="footnote">Downloads and quantization run outside inference. Safe to leave running.</div></div><button id="refreshJobs" class="secondary">Refresh</button></div>
+          <div id="jobList" class="log-view" style="min-height:220px;max-height:420px;margin-top:0"><div class="footnote">No jobs yet.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="chat" class="tab">
+      <div class="grid chat-layout">
+        <div class="card">
+          <div class="section-title"><h2>Chat</h2><div class="controls"><button id="chatClear" class="secondary">New chat</button><button id="chatCancel" class="secondary">Cancel</button></div></div>
+          <div id="chatMessages" class="conversation"><div class="chat-empty">Load a model, then start a conversation.<br>Requests use the OpenAI-compatible Chat Completions API.</div></div>
+          <div class="composer">
+            <textarea id="chatInput" placeholder="Message Logan…"></textarea>
+            <div class="chat-settings">
+              <label>Max output tokens<input id="chatMax" type="number" min="1" max="65536" value="256"></label>
+              <label>Temperature<input id="chatTemp" type="number" min="0" max="2" step="0.05" value="0.7"></label>
+              <label>Top-p<input id="chatTopP" type="number" min="0.01" max="1" step="0.01" value="0.8"></label>
+            </div>
+            <div class="chat-actions"><span class="footnote">Enter to send · Shift+Enter for newline</span><div class="right"><button id="chatSend" class="primary">Send</button></div></div>
+          </div>
+        </div>
+        <div class="card sticky">
+          <div class="section-title"><h2>Live chat stats</h2><div class="eyebrow" id="chatPhase">Idle</div></div>
+          <div class="stat-stack">
+            <div class="metric"><span>Generation</span><b id="chatGenTps">—</b></div>
+            <div class="metric"><span>Prompt speed</span><b id="chatPromptTps">—</b></div>
+            <div class="metric"><span>TTFT</span><b id="chatTtft">—</b></div>
+            <div class="metric"><span>Total wall</span><b id="chatWall">—</b></div>
+            <div class="metric"><span>Prompt forwarded</span><b id="chatForwarded">—</b></div>
+            <div class="metric"><span>Output tokens</span><b id="chatOutputTokens">—</b></div>
+            <div class="metric"><span>RAM cache hit</span><b id="chatRamHit">—</b></div>
+            <div class="metric"><span>SSD cache hit</span><b id="chatSsdHit">—</b></div>
+            <div class="metric"><span>RAM prefix cache</span><b id="chatRamBytes">—</b></div>
+            <div class="metric"><span>SSD prefix cache</span><b id="chatSsdBytes">—</b></div>
+            <div class="metric"><span>Expert hit rate</span><b id="chatExpertHit">—</b></div>
+            <div class="metric"><span>Resident experts</span><b id="chatExperts">—</b></div>
+            <div class="metric"><span>Metal kernel</span><b id="chatMetalKernel">—</b></div>
+            <div class="metric"><span>Metal wait</span><b id="chatMetalWait">—</b></div>
+            <div class="metric"><span>MetalIO read</span><b id="chatMioBytes">—</b></div>
+            <div class="metric"><span>MetalIO latency</span><b id="chatMioLatency">—</b></div>
+            <div class="metric"><span>GDN</span><b id="chatGdn">—</b></div>
+            <div class="metric"><span>Attention</span><b id="chatAttn">—</b></div>
+            <div class="metric"><span>Routed expert I/O</span><b id="chatIo">—</b></div>
+            <div class="metric"><span>Context</span><b id="chatContext">—</b></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="cache" class="tab">
+      <div class="card">
+        <div class="section-title"><h2>Prompt cache tiers</h2><div class="controls"><button id="clearHot" class="secondary">Clear RAM cache</button><button id="clearCold" class="danger">Clear SSD cache</button></div></div>
+        <div class="cache-grid">
+          <div class="cachebox"><div class="eyebrow">Hot / RAM</div><div class="big" id="hotSize2">0 B</div><div class="row"><span>LRU entries</span><b id="hotEntries2">0</b></div><div class="row"><span>Cached prefix tokens</span><b id="hotTokens2">0</b></div><div class="row"><span>RAM-restored last turn</span><b id="hotReuse2">0</b></div><div class="row"><span>Live session reuse</span><b id="liveReuse2">0</b></div><div class="row"><span>Active causal state</span><b id="activeState2">0 B</b></div><div class="row"><span>RAM restore / write</span><b id="hotTiming2">0 / 0 ms</b></div></div>
+          <div class="cachebox"><div class="eyebrow">Cold / SSD</div><div class="big" id="coldSize2">0 B</div><div class="row"><span>.lpfx entries</span><b id="coldEntries2">0</b></div><div class="row"><span>Restored last turn</span><b id="coldHit2">0</b></div><div class="row"><span>Last cache write</span><b id="writeMs">0 ms</b></div></div>
+        </div>
+        <div class="footnote">RAM is a bounded LRU of exact reusable causal-state snapshots; SSD is the persistent second-level `.lpfx` cache. Active causal state is reported separately and excludes model weights and allocator metadata.</div>
+        <div class="footnote path" id="cachePath"></div>
+      </div>
+    </section>
+
+    <section id="runtime" class="tab">
+      <div class="card">
+        <div class="section-title"><h2>Live runtime</h2><div class="eyebrow">Current turn delta</div></div>
+        <div class="runtime">
+          <div class="metric"><span>Expert cache hit rate</span><b id="expertHit">—</b></div>
+          <div class="metric"><span>Resident experts</span><b id="experts">—</b></div>
+          <div class="metric"><span>Expert evictions</span><b id="evictions">—</b></div>
+          <div class="metric"><span>Metal kernel</span><b id="metalKernel">—</b></div>
+          <div class="metric"><span>Metal wait</span><b id="metalWait">—</b></div>
+          <div class="metric"><span>MetalIO latency</span><b id="mioLatency">—</b></div>
+          <div class="metric"><span>MetalIO loads</span><b id="mioLoads">—</b></div>
+          <div class="metric"><span>MetalIO bytes</span><b id="mioBytes">—</b></div>
+          <div class="metric"><span>Outstanding I/O</span><b id="mioOutstanding">—</b></div>
+          <div class="metric"><span>GDN</span><b id="gdnMs">—</b></div>
+          <div class="metric"><span>Attention</span><b id="attnMs">—</b></div>
+          <div class="metric"><span>Routed I/O</span><b id="ioMs">—</b></div>
+        </div>
+        <div id="features" class="feature-wrap"></div>
+      </div>
+    </section>
+
+    <section id="logs" class="tab">
+      <div class="card">
+        <div class="section-title">
+          <div><h2>Daemon logs</h2><div class="footnote">Recent model, API, cache, warning, and runtime events. Use Copy diagnostic report when you want to send an error back for debugging.</div></div>
+          <div class="logs-toolbar">
+            <select id="logLevel"><option value="all">All levels</option><option value="error">Errors</option><option value="warn">Warnings</option><option value="info">Info</option></select>
+            <button id="refreshLogs" class="secondary">Refresh</button>
+            <button id="copyReport" class="primary">Copy diagnostic report</button>
+          </div>
+        </div>
+        <div id="logView" class="log-view"><div class="log-line"><span class="log-time">—</span><span class="log-level info">INFO</span><span class="log-source">daemon</span><span class="log-message">Waiting for log data…</span></div></div>
+        <div class="report-note">The copied report includes these logs plus the current model, performance, cache, runtime, feature, RAM, and daemon-state snapshot. Prompt/message text is not included in daemon logs.</div>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+const $=id=>document.getElementById(id); let speed=[]; let models=[]; let currentState=null; let chatHistory=[]; let chatBusy=false; let daemonLogs=[]; let jobs=[];
+function bytes(n){n=Number(n||0);const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i? n.toFixed(n>=100?0:n>=10?1:2):Math.round(n))+' '+u[i]}
+function ms(n){n=Number(n||0);return n? (n>=1000?(n/1000).toFixed(2)+' s':n.toFixed(n>=100?0:1)+' ms'):'0 ms'}
+function num(n,d=1){return Number(n||0).toFixed(d)}
+function drawSpeed(v){speed.push(Number(v||0));if(speed.length>60)speed.shift();const c=$('speedChart'),r=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*r;c.height=h*r;const x=c.getContext('2d');x.scale(r,r);x.clearRect(0,0,w,h);if(speed.length<2)return;const max=Math.max(...speed,1);x.strokeStyle='#8fb5ff';x.lineWidth=1.5;x.beginPath();speed.forEach((n,i)=>{const px=i/(speed.length-1)*w,py=h-(n/max)*(h-5)-2;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}
+async function getJSON(url,opts){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw new Error(j.message||r.statusText);return j}
+async function refreshModels(){try{models=await getJSON('/api/models');const selected=$('modelSelect').value||currentState?.model?.path;const settingsSelected=$('settingsModel').value||selected;for(const id of ['modelSelect','settingsModel']){const s=$(id);s.innerHTML='';if(!models.length){const o=document.createElement('option');o.textContent='No loadable models found';o.value='';s.appendChild(o)}else models.forEach(m=>{const o=document.createElement('option');o.value=m.path;o.textContent=`${m.name} · ${bytes(m.sizeBytes)}`;s.appendChild(o)})}if(selected&&models.some(m=>m.path===selected))$('modelSelect').value=selected;if(settingsSelected&&models.some(m=>m.path===settingsSelected))$('settingsModel').value=settingsSelected;renderSettingsForm($('settingsModel').value)}catch(e){showTransient(e.message)}}
+function renderSettingsForm(path){const m=models.find(x=>x.path===path);const s=m?.settings||{systemPrompt:'',maxNew:256,temperature:.7,topP:.8,topK:20,repeatPenalty:1};$('settingsSystemPrompt').value=s.systemPrompt||'';$('settingsMaxNew').value=s.maxNew??256;$('settingsTemperature').value=s.temperature??.7;$('settingsTopP').value=s.topP??.8;$('settingsTopK').value=s.topK??20;$('settingsRepeatPenalty').value=s.repeatPenalty??1}
+async function saveModelSettings(){const path=$('settingsModel').value;if(!path)return;await action('/api/model/settings',{path,systemPrompt:$('settingsSystemPrompt').value,maxNew:Number($('settingsMaxNew').value),temperature:Number($('settingsTemperature').value),topP:Number($('settingsTopP').value),topK:Number($('settingsTopK').value),repeatPenalty:Number($('settingsRepeatPenalty').value)});await refreshModels()}
+async function refreshJobs(){try{jobs=await getJSON('/api/jobs');const box=$('jobList');box.innerHTML='';if(!jobs.length){box.innerHTML='<div class="footnote">No jobs yet.</div>';return}jobs.slice().reverse().forEach(j=>{const row=document.createElement('div');row.style.cssText='padding:9px 4px;border-bottom:1px solid var(--line)';const title=document.createElement('div');title.style.fontWeight='650';title.textContent=`${j.kind} · ${j.status}`;const detail=document.createElement('div');detail.className='footnote';detail.textContent=j.phase+(j.output?' · '+j.output:'')+(j.error?' · '+j.error:'');row.append(title,detail);box.appendChild(row)})}catch(e){showTransient(e.message)}}
+async function downloadModel(){const repoId=$('hfRepo').value.trim();if(!repoId){showTransient('Enter a Hugging Face repository id.');return}try{await getJSON('/api/models/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repoId,destination:$('hfDestination').value.trim()||null,revision:$('hfRevision').value.trim()||null,include:$('hfInclude').value.trim()||null})});showTransient('Download queued.');refreshJobs()}catch(e){showTransient(e.message)}}
+async function quantizeModel(){const source=$('quantSource').value.trim(),output=$('quantOutput').value.trim();if(!source||!output){showTransient('Enter source and output directories.');return}try{await getJSON('/api/models/quantize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,output,maxContext:Number($('quantContext').value)||131072,target:$('quantTarget').value,quant:$('quantQuant').value,quantFloor:$('quantFloor').value,codec:$('quantCodec').value,optimization:$('quantOptimization').value,verify:$('quantVerify').checked,force:$('quantForce').checked})});showTransient('Quantization queued.');refreshJobs()}catch(e){showTransient(e.message)}}
+async function refreshLogs(){try{daemonLogs=await getJSON('/api/logs');renderLogs()}catch(e){showTransient(e.message)}}
+function renderLogs(){const box=$('logView'),filter=$('logLevel')?.value||'all';box.innerHTML='';const rows=daemonLogs.filter(e=>filter==='all'||e.level===filter);if(!rows.length){const line=document.createElement('div');line.className='log-line';line.innerHTML='<span class="log-time">—</span><span class="log-level info">INFO</span><span class="log-source">daemon</span><span class="log-message">No matching log entries.</span>';box.appendChild(line);return}rows.forEach(e=>{const line=document.createElement('div');line.className='log-line';const time=document.createElement('span');time.className='log-time';time.textContent=new Date(Number(e.tsMs||0)).toLocaleString();const level=document.createElement('span');level.className='log-level '+(e.level||'info');level.textContent=(e.level||'info').toUpperCase();const source=document.createElement('span');source.className='log-source';source.textContent=e.source||'daemon';const message=document.createElement('span');message.className='log-message';message.textContent=e.message||'';line.append(time,level,source,message);box.appendChild(line)});box.scrollTop=box.scrollHeight}
+async function copyDiagnosticReport(){try{if(!currentState)currentState=await getJSON('/api/state');daemonLogs=await getJSON('/api/logs');const report={loganDiagnosticReport:1,generatedAt:new Date().toISOString(),state:currentState,logs:daemonLogs};await navigator.clipboard.writeText(JSON.stringify(report,null,2));$('copyReport').textContent='Copied';setTimeout(()=>$('copyReport').textContent='Copy diagnostic report',1600)}catch(e){showTransient('Could not copy report: '+e.message)}}
+function update(s){currentState=s;const p=s.performance||{},c=s.cache||{},r=s.runtime||{},m=s.model;const status=s.status||'idle';$('sideDot').className='dot '+status;$('sideStatus').textContent=status[0].toUpperCase()+status.slice(1);$('status').textContent=status;$('phase').textContent=s.phase||'';$('uptime').textContent='uptime '+formatDuration(s.uptimeSeconds||0);$('modelName').textContent=m?m.name:'None';$('modelPath').textContent=m?m.path:'—';$('rss').textContent=bytes(s.peakRssBytes);$('genTps').textContent=p.generationTokensPerSecond?num(p.generationTokensPerSecond,2):'—';$('promptTps').textContent=p.promptTokensPerSecond?num(p.promptTokensPerSecond,1):'—';$('ttft').textContent=p.ttftMs?ms(p.ttftMs):'—';$('context').textContent=(p.contextTokens||0).toLocaleString();$('contextDetail').textContent=`of ${(p.contextLimit||0).toLocaleString()} tokens`;$('contextBar').style.width=(p.contextLimit?Math.min(100,(p.contextTokens/p.contextLimit)*100):0)+'%';drawSpeed(p.generationTokensPerSecond||0);
+$('hotEntries').textContent=c.hotEntries||0;$('hotSize').textContent=bytes(c.hotBytes);$('hotTokens').textContent=(c.hotTokens||0).toLocaleString();$('hotReuse').textContent=(c.lastHotReuseTokens||0).toLocaleString();$('activeState').textContent=bytes(c.activeStateBytes);$('coldEntries').textContent=c.coldEntries||0;$('coldSize').textContent=bytes(c.coldBytes);$('coldHit').textContent=(c.lastColdHitTokens||0)+' tok';$('restoreMs').textContent=ms(c.restoreMs);$('hotEntries2').textContent=c.hotEntries||0;$('hotSize2').textContent=bytes(c.hotBytes);$('hotTokens2').textContent=(c.hotTokens||0).toLocaleString();$('hotReuse2').textContent=(c.lastHotReuseTokens||0).toLocaleString();$('liveReuse2').textContent=(c.liveReuseTokens||0).toLocaleString();$('activeState2').textContent=bytes(c.activeStateBytes);$('hotTiming2').textContent=ms(c.hotRestoreMs)+' / '+ms(c.hotWriteMs);$('coldEntries2').textContent=c.coldEntries||0;$('coldSize2').textContent=bytes(c.coldBytes);$('coldHit2').textContent=(c.lastColdHitTokens||0).toLocaleString();$('writeMs').textContent=ms(c.writeMs);$('cachePath').textContent=c.directory||'';
+$('output').textContent=s.assistantText||((status==='generating')?'…':'Load a model, then send a prompt.');$('generateBtn').disabled=!m||status==='loading'||status==='generating';$('cancelBtn').disabled=status!=='generating';$('unloadBtn').disabled=!m;
+$('expertHit').textContent=r.expertHits||r.expertMisses?num((r.expertHitRate||0)*100,1)+'%':'—';$('experts').textContent=(r.expertCapacity||0)?`${r.expertResident}/${r.expertCapacity}`:'—';$('evictions').textContent=(r.expertEvictions||0).toLocaleString();$('metalKernel').textContent=ms(r.metalKernelMs);$('metalWait').textContent=ms(r.metalWaitMs);$('mioLatency').textContent=ms(r.metalIoAvgLatencyMs);$('mioLoads').textContent=(r.metalIoLoads||0).toLocaleString();$('mioBytes').textContent=bytes(r.metalIoBytes);$('mioOutstanding').textContent=`${r.metalIoOutstanding||0} / peak ${r.metalIoPeakOutstanding||0}`;$('gdnMs').textContent=ms(r.gdnMs);$('attnMs').textContent=ms(r.attnMs);$('ioMs').textContent=ms(r.ioMs);renderFeatures(r.features||{});
+$('chatPhase').textContent=s.phase||status;$('chatGenTps').textContent=p.generationTokensPerSecond?num(p.generationTokensPerSecond,2)+' tok/s':'—';$('chatPromptTps').textContent=p.promptTokensPerSecond?num(p.promptTokensPerSecond,1)+' tok/s':'—';$('chatTtft').textContent=p.ttftMs?ms(p.ttftMs):'—';$('chatWall').textContent=p.totalMs?ms(p.totalMs):'—';$('chatForwarded').textContent=(p.forwardedPromptTokens||0).toLocaleString();$('chatOutputTokens').textContent=(p.generatedTokens||0).toLocaleString();$('chatRamHit').textContent=(c.lastHotReuseTokens||0).toLocaleString()+' tok';$('chatSsdHit').textContent=(c.lastColdHitTokens||0).toLocaleString()+' tok';$('chatRamBytes').textContent=bytes(c.hotBytes);$('chatSsdBytes').textContent=bytes(c.coldBytes);$('chatExpertHit').textContent=r.expertHits||r.expertMisses?num((r.expertHitRate||0)*100,1)+'%':'—';$('chatExperts').textContent=(r.expertCapacity||0)?`${r.expertResident}/${r.expertCapacity}`:'—';$('chatMetalKernel').textContent=ms(r.metalKernelMs);$('chatMetalWait').textContent=ms(r.metalWaitMs);$('chatMioBytes').textContent=bytes(r.metalIoBytes);$('chatMioLatency').textContent=ms(r.metalIoAvgLatencyMs);$('chatGdn').textContent=ms(r.gdnMs);$('chatAttn').textContent=ms(r.attnMs);$('chatIo').textContent=ms(r.ioMs);$('chatContext').textContent=`${(p.contextTokens||0).toLocaleString()} / ${(p.contextLimit||0).toLocaleString()}`;$('chatSend').disabled=!m||chatBusy||status==='loading';$('chatCancel').disabled=!chatBusy;
+setAlert('errorBox',s.error);setAlert('warningBox',s.warning)}
+function setAlert(id,text){const e=$(id);e.textContent=text||'';e.classList.toggle('show',!!text)}function renderFeatures(f){const box=$('features');box.innerHTML='';Object.entries(f).forEach(([k,v])=>{const e=document.createElement('span');e.className='feature '+(v?'on':'');e.textContent=k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());box.appendChild(e)})}
+function formatDuration(s){s=Math.floor(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+async function action(url,body){try{const opts={method:'POST',headers:{'Content-Type':'application/json'}};if(body!==undefined)opts.body=JSON.stringify(body);await getJSON(url,opts)}catch(e){showTransient(e.message)}}function showTransient(msg){const e=$('errorBox');e.textContent=msg;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),5000)}
+function renderChat(){const box=$('chatMessages');box.innerHTML='';if(!chatHistory.length){const empty=document.createElement('div');empty.className='chat-empty';empty.textContent=currentState&&currentState.model?'Start a conversation with the loaded model.':'Load a model, then start a conversation.';box.appendChild(empty);return}chatHistory.forEach(m=>{const el=document.createElement('div');el.className='message '+m.role;const who=document.createElement('div');who.className='who';who.textContent=m.role==='user'?'You':'Logan';const body=document.createElement('div');body.textContent=m.content||(m.pending?'…':'');el.append(who,body);if(m.stats){const meta=document.createElement('div');meta.className='message-meta';const s=m.stats;meta.textContent=`${num(s.generation_tokens_per_second,2)} tok/s · TTFT ${ms(s.ttft_ms)} · prompt ${num(s.prompt_tokens_per_second,1)} tok/s · RAM hit ${s.ram_cached_tokens||0} · SSD hit ${s.ssd_cached_tokens||0} · Metal ${ms(s.metal_kernel_ms)}`;el.appendChild(meta)}box.appendChild(el)});box.scrollTop=box.scrollHeight}
+async function sendChat(){if(chatBusy)return;const text=$('chatInput').value.trim();if(!text)return;if(!currentState||!currentState.model){showTransient('Load a model before chatting.');return}chatHistory.push({role:'user',content:text});const requestMessages=chatHistory.map(({role,content})=>({role,content}));const assistant={role:'assistant',content:'',pending:true,stats:null};chatHistory.push(assistant);$('chatInput').value='';chatBusy=true;renderChat();$('chatSend').disabled=true;$('chatCancel').disabled=false;try{const body={model:currentState.model.name,messages:requestMessages,stream:true,stream_options:{include_usage:true},max_completion_tokens:Number($('chatMax').value)||256,temperature:Number($('chatTemp').value),top_p:Number($('chatTopP').value)};const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){let e={};try{e=await response.json()}catch{}throw new Error(e.error?.message||response.statusText)}const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let split;while((split=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,split);buffer=buffer.slice(split+2);const data=block.split('\n').filter(x=>x.startsWith('data:')).map(x=>x.slice(5).trimStart()).join('\n');if(!data||data==='[DONE]')continue;let event;try{event=JSON.parse(data)}catch{continue}if(event.error)throw new Error(event.error.message||'Generation failed');const delta=event.choices?.[0]?.delta?.content;if(delta){assistant.content+=delta;renderChat()}if(event.x_logan)assistant.stats=event.x_logan}}assistant.pending=false;renderChat()}catch(e){assistant.pending=false;if(!assistant.content)assistant.content='Error: '+e.message;showTransient(e.message);renderChat()}finally{chatBusy=false;$('chatSend').disabled=!(currentState&&currentState.model);$('chatCancel').disabled=true}}
+$('refreshModels').onclick=refreshModels;$('loadBtn').onclick=()=>{const path=$('modelSelect').value;if(path)action('/api/model/load',{path})};$('unloadBtn').onclick=()=>action('/api/model/unload',{});$('generateBtn').onclick=()=>action('/api/generate',{text:$('prompt').value});$('cancelBtn').onclick=()=>action('/api/cancel',{});$('clearHot').onclick=()=>action('/api/cache/hot/clear',{});$('clearCold').onclick=()=>{if(confirm('Delete all persistent Logan .lpfx prompt-cache files?'))action('/api/cache/cold/clear',{})};$('chatSend').onclick=sendChat;$('chatCancel').onclick=()=>action('/api/cancel',{});$('chatClear').onclick=()=>{if(chatBusy)return;chatHistory=[];renderChat()};$('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});$('refreshLogs').onclick=refreshLogs;$('copyReport').onclick=copyDiagnosticReport;$('logLevel').onchange=renderLogs;$('settingsModel').onchange=()=>renderSettingsForm($('settingsModel').value);$('saveSettings').onclick=saveModelSettings;$('loadSettingsModel').onclick=()=>{const path=$('settingsModel').value;if(path)action('/api/model/load',{path})};$('downloadModel').onclick=downloadModel;$('quantizeModel').onclick=quantizeModel;$('refreshJobs').onclick=refreshJobs;document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active');const titles={overview:'Inference dashboard',models:'Model library',chat:'Chat',cache:'Prompt cache',runtime:'Runtime telemetry',logs:'Logs & diagnostics'};$('title').textContent=titles[b.dataset.tab]||'Logan'});
+async function poll(){try{update(await getJSON('/api/state'))}catch(e){$('phase').textContent='logand unavailable';$('sideStatus').textContent='Disconnected'}}refreshModels();refreshJobs();refreshLogs();renderChat();poll();setInterval(poll,350);setInterval(refreshLogs,1000);setInterval(refreshJobs,1000);setInterval(refreshModels,10000);
+</script>
+</body>
+</html>

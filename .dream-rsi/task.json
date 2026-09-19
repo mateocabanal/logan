@@ -1,0 +1,40 @@
+{
+  "name": "logan-runtime-model-agnostic",
+  "problem_file": "task/problem.md",
+  "workspace": "task/seed",
+  "eval_program": "logan-core/src/lib.rs",
+  "score_program": "python3 /Users/mateo/CODE/logan/task/score.py",
+  "score_path": "eval/score.json",
+  "score_field": "score",
+  "valid_field": "valid",
+  "fail_class_field": "fail_class",
+  "error_field": "error",
+  "higher_is_better": true,
+  "workers": 2,
+  "k1": 3,
+  "k2": 4,
+  "revisions": 2,
+  "beta1": 0.01,
+  "beta2": 0.01,
+  "beta_grid": [
+    0.2,
+    0.4,
+    0.6,
+    0.8,
+    1
+  ],
+  "default_beta": 0.6,
+  "agent_timeout_ms": 1800000,
+  "evaluator_timeout_ms": 1800000,
+  "agent": {
+    "command": "codex",
+    "args": [
+      "exec",
+      "--ephemeral",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-"
+    ],
+    "model": "gpt-5.6-sol",
+    "prompt_via": "stdin"
+  }
+}

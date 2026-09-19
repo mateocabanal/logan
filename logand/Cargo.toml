@@ -1,0 +1,20 @@
+[package]
+name = "logand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "logand"
+path = "src/main.rs"
+
+[dependencies]
+logan-chat = { path = "../logan-chat" }
+logan-qwen4 = { path = "../logan-qwen4" }
+logan-llama = { path = "../logan-llama" }
+libc = "0.2"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-stream = "0.1"
