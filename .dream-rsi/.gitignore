@@ -1,5 +1,0 @@
-# Written by pi-dream-rsi: bulk run state stays out of git by default.
-# task.json, policy/ and history/ remain visible; delete this file to version everything.
-work/
-trace_pool/
-runtime/

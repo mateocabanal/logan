@@ -1,9 +1,0 @@
-[workspace]
-resolver = "3"
-members = ["logan-abi", "logan-format", "logan-ir", "logan-core", "logan-metal", "logan-compiler", "logan-qwen", "logan-qwen4", "logan-llama", "logan-spark", "logan-chat", "logand", "logan-ane"]
-
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "Apache-2.0"
