@@ -1,21 +1,28 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use logan_llama::{DenseModel, DenseSession};
+use logan_core::prefix::{
+    CacheStats, ModelFingerprint, PlanFingerprint, PrefixKey, PrefixRuntime, PrefixRuntimeConfig,
+    RamPrefixCache, StateSchemaFingerprint, TokenizerFingerprint,
+};
+use logan_core::state::StateSnapshot;
+use logan_llama::{DenseModel, DenseSession, LlamaStateCodec};
 use logan_qwen4::colisource::ColiSource;
+use logan_qwen4::plan::QwenStateSnapshot;
 use logan_qwen4::plan::prefix_runtime::{
     apply_max_performance_defaults, persist_prefix_boundary, restore_longest_prefix,
 };
-use logan_qwen4::plan::{QwenStateSnapshot, RuntimeFeatures, RuntimeStats};
-use logan_qwen4::{load_cfg, Cfg, Model};
+use logan_qwen4::plan::{RuntimeFeatures, RuntimeStats};
+use logan_qwen4::{Cfg, Model, load_cfg};
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 use crate::openai::ApiMessage;
 use crate::protocol::minicpm5::{
-    is_minicpm5_eos, MiniCpm5Delta, MiniCpm5ParseError, MiniCpm5StreamParser,
+    MiniCpm5Delta, MiniCpm5ParseError, MiniCpm5StreamParser, is_minicpm5_eos,
 };
 
 /// Qwen3.8-Flash-Next's official non-thinking assistant generation prefix.
@@ -298,9 +305,7 @@ pub fn spawn(package: PathBuf, system_prompt: String) -> EngineHandle {
 }
 
 fn is_dense_package(package: &Path) -> bool {
-    package
-        .join("config.json")
-        .is_file()
+    package.join("config.json").is_file()
         && logan_llama::load_config(package.join("config.json")).is_ok()
 }
 
@@ -327,9 +332,7 @@ fn spawn_dense_compat(package: PathBuf, system_prompt: String) -> EngineHandle {
                 .to_string();
             let context_limit = worker.context_limit();
             let mut system_prompt = system_prompt;
-            let _ = event_tx.send(EngineEvent::Loading(
-                "loading MiniCPM5 dense model".into(),
-            ));
+            let _ = event_tx.send(EngineEvent::Loading("loading MiniCPM5 dense model".into()));
             let _ = event_tx.send(EngineEvent::Ready {
                 model_name,
                 context_limit,
@@ -383,7 +386,9 @@ fn spawn_dense_compat(package: PathBuf, system_prompt: String) -> EngineHandle {
                             let _ = event_tx.send(EngineEvent::Error(error));
                         }
                     }
-                    EngineCommand::Reset { system_prompt: replacement } => {
+                    EngineCommand::Reset {
+                        system_prompt: replacement,
+                    } => {
                         worker_cancel.store(true, Ordering::Relaxed);
                         system_prompt = replacement;
                         worker.reset();
@@ -394,9 +399,10 @@ fn spawn_dense_compat(package: PathBuf, system_prompt: String) -> EngineHandle {
                     }
                     EngineCommand::ClearHot => {
                         worker_cancel.store(true, Ordering::Relaxed);
+                        worker.clear_hot_cache();
                         worker.reset();
                         let _ = event_tx.send(EngineEvent::Loading(
-                            "resetting MiniCPM5 model state".into(),
+                            "clearing MiniCPM5 RAM prefix cache".into(),
                         ));
                         let _ = event_tx.send(EngineEvent::ResetDone);
                     }
@@ -484,13 +490,7 @@ fn run_dense_compat(
         if generated_tokens == 1 {
             first_token_ms = elapsed_ms;
         }
-        let metrics = dense_turn_metrics(
-            0,
-            generated_tokens,
-            first_token_ms,
-            elapsed_ms,
-            None,
-        );
+        let metrics = dense_turn_metrics(0, generated_tokens, first_token_ms, elapsed_ms, None);
         let _ = events.send(EngineEvent::Token {
             chunk: token.chunk.clone(),
             token_id: token.token_id,
@@ -588,6 +588,69 @@ pub struct DenseMiniCpm {
     session: DenseSession,
     tokenizer: Tokenizer,
     eos_ids: Vec<u32>,
+    model_fingerprint: [u8; 32],
+    tokenizer_fingerprint: Option<[u8; 32]>,
+    prefix_cache: RamPrefixCache<DensePrefixValue>,
+    prefix_ssd: Option<PrefixRuntime>,
+}
+
+#[derive(Clone)]
+struct DensePrefixValue {
+    snapshot: StateSnapshot,
+    logits: Vec<f32>,
+}
+
+fn hash_identity(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    for part in parts {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    hash.finalize().into()
+}
+
+fn dense_state_schema_fingerprint() -> [u8; 32] {
+    let schema = LlamaStateCodec::schema_id();
+    hash_identity(
+        b"logan-dense-state-schema-v1",
+        &[
+            schema.engine.as_bytes(),
+            &schema.version.to_le_bytes(),
+            &schema.sub_version.to_le_bytes(),
+        ],
+    )
+}
+
+fn dense_plan_fingerprint() -> [u8; 32] {
+    let native = std::env::var("LOGAN_DENSE_NATIVE").unwrap_or_default();
+    let bnns = std::env::var("LOGAN_BNNS_BF16").unwrap_or_default();
+    hash_identity(
+        b"logan-dense-plan-v1",
+        &[
+            std::env::consts::OS.as_bytes(),
+            std::env::consts::ARCH.as_bytes(),
+            native.as_bytes(),
+            bnns.as_bytes(),
+        ],
+    )
+}
+
+fn tokenizer_fingerprint(tokenizer: &Tokenizer) -> Option<[u8; 32]> {
+    let json = tokenizer.to_string(false).ok()?;
+    Some(hash_identity(b"logan-tokenizer-v1", &[json.as_bytes()]))
+}
+
+fn dense_prefix_cache_root() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LOGAN_PREFIX_CACHE_DIR") {
+        return Some(PathBuf::from(path).join("dense"));
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(path).join("logan/prefix/dense"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cache/logan/prefix/dense"))
 }
 
 impl DenseMiniCpm {
@@ -612,7 +675,6 @@ impl DenseMiniCpm {
             .map_err(|error| format!("load MiniCPM5 dense weights: {error}"))?;
         Ok(Self::from_model(Arc::new(model), tokenizer))
     }
-
     pub fn from_model(model: Arc<DenseModel>, tokenizer: Tokenizer) -> Self {
         let mut eos_ids = model.config.eos_token_ids.clone();
         for token_id in crate::protocol::minicpm5::MINICPM5_EOS_IDS {
@@ -620,12 +682,81 @@ impl DenseMiniCpm {
                 eos_ids.push(token_id);
             }
         }
+
+        let tokenizer_fingerprint = tokenizer_fingerprint(&tokenizer);
+        let persistent_identity = model.root.is_some() && tokenizer_fingerprint.is_some();
+        let model_fingerprint = if persistent_identity {
+            model.cache_fingerprint()
+        } else {
+            [0x11; 32]
+        };
+        let prefix_ssd = persistent_identity
+            .then(dense_prefix_cache_root)
+            .flatten()
+            .and_then(|root| {
+                let mb = std::env::var("LOGAN_PREFIX_SSD_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(4096);
+                let min_cache_tokens = std::env::var("LOGAN_PREFIX_CACHE_MIN_TOKENS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(4);
+                let writes_enabled = std::env::var("LOGAN_PREFIX_CACHE_WRITE")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                let salt = std::env::var("LOGAN_PREFIX_CACHE_SALT")
+                    .map(|v| v.into_bytes())
+                    .unwrap_or_default();
+                PrefixRuntime::new(PrefixRuntimeConfig {
+                    ram_cache_bytes: 0,
+                    ssd_cache_bytes: mb.saturating_mul(1024 * 1024),
+                    ssd_root: Some(root),
+                    min_cache_tokens,
+                    writes_enabled,
+                    salt,
+                })
+                .map_err(|error| {
+                    eprintln!("[logan-chat] dense SSD prefix cache disabled: {error}");
+                    error
+                })
+                .ok()
+            });
+
         Self {
             session: model.new_session(),
             model,
             tokenizer,
             eos_ids,
+            model_fingerprint,
+            tokenizer_fingerprint,
+            prefix_cache: RamPrefixCache::new(
+                std::env::var("LOGAN_PREFIX_RAM_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(512)
+                    .saturating_mul(1024 * 1024),
+            ),
+            prefix_ssd,
         }
+    }
+
+    fn prefix_key(&self, tokens: &[u32]) -> PrefixKey {
+        PrefixKey::new(
+            ModelFingerprint {
+                digest: self.model_fingerprint,
+            },
+            StateSchemaFingerprint {
+                digest: dense_state_schema_fingerprint(),
+            },
+            TokenizerFingerprint {
+                digest: self.tokenizer_fingerprint.unwrap_or([0; 32]),
+            },
+            PlanFingerprint {
+                digest: dense_plan_fingerprint(),
+            },
+            tokens.to_vec(),
+        )
     }
 
     pub fn model(&self) -> &DenseModel {
@@ -638,6 +769,10 @@ impl DenseMiniCpm {
 
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
+    }
+
+    pub fn active_tokens(&self) -> usize {
+        self.session.kv().processed_tokens()
     }
 
     pub fn reset(&mut self) {
@@ -685,6 +820,98 @@ impl DenseMiniCpm {
         self.generate_stream(&prompt, settings, cancel, on_token)
     }
 
+    fn lookup_prefix(&mut self, prompt: &[u32]) -> Result<Option<(usize, Vec<f32>)>, String> {
+        let query = self.prefix_key(prompt);
+        if let Some(hit) = self.prefix_cache.lookup(&query) {
+            hit.value.snapshot.restore_with(
+                &LlamaStateCodec,
+                &mut self.session,
+                hit.fingerprint.prefix_token_hash,
+            )?;
+            return Ok(Some((hit.prefix_len, hit.value.logits)));
+        }
+
+        // SSD snapshots carry causal state but intentionally not boundary
+        // logits. Query at most prompt_len-1 so a restored hit always leaves
+        // one real suffix token to produce the logits needed for generation.
+        if prompt.len() > 1 {
+            let strict_query = self.prefix_key(&prompt[..prompt.len() - 1]);
+            if let Some(runtime) = self.prefix_ssd.as_mut() {
+                let hit = runtime.lookup_prefix(&strict_query)?;
+                if let Some(snapshot) = hit.snapshot {
+                    snapshot.restore_with(
+                        &LlamaStateCodec,
+                        &mut self.session,
+                        snapshot.prefix_hash,
+                    )?;
+                    return Ok(Some((hit.prefix_len, Vec::new())));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn store_prefix(&mut self, tokens: &[u32], logits: &[f32]) -> Result<(), String> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let key = self.prefix_key(tokens);
+        let snapshot = StateSnapshot::capture(
+            &LlamaStateCodec,
+            &self.session,
+            tokens.len(),
+            key.prefix_token_hash,
+        )?;
+        let bytes = snapshot
+            .to_bytes()?
+            .len()
+            .saturating_add(logits.len() * std::mem::size_of::<f32>())
+            .saturating_add(tokens.len() * std::mem::size_of::<u32>());
+
+        if self.prefix_cache.capacity_bytes() > 0 && bytes <= self.prefix_cache.capacity_bytes() {
+            self.prefix_cache.insert(
+                key.clone(),
+                DensePrefixValue {
+                    snapshot: snapshot.clone(),
+                    logits: logits.to_vec(),
+                },
+                bytes,
+            )?;
+        }
+        if let Some(runtime) = self.prefix_ssd.as_mut() {
+            runtime.cache_prefix(key, snapshot)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_hot_cache(&mut self) {
+        self.prefix_cache.clear();
+    }
+
+    pub fn configure_prefix_ssd(
+        &mut self,
+        root: impl Into<PathBuf>,
+        max_bytes: usize,
+        min_cache_tokens: usize,
+    ) -> Result<(), String> {
+        self.prefix_ssd = Some(PrefixRuntime::new(PrefixRuntimeConfig {
+            ram_cache_bytes: 0,
+            ssd_cache_bytes: max_bytes,
+            ssd_root: Some(root.into()),
+            min_cache_tokens,
+            writes_enabled: true,
+            salt: Vec::new(),
+        })?);
+        Ok(())
+    }
+
+    pub fn prefix_cache_stats(&self) -> (CacheStats, Option<CacheStats>) {
+        (
+            self.prefix_cache.stats(),
+            self.prefix_ssd.as_ref().map(PrefixRuntime::ssd_stats),
+        )
+    }
+
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -707,7 +934,6 @@ impl DenseMiniCpm {
         if prompt.trim().is_empty() {
             return Err("MiniCPM5 completion prompt is empty".into());
         }
-        self.session.reset();
         let encoding = self
             .tokenizer
             .encode(prompt, false)
@@ -724,11 +950,19 @@ impl DenseMiniCpm {
             ));
         }
 
+        // Restore the longest cached prefix, including exact-prompt hits.
+        let (cached_len, mut logits) = match self.lookup_prefix(prompt_ids)? {
+            Some(hit) => hit,
+            None => {
+                self.session.reset();
+                (0, Vec::new())
+            }
+        };
+
         // Keep chunks bounded so a long prompt does not create a second large
         // temporary activation buffer. DenseSession commits every chunk to KV.
         const PREFILL_CHUNK: usize = 32;
-        let mut logits = Vec::new();
-        for chunk in prompt_ids.chunks(PREFILL_CHUNK) {
+        for chunk in prompt_ids[cached_len..].chunks(PREFILL_CHUNK) {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(DenseGeneration {
                     input_tokens: prompt_ids.len(),
@@ -747,6 +981,7 @@ impl DenseMiniCpm {
                 .ok_or_else(|| "MiniCPM5 prompt produced no final-token logits".to_string())?
                 .to_vec();
         }
+        self.store_prefix(prompt_ids, &logits)?;
 
         let mut parser = MiniCpm5StreamParser::new();
         let mut decode_stream = self.tokenizer.decode_stream(true);
@@ -1094,7 +1329,9 @@ impl HotPrefixCache {
         };
 
         let started = Instant::now();
-        model.restore_state(&self.entries[index].snapshot)?;
+        self.entries[index]
+            .snapshot
+            .restore_tokens(model, &self.entries[index].tokens)?;
         let restore_ms = started.elapsed().as_secs_f64() * 1e3;
         self.clock = self.clock.wrapping_add(1);
         self.entries[index].last_used = self.clock;
@@ -1121,8 +1358,8 @@ impl HotPrefixCache {
         }
 
         let started = Instant::now();
-        let snapshot = model.snapshot_state(tokens.len())?;
-        let bytes = (snapshot.payload_bytes() as u64)
+        let snapshot = QwenStateSnapshot::capture_tokens(model, tokens)?;
+        let bytes = (snapshot.inner().to_bytes()?.len() as u64)
             .saturating_add((last_logits.len() as u64).saturating_mul(4))
             .saturating_add((tokens.len() as u64).saturating_mul(4));
         if bytes > self.budget {
@@ -1199,7 +1436,7 @@ impl ChatWorker {
         let _ = events.send(EngineEvent::Loading("loading Qwen4 package".into()));
         let cfg = load_cfg(&package.join("config.json"))?;
         let model = load_model(&package, &cfg)?;
-        let zero_state = model.snapshot_state(0)?;
+        let zero_state = QwenStateSnapshot::capture_tokens(&model, &[])?;
         let stats = model.runtime_stats();
         let eos_id = (stats.eos_token_id >= 0).then_some(stats.eos_token_id as u32);
         let model_name = package
@@ -1250,7 +1487,7 @@ impl ChatWorker {
     }
 
     fn restore_zero_state(&mut self) -> Result<(), String> {
-        self.model.restore_state(&self.zero_state)?;
+        self.zero_state.restore_tokens(&mut self.model, &[])?;
         self.tokens.clear();
         self.consumed = 0;
         self.position = 0;

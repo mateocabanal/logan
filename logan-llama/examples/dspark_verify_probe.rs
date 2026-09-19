@@ -1,5 +1,5 @@
 use logan_llama::dspark::{
-    DsparkGeometry, DsparkSession, DsparkWeights, VerificationOptions, DSPARK_TAPS,
+    DSPARK_TAPS, DsparkGeometry, DsparkSession, DsparkWeights, VerificationOptions,
 };
 use logan_llama::{BackendPreference, DenseModel};
 use std::{env, sync::Arc, time::Instant};

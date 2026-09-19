@@ -6,6 +6,7 @@
 use std::{fmt, path::Path, sync::Arc};
 
 pub mod ane;
+pub mod codec_adapter;
 pub mod config;
 pub mod kv;
 pub mod metal;
@@ -15,6 +16,7 @@ pub mod weights;
 pub mod placement;
 
 pub mod dspark;
+pub use codec_adapter::LlamaStateCodec;
 pub use config::{LlamaConfig, load_config};
 pub use placement::{
     CalibrationConfig, CalibrationKey, CalibrationStatus, ContextBucket, ModelPairIdentity,

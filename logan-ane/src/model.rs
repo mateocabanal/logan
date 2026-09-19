@@ -87,7 +87,9 @@ pub struct AnePending {
 impl AnePending {
     pub fn finish(mut self, timeout_ms: u64) -> Result<()> {
         let Some(raw) = self.raw.take() else {
-            return Err(AneError::InvalidArgument("ANE pending already consumed".into()));
+            return Err(AneError::InvalidArgument(
+                "ANE pending already consumed".into(),
+            ));
         };
         let mut error = [0u8; 512];
         let rc = unsafe {
@@ -141,39 +143,61 @@ pub struct AneChannelPending {
 impl AneAsyncChannel {
     pub fn submit(&mut self, signal_value: u64) -> Result<AneChannelPending> {
         if signal_value == 0 {
-            return Err(AneError::InvalidArgument("ANE channel signal value must be nonzero".into()));
+            return Err(AneError::InvalidArgument(
+                "ANE channel signal value must be nonzero".into(),
+            ));
         }
         let mut error = [0u8; 512];
         let raw = unsafe {
             logan_ane_async_channel_submit(
-                self.raw.as_ptr(), 0, signal_value, error.as_mut_ptr().cast(), error.len(),
+                self.raw.as_ptr(),
+                0,
+                signal_value,
+                error.as_mut_ptr().cast(),
+                error.len(),
             )
         };
         let raw = std::ptr::NonNull::new(raw).ok_or_else(|| AneError::ObjectiveC {
             operation: "async channel submit",
             message: async_error(&error),
         })?;
-        Ok(AneChannelPending { raw: Some(raw), _not_send_sync: PhantomData })
+        Ok(AneChannelPending {
+            raw: Some(raw),
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Submit a channel configured with a device-side wait event. ANE starts
     /// only after `wait_value` is signaled and signals `signal_value` on
     /// completion; both values can change per reusable submission.
-    pub fn submit_after(&mut self, wait_value: u64, signal_value: u64) -> Result<AneChannelPending> {
+    pub fn submit_after(
+        &mut self,
+        wait_value: u64,
+        signal_value: u64,
+    ) -> Result<AneChannelPending> {
         if wait_value == 0 || signal_value == 0 {
-            return Err(AneError::InvalidArgument("ANE channel wait/signal values must be nonzero".into()));
+            return Err(AneError::InvalidArgument(
+                "ANE channel wait/signal values must be nonzero".into(),
+            ));
         }
         let mut error = [0u8; 512];
         let raw = unsafe {
             logan_ane_async_channel_submit(
-                self.raw.as_ptr(), wait_value, signal_value,
-                error.as_mut_ptr().cast(), error.len(),
+                self.raw.as_ptr(),
+                wait_value,
+                signal_value,
+                error.as_mut_ptr().cast(),
+                error.len(),
             )
         };
         let raw = std::ptr::NonNull::new(raw).ok_or_else(|| AneError::ObjectiveC {
-            operation: "async channel submit-after", message: async_error(&error),
+            operation: "async channel submit-after",
+            message: async_error(&error),
         })?;
-        Ok(AneChannelPending { raw: Some(raw), _not_send_sync: PhantomData })
+        Ok(AneChannelPending {
+            raw: Some(raw),
+            _not_send_sync: PhantomData,
+        })
     }
 }
 
@@ -186,11 +210,18 @@ impl Drop for AneAsyncChannel {
 impl AneChannelPending {
     pub fn finish(mut self, timeout_ms: u64) -> Result<()> {
         let Some(raw) = self.raw.take() else {
-            return Err(AneError::InvalidArgument("ANE channel pending already consumed".into()));
+            return Err(AneError::InvalidArgument(
+                "ANE channel pending already consumed".into(),
+            ));
         };
         let mut error = [0u8; 512];
         let rc = unsafe {
-            logan_ane_async_channel_finish(raw.as_ptr(), timeout_ms, error.as_mut_ptr().cast(), error.len())
+            logan_ane_async_channel_finish(
+                raw.as_ptr(),
+                timeout_ms,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
         };
         match rc {
             1 => Ok(()),
@@ -890,8 +921,7 @@ fn private_local_model_path(object: raw::Id) -> Option<PathBuf> {
 }
 
 fn private_compiled_model_exists(object: raw::Id) -> bool {
-    raw::require_instance_selector_encoding(CLS_MODEL, "compiledModelExists", "B16@0:8")
-        .is_ok()
+    raw::require_instance_selector_encoding(CLS_MODEL, "compiledModelExists", "B16@0:8").is_ok()
         && unsafe { raw::msg0_bool(object, raw::selector("compiledModelExists")) }
 }
 
@@ -990,7 +1020,9 @@ fn compile_program(program: &MilProgram, options: CompileOptions) -> Result<AneM
         for weight in program.weights() {
             let relative = weight.path().strip_prefix("@model_path/").unwrap();
             let destination = runtime_inputs.join(relative);
-            if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::write(destination, weight.data())?;
         }
         let empty_options = raw::ns_dictionary(&[])?;
@@ -1020,7 +1052,10 @@ fn compile_program(program: &MilProgram, options: CompileOptions) -> Result<AneM
     // directory. On current macOS the daemon often keeps the compiled object
     // solely in its own cache, in which case Logan records the native hit but
     // does not pretend the MIL/weight mirror is itself a compiled artifact.
-    if let (Some(entry), Some(runtime_local)) = (persistent.as_ref(), private_local_model_path(object.as_ptr())) {
+    if let (Some(entry), Some(runtime_local)) = (
+        persistent.as_ref(),
+        private_local_model_path(object.as_ptr()),
+    ) {
         if runtime_local.is_dir() {
             let mirrored = entry.join("compiled");
             let staging = entry.join("compiled.tmp");
@@ -1099,7 +1134,9 @@ impl AneModel {
 
     /// Whether this compilation reused the private runtime's compiled model,
     /// rather than merely reusing Logan's generated MIL/weight inputs.
-    pub fn native_cache_hit(&self) -> bool { self.native_cache_hit }
+    pub fn native_cache_hit(&self) -> bool {
+        self.native_cache_hit
+    }
 
     pub fn is_loaded(&self) -> bool {
         self.loaded
@@ -1135,11 +1172,7 @@ impl AneModel {
     /// result means Logan should compile normally; it does not imply that the
     /// model is invalid.
     pub fn compiled_model_exists(&self) -> Result<bool> {
-        raw::require_instance_selector_encoding(
-            CLS_MODEL,
-            "compiledModelExists",
-            "B16@0:8",
-        )?;
+        raw::require_instance_selector_encoding(CLS_MODEL, "compiledModelExists", "B16@0:8")?;
         Ok(unsafe { raw::msg0_bool(self.object.as_ptr(), raw::selector("compiledModelExists")) })
     }
 
@@ -1208,10 +1241,14 @@ impl AneModel {
         premap: bool,
     ) -> Result<AneAsyncChannel> {
         if !self.loaded && submit_mode != 2 {
-            return Err(AneError::InvalidArgument("model must be loaded before async channel creation".into()));
+            return Err(AneError::InvalidArgument(
+                "model must be loaded before async channel creation".into(),
+            ));
         }
         if inputs.is_empty() || outputs.is_empty() || shared_event.is_null() {
-            return Err(AneError::InvalidArgument("invalid reusable ANE channel".into()));
+            return Err(AneError::InvalidArgument(
+                "invalid reusable ANE channel".into(),
+            ));
         }
         let input_raw: Vec<*mut c_void> = inputs.iter().map(|s| s.raw_surface().cast()).collect();
         let output_raw: Vec<*mut c_void> = outputs.iter().map(|s| s.raw_surface().cast()).collect();
@@ -1219,49 +1256,85 @@ impl AneModel {
         let raw = unsafe {
             logan_ane_async_channel_create(
                 self.object.as_ptr(),
-                input_raw.as_ptr(), input_raw.len(),
-                output_raw.as_ptr(), output_raw.len(),
-                procedure_index, shared_event, std::ptr::null_mut(), self.qos.0,
-                submit_mode, u8::from(premap),
-                error.as_mut_ptr().cast(), error.len(),
+                input_raw.as_ptr(),
+                input_raw.len(),
+                output_raw.as_ptr(),
+                output_raw.len(),
+                procedure_index,
+                shared_event,
+                std::ptr::null_mut(),
+                self.qos.0,
+                submit_mode,
+                u8::from(premap),
+                error.as_mut_ptr().cast(),
+                error.len(),
             )
         };
         let raw = std::ptr::NonNull::new(raw).ok_or_else(|| AneError::ObjectiveC {
             operation: "async channel create",
             message: async_error(&error),
         })?;
-        Ok(AneAsyncChannel { raw, _not_send_sync: PhantomData })
+        Ok(AneAsyncChannel {
+            raw,
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Build a reusable ANE request with both a device-side wait event and a
     /// completion signal event. The events may share the same backing as long
     /// as callers use strictly increasing values.
     pub unsafe fn async_channel_wait_signal(
-        &self, inputs: &[&AneSurface], outputs: &[&AneSurface], procedure_index: u64,
-        shared_event: *mut c_void, wait_shared_event: *mut c_void,
-        submit_mode: u8, premap: bool,
+        &self,
+        inputs: &[&AneSurface],
+        outputs: &[&AneSurface],
+        procedure_index: u64,
+        shared_event: *mut c_void,
+        wait_shared_event: *mut c_void,
+        submit_mode: u8,
+        premap: bool,
     ) -> Result<AneAsyncChannel> {
         if !self.loaded && submit_mode != 2 {
-            return Err(AneError::InvalidArgument("model must be loaded before async channel creation".into()));
+            return Err(AneError::InvalidArgument(
+                "model must be loaded before async channel creation".into(),
+            ));
         }
-        if inputs.is_empty() || outputs.is_empty() || shared_event.is_null() || wait_shared_event.is_null() {
-            return Err(AneError::InvalidArgument("invalid reusable ANE wait/signal channel".into()));
+        if inputs.is_empty()
+            || outputs.is_empty()
+            || shared_event.is_null()
+            || wait_shared_event.is_null()
+        {
+            return Err(AneError::InvalidArgument(
+                "invalid reusable ANE wait/signal channel".into(),
+            ));
         }
         let input_raw: Vec<*mut c_void> = inputs.iter().map(|s| s.raw_surface().cast()).collect();
         let output_raw: Vec<*mut c_void> = outputs.iter().map(|s| s.raw_surface().cast()).collect();
         let mut error = [0u8; 512];
         let raw = unsafe {
             logan_ane_async_channel_create(
-                self.object.as_ptr(), input_raw.as_ptr(), input_raw.len(),
-                output_raw.as_ptr(), output_raw.len(), procedure_index,
-                shared_event, wait_shared_event, self.qos.0, submit_mode, u8::from(premap),
-                error.as_mut_ptr().cast(), error.len(),
+                self.object.as_ptr(),
+                input_raw.as_ptr(),
+                input_raw.len(),
+                output_raw.as_ptr(),
+                output_raw.len(),
+                procedure_index,
+                shared_event,
+                wait_shared_event,
+                self.qos.0,
+                submit_mode,
+                u8::from(premap),
+                error.as_mut_ptr().cast(),
+                error.len(),
             )
         };
         let raw = std::ptr::NonNull::new(raw).ok_or_else(|| AneError::ObjectiveC {
-            operation: "async wait/signal channel create", message: async_error(&error),
+            operation: "async wait/signal channel create",
+            message: async_error(&error),
         })?;
-        Ok(AneAsyncChannel { raw, _not_send_sync: PhantomData })
+        Ok(AneAsyncChannel {
+            raw,
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Submit an ANE request that signals a Metal-owned shared event on
@@ -1287,7 +1360,9 @@ impl AneModel {
             ));
         }
         if inputs.is_empty() || outputs.is_empty() || shared_event.is_null() || signal_value == 0 {
-            return Err(AneError::InvalidArgument("invalid async ANE request".into()));
+            return Err(AneError::InvalidArgument(
+                "invalid async ANE request".into(),
+            ));
         }
         let input_raw: Vec<*mut c_void> = inputs.iter().map(|s| s.raw_surface().cast()).collect();
         let output_raw: Vec<*mut c_void> = outputs.iter().map(|s| s.raw_surface().cast()).collect();
@@ -1312,7 +1387,10 @@ impl AneModel {
             operation: "async evaluate submit",
             message: async_error(&error),
         })?;
-        Ok(AnePending { raw: Some(raw), _not_send_sync: PhantomData })
+        Ok(AnePending {
+            raw: Some(raw),
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Explicitly asks the private runtime to map request IOSurfaces ahead of
@@ -1370,13 +1448,17 @@ impl AneModel {
         let mut error = [0u8; 512];
         let rc = unsafe {
             logan_ane_probe_mutable_buffer(
-                self.object.as_ptr(), buffer_id, &mut size,
-                error.as_mut_ptr().cast(), error.len(),
+                self.object.as_ptr(),
+                buffer_id,
+                &mut size,
+                error.as_mut_ptr().cast(),
+                error.len(),
             )
         };
         if rc == 1 {
-            usize::try_from(size).map_err(|_| AneError::InvalidArgument(
-                format!("mutable ANE buffer too large: {size}")))
+            usize::try_from(size).map_err(|_| {
+                AneError::InvalidArgument(format!("mutable ANE buffer too large: {size}"))
+            })
         } else {
             Err(AneError::ObjectiveC {
                 operation: "probe mutable weight buffer",

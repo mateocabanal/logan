@@ -1,15 +1,15 @@
 use std::{
     collections::BTreeMap,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use logan_chat::{
     engine::{DenseMiniCpm, FamilyEngineHandle, GenerationSettings, StopReason},
     openai::ApiMessage,
-    runtime::{render_prompt, ModelFamily, ProtocolOptions},
+    runtime::{ModelFamily, ProtocolOptions, render_prompt},
 };
 use logan_llama::{DType, DenseModel, DenseTensor, LlamaConfig};
-use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
+use tokenizers::{Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace};
 
 fn tiny_adapter() -> DenseMiniCpm {
     let config = LlamaConfig {
@@ -102,7 +102,7 @@ fn tiny_adapter() -> DenseMiniCpm {
         vec![0.1; 4],
     );
     let model = Arc::new(DenseModel::from_tensors(config, tensors).unwrap());
-    let tokenizer = Tokenizer::new(
+    let mut tokenizer = Tokenizer::new(
         WordLevel::builder()
             .vocab(
                 [("hello".into(), 0), ("<unk>".into(), 1)]
@@ -113,6 +113,7 @@ fn tiny_adapter() -> DenseMiniCpm {
             .build()
             .unwrap(),
     );
+    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
     DenseMiniCpm::from_model(model, tokenizer)
 }
 
@@ -143,6 +144,27 @@ fn dense_adapter_honors_both_minicpm5_eos_ids_and_commits_prompt() {
     assert_eq!(output.input_tokens, 1);
     assert!(output.token_ids.is_empty());
     assert_eq!(output.stop_reason, StopReason::MaxTokens);
+}
+
+#[test]
+fn dense_prefix_cache_restores_exact_prompt_state() {
+    let mut adapter = tiny_adapter();
+    let settings = GenerationSettings {
+        max_new: 0,
+        ..Default::default()
+    };
+    let cancel = AtomicBool::new(false);
+
+    adapter.generate("hello", &settings, &cancel).unwrap();
+    assert_eq!(adapter.active_tokens(), 1);
+
+    adapter.generate("hello hello", &settings, &cancel).unwrap();
+    assert_eq!(adapter.active_tokens(), 2);
+
+    // Exact-prompt hit must restore the one-token snapshot without replaying
+    // or retaining the two-token active state.
+    adapter.generate("hello", &settings, &cancel).unwrap();
+    assert_eq!(adapter.active_tokens(), 1);
 }
 
 #[test]

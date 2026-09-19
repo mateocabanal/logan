@@ -127,9 +127,15 @@ mod tests {
         // These two collapse to the same visible prefix after sanitization
         // (`::` -> `__`), so only the hash separates them. This is the property
         // that keeps distinct tests from sharing one scratch file.
-        assert_ne!(sanitize_component("tests::a"), sanitize_component("tests__a"));
+        assert_ne!(
+            sanitize_component("tests::a"),
+            sanitize_component("tests__a")
+        );
 
         // Same input, same output: the helper is deterministic.
-        assert_eq!(sanitize_component("tests::a"), sanitize_component("tests::a"));
+        assert_eq!(
+            sanitize_component("tests::a"),
+            sanitize_component("tests::a")
+        );
     }
 }

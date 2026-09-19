@@ -1,7 +1,7 @@
 pub use crate::DType;
 use crate::{
-    model::{DenseTensor, QuantizedPayload},
     ContractError, ContractResult, LlamaConfig,
+    model::{DenseTensor, QuantizedPayload},
 };
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};

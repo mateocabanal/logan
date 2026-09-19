@@ -22,7 +22,7 @@ pub use prefix_runtime::{
     restore_longest_prefix, run_greedy_cached_coli, PrefixRestoreSummary,
 };
 pub use runtime_stats::{RuntimeFeatures, RuntimeStats};
-pub use snapshot::QwenStateSnapshot;
+pub use snapshot::{QwenStateCodec, QwenStateSnapshot};
 
 /// One planned expert load: the exact record identity + absolute stream
 /// regions the validated plan resolved. The runtime performs the MetalIO

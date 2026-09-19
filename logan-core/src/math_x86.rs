@@ -201,7 +201,9 @@ mod tests {
     }
 
     fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
-        vals.iter().flat_map(|v| crate::math::bf16_bytes(*v)).collect()
+        vals.iter()
+            .flat_map(|v| crate::math::bf16_bytes(*v))
+            .collect()
     }
 
     /// Skip rather than pass when the CPU lacks AVX2: a pass would be a lie.
@@ -225,7 +227,11 @@ mod tests {
             let mut want = vec![0.0f32; o];
             unsafe { matmul_bf16_avx2(&mut got, &x, &wb, o, i) };
             scalar_bf16(&mut want, &x, &wb, o, i);
-            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+            let scale = want
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-30);
             for r in 0..o {
                 assert!(
                     (got[r] - want[r]).abs() / scale < 1e-5,

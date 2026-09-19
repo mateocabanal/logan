@@ -501,7 +501,9 @@ impl Package {
             return invalid("record is not a tensor record");
         }
         if record.codec != 0 {
-            return invalid("tensor record uses an unsupported codec (rANS decode lands with RW-014)");
+            return invalid(
+                "tensor record uses an unsupported codec (rANS decode lands with RW-014)",
+            );
         }
         let header = self.read_payload_range(record, 0, 128)?;
         if &header[..8] != b"COLITENS" || u32_at(&header, 12)? != 128 || u16_at(&header, 16)? > 8 {

@@ -10,8 +10,8 @@
 use std::{env, fs, path::PathBuf, time::Instant};
 
 use half::{bf16, f16};
-use logan_ane::{mil, AneRequest, AneRuntime, AneSurface, CompileOptions, DenseProjection};
-use safetensors::{tensor::Dtype, SafeTensors};
+use logan_ane::{AneRequest, AneRuntime, AneSurface, CompileOptions, DenseProjection, mil};
+use safetensors::{SafeTensors, tensor::Dtype};
 
 const HIDDEN: usize = 2048;
 const SPATIAL: usize = 16;

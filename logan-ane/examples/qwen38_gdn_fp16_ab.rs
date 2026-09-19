@@ -1,6 +1,6 @@
 use std::{path::Path, time::Instant};
 
-use logan_ane::{mil::DenseProjection, AneRequest, AneRuntime, AneSurface, CompileOptions};
+use logan_ane::{AneRequest, AneRuntime, AneSurface, CompileOptions, mil::DenseProjection};
 use logan_qwen4::colisource::ColiSource;
 
 const HIDDEN: usize = 2560;

@@ -149,7 +149,7 @@
 //! *would* matter for a bf16-weight kernel, which is part of why none was
 //! written — see [`available_for`].
 
-use logan_core::cuda::{DeviceBuf, Kernel, compile, enabled, launches, synchronize};
+use logan_core::cuda::{compile, enabled, launches, synchronize, DeviceBuf, Kernel};
 use std::sync::{LazyLock, Mutex};
 
 use super::GgmlType;
@@ -533,8 +533,12 @@ pub fn q4k_dot_row(y: &mut [f32], x: &[f32], weights: &[u8], o: usize, i: usize)
         tiled.launch((o as u32, 1, 1), (block, 1, 1), block * 4, &mut params)?;
     } else {
         let block = 256u32;
-        st.kernel_row
-            .launch(((o as u32).div_ceil(block), 1, 1), (block, 1, 1), 0, &mut params)?;
+        st.kernel_row.launch(
+            ((o as u32).div_ceil(block), 1, 1),
+            (block, 1, 1),
+            0,
+            &mut params,
+        )?;
     }
     synchronize()?;
 
@@ -696,10 +700,17 @@ mod tests {
         let sign = ((bits >> 31) & 1) as u16;
         let exp = ((bits >> 23) & 0xff) as i32;
         let frac = bits & 0x7f_ffff;
-        assert!((64..=192).contains(&exp), "test value {v} is not a normal f16");
+        assert!(
+            (64..=192).contains(&exp),
+            "test value {v} is not a normal f16"
+        );
         let e16 = (exp - 127 + 15) as u16;
         let m16 = (frac >> 13) as u16;
-        assert_eq!((m16 as u32) << 13, frac, "test value {v} is not exact in f16");
+        assert_eq!(
+            (m16 as u32) << 13,
+            frac,
+            "test value {v} is not exact in f16"
+        );
         (sign << 15) | (e16 << 10) | m16
     }
 
@@ -750,7 +761,10 @@ mod tests {
 
     impl Lcg {
         fn next_byte(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u8
         }
     }
@@ -803,19 +817,16 @@ mod tests {
     /// per row: a row whose sum happens to cancel to near zero would otherwise
     /// report an enormous relative error for a perfectly good kernel. This is
     /// the same convention `math_x86::tests` uses.
-    fn compare(
-        label: &str,
-        o: usize,
-        i: usize,
-        weights: &[u8],
-        x: &[f32],
-    ) -> (f32, f32) {
+    fn compare(label: &str, o: usize, i: usize, weights: &[u8], x: &[f32]) -> (f32, f32) {
         let row_bytes = (i / 256) * 144;
         assert_eq!(weights.len(), o * row_bytes, "{label}: weight geometry");
 
         let mut got = vec![0.0f32; o];
         let ran = q4k_dot_row(&mut got, x, weights, o, i);
-        assert!(ran.is_some(), "{label}: kernel refused to run (o={o} i={i})");
+        assert!(
+            ran.is_some(),
+            "{label}: kernel refused to run (o={o} i={i})"
+        );
 
         let want: Vec<f32> = (0..o)
             .map(|row| {
@@ -828,7 +839,11 @@ mod tests {
             })
             .collect();
 
-        let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+        let scale = want
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-30);
         let mut max_abs = 0.0f32;
         for row in 0..o {
             let abs = (got[row] - want[row]).abs();
@@ -973,7 +988,10 @@ mod tests {
         // Deliberately mixed-sign and not summing to zero, so a stale result
         // cannot coincide with the correct one by cancellation.
         let x: Vec<f32> = (0..i).map(|k| ((k % 17) as f32 - 8.0) / 4.0).collect();
-        assert!(x.iter().sum::<f32>().abs() > 1.0, "need a non-cancelling sum");
+        assert!(
+            x.iter().sum::<f32>().abs() > 1.0,
+            "need a non-cancelling sum"
+        );
         let scales = [4u8, 4, 4, 4, 4, 4, 4, 4];
         let mins = [0u8; 8];
 
@@ -1221,7 +1239,10 @@ mod tests {
                 "tiled child failed:\n{stdout}\n{}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            assert!(stdout.contains("tiled parity worst"), "child took no arm:\n{stdout}");
+            assert!(
+                stdout.contains("tiled parity worst"),
+                "child took no arm:\n{stdout}"
+            );
             print!("{stdout}");
             return;
         }
@@ -1238,7 +1259,13 @@ mod tests {
 
         let mut worst_rel = 0.0f32;
         let mut worst_abs = 0.0f32;
-        for (o, i) in [(1usize, 256usize), (3, 256), (7, 512), (33, 1024), (129, 2048)] {
+        for (o, i) in [
+            (1usize, 256usize),
+            (3, 256),
+            (7, 512),
+            (33, 1024),
+            (129, 2048),
+        ] {
             let blocks = i / 256;
             let row_bytes = blocks * 144;
             let mut random = Vec::with_capacity(o * row_bytes);
@@ -1253,10 +1280,7 @@ mod tests {
                 q4k_dot_row(&mut got, &x, &random, o, i).is_some(),
                 "o={o} i={i}: tiled kernel refused to run"
             );
-            assert!(
-                kernel_launches() > before,
-                "o={o} i={i}: nothing launched"
-            );
+            assert!(kernel_launches() > before, "o={o} i={i}: nothing launched");
 
             let want: Vec<f32> = (0..o)
                 .map(|row| {
@@ -1268,7 +1292,11 @@ mod tests {
                     .unwrap()
                 })
                 .collect();
-            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-30);
+            let scale = want
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-30);
             for row in 0..o {
                 let abs = (got[row] - want[row]).abs();
                 worst_abs = worst_abs.max(abs);
@@ -1368,7 +1396,10 @@ mod tests {
             "revert child failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(stdout.contains("revert arm:"), "child took no arm:\n{stdout}");
+        assert!(
+            stdout.contains("revert arm:"),
+            "child took no arm:\n{stdout}"
+        );
         print!("{stdout}");
     }
 
@@ -1416,8 +1447,14 @@ mod tests {
         assert!(code.contains("(float)scale"), "six-bit scales widen to f32");
         assert!(code.contains("(float)mn"), "six-bit minima widen to f32");
         // The nibble split: even groups low, odd groups high.
-        assert!(code.contains("packed >> 4"), "odd groups take the high nibble");
-        assert!(code.contains("packed & 0x0f"), "even groups take the low nibble");
+        assert!(
+            code.contains("packed >> 4"),
+            "odd groups take the high nibble"
+        );
+        assert!(
+            code.contains("packed & 0x0f"),
+            "even groups take the low nibble"
+        );
         // 8 groups of 32 within a 256-value block.
         assert!(code.contains("g < 8"));
         assert!(code.contains("k < 32"));

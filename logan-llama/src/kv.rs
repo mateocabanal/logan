@@ -181,4 +181,78 @@ impl KvCache {
         self.processed_tokens = 0;
         self.history.clear();
     }
+    /// Serialize the committed KV rows for a persistent prefix snapshot.
+    ///
+    /// The payload is intentionally engine-owned; the generic prefix store
+    /// treats it as opaque bytes and validates the surrounding cache key.
+    pub fn serialize_state(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(40);
+        out.extend_from_slice(b"LOGANKV1");
+        out.extend_from_slice(&(self.layers.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.key_width as u64).to_le_bytes());
+        out.extend_from_slice(&(self.generation).to_le_bytes());
+        out.extend_from_slice(&(self.processed_tokens as u64).to_le_bytes());
+        for layer in &self.layers {
+            out.extend_from_slice(&(layer.keys.len() as u64).to_le_bytes());
+            for value in layer.keys.iter().chain(&layer.values) {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Restore a state produced by [`Self::serialize_state`].
+    pub fn deserialize_state(&mut self, data: &[u8]) -> Result<(), KvError> {
+        fn take<'a>(data: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8], KvError> {
+            let end = cursor.checked_add(n).ok_or(KvError::InvalidShape)?;
+            let bytes = data.get(*cursor..end).ok_or(KvError::InvalidShape)?;
+            *cursor = end;
+            Ok(bytes)
+        }
+        fn u64_at(data: &[u8], cursor: &mut usize) -> Result<u64, KvError> {
+            Ok(u64::from_le_bytes(
+                take(data, cursor, 8)?
+                    .try_into()
+                    .map_err(|_| KvError::InvalidShape)?,
+            ))
+        }
+        if data.get(..8) != Some(b"LOGANKV1") {
+            return Err(KvError::InvalidShape);
+        }
+        let mut cursor = 8;
+        let layers = u64_at(data, &mut cursor)? as usize;
+        let width = u64_at(data, &mut cursor)? as usize;
+        if layers != self.layers.len() || width != self.key_width {
+            return Err(KvError::InvalidShape);
+        }
+        let generation = u64_at(data, &mut cursor)?;
+        let processed = u64_at(data, &mut cursor)? as usize;
+        let mut restored = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            let key_len = u64_at(data, &mut cursor)? as usize;
+            if key_len % width != 0 {
+                return Err(KvError::InvalidShape);
+            }
+            let float_count = key_len.checked_mul(2).ok_or(KvError::InvalidShape)?;
+            let mut values = Vec::with_capacity(float_count);
+            for _ in 0..float_count {
+                values.push(f32::from_le_bytes(
+                    take(data, &mut cursor, 4)?
+                        .try_into()
+                        .map_err(|_| KvError::InvalidShape)?,
+                ));
+            }
+            let keys = values[..key_len].to_vec();
+            let vals = values[key_len..].to_vec();
+            restored.push(LayerKv { keys, values: vals });
+        }
+        if cursor != data.len() {
+            return Err(KvError::InvalidShape);
+        }
+        self.layers = restored;
+        self.generation = generation;
+        self.processed_tokens = processed;
+        self.history.clear();
+        Ok(())
+    }
 }

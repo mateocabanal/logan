@@ -791,76 +791,144 @@ mod tests {
     #[test]
     fn failure_completion_removes_cancelled_backpressured_dispatch() {
         let state = Arc::new(Mutex::new(FakeState::default()));
-        let (handle, runtime) = SchedulerRuntime::spawn(Budget::default(), RuntimeConfig::default(), executors(&state)).unwrap();
+        let (handle, runtime) = SchedulerRuntime::spawn(
+            Budget::default(),
+            RuntimeConfig::default(),
+            executors(&state),
+        )
+        .unwrap();
         let session = match recv(handle.try_request(RuntimeRequest::CreateSession).unwrap()) {
             RuntimeReply::SessionCreated(session) => session,
             other => panic!("unexpected reply: {other:?}"),
         };
-        let running = match recv(handle.try_request(RuntimeRequest::Submit {
-            session,
-            action: Action { kind: ActionKind::Cpu, payload: vec![1] },
-        }).unwrap()) {
+        let running = match recv(
+            handle
+                .try_request(RuntimeRequest::Submit {
+                    session,
+                    action: Action {
+                        kind: ActionKind::Cpu,
+                        payload: vec![1],
+                    },
+                })
+                .unwrap(),
+        ) {
             RuntimeReply::Submitted { ticket, .. } => ticket,
             other => panic!("unexpected reply: {other:?}"),
         };
         state.lock().unwrap().full = true;
-        let pending = match recv(handle.try_request(RuntimeRequest::Submit {
-            session,
-            action: Action { kind: ActionKind::Cpu, payload: vec![2] },
-        }).unwrap()) {
-            RuntimeReply::Submitted { ticket, disposition: SubmitDisposition::Backpressured } => ticket,
+        let pending = match recv(
+            handle
+                .try_request(RuntimeRequest::Submit {
+                    session,
+                    action: Action {
+                        kind: ActionKind::Cpu,
+                        payload: vec![2],
+                    },
+                })
+                .unwrap(),
+        ) {
+            RuntimeReply::Submitted {
+                ticket,
+                disposition: SubmitDisposition::Backpressured,
+            } => ticket,
             other => panic!("unexpected reply: {other:?}"),
         };
 
         state.lock().unwrap().full = false;
-        let _ = recv(handle.try_request(RuntimeRequest::Complete {
-            ticket: running,
-            outcome: Outcome::Err("failed".into()),
-        }).unwrap());
-        handle.try_notify(RuntimeRequest::ExecutorReady { kind: ActionKind::Cpu }).unwrap();
+        let _ = recv(
+            handle
+                .try_request(RuntimeRequest::Complete {
+                    ticket: running,
+                    outcome: Outcome::Err("failed".into()),
+                })
+                .unwrap(),
+        );
+        handle
+            .try_notify(RuntimeRequest::ExecutorReady {
+                kind: ActionKind::Cpu,
+            })
+            .unwrap();
         let _ = recv(handle.try_request(RuntimeRequest::CreateSession).unwrap()); // ordered barrier
         let snapshot = state.lock().unwrap();
         assert!(snapshot.cancelled.contains(&pending));
         assert!(!snapshot.accepted.contains(&pending));
         drop(snapshot);
 
-        let _ = recv(handle.try_request(RuntimeRequest::Shutdown { mode: ShutdownMode::Cancel }).unwrap());
+        let _ = recv(
+            handle
+                .try_request(RuntimeRequest::Shutdown {
+                    mode: ShutdownMode::Cancel,
+                })
+                .unwrap(),
+        );
         runtime.join().unwrap();
     }
 
     #[test]
     fn completion_retries_backpressured_work_when_capacity_returns() {
         let state = Arc::new(Mutex::new(FakeState::default()));
-        let (handle, runtime) = SchedulerRuntime::spawn(Budget::default(), RuntimeConfig::default(), executors(&state)).unwrap();
+        let (handle, runtime) = SchedulerRuntime::spawn(
+            Budget::default(),
+            RuntimeConfig::default(),
+            executors(&state),
+        )
+        .unwrap();
         let session = match recv(handle.try_request(RuntimeRequest::CreateSession).unwrap()) {
             RuntimeReply::SessionCreated(session) => session,
             other => panic!("unexpected reply: {other:?}"),
         };
-        let running = match recv(handle.try_request(RuntimeRequest::Submit {
-            session,
-            action: Action { kind: ActionKind::Cpu, payload: vec![1] },
-        }).unwrap()) {
+        let running = match recv(
+            handle
+                .try_request(RuntimeRequest::Submit {
+                    session,
+                    action: Action {
+                        kind: ActionKind::Cpu,
+                        payload: vec![1],
+                    },
+                })
+                .unwrap(),
+        ) {
             RuntimeReply::Submitted { ticket, .. } => ticket,
             other => panic!("unexpected reply: {other:?}"),
         };
         state.lock().unwrap().full = true;
-        let pending = match recv(handle.try_request(RuntimeRequest::Submit {
-            session,
-            action: Action { kind: ActionKind::Cpu, payload: vec![2] },
-        }).unwrap()) {
-            RuntimeReply::Submitted { ticket, disposition: SubmitDisposition::Backpressured } => ticket,
+        let pending = match recv(
+            handle
+                .try_request(RuntimeRequest::Submit {
+                    session,
+                    action: Action {
+                        kind: ActionKind::Cpu,
+                        payload: vec![2],
+                    },
+                })
+                .unwrap(),
+        ) {
+            RuntimeReply::Submitted {
+                ticket,
+                disposition: SubmitDisposition::Backpressured,
+            } => ticket,
             other => panic!("unexpected reply: {other:?}"),
         };
 
         state.lock().unwrap().full = false;
-        let _ = recv(handle.try_request(RuntimeRequest::Complete {
-            ticket: running,
-            outcome: Outcome::Ok,
-        }).unwrap());
+        let _ = recv(
+            handle
+                .try_request(RuntimeRequest::Complete {
+                    ticket: running,
+                    outcome: Outcome::Ok,
+                })
+                .unwrap(),
+        );
         let _ = recv(handle.try_request(RuntimeRequest::CreateSession).unwrap()); // ordered barrier
         assert!(state.lock().unwrap().accepted.contains(&pending));
 
-        let _ = recv(handle.try_request(RuntimeRequest::Shutdown { mode: ShutdownMode::Cancel }).unwrap());
+        let _ = recv(
+            handle
+                .try_request(RuntimeRequest::Shutdown {
+                    mode: ShutdownMode::Cancel,
+                })
+                .unwrap(),
+        );
         runtime.join().unwrap();
     }
 

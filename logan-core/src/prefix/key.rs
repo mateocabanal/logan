@@ -1,82 +1,58 @@
-//! Prefix key and fingerprint definitions.
+//! Prefix identity and compatibility.
+//!
+//! Exact fingerprints identify persisted entries. Longest-prefix lookup uses the
+//! actual token sequence; a hash of a longer sequence can never prove that a
+//! shorter sequence is its prefix.
 
+use sha2::{Digest, Sha256};
 use std::fmt;
 
-/// Fingerprint of a model artifact or checkpoint.
-/// Used to reject cache entries for incompatible models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct ModelFingerprint {
-    /// SHA-256 digest of model artifact
     pub digest: [u8; 32],
 }
 
-impl fmt::Display for ModelFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.digest))
-    }
-}
-
-/// Fingerprint of tokenizer/template identity.
-/// Used to reject cache entries for incompatible tokenizers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct TokenizerFingerprint {
-    /// SHA-256 digest of tokenizer/template identity
     pub digest: [u8; 32],
 }
 
-impl fmt::Display for TokenizerFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.digest))
-    }
-}
-
-/// Fingerprint of state representation/schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct StateSchemaFingerprint {
-    /// SHA-256 digest of state schema
     pub digest: [u8; 32],
 }
 
-impl fmt::Display for StateSchemaFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.digest))
-    }
-}
-
-/// Fingerprint of compiled plan/package identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct PlanFingerprint {
-    /// SHA-256 digest of compiled plan/package
     pub digest: [u8; 32],
 }
 
-impl fmt::Display for PlanFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.digest))
-    }
+macro_rules! impl_display {
+    ($ty:ty) => {
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", hex::encode(self.digest))
+            }
+        }
+    };
 }
 
-/// Complete prefix cache identity.
-/// Rejects any snapshot that doesn't belong to exactly the compatible
-/// model/runtime state contract.
+impl_display!(ModelFingerprint);
+impl_display!(TokenizerFingerprint);
+impl_display!(StateSchemaFingerprint);
+impl_display!(PlanFingerprint);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct PrefixFingerprint {
-    /// Model fingerprint
     pub model: ModelFingerprint,
-    /// State schema fingerprint
     pub state_schema: StateSchemaFingerprint,
-    /// Tokenizer/template fingerprint
     pub tokenizer: TokenizerFingerprint,
-    /// Compiled plan/package fingerprint
     pub plan: PlanFingerprint,
-    /// Prefix token hash
     pub prefix_token_hash: u64,
-    /// Prefix token count
     pub prefix_len: usize,
 }
 
 impl PrefixFingerprint {
-    /// Create new prefix fingerprint
     pub fn new(
         model: ModelFingerprint,
         state_schema: StateSchemaFingerprint,
@@ -85,7 +61,7 @@ impl PrefixFingerprint {
         prefix_token_hash: u64,
         prefix_len: usize,
     ) -> Self {
-        PrefixFingerprint {
+        Self {
             model,
             state_schema,
             tokenizer,
@@ -95,127 +71,155 @@ impl PrefixFingerprint {
         }
     }
 
-    /// Check compatibility with another fingerprint
-    pub fn is_compatible_with(&self, other: &PrefixFingerprint) -> bool {
+    pub fn same_contract(&self, other: &Self) -> bool {
         self.model == other.model
             && self.state_schema == other.state_schema
             && self.tokenizer == other.tokenizer
             && self.plan == other.plan
+    }
+
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        self.same_contract(other)
             && self.prefix_token_hash == other.prefix_token_hash
             && self.prefix_len == other.prefix_len
     }
-
-    /// Check if compatible except prefix length (for longest-prefix lookup)
-    pub fn is_compatible_prefix(&self, other: &PrefixFingerprint) -> bool {
-        self.model == other.model
-            && self.state_schema == other.state_schema
-            && self.tokenizer == other.tokenizer
-            && self.plan == other.plan
-            && self.prefix_token_hash == other.prefix_token_hash
-    }
 }
 
-/// Hash function for token sequences.
-pub fn hash_tokens(tokens: &[u32]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    for token in tokens {
-        token.hash(&mut hasher);
-        // Include token boundaries to avoid ambiguity
-        0xFFu32.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Checksum for prefix token sequence.
-pub fn checksum_tokens(tokens: &[u32]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    for token in tokens {
-        hasher.update(&token.to_le_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut checksum = [0u8; 32];
-    checksum.copy_from_slice(&digest);
-    checksum
-}
-
-/// Query key for prefix cache lookup
+/// Query/cache key. Tokens are retained so longest-prefix lookup is exact.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PrefixKey {
     pub model_fingerprint: ModelFingerprint,
     pub state_schema_fingerprint: StateSchemaFingerprint,
     pub tokenizer_fingerprint: TokenizerFingerprint,
     pub plan_fingerprint: PlanFingerprint,
+    pub prefix_tokens: Vec<u32>,
     pub prefix_token_hash: u64,
-    pub prefix_len: usize,
 }
+
+impl PrefixKey {
+    pub fn new(
+        model_fingerprint: ModelFingerprint,
+        state_schema_fingerprint: StateSchemaFingerprint,
+        tokenizer_fingerprint: TokenizerFingerprint,
+        plan_fingerprint: PlanFingerprint,
+        prefix_tokens: impl Into<Vec<u32>>,
+    ) -> Self {
+        let prefix_tokens = prefix_tokens.into();
+        let prefix_token_hash = hash_tokens(&prefix_tokens);
+        Self {
+            model_fingerprint,
+            state_schema_fingerprint,
+            tokenizer_fingerprint,
+            plan_fingerprint,
+            prefix_tokens,
+            prefix_token_hash,
+        }
+    }
+
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_tokens.len()
+    }
+
+    pub fn fingerprint(&self) -> PrefixFingerprint {
+        PrefixFingerprint::new(
+            self.model_fingerprint,
+            self.state_schema_fingerprint,
+            self.tokenizer_fingerprint,
+            self.plan_fingerprint,
+            self.prefix_token_hash,
+            self.prefix_len(),
+        )
+    }
+
+    pub fn same_contract(&self, other: &Self) -> bool {
+        self.model_fingerprint == other.model_fingerprint
+            && self.state_schema_fingerprint == other.state_schema_fingerprint
+            && self.tokenizer_fingerprint == other.tokenizer_fingerprint
+            && self.plan_fingerprint == other.plan_fingerprint
+    }
+
+    pub fn is_prefix_of(&self, query: &Self) -> bool {
+        self.same_contract(query) && query.prefix_tokens.starts_with(&self.prefix_tokens)
+    }
+
+    /// Derive a namespace-isolated key without discarding tokenizer/state/plan
+    /// identity. This is appropriate for per-user cache isolation.
+    pub fn with_salt(&self, salt: impl AsRef<[u8]>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"logan-prefix-salt-v1");
+        hasher.update(self.model_fingerprint.digest);
+        hasher.update(salt.as_ref());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut key = self.clone();
+        key.model_fingerprint = ModelFingerprint { digest };
+        key
+    }
+}
+
+/// Stable token-sequence hash for filenames/indexing. Prefix correctness never
+/// relies on this alone; lookup also checks the actual token sequence.
+pub fn hash_tokens(tokens: &[u32]) -> u64 {
+    let checksum = checksum_tokens(tokens);
+    u64::from_le_bytes(checksum[..8].try_into().unwrap())
+}
+
+pub fn checksum_tokens(tokens: &[u32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"logan-prefix-tokens-v1");
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fingerprint() -> PrefixFingerprint {
-        PrefixFingerprint::new(
+    fn key(tokens: &[u32]) -> PrefixKey {
+        PrefixKey::new(
             ModelFingerprint { digest: [1; 32] },
             StateSchemaFingerprint { digest: [2; 32] },
             TokenizerFingerprint { digest: [3; 32] },
             PlanFingerprint { digest: [4; 32] },
-            0xabc123,
-            100,
+            tokens.to_vec(),
         )
     }
 
     #[test]
-    fn test_fingerprint_compatible() {
-        let a = fingerprint();
-        let b = fingerprint();
-        assert!(a.is_compatible_with(&b));
+    fn longest_prefix_uses_tokens_not_equal_hashes() {
+        let short = key(&[1, 2, 3]);
+        let long = key(&[1, 2, 3, 4, 5]);
+        assert_ne!(short.prefix_token_hash, long.prefix_token_hash);
+        assert!(short.is_prefix_of(&long));
+        assert!(!long.is_prefix_of(&short));
     }
 
     #[test]
-    fn test_fingerprint_prefix_compatible() {
-        let a = fingerprint();
-        let b = PrefixFingerprint::new(
-            a.model,
-            a.state_schema,
-            a.tokenizer,
-            a.plan,
-            0xabc123,
-            150,
+    fn contract_mismatch_rejects_prefix() {
+        let a = key(&[1, 2]);
+        let mut b = key(&[1, 2, 3]);
+        b.model_fingerprint = ModelFingerprint { digest: [9; 32] };
+        assert!(!a.is_prefix_of(&b));
+    }
+
+    #[test]
+    fn token_hash_is_stable_and_order_sensitive() {
+        assert_eq!(hash_tokens(&[1, 2, 3]), hash_tokens(&[1, 2, 3]));
+        assert_ne!(hash_tokens(&[1, 2, 3]), hash_tokens(&[1, 3, 2]));
+    }
+
+    #[test]
+    fn salt_preserves_non_model_contract_identity() {
+        let original = key(&[1, 2, 3]);
+        let salted = original.with_salt(b"alice");
+        assert_ne!(salted.model_fingerprint, original.model_fingerprint);
+        assert_eq!(
+            salted.state_schema_fingerprint,
+            original.state_schema_fingerprint
         );
-        assert!(a.is_compatible_prefix(&b));
-        assert!(!a.is_compatible_with(&b));
-    }
-
-    #[test]
-    fn test_fingerprint_mismatch() {
-        let a = fingerprint();
-        let b = PrefixFingerprint::new(
-            ModelFingerprint { digest: [5; 32] },
-            a.state_schema,
-            a.tokenizer,
-            a.plan,
-            0xabc123,
-            100,
-        );
-        assert!(!a.is_compatible_with(&b));
-        assert!(!a.is_compatible_prefix(&b));
-    }
-
-    #[test]
-    fn test_token_hash() {
-        assert_eq!(hash_tokens(&[]), hash_tokens(&[]));
-        assert_ne!(hash_tokens(&[1, 2, 3]), hash_tokens(&[1, 2, 4]));
-    }
-
-    #[test]
-    fn test_token_checksum() {
-        let a = checksum_tokens(&[1, 2, 3]);
-        let b = checksum_tokens(&[1, 2, 3]);
-        assert_eq!(a, b);
-        assert_ne!(a, checksum_tokens(&[1, 2, 4]));
+        assert_eq!(salted.tokenizer_fingerprint, original.tokenizer_fingerprint);
+        assert_eq!(salted.plan_fingerprint, original.plan_fingerprint);
+        assert_eq!(salted.prefix_tokens, original.prefix_tokens);
     }
 }

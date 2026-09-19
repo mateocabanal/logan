@@ -9,13 +9,18 @@
 //!
 //! Lookup supports longest reusable prefix (not just exact matches).
 
-pub mod key;
-pub mod index;
-pub mod memory;
 pub mod disk;
 pub mod format;
+pub mod index;
+pub mod key;
+pub mod memory;
 pub mod runtime;
-pub use key::{ModelFingerprint, StateSchemaFingerprint, TokenizerFingerprint, PlanFingerprint};
-pub use key::{PrefixKey, PrefixFingerprint};
-pub use index::{PrefixIndex, PrefixLookup, CacheStats};
-pub use memory::RamPrefixCache;
+
+pub use disk::SsdPrefixStore;
+pub use index::{CacheStats, PrefixIndex, PrefixLookup};
+pub use key::{
+    ModelFingerprint, PlanFingerprint, PrefixFingerprint, PrefixKey, StateSchemaFingerprint,
+    TokenizerFingerprint, checksum_tokens, hash_tokens,
+};
+pub use memory::{CacheHit, RamPrefixCache};
+pub use runtime::{PrefixLookupResult, PrefixRuntime, PrefixRuntimeConfig};

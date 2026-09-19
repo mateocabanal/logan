@@ -831,11 +831,16 @@ mod tests {
         let mut manager = ResidencyManager::new();
         manager.add_pool(pool, 50).unwrap();
         let expert = key(pool, repr(1));
-        let load = match manager.begin_load(expert.clone(), 20, SessionId(1)).unwrap() {
+        let load = match manager
+            .begin_load(expert.clone(), 20, SessionId(1))
+            .unwrap()
+        {
             LoadDisposition::Started { load_id } => load_id,
             _ => unreachable!(),
         };
-        manager.begin_load(expert.clone(), 20, SessionId(2)).unwrap();
+        manager
+            .begin_load(expert.clone(), 20, SessionId(2))
+            .unwrap();
         let disposition = manager
             .complete_load(LoadCompletion {
                 load_id: load,
@@ -845,15 +850,25 @@ mod tests {
         assert!(
             matches!(&disposition, CompletionDisposition::Failed { wakes } if wakes.len() == 2)
         );
-        assert!(matches!(disposition, CompletionDisposition::Failed { wakes } if wakes.iter().all(|wake| wake.result.is_err())));
-        assert!(matches!(manager.state(&expert), ResidencyState::Failed { .. }));
+        assert!(
+            matches!(disposition, CompletionDisposition::Failed { wakes } if wakes.iter().all(|wake| wake.result.is_err()))
+        );
+        assert!(matches!(
+            manager.state(&expert),
+            ResidencyState::Failed { .. }
+        ));
         assert_eq!(manager.pool_stats(pool).unwrap().reserved_loading_bytes, 0);
         assert_eq!(manager.pool_stats(pool).unwrap().resident_bytes, 0);
         assert_eq!(manager.pool_stats(pool).unwrap().failures, 1);
         // A failed entry is retryable: the next miss starts a fresh load.
-        let retry = manager.begin_load(expert.clone(), 20, SessionId(3)).unwrap();
+        let retry = manager
+            .begin_load(expert.clone(), 20, SessionId(3))
+            .unwrap();
         assert!(matches!(retry, LoadDisposition::Started { .. }));
-        assert!(matches!(manager.state(&expert), ResidencyState::Loading { .. }));
+        assert!(matches!(
+            manager.state(&expert),
+            ResidencyState::Loading { .. }
+        ));
         let load = match retry {
             LoadDisposition::Started { load_id } => load_id,
             _ => unreachable!(),

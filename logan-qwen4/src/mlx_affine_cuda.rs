@@ -5,7 +5,10 @@
 //! into the `ResidentAffine` owned by the corresponding `WtBytes`.
 
 use std::ffi::c_void;
-use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
 use logan_core::cuda::{self, DeviceBuf, Kernel};
 
@@ -63,7 +66,9 @@ static KERNEL: OnceLock<Option<Kernel>> = OnceLock::new();
 static WEIGHT_UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 fn kernel() -> Option<&'static Kernel> {
-    KERNEL.get_or_init(|| cuda::compile(SOURCE, "mlx_affine_gemv")).as_ref()
+    KERNEL
+        .get_or_init(|| cuda::compile(SOURCE, "mlx_affine_gemv"))
+        .as_ref()
 }
 
 pub(crate) fn weight_uploads() -> u64 {
@@ -99,10 +104,7 @@ fn f32_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: `f32` is POD; the resulting byte slice has exactly the same
     // lifetime and covers exactly `len * size_of::<f32>()` initialized bytes.
     unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(values),
-        )
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
@@ -168,11 +170,21 @@ pub(crate) fn matmul(
         return false;
     }
 
-    let Some(mut w_ptr) = r.weights.ptr() else { return false; };
-    let Some(mut s_ptr) = r.scales.ptr() else { return false; };
-    let Some(mut b_ptr) = r.biases.ptr() else { return false; };
-    let Some(mut x_ptr) = r.x.ptr() else { return false; };
-    let Some(mut y_ptr) = r.y.ptr() else { return false; };
+    let Some(mut w_ptr) = r.weights.ptr() else {
+        return false;
+    };
+    let Some(mut s_ptr) = r.scales.ptr() else {
+        return false;
+    };
+    let Some(mut b_ptr) = r.biases.ptr() else {
+        return false;
+    };
+    let Some(mut x_ptr) = r.x.ptr() else {
+        return false;
+    };
+    let Some(mut y_ptr) = r.y.ptr() else {
+        return false;
+    };
     let mut rows_i = rows as i32;
     let mut cols_i = cols as i32;
     let mut bits_i = bits as i32;

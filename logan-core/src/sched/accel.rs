@@ -180,10 +180,12 @@ impl Accel {
     ) -> Result<Vec<Effect>, AccelError> {
         if let Some(leases) = self.inflight.remove(&completion.ticket) {
             for lease in leases {
-                residency.release(lease).map_err(|error| AccelError::Release {
-                    ticket: completion.ticket,
-                    error,
-                })?;
+                residency
+                    .release(lease)
+                    .map_err(|error| AccelError::Release {
+                        ticket: completion.ticket,
+                        error,
+                    })?;
             }
         }
         let outcome = match completion.outcome {
@@ -252,9 +254,17 @@ mod tests {
 
     /// Load `bytes` for a key and publish it resident. The begin-load waiter
     /// lease is returned to the manager, leaving the entry unpinned.
-    fn resident(manager: &mut ResidencyManager, pool: MemoryPoolId, layout: u32, bytes: usize) -> ExpertKey {
+    fn resident(
+        manager: &mut ResidencyManager,
+        pool: MemoryPoolId,
+        layout: u32,
+        bytes: usize,
+    ) -> ExpertKey {
         let key = key(pool, layout);
-        let load = match manager.begin_load(key.clone(), bytes, SessionId(0)).unwrap() {
+        let load = match manager
+            .begin_load(key.clone(), bytes, SessionId(0))
+            .unwrap()
+        {
             LoadDisposition::Started { load_id } => load_id,
             other => panic!("unexpected {other:?}"),
         };
@@ -434,14 +444,16 @@ mod tests {
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
 
         // Duplicate completion is a harmless no-op: same state, no release.
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                mock.completion(ticket, AccelOutcome::Success),
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    mock.completion(ticket, AccelOutcome::Success),
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(core.session_state(session), Some(SessionState::Failed));
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
         assert_eq!(accel.inflight_len(), 0);
@@ -475,7 +487,10 @@ mod tests {
         // The core revokes the session logically, but native GPU work may
         // still be reading the expert. Cancellation therefore keeps the
         // generation pinned until the backend reports actual completion.
-        assert_eq!(core.cancel(doomed).unwrap(), vec![Effect::Cancel { ticket }]);
+        assert_eq!(
+            core.cancel(doomed).unwrap(),
+            vec![Effect::Cancel { ticket }]
+        );
         assert!(accel.cancel_ticket(&mut residency, ticket));
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 40);
         assert_eq!(accel.inflight_len(), 1);
@@ -483,14 +498,16 @@ mod tests {
         // Native completion is the point where the retained generation may
         // finally be released. The core ticket is already revoked, so its
         // late logical completion remains a harmless no-op.
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                mock.completion(ticket, AccelOutcome::Cancelled),
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    mock.completion(ticket, AccelOutcome::Cancelled),
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
         assert_eq!(core.session_state(doomed), Some(SessionState::Cancelling));
         assert!(!accel.cancel_ticket(&mut residency, ticket));
@@ -562,7 +579,10 @@ mod tests {
 
         // The generation is reused: publish generation 1 (waiter lease
         // returned, so the entry is not pinned by the reload either).
-        let reload = match residency.begin_load(expert.clone(), 40, SessionId(1)).unwrap() {
+        let reload = match residency
+            .begin_load(expert.clone(), 40, SessionId(1))
+            .unwrap()
+        {
             LoadDisposition::Started { load_id } => load_id,
             other => panic!("unexpected {other:?}"),
         };
@@ -588,14 +608,16 @@ mod tests {
         // A stale duplicate completion after the reuse releases nothing and
         // cannot observe the new generation: the old lease was already
         // returned at first completion.
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                mock.completion(ticket, AccelOutcome::Success),
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    mock.completion(ticket, AccelOutcome::Success),
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
         assert!(matches!(
             residency.state(&expert),
@@ -616,17 +638,19 @@ mod tests {
         let mut mock = MockTarget::new();
 
         // Completion for a ticket this contract never issued.
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                AccelCompletion {
-                    ticket: Ticket(999),
-                    outcome: AccelOutcome::Success,
-                },
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    AccelCompletion {
+                        ticket: Ticket(999),
+                        outcome: AccelOutcome::Success,
+                    },
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(accel.inflight_len(), 0);
 
         let (ticket, dispatch) = accel
@@ -641,35 +665,41 @@ mod tests {
             .unwrap();
         mock.submit(&dispatch);
         // Other tickets do not disturb the live one.
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                AccelCompletion {
-                    ticket: Ticket(998),
-                    outcome: AccelOutcome::Failed("late stranger".into()),
-                },
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    AccelCompletion {
+                        ticket: Ticket(998),
+                        outcome: AccelOutcome::Failed("late stranger".into()),
+                    },
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(accel.inflight_len(), 1);
 
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                mock.completion(ticket, AccelOutcome::Success),
-            )
-            .unwrap()
-            .is_empty()); // session not blocked: nothing to wake
-        assert!(accel
-            .complete(
-                &mut core,
-                &mut residency,
-                mock.completion(ticket, AccelOutcome::Success),
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    mock.completion(ticket, AccelOutcome::Success),
+                )
+                .unwrap()
+                .is_empty()
+        ); // session not blocked: nothing to wake
+        assert!(
+            accel
+                .complete(
+                    &mut core,
+                    &mut residency,
+                    mock.completion(ticket, AccelOutcome::Success),
+                )
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(accel.inflight_len(), 0);
         assert_eq!(residency.pool_stats(pool).unwrap().pinned_bytes, 0);
     }
@@ -692,7 +722,14 @@ mod tests {
         };
         assert_eq!(
             accel
-                .submit(&mut core, &mut residency, &registry, session, &rogue, action(b"x", vec![]))
+                .submit(
+                    &mut core,
+                    &mut residency,
+                    &registry,
+                    session,
+                    &rogue,
+                    action(b"x", vec![])
+                )
                 .unwrap_err(),
             AccelError::UnknownTarget(DeviceId(9))
         );
@@ -706,7 +743,14 @@ mod tests {
         registry.register(cpu.clone()).unwrap();
         assert_eq!(
             accel
-                .submit(&mut core, &mut residency, &registry, session, &cpu, action(b"x", vec![]))
+                .submit(
+                    &mut core,
+                    &mut residency,
+                    &registry,
+                    session,
+                    &cpu,
+                    action(b"x", vec![])
+                )
                 .unwrap_err(),
             AccelError::UnsupportedTarget(DeviceId(2))
         );

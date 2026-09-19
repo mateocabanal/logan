@@ -1616,6 +1616,33 @@ pub struct Model {
     /// Resume cursor for a blocked token forward (same-op resubmission).
     sched_pause: Option<TokenPause>,
 }
+/// Snapshot of Qwen4 causal state for prefix reuse and verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QwenSnapshot {
+    /// Digest of the captured causal state.
+    pub digest: [u8; 32],
+    /// Size of payload in bytes.
+    pub payload_bytes: u64,
+    /// Captured prefix length.
+    pub prefix_len: usize,
+    /// Actual serialized payload (in-memory for restore).
+    pub payload: Vec<u8>,
+}
+
+impl QwenSnapshot {
+    /// Exact equality via digest + payload comparison.
+    pub fn exact_eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
+            && self.payload_bytes == other.payload_bytes
+            && self.prefix_len == other.prefix_len
+            && self.payload == other.payload
+    }
+
+    /// Payload byte count.
+    pub fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+}
 
 // Profiling-only routed-MoE fallback diagnostics. Each benchmark process owns
 // one model in practice; counters are process-lifetime and printed only when
@@ -7675,8 +7702,7 @@ impl Model {
             // Tail for the final row only: intermediate rows need their causal
             // state committed, not their logits.
             if self.mtp.is_some() {
-                self.last_hidden_nextn
-                    .extend_from_slice(&streams[rows - 1]);
+                self.last_hidden_nextn.extend_from_slice(&streams[rows - 1]);
             }
             return Ok(if want_logits_last {
                 Some(self.forward_tail(&streams[rows - 1]))
@@ -9337,7 +9363,7 @@ fn load_mlx_quantized_expert_wt(
                     group_size,
                     metal_aux: std::sync::OnceLock::new(),
                     metal_tensor: std::sync::Mutex::new(0),
-                cuda_resident: std::sync::Mutex::new(None),
+                    cuda_resident: std::sync::Mutex::new(None),
                 }),
                 o,
                 i,
@@ -10280,6 +10306,34 @@ impl Model {
             sched_pause: None,
         })
     }
+    /// Snapshot the current causal state for the given prefix length.
+    pub fn snapshot_state(&self, prefix_len: usize) -> Result<QwenSnapshot, String> {
+        let digest = crate::plan::prefix_cache::live_prefix_state_digest(self, prefix_len)?;
+        let payload_bytes =
+            crate::plan::prefix_cache::prefix_state_payload_bytes(self, prefix_len)?;
+        // Collect payload by visiting
+        let mut payload = Vec::with_capacity(payload_bytes as usize);
+        crate::plan::prefix_cache::visit_live_payload(self, prefix_len, |bytes| {
+            payload.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(QwenSnapshot {
+            digest,
+            payload_bytes,
+            prefix_len,
+            payload,
+        })
+    }
+
+    /// Restore causal state from a snapshot.
+    /// Returns Err if snapshot is incompatible (wrong model config, corrupted payload, etc).
+    pub fn restore_state(&mut self, snapshot: &QwenSnapshot) -> Result<(), String> {
+        crate::plan::prefix_cache::restore_payload_from_bytes(
+            self,
+            snapshot.prefix_len,
+            &snapshot.payload,
+        )
+    }
 }
 
 fn ple_conv_state_len(hcd: usize, kernel: usize, ngram_size: usize) -> usize {
@@ -11112,7 +11166,10 @@ mod tests {
                         }
                     }
                 }
-                words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>()
+                words
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>()
             };
 
             for (bits, group) in [(4_u8, 64_usize), (5, 128), (6, 64), (8, 128)] {
@@ -11148,13 +11205,20 @@ mod tests {
                 for _ in 0..2 {
                     let mut got = vec![0.0_f32; O];
                     matmul(&mut got, &x, &w);
-                    let scale = want.iter().map(|v| v.abs()).fold(0.0_f32, f32::max).max(1e-6);
+                    let scale = want
+                        .iter()
+                        .map(|v| v.abs())
+                        .fold(0.0_f32, f32::max)
+                        .max(1e-6);
                     let max_rel = got
                         .iter()
                         .zip(&want)
                         .map(|(a, b)| (a - b).abs() / scale)
                         .fold(0.0_f32, f32::max);
-                    assert!(max_rel < 2e-5, "bits={bits} group={group} max_rel={max_rel:e}");
+                    assert!(
+                        max_rel < 2e-5,
+                        "bits={bits} group={group} max_rel={max_rel:e}"
+                    );
                 }
                 assert_eq!(
                     logan_core::cuda::launches() - before_launch,
@@ -11173,14 +11237,25 @@ mod tests {
 
         let exe = std::env::current_exe().expect("test binary path");
         let out = std::process::Command::new(exe)
-            .args(["--exact", "tests::qwen_mlx_affine_matmul_uses_cuda_when_enabled", "--nocapture"])
+            .args([
+                "--exact",
+                "tests::qwen_mlx_affine_matmul_uses_cuda_when_enabled",
+                "--nocapture",
+            ])
             .env(CHILD, "1")
             .env("LOGAN_CUDA", "1")
             .output()
             .expect("spawn CUDA child test");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "CUDA child failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-        assert!(stdout.contains("mlx-affine cuda bits=") || stdout.contains("SKIP mlx-affine CUDA"), "child did not execute CUDA arm:\n{stdout}");
+        assert!(
+            out.status.success(),
+            "CUDA child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("mlx-affine cuda bits=") || stdout.contains("SKIP mlx-affine CUDA"),
+            "child did not execute CUDA arm:\n{stdout}"
+        );
         print!("{stdout}");
     }
 

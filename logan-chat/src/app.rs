@@ -1,13 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use logan_qwen4::plan::{RuntimeFeatures, RuntimeStats};
 
-use crate::engine::{
-    EngineCommand, EngineEvent, GenerationSettings, StopReason, TurnMetrics,
-};
+use crate::engine::{EngineCommand, EngineEvent, GenerationSettings, StopReason, TurnMetrics};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -290,16 +288,12 @@ impl App {
                 })
             }
             "max" => self.set_usize("max tokens", arg, 1, 4096, |s, v| s.max_new = v),
-            "top-k" | "topk" => {
-                self.set_usize("top-k", arg, 0, 4096, |s, v| s.top_k = v)
-            }
+            "top-k" | "topk" => self.set_usize("top-k", arg, 0, 4096, |s, v| s.top_k = v),
             "temp" | "temperature" => {
                 self.set_f32("temperature", arg, 0.0, 5.0, |s, v| s.temperature = v)
             }
             "top-p" | "topp" => self.set_f32("top-p", arg, 0.01, 1.0, |s, v| s.top_p = v),
-            "repeat" => self.set_f32("repeat penalty", arg, 1.0, 2.0, |s, v| {
-                s.repeat_penalty = v
-            }),
+            "repeat" => self.set_f32("repeat penalty", arg, 1.0, 2.0, |s, v| s.repeat_penalty = v),
             "greedy" => {
                 self.settings.temperature = 0.0;
                 self.settings.top_k = 1;
@@ -307,7 +301,11 @@ impl App {
                 UiAction::None
             }
             "save" => {
-                let path = if arg.is_empty() { "logan-chat.txt" } else { arg };
+                let path = if arg.is_empty() {
+                    "logan-chat.txt"
+                } else {
+                    arg
+                };
                 match self.save_transcript(path) {
                     Ok(()) => self.notice(&format!("saved transcript to {path}")),
                     Err(e) => self.notice(&format!("save failed: {e}")),
