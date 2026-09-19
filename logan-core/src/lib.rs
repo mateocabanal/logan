@@ -13,4 +13,5 @@ pub mod math_x86;
 pub mod sched;
 pub mod shared;
 pub mod storage;
+pub mod state;
 pub mod telemetry;
