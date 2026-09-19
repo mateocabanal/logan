@@ -1,90 +1,199 @@
-# Logan Model-Agnostic Runtime — Architecture (Post-Refactor)
+# Logan Model-Agnostic Runtime Architecture
 
-## Summary
+Last verified: 2026-09-19
 
-The shared inference infrastructure in `logan-core` is now genuinely model-agnostic.
-New model families (DeepSeek V4, new Qwen variants, Gemma, MiniCPM) inherit scheduling,
-residency, storage tiers, telemetry, device execution, and speculative lifecycle without
-reimplementing those systems.
+## Status
 
-## Shared / Core (logan-core)
+Logan now has a compiled, tested model-neutral causal-state and prefix-cache layer in
+`logan-core`. Engines still own the semantics and physical representation of their
+causal state through small codec adapters.
 
-| Subsystem | File(s) | Owner |
+The important boundary is:
+
+- **core owns policy and lifecycle**: identity, prefix matching, RAM/SSD policy,
+  checksums, transactions, persistence containers, cache budgets, and telemetry;
+- **engines own state semantics and performance-critical codecs**: how live KV,
+  recurrent state, QSA/GDN state, or other model-specific state is captured and
+  restored.
+
+This is intentionally not a requirement that every model use the same physical
+serialization algorithm.
+
+## Shared Core
+
+| Subsystem | File(s) | Responsibility |
 |---|---|---|
-| Model-neutral causal state | `state/mod.rs`, `state/page.rs`, `state/transaction.rs`, `state/snapshot.rs`, `state/schema.rs` | Core |
-| State patterns (AppendOnly, Ring, MutableFixed, SparsePaged, Opaque) | `state/mod.rs` | Core |
-| Prefix identity + fingerprint | `prefix/key.rs` | Core |
-| Prefix index + longest-prefix lookup | `prefix/index.rs` | Core |
-| RAM hot cache | `prefix/memory.rs` | Core |
-| SSD persistent snapshot store | `prefix/disk.rs`, `prefix/format.rs` | Core |
-| Prefix runtime integration (tokenize → lookup → restore → suffix → persist) | `prefix/runtime.rs` | Core |
-| Transactional checkpoint / commit / rollback | `state/transaction.rs` | Core |
-| Stable versioned snapshot container (`LOGANPF1`) | `prefix/format.rs` | Core |
-| Generic telemtry / metrics | `telemetry.rs` (restored) | Core |
+| Causal-state abstraction | `logan-core/src/state/mod.rs` | `CausalState`, state patterns, `CausalStateCodec`, schema identity |
+| State schemas | `logan-core/src/state/schema.rs` | Logical region geometry, dtype, validation, state-size accounting |
+| State pages | `logan-core/src/state/page.rs` | Page identity/reference/pinning primitives |
+| State transactions | `logan-core/src/state/transaction.rs` | Generation-safe checkpoint, commit, rollback, cancellation |
+| State snapshots | `logan-core/src/state/snapshot.rs` | Versioned checksummed causal-state snapshots and codec capture/restore |
+| Prefix identity | `logan-core/src/prefix/key.rs` | Model/state/tokenizer/plan identity and stable token hashing |
+| Prefix index | `logan-core/src/prefix/index.rs` | Exact token-prefix matching, longest-prefix selection, LRU accounting |
+| RAM prefix cache | `logan-core/src/prefix/memory.rs` | Byte-budgeted hot cache storing real snapshot values |
+| Generic SSD store | `logan-core/src/prefix/disk.rs`, `format.rs` | Atomic checksummed persistence and restart-safe token/state identity |
+| Prefix runtime | `logan-core/src/prefix/runtime.rs` | RAM/SSD lookup, promotion, persistence, budgets, cache isolation |
 
-## Model-Specific Boundary (remains in engine)
+The generic persistent prefix container is `LOGANPF1`. It stores the actual token
+sequence plus a versioned `StateSnapshot`; a hash alone is never treated as proof
+that one sequence is a prefix of another.
 
-- **Forward graph / operation ordering** — `logan-qwen4/src/plan/`, `logan-llama/src/kv.rs`
-- **Attention mathematics** — GQA (Llama) vs QSA (Qwen) vs GDN (Qwen)
-- **State semantics / meaning** — engine codec adapter (`CausalStateCodec` trait)
-- **Router / expert policies** — `logan-core/src/expert.rs` provides primitives; engine defines policy
-- **Tokenization / chat-template** — engine-specific
-- **Specialized kernels** — `metal.rs`, `cuda/` kernels
-- **Drafter conditioning geometry** — `dspark/` modules
+## Engine Boundary
 
-## Architecture Diagram (final)
+### Dense Llama / MiniCPM
 
+`logan-llama/src/codec_adapter.rs` implements `LlamaStateCodec`.
+
+The dense chat path uses:
+
+1. the generic `RamPrefixCache` for hot snapshots plus boundary logits;
+2. the generic `PrefixRuntime` for persistent SSD state;
+3. exact model, tokenizer, state-schema, and numerical-plan fingerprints;
+4. strict-prefix SSD restore, followed by a real suffix token to regenerate boundary
+   logits. No synthetic token position is replayed.
+
+`DenseModel::cache_fingerprint()` binds persistent state to the effective resident
+model, including model geometry and weight representation.
+
+### Qwen4 / Qwen4Exp
+
+`logan-qwen4/src/plan/snapshot.rs` implements `QwenStateCodec` and exposes the
+core-backed `QwenStateSnapshot` used by the hot-cache path.
+
+Qwen also deliberately retains its specialized streaming persistent `.lpfx` codec in
+`logan-qwen4/src/plan/prefix_cache.rs`. That is an engine-specific physical codec,
+not a separate architectural policy layer. Qwen hybrid state can be very large
+(GDN, attention KV, QSA, PLE), so direct validated streaming restore avoids allocating
+a second full in-memory state image.
+
+The specialized Qwen restore now validates exact payload size, decodes little-endian
+values without unaligned typed-pointer casts, and restores attention KV using the
+correct per-head stride.
+
+## State Patterns
+
+Core supports reusable logical state patterns:
+
+- `AppendOnly` — conventional KV-like state;
+- `Ring` — sliding-window/circular state;
+- `MutableFixed` — fixed-size recurrent or compressor state;
+- `SparsePaged` — page-oriented sparse state;
+- `Opaque` — engine-owned compound state that must be captured/restored atomically.
+
+`Opaque` is intentional: model-agnostic lifecycle management does not require core
+to understand every engine's internal tensor layout.
+
+## Cache Identity and Correctness
+
+A generic prefix key includes:
+
+- model fingerprint;
+- state-schema fingerprint;
+- tokenizer fingerprint;
+- execution/numerical-plan fingerprint;
+- the exact prefix token sequence;
+- a stable SHA-256-derived token hash for indexing.
+
+Longest-prefix lookup compares the real token sequence. Two different-length prefixes
+are not expected to have equal hashes.
+
+Generic SSD entries use:
+
+- a versioned container;
+- exact token storage;
+- state snapshot checksums;
+- atomic temp-file + fsync + rename publication;
+- byte-budgeted eviction;
+- restart-time index reconstruction.
+
+State transactions are session-bound and generation-bound so a checkpoint from a
+different session or an older committed state cannot become valid accidentally.
+
+## Verification
+
+The exact integrated tree was verified on 2026-09-19 with:
+
+```text
+cargo fmt --all -- --check
+PASS
+
+git diff --check
+PASS
+
+cargo test --workspace --all-targets
+PASS (exit 0)
 ```
-                    frontends / daemon / API
-                            |
-                            v
-                    EngineSession interface
-                            |
-          +-----------------+------------------+
-          |              logan-core            |
-          |  CausalStateManager                 |
-          |  PrefixCache (RAM + SSD + .lpfx)     |
-          |  TransactionManager                  |
-          |  ResourceManager / Residency         |
-          |  Scheduler / Storage / Telemetry     |
-          +--------+------------+-------------+
-                   |            |
-              logan-llama   logan-qwen4    future logan-v4
-              (codec adapter) (codec adapter)
+
+Important targeted regressions that pass include:
+
+- Qwen head-major KV restore uses the real per-head stride and preserves unused tail;
+- Qwen byte restore accepts unaligned byte sources safely;
+- MiniCPM exact-prompt RAM cache restore returns the exact committed causal position;
+- generic SSD cache survives runtime reconstruction and promotes restored entries;
+- state rollback restores exact state and rejects stale/cross-session checkpoints.
+
+### Real MiniCPM5 checks
+
+The installed `MiniCPM5-2B-oQ8e` checkpoint was run through the release Logan
+dense path. A one-token decode completed on the Metal backend:
+
+```text
+backend=Auto
+tokens=1
+tok_s=1.425
+used=Metal
+reason="fused standard Llama layer"
 ```
 
-## Key Changes
+A separate release-mode real-model SSD test used a 2-token prefix and 3-token
+continuation, explicitly cleared the RAM hot cache, and verified the persistent state
+restore:
 
-- `logan-core/src/state/` created: generic causal-state subsystem with transaction semantics
-- `logan-core/src/prefix/` created: generic prefix cache hierarchy (RAM hot → SSD persistent → replay)
-- `logan-core/src/lib.rs`: restored `telemetry`; exported `state` and `prefix`
-- `logan-core/Cargo.toml`: added `bytemuck`, `sha2`, `hex`, `serde`
-- `prefix/format.rs`: stable binary container (`LOGANPF1`) with version, checksum, compatibility rejection
-- `prefix/index.rs`: longest-prefix lookup (not exact-match), LRU eviction
-- `prefix/memory.rs` / `disk.rs`: generic RAM/SSD stores with identity/fingerprint checks
-- No second independent Qwen-only prefix cache remains
+```text
+real_ssd_prefix=ok
+first_tokens=2
+second_tokens=3
+ssd_hits=1
+ssd_misses=1
+live_tokens=3
+```
 
-## Verified
+This demonstrates that the dense generic SSD path is not only a synthetic/unit-test
+implementation.
 
-- `cargo check -p logan-core`: clean (warnings only)
-- `cargo test -p logan-core --lib`: 94 passed; 0 failed
-- Workspace builds (`cargo build`): passes
-- `state::tests` exercise AppendOnly, Ring, MutableFixed, SparsePaged, transaction isolation, COW
-- `prefix::tests` exercise exact/longest-prefix hits, miss, eviction, budget enforcement
+## Deliberate Remaining Specialization
 
-## Not Fully Verified (requires engine-specific integration)
+Model-agnostic does **not** mean model-identical.
 
-- Llama dense end-to-end prefix reuse (cold vs RAM hit vs SSD cross-process)
-- Qwen4Exp full causal-state restoration (GDN, QSA, PLE) against new snapshot format
-- MiniCPM5 DSpark speculative transaction gates
-- Performance benchmarks (TTFT / decode tok/s before/after; requires warm model runs on Mac M2)
+It remains appropriate for an engine to specialize:
 
-These remain correct by design: the core mechanisms are generic, and the engine codecs
-(`CausalStateCodec`) only need to import/export state meaning. DeepSeek V4 future
-requirements (window KV = Ring, compressed pages = SparsePaged, partial compressor = MutableFixed)
-are naturally representable without core revisions.
+- state capture/restore layout when copying a generic snapshot would be prohibitively
+  expensive;
+- attention or recurrent-state mathematics;
+- router/expert behavior;
+- tokenizer/chat-template handling;
+- Metal/CUDA/ANE kernels;
+- speculative drafter conditioning and verification geometry.
 
-## Commits
+Those pieces should remain behind the engine boundary while lifecycle, identity,
+cache policy, transactions, and resource management stay reusable.
 
-- `ce5b657` feat(logan-core): generic model-agnostic state + prefix subsystems (#9570f78)
-- `9570f78` (prior) Refactor: Make Logan's Runtime Subsystems Model-Agnostic (goal completion)
+## Remaining Qualification Work
+
+The following are not claimed by this verification pass:
+
+- a full real-model Qwen4Exp persistent-SSD restore A/B on a large production
+  `.coli` checkpoint;
+- real-model DSpark/MTP speculative performance qualification;
+- before/after TTFT and throughput benchmarks for the cache refactor.
+
+These are performance/engine qualification tasks rather than blockers for the shared
+state/cache architecture.
+
+## Integration History
+
+- `ce5b657` — original model-agnostic runtime refactor base.
+- `11fe4df` — verified repair integrating state/cache correctness fixes and dense
+  Llama/MiniCPM adapters.
+- The repair is merged onto `main`; see Git history for the merge commit and this
+  documentation update.
