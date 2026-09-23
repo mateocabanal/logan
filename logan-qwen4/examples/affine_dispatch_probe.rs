@@ -173,6 +173,34 @@ fn main() {
         (t0.elapsed().as_secs_f64() * 1e6 / iters as f64, groups)
     };
 
+    // ---- Arm: batched, but with FRESH tensor handles each iteration ---------
+    // `materialize_plan` builds a new unaligned `Vec<u8>` per matrix per token and
+    // sets `metal_tensor = null`, so the C side never has a cached wrapper: it
+    // calls `wrap()`, which zero-copies only for a 16 KiB-aligned AND
+    // page-rounded pointer and otherwise does a full `newBufferWithBytes` copy.
+    // The two arms above cache `ts[]` across iterations, so after warmup they
+    // measure zero upload cost and structurally cannot see this. Resetting the
+    // handles every iteration is what makes the upload cost visible.
+    let (batched_cold_us, groups_cold) = {
+        let mut ys: Vec<Vec<f32>> = slots.iter().map(|s| vec![0.0_f32; out_dim(s.role)]).collect();
+        let mut ts: Vec<*mut ffi::ColiMetalTensor> = vec![std::ptr::null_mut(); n];
+        let mut groups = 0usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for t in ts.iter_mut() {
+                *t = std::ptr::null_mut();
+            }
+            groups = run_batched(&slots, &experts, &mut ys, &mut ts, &x, &down_x);
+        }
+        (t0.elapsed().as_secs_f64() * 1e6 / iters as f64, groups)
+    };
+    println!("PROBE batched_cold_us_per_token={batched_cold_us:.2}");
+    println!("PROBE batched_cold_cmd_buffers={groups_cold}");
+    println!(
+        "PROBE upload_overhead_us={:.2}",
+        batched_cold_us - batched_us
+    );
+
     println!("PROBE serial_us_per_token={serial_us:.2}");
     println!("PROBE batched_us_per_token={batched_us:.2}");
     println!("PROBE serial_cmd_buffers={n}");

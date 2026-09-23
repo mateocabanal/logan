@@ -1660,7 +1660,15 @@ moved to `.perf_runs/routescout/EXP-032-mixed-binary-invalid/` and only the
 single-build pair above is cited. Rebuilding during a measurement is exactly the
 comparability failure `AGENTS.md` warns about.
 
-**Decision:** **REJECTED.** `LOGAN_EXPERT_IO_CONCURRENCY` defaults to **1**
+**Decision:** **SUPERSEDED by EXP-039.** As measured here this was REJECTED and
+the knob defaulted to **1**. **EXP-039 later reversed it**: once EXP-037/038 cut
+the MoE compute phase from ~1191 dispatches to two command buffers per layer, the
+concurrent path became a verified win (1.2607x and 1.2915x in both arm orders) and
+the shipped default is now **0 = issue the whole route**. The original text below
+is retained because its conservation observation was correct at the time; do not
+act on it without also reading EXP-039.
+
+**Original decision:** **REJECTED.** `LOGAN_EXPERT_IO_CONCURRENCY` defaults to **1**
 (serial); the concurrent path is retained opt-in for A/B on hosts with different
 UMA characteristics, but it is not enabled. The useful output is the corrected
 attribution: of a ~332 ms expert phase per forward, the *storage wait* is
@@ -2228,6 +2236,50 @@ per-matrix shape for A/B.
 
 ---
 
+## EXP-039 — Re-opening `LOGAN_EXPERT_IO_CONCURRENCY` after the dispatch batching
+
+**Date:** 2026-09-23  
+**Area:** routed MoE / MetalIO / decode throughput  
+**Status:** **KEPT** (supersedes EXP-032)
+
+**Why EXP-032's rejection no longer applies.** EXP-032 measured
+`LOGAN_EXPERT_IO_CONCURRENCY > 1` as equal-or-worse and recorded the mechanism as
+"the freed wait did not leave the critical path, it reappeared in compute". That
+was measured when the MoE compute phase was ~1191 synchronous affine dispatches
+per forward at ~278 us of command-buffer overhead each (EXP-018/029). At that
+scale a ~50 ms/token wait saving was invisible against ~335 ms/token of dispatch
+overhead. EXP-037/EXP-038 reduced the MoE compute phase to **two** command
+buffers per layer, changing exactly the ratio EXP-032's conclusion rested on.
+
+**Change:** `LOGAN_EXPERT_IO_CONCURRENCY` now defaults to `0`, meaning "issue the
+whole route"; an explicit value caps the in-flight reads. (Previously 1 = serial.)
+
+**Paired real-model A/B,** sampled decode, 16 tokens, 6 interleaved pairs, one
+binary, pooled per-step median over 90 forwards per arm:
+
+| run order | off (serial) ms/token | on (whole route) ms/token | speedup |
+|---|---:|---:|---:|
+| `on, off` | 566.53 | 449.38 | **1.2607x** |
+| `off, on` (reversed) | 578.68 | 448.07 | **1.2915x** |
+
+Both orders agree, so this is not the arm-position artifact a fixed-order schedule
+can produce. `identical_across_arms=True`; the greedy trajectory is byte-identical
+to baseline.
+
+**Mechanism:** `peak_outstanding` 1 -> 8 and `wait_ms_per_token` 129.9 -> 84.4,
+with per-read `p50` latency collapsing 0.256 -> 0.002 ms. The `load` term fell
+149.9 -> 118.9 ms/token. (In that single profile run `compute_ms` read 154.9 vs
+121.5 — the two terms trade off, which is why the *paired* A/B is the evidence
+here rather than the profile.)
+
+**Canonical harness:** `tok_per_sec` 1.9146 -> **2.1509** (+12.3%).
+
+**Decision:** **KEPT, default 0 = whole route.** `LOGAN_EXPERT_IO_CONCURRENCY=1`
+restores the serial behavior. Any further change to the MoE compute shape should
+re-check this knob, because the two terms trade off.
+
+---
+
 ## EXP-040 — Vectorized 4-bit MLX affine GEMV branch: the kernel was ALU-bound, not bandwidth-bound
 
 **Date:** 2026-09-23  
@@ -2673,7 +2725,7 @@ A/Bs of a default-on feature should express the candidate directly
 
 ---
 
-## EXP-050 — Vectorized kernels reproduce the scalar path over 128 tokens; MoE compute is now bandwidth-bound
+## EXP-050 — Vectorized kernels reproduce the scalar path over 128 tokens; MoE compute cost not yet explained
 
 **Date:** 2026-09-23  
 **Area:** kernel correctness / MoE compute ceiling  
@@ -2696,54 +2748,175 @@ token diverges — so equivalence over 128 steps is strong evidence that the
 vectorized decoding reproduces the scalar element order exactly for every width
 present in this checkpoint.
 
-### B. The MoE compute phase is now bandwidth-bound
+### B. MoE compute cost after the vectorization — and what the probe does NOT show
 
 `affine_dispatch_probe` was updated to the real two-command-buffer shape (gate/up
 in one shared-activation batch, all `k` downs in one per-descriptor-activation
 batch, EXP-038). Measured **~1301 us/layer** (median of 5, `bit_identical=true`),
 down from 6683 us at the start of the session.
 
-That number is at the memory system's limit rather than an implementation limit.
-Per layer the expert work moves: 12 MB of weights + an output of 8 x 512 x 2048
-floats = 32 MB, and each of the 2048 output rows in the gate/up phase re-reads the
-2048-float activation (16 MB, mostly L2-resident). The gate/up phase alone is
-already ~1000 us at ~90 GB/s and writes 32 MB out, all against a shared UMA
-memory system. So:
+**Correction (this entry originally claimed the phase is "bandwidth-bound at
+~90 GB/s" — that arithmetic was wrong and the claim is withdrawn).** Per layer the
+expert weights moved are 8 experts x (2 x 512x2048 + 2048x512) at 4-bit ~= 12 MB,
+so 12 MB / 1301 us is **~10 GB/s**, an order of magnitude *below* this host's UMA
+bandwidth, not at it. So the probe result does **not** establish that the phase is
+bandwidth-bound.
 
-- Further MoE dispatch batching has nothing left (2 command buffers is the floor
-  for a correct schedule).
-- The remaining ~22 ms/token of command-buffer overhead (80 buffers at 278 us) is
-  real but the kernels they enclose are now bandwidth-bound, so fusing SwiGLU
-  GPU-side would remove one buffer per layer (~1.5%) at substantial kernel-work
-  risk.
+What the probe actually shows is ambiguous between two explanations, and the cheap
+discriminator is stated here rather than a closure claim:
 
-**Decision:** the kernel-sweep branch is **closed** — recorded so it is not
-re-opened as "obvious headroom".
+- **overhead/ALU-bound:** time flat as the expert count grows (fixed per-dispatch
+  step dominates), or
+- **bandwidth-bound:** time scaling with bytes.
+
+The 1/2/4/8-expert sweep already run in EXP-040 (1.6 / 2.4 / 2.2 / 2.1 GB/s on
+the *scalar* kernel) showed scaling with bytes at a constant rate, which under the
+old kernel was ALU-bound. The same sweep has **not** been re-run against the
+vectorized kernel, so the post-vectorization shape is unmeasured. That sweep is
+the discriminating experiment and it is cheap.
+
+Additionally: `compute_ms_per_token` ~77-89 ms for ~2.0 GFLOP/token of expert GEMM
+is ~25 GFLOPS against ~2.6 TFLOPS available. That ~100x gap is **not** explained by
+either explanation above, and a plausible unmeasured contributor is the
+per-matrix weight upload — `materialize_plan` hands each of ~960 matrices/token a
+fresh unaligned `Vec<u8>` with a null `metal_tensor`, so `wrap()` takes its
+copying `newBufferWithBytes` path (it zero-copies only for a 16 KiB-aligned,
+page-rounded pointer). The existing probe **cannot see this**, because it caches
+`ts[]` across iterations so `wrap()` runs zero times after warmup. A probe arm
+that resets `ts[m] = null` each iteration would isolate it.
+
+**Decision:** the kernel-sweep work (EXP-040/042/043/045) is **kept and
+verified**, and the *dispatch-batching* part has nothing left at 2 command
+buffers/layer. But the branch is **NOT closed**: the two candidate explanations
+above (vectorized 1/2/4/8 sweep, and per-matrix `wrap()` upload cost) are both
+unmeasured, and one of them plausibly accounts for ~100x of arithmetic-to-wall
+mismatch. Recorded explicitly so a future session measures rather than assumes.
 
 ---
 
-## EXP-051 — Expert residency cache on raw MLX, re-tested: still a loss (EXP-019 confirmed)
+## EXP-051 — Expert residency cache on raw MLX: REJECTED for a now-understood reason (temporal reuse is ~5%, not ~50%)
 
 **Date:** 2026-09-23  
 **Area:** routed MoE / storage  
-**Status:** **REJECTED**
+**Status:** **REJECTED** (mechanism identified)
 
-**Why re-test:** EXP-019 rejected an expert LRU on the raw-MLX path (`QWEN_MLX_EXPERT_CACHE_PER_LAYER`, every capacity regressed). That was measured when the path was **dispatch-bound** — ~1191 synchronous affine dispatches per forward made the `load` term irrelevant. This session removed that (EXP-037/038) and made the kernels ~2.7x faster (EXP-040..045), so storage became the largest single term again (`wait` ~74 ms/token against ~512 MB of expert bytes per token, i.e. ~7 GB/s — plausibly at the SSD's limit). The tradeoff that EXP-019 measured no longer held in the same form, so it was re-measured rather than assumed.
+**Why re-test:** EXP-019 rejected an expert LRU on this path (every capacity
+regressed). That was measured when the path was dispatch-bound (~1191 synchronous
+affine dispatches per forward made the `load` term irrelevant). EXP-037/038 removed
+that and EXP-040..045 made the kernels ~2.7x faster, so `wait` (~74 ms/token)
+became the largest single term. The tradeoff EXP-019 measured no longer held in
+the same form, so it was re-measured rather than assumed.
 
-**Implementation:** a `(layer, expert)` -> (raw MetalIO bytes, I/O plan) cache in `MlxLocalExpertSource`. Raw bytes rather than materialized `Wt`s, because the cache's job is to skip the **SSD read** (the dominant term); materialization still runs on a hit. Two correctness/robustness issues were handled explicitly:
+**Implementation:** a `(layer, expert)` -> (raw MetalIO bytes, I/O plan) cache in
+`MlxLocalExpertSource`. Two robustness points were handled explicitly:
+1. Residency is resolved **before** the fetch-issue loop, so only misses are
+   issued. Doing it after would leave a pre-issued `DemandFetch::Pending`
+   uncollected on a hit, and since `DemandFetch` has no `Drop` its MetalIO slot
+   would never be freed.
+2. Any issued-but-superseded fetch is explicitly `mio_discard_slot`-ed.
 
-1. The residency lookup runs **before** the fetch-issue loop, so only misses are issued. Looking up after issuing would leave a pre-issued `DemandFetch::Pending` uncollected on a hit, and since `DemandFetch` has no `Drop` its MetalIO slot would never be freed — at ~50-70% route overlap that leaks hundreds of 1.6 MB slots per token.
-2. Any fetch issued but superseded by a hit is explicitly `mio_discard_slot`-ed.
+The cache also **moves** `raw` in after materializing (rather than cloning), so a
+miss costs only a hashmap insert. An earlier attempt cloned and paid ~1.6 MB per
+miss (~512 MB/token), which is a real cost this design avoids.
 
-**Paired A/B** (5 pairs, alternating arm order, 24 tokens):
+**The measurement that mattered — the hit rate.** Instrumenting
+`(resident_hits, resident_misses)` (printed in the `mlx-expert-load` profile line)
+turned out to be the decisive step, because tok/s alone cannot distinguish
+"hit 60% and gained nothing" from "hit 3% and gained nothing":
+
+| cap (slots) | resident hits | resident misses | hit rate | ~cache bytes |
+|---:|---:|---:|---:|---:|
+| 256 | 0 | 16 000 | **0%** | 0.4 GB |
+| 1024 (48 tokens) | 12 517 | 11 163 | **52.9%** | 1.6 GB |
+
+**Capacity below one token's working set never fires at all.** A single token
+touches 40 layers x 8 experts = **320 distinct** `(layer, expert)` keys, so a
+256-slot cache is evicted before any key can repeat. Any capacity < 320 is
+structurally 0% hit rate — and the first attempt at this experiment screened caps
+of 64/320/512, i.e. all at or below that threshold, which is why it produced a
+spurious "no capacity helps" result.
+
+**Paired A/B at a capacity that does fire** (cap 1280, 5 pairs, alternating arm
+order, 32 tokens, ~53% hit rate):
 
 | arm | median ms/token | tok/s |
 |---|---:|---:|
-| residency off | 283.75 | 3.5243 |
-| residency 512 experts (~1.2 GB) | 298.42 | 3.3510 |
+| cache off | 271.75 | 3.6798 |
+| cache on (1280 slots) | 325.42 | 3.0729 |
 
-**0.9508x — 5% SLOWER.** A capacity screen agrees: cap 0 read 280.2/296.1 ms, cap 64 read 302.7/293.0, cap 320 read 331.2/296.9 — no capacity won, and larger caps were progressively worse (cap 2048 read 319.1 ms).
+**0.8351x — 16.5% SLOWER**, token-identical.
 
-**Decision:** **REJECTED and reverted.** This is now a two-time-confirmed rejection on this host: an expert residency cache costs more than it saves. The mechanism is consistent with EXP-019's and EXP-032/046's shared finding — this 16 GiB UMA host has no headroom for holding ~1.2 GB of extra resident bytes while the GDN/attention/expert kernels run against the same memory system, so every attempt to trade memory for I/O loses. Treat "cache more experts" as closed, not as unexplored headroom.
+**Mechanism (and the correction to this session's premise):** the premise for
+re-testing was the RouteScout note that "adjacent-route overlap was ~50%". That
+figure is **adjacent-layer (spatial)** overlap — layers L and L+1 of the same
+token. A `(layer, expert)` cache exploits **temporal** (token-to-token) reuse, and
+**EXP-011 measured temporal overlap collapsing to ~4.5%** while spatial held at
+~74.6%. So the reuse this cache was sized and justified against is on the wrong
+axis: the ~53% hit rate observed here is diluted cross-layer reuse, and the actual
+temporal reuse it needs is ~5%. At 53% hits the win is only ~13% of the 74 ms wait
+term (~5 ms) against a 1.6 GB working set on a 16 GiB host — a clear loss, and it
+matches EXP-019's and EXP-032's repeated finding that this host cannot trade
+memory for I/O.
+
+**Decision:** **REJECTED and reverted.** Two-times-confirmed (EXP-019, EXP-051),
+now with the axis error identified, and the capacity/working-set constraint
+recorded: any future expert cache must (a) target temporal reuse, which is ~5% on
+this model, and (b) hold at least one full token's 320 keys before it can fire at
+all. Treat "cache more experts" as closed for this workload, not as unexplored
+headroom.
+
+---
+
+## EXP-052 — Per-matrix Metal weight upload costs 395 us/layer (1.33x on the MoE compute phase)
+
+**Date:** 2026-09-23  
+**Area:** Metal weight upload / expert path  
+**Status:** **CONFIRMED (measured), fix not yet attempted**
+
+**Motivation:** `compute_ms_per_token` reads ~77-89 ms for ~2.0 GFLOP/token of
+expert GEMM, i.e. ~25 GFLOPS against ~2.6 TFLOPS available — a ~100x gap that
+neither dispatch overhead nor arithmetic explains. EXP-050 records this as open.
+
+**Hypothesis:** the gap is per-matrix weight **upload**. `materialize_plan`
+(lib.rs) gives each of the 24 matrices per layer a fresh `Vec<u8>` with
+`metal_tensor = Mutex::new(0)`. `wrap()` in backend_metal.mm zero-copies only
+when the pointer is 16 KiB-aligned AND the length is page-rounded
+(`newBufferWithBytesNoCopy`); a `Vec` from `.to_vec()` satisfies neither, so it
+takes the `newBufferWithBytes` path — a full ~590 KB copy per matrix, i.e. ~960
+matrices/token ≈ 566 MB/token of MTLBuffer allocation + copy, all booked to
+`compute_ms`.
+
+**Why the existing probe could not see it:** `affine_dispatch_probe` caches its
+`ts[]` (ColiMetalTensor) handles across iterations, so after warmup the C side
+already has a wrapper and `wrap()` runs **zero** times. The probe therefore
+measures pure dispatch cost by construction.
+
+**Measurement — a third probe arm that resets `ts[m] = null` every iteration:**
+
+| arm | median us/layer (n=9) |
+|---|---:|
+| warm (handles cached, = what the probe measured before) | 1182.2 |
+| cold (fresh handles each iteration, = what the model actually does) | 1577.2 |
+
+**+395 us/layer = 1.334x**, i.e. **~15.8 ms/token** at 40 layers. `bit_identical`
+is true in both arms, so this is pure upload cost, not a numerics difference.
+
+**Consequence:** roughly a fifth of the measured MoE `compute_ms` is weight upload
+rather than arithmetic, and the probe numbers used throughout this session
+(EXP-040/050) understate the real per-layer cost because they omit it.
+
+**Candidate fix (not attempted):** the repo already has both halves needed.
+`AlignedBuf` (16 KiB `posix_memalign`, used for GDN/attention/LM-head weights)
+supplies the alignment, and `coli_metal_register`/`resolve()` is the documented
+registered-slab zero-copy path — but `coli_metal_register` currently has **no
+caller anywhere in the repo**, so that fast path is dead and every expert matrix
+falls through to the copying `wrap()`. Pooling a small set of page-aligned,
+page-rounded destination buffers (one layer's worth: 8 experts x 3 roles = 24
+buffers, ~38 MB) and materializing into those would make `wrap()` take its
+zero-copy path and remove ~566 MB/token of copies plus ~960 alloc/free per token.
+
+**Correctness gate for any fix:** `bit_identical` must stay true in the probe, and
+the real-model greedy trajectory must remain byte-identical (`e4f361a8…`) — this
+is a memory-aliasing change, so it needs both.
 
 ---
