@@ -6947,29 +6947,74 @@ impl Model {
         if full_mxfp4 {
             let ws = [&layer.se_gate, &layer.se_up, &layer.se_down];
             let mut parts = Vec::with_capacity(3);
-            let mut all_mx = true;
+            let mut all_fusable = true;
             for &w in &ws {
-                if let Some(WtBytes::Mxfp4 {
-                    weights,
-                    scales,
-                    metal_tensor,
-                }) = w.bytes.as_ref()
-                {
-                    parts.push((
+                match w.bytes.as_ref() {
+                    Some(WtBytes::Mxfp4 {
+                        weights,
+                        scales,
+                        metal_tensor,
+                    }) => parts.push((
                         weights.as_slice(),
                         scales.as_slice(),
                         metal_tensor,
                         w.i,
                         w.o,
-                    ));
-                } else {
-                    all_mx = false;
-                    break;
+                        7u8,
+                        0usize,
+                    )),
+                    // MLX affine shared-expert matrices (what a raw MLX
+                    // checkpoint has). `qwen_gdn_mx_tensor` and
+                    // `qwen_gdn_mx_encode_gemv` already handle fmt 21..24, so
+                    // these can join the same single command buffer; without
+                    // this arm the fusion declines and gate/up/down run as three
+                    // separate commit+wait dispatches per layer.
+                    Some(WtBytes::MlxAffine {
+                        weights,
+                        scales,
+                        biases,
+                        bits,
+                        group_size,
+                        aux_fp16,
+                        metal_aux,
+                        metal_tensor,
+                        ..
+                    }) if *aux_fp16 => {
+                        let fmt: u8 = match bits {
+                            4 => 21,
+                            5 => 22,
+                            6 => 23,
+                            8 => 24,
+                            _ => {
+                                all_fusable = false;
+                                break;
+                            }
+                        };
+                        let aux = metal_aux.get_or_init(|| {
+                            let mut combined = Vec::with_capacity(scales.len() + biases.len());
+                            combined.extend_from_slice(scales);
+                            combined.extend_from_slice(biases);
+                            combined
+                        });
+                        parts.push((
+                            weights.as_slice(),
+                            aux.as_slice(),
+                            metal_tensor,
+                            w.i,
+                            w.o,
+                            fmt,
+                            *group_size,
+                        ));
+                    }
+                    _ => {
+                        all_fusable = false;
+                        break;
+                    }
                 }
             }
-            if all_mx {
+            if all_fusable {
                 let mut guards = Vec::with_capacity(3);
-                for (_, _, metal_tensor, _, _) in &parts {
+                for (_, _, metal_tensor, _, _, _, _) in &parts {
                     guards.push(
                         metal_tensor
                             .lock()
@@ -6978,13 +7023,13 @@ impl Model {
                 }
                 let mut descs = Vec::with_capacity(3);
                 for (part, guard) in parts.iter().zip(guards.iter()) {
-                    let (weights, scales, _, input, output) = *part;
+                    let (weights, scales, _, input, output, fmt, gsz) = *part;
                     descs.push(logan_metal::MetalWeightDesc {
                         tensor: **guard as *mut logan_metal::ColiMetalTensor,
                         weights,
                         scales,
-                        fmt: 7,
-                        group_size: 0,
+                        fmt: fmt as i32,
+                        group_size: gsz,
                         i: input,
                         o: output,
                     });

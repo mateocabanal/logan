@@ -3388,9 +3388,18 @@ extern "C" int coli_metal_shared_mxfp4(
       !x || !out || D <= 0 || Iinter <= 0) return 0;
   const int expected_I[3] = {D, D, Iinter};
   const int expected_O[3] = {Iinter, Iinter, D};
-  for (int i = 0; i < 3; ++i)
-    if (descs[i].fmt != 7 || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
+  // fmt 7 is MXFP4; 21..24 are MLX-affine with IEEE fp16 sidecars, which is what
+  // an FP16 checkpoint provides. `qwen_gdn_mx_tensor` and `qwen_gdn_mx_encode_gemv`
+  // already handle both (same encoder the GDN path uses), so accepting the affine
+  // formats here lets the shared expert run as ONE command buffer with the SwiGLU
+  // kept on the GPU, instead of three separate commit+wait dispatches per layer.
+  for (int i = 0; i < 3; ++i) {
+    const bool fmt_ok = (descs[i].fmt == 7) ||
+                        (descs[i].fmt >= 21 && descs[i].fmt <= 24);
+    if (!fmt_ok || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
       return 0;
+    if (descs[i].fmt != 7 && descs[i].gs <= 0) return 0;
+  }
 
   std::lock_guard<std::mutex> lk(g_op_mtx);
   @autoreleasepool {

@@ -2594,11 +2594,38 @@ mod imp {
         let expected = [(d, iinter), (d, iinter), (iinter, d)];
         let mut raw = Vec::with_capacity(3);
         for (dsc, &(ei, eo)) in descs.iter_mut().zip(expected.iter()) {
-            if dsc.fmt != 7 || dsc.i != ei || dsc.o != eo {
+            if dsc.i != ei || dsc.o != eo {
                 return Ok(None);
             }
-            let weight_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(2));
-            let scale_bytes = dsc.o.saturating_mul(dsc.i.div_ceil(32));
+            // fmt 7 = MXFP4; 21..24 = MLX affine with fp16 sidecars. The sizing
+            // MUST branch by format: the MXFP4 sizes (i/2 per row, one scale byte
+            // per 32) are far smaller than the affine sizes, so reusing them for
+            // an affine descriptor would let the length check pass while the C
+            // side reads using its own larger stride -- an out-of-bounds read.
+            let (weight_bytes, scale_bytes, fmt) = if dsc.fmt == 7 {
+                (
+                    dsc.o.saturating_mul(dsc.i.div_ceil(2)),
+                    dsc.o.saturating_mul(dsc.i.div_ceil(32)),
+                    7,
+                )
+            } else {
+                let bits: usize = match dsc.fmt {
+                    21 => 4,
+                    22 => 5,
+                    23 => 6,
+                    24 => 8,
+                    _ => return Ok(None),
+                };
+                if dsc.group_size == 0 || dsc.i % dsc.group_size != 0 {
+                    return Ok(None);
+                }
+                (
+                    dsc.o.saturating_mul((dsc.i * bits).div_ceil(8)),
+                    // bf16/fp16 scale + bias per group, 2 bytes each.
+                    2 * dsc.o.saturating_mul(dsc.i / dsc.group_size) * 2,
+                    dsc.fmt,
+                )
+            };
             if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes {
                 return Ok(None);
             }
@@ -2607,10 +2634,10 @@ mod imp {
                 y: std::ptr::null_mut(),
                 weights: dsc.weights.as_ptr() as *const c_void,
                 scales: dsc.scales.as_ptr() as *const f32,
-                fmt: 7,
+                fmt,
                 i: dsc.i as i32,
                 o: dsc.o as i32,
-                gs: 0,
+                gs: if fmt == 7 { 0 } else { dsc.group_size as i32 },
                             // No per-descriptor activation on this path: every descriptor
                 // reads the function-level shared `x`.
                 x: std::ptr::null(),
