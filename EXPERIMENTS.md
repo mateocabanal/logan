@@ -3469,3 +3469,45 @@ useful outcome here, and because the *probe cannot set the model's ceiling* — 
 model's own timers can.
 
 ---
+
+## EXP-061 — Same-harness baseline re-measurement: the headline is 2.08x, not 2.15-2.2x
+
+**Date:** 2026-09-23  
+**Area:** methodology / final result  
+**Status:** **MEASURED (headline corrected)**
+
+**Why.** Every ratio quoted this session compared the current build against the
+*recorded* 1.7725 baseline from run #1. That baseline was taken before the harness
+guard existed, on an earlier host state, and with a `sample` arm that at 24 tokens
+replays argmax (EXP-055) — so the ratio carried cross-session and cross-protocol
+uncertainty. The fix is to re-measure the **baseline commit on the current harness**
+and interleave the two builds.
+
+**Method.** `git worktree add /tmp/base de5795f`, built `decode_bench` there (the
+baseline commit already contains both the harness and the driver, and its harness
+neither forces `LOGAN_PROFILE` nor carries the guard, so its protocol matches the
+current profile-free measured arms exactly). Then 3 pairs, alternating order
+(`base cur` / `cur base`), `--tokens 24 --arm greedy`:
+
+| build | readings | median |
+|---|---|---:|
+| baseline `de5795f` | 2.0287, 1.6642, 1.7688 | **1.7688** |
+| current | 3.8753, 3.6838, 3.4016 | **3.6838** |
+
+**Same-harness ratio: 2.08x.** Both builds produce the identical canonical
+`trajectory_sha` (`e4f361a8…`), confirming the comparison is like-for-like on the
+token sequence.
+
+**Note on the spread.** Both builds range ~±10-20% across pairs (base 1.66-2.03,
+current 3.40-3.88) — the same host drift the whole session fought. The medians are
+therefore the defensible statistic, and the honest statement of this session's result
+is **~2.0-2.1x**, not the 2.15-2.21x previously implied, nor the 1.88-3.91 raw
+extremes.
+
+**Decision:** headline corrected to **2.08x** (same harness, interleaved, identical
+trajectory). The recorded 1.7725 from run #1 remains useful as the session's original
+anchor but should not be used for the final ratio; it reads ~4% below the same
+harness's own baseline today (1.7688 measured now vs 1.7725 recorded then — close,
+but the current-harness pairing is the valid comparison).
+
+---
