@@ -10747,14 +10747,20 @@ pub(crate) struct MlxLocalExpertSource {
     pending_order: std::collections::VecDeque<(u32, usize)>,
     pending_cap: usize,
     /// How many expert demand reads may be in flight at once
-    /// (`LOGAN_EXPERT_IO_CONCURRENCY`). 1 reproduces the legacy serial
-    /// issue-then-wait path; >1 issues a layer's reads before waiting on them.
+    /// (`LOGAN_EXPERT_IO_CONCURRENCY`). `0` (the default) means "issue the whole
+    /// route", which is what the layer actually needs; set an explicit value to
+    /// bound the in-flight reads.
     ///
-    /// Default is 1 (serial) because the paired sweep in EXP-032 measured the
-    /// concurrent arms as equal-or-worse on wall time despite cutting the
-    /// measured MetalIO wait: the wait did not leave the critical path, it moved
-    /// into the compute term. Kept opt-in rather than defaulted until a paired
-    /// win exists.
+    /// **EXP-032 measured `>1` as equal-or-worse and left this at 1. That
+    /// measurement no longer holds and the default is now the whole route.**
+    /// EXP-032's mechanism note was that cut wait "moved into the compute term" —
+    /// but at that time the compute term was ~1191 synchronous affine dispatches
+    /// with ~278 us of command-buffer overhead each, which swamped a ~50 ms/token
+    /// wait saving. EXP-037/EXP-038 took the MoE compute phase to two command
+    /// buffers per layer, so the wait is now a real fraction of the forward
+    /// again. Re-measured as a paired A/B on the batched build: 566.5 -> 449.4
+    /// ms/token (**1.26x**) in `on/off` order and 578.7 -> 448.1 ms/token
+    /// (**1.29x**) in the reversed order, token-identical both ways.
     io_concurrency: usize,
     /// Immutable per-(layer,expert) I/O plans, resolved once.
     ///
@@ -10833,11 +10839,12 @@ impl MlxLocalExpertSource {
             pending: std::collections::HashMap::new(),
             pending_order: std::collections::VecDeque::new(),
             pending_cap,
+            // 0 means "the whole route" (the default); resolve it to the
+            // layer's actual width at use time, since `topk` is not known here.
             io_concurrency: std::env::var("LOGAN_EXPERT_IO_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1)
-                .max(1),
+                .unwrap_or(0),
             plan_cache: PlanCache {
                 enabled: crate::env_flag("LOGAN_EXPERT_PLAN_CACHE"),
                 plans: std::collections::HashMap::new(),
@@ -11417,10 +11424,12 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
         //
         // `LOGAN_EXPERT_IO_CONCURRENCY` caps how many reads are in flight; 1
         // reproduces the legacy serial path.
-        let limit = if self.io_concurrency > 1 && calls.len() > 1 {
-            self.io_concurrency
+        // `0` (the default) means issue the whole route; an explicit value caps
+        // how many reads are ever outstanding.
+        let limit = if self.io_concurrency == 0 {
+            calls.len().max(1)
         } else {
-            1
+            self.io_concurrency.clamp(1, calls.len().max(1))
         };
         let mut fetches: Vec<DemandFetch> = Vec::with_capacity(calls.len());
         for call in calls.iter().take(limit) {

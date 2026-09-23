@@ -2153,3 +2153,77 @@ portion is ~8 x 278 us per layer.
 `logan-qwen4/examples/affine_dispatch_probe.rs`.
 
 ---
+
+## EXP-038 — Two-command-buffer MoE compute phase (per-descriptor activation)
+
+**Date:** 2026-09-23  
+**Area:** routed MoE / Metal dispatch / decode throughput  
+**Status:** **KEPT**
+
+**Motivation:** EXP-037 batched the `2*k` gate/up projections into one command
+buffer and left the `k` down projections as one dispatch each — 9 command buffers
+per layer instead of 24. The down projections could not join because each
+consumes its own expert's SwiGLU output, while `coli_metal_matmul_multi` copied a
+single shared activation `x` into one buffer and required every descriptor to
+match its width.
+
+**Hypothesis:** The per-command-buffer cost is not tied to the activation being
+shared. If the C entry point accepted a per-descriptor activation, the `k` down
+projections could share a command buffer with each other, taking the layer to
+**2** command buffers (one for gate/up, one for down) with the host SwiGLU loop
+between them.
+
+**Implementation:**
+- `ColiMetalMatmulDesc` (`logan-metal/metal/backend_metal.h`) gained `x` and `S`:
+  `x == NULL` means "use the function-level shared activation" (the original
+  contract), non-NULL supplies a private activation with its own batch size.
+- `coli_metal_matmul_multi` now decides *before* touching the shared buffer
+  whether any descriptor needs it, requires agreement on `I` only among the
+  descriptors that fall back to it, and uploads it once. Descriptors with their
+  own activation upload into per-descriptor buffers
+  (`g_multi_xs`/`g_multi_x_caps`).
+- Rust: `MlxAffineMatmulDesc` gained `x: Option<&[f32]>`;
+  `matmul_mlx_affine_multi_x` is the general form and `matmul_mlx_affine_multi`
+  is the shared-activation wrapper, so existing callers are unchanged.
+- `MlxLocalExpertSource::eval` now runs two phases: 2*k gate/up shared-activation
+  batch → host SwiGLU → k down private-activation batch.
+
+**Bug found and fixed during bring-up (important):** the first version SIGSEGV'd
+(exit 139) on the first MoE layer. The C function computed
+`shared_bytes = S * descs[0].I * 4` and `memcpy`'d from the caller's `x`
+*unconditionally*, before inspecting any descriptor. In an all-private batch the
+caller passes an empty placeholder, whose Rust slice pointer is a dangling low
+address — so this was a genuine crash, not a benign over-read. Fixed by checking
+`x != NULL && S > 0 && shared_I > 0` only when some descriptor actually falls
+back to the shared activation. Recorded here because "the shared slice is never
+read" was the wrong assumption to reason from; the buffer was read before any
+per-descriptor logic ran.
+
+**Correctness gate:** greedy trajectory
+`248068,198,8160,579,264,7047,1817,25,271,16,13,220,2972,15771,2598,2570`
+byte-identical to baseline, and `identical_across_arms=True` in the paired A/B
+(1 distinct trajectory per arm, equal between arms).
+
+**Paired real-model A/B:** `LOGAN_EXPERT_NOCACHE=1`, sampled decode
+(`BENCH_TEMP=1.0`, fixed seed), 16 tokens, 6 interleaved pairs, one binary via
+`LOGAN_EXPERT_BATCH_GATEUP={1,0}`, pooled per-step median over 90 forwards/arm:
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| off (per-matrix) | 774.42 | 1.2913 |
+| on (two-phase) | 547.82 | 1.8254 |
+
+**1.4136x** versus the per-matrix shape (the gate/up-only variant of EXP-037
+measured 1.2921x on the same harness), so the down-projection batching added a
+further ~9%.
+
+**Canonical harness:** `tok_per_sec` **1.7725 -> 1.9146** (+8.0%), with
+`greedy_trajectory_sha` unchanged from the baseline run.
+
+**Decision:** **KEPT, default ON.** `LOGAN_EXPERT_BATCH_GATEUP=0` restores the
+per-matrix shape for A/B.
+
+**Artifacts:** `.perf_runs/autoresearch/ab-batch/`,
+`logan-qwen4/examples/affine_dispatch_probe.rs`.
+
+---
