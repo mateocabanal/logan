@@ -3287,6 +3287,13 @@ pool on, which is the direct confirmation that the buffers are created once.
 
 **Decision:** **KEPT, default ON** (`LOGAN_EXPERT_WT_POOL=0` opts out).
 
+**Protocol caveat (see EXP-058):** the canonical 3.8309/3.8521 figures above were
+measured while `LOGAN_PROFILE=1` was forced on by the GPU-engagement guard, i.e. on a
+different protocol from the 1.7725 baseline. On the restored profile-free protocol
+the same code reads **3.8070**. The pooled-vs-unpooled paired A/B (1.0336x, both arms
+on the same protocol) is unaffected, and the mechanism counters (wrap calls
+96 702 -> 2622, `bytes_created` 30 GB -> 2.24 GB, 98% pool hits) are protocol-independent.
+
 **Note superseding the earlier closure claim:** EXP-056 originally closed this branch
 on the premise that avoiding these creations required *residency*, which had been
 rejected. That premise was wrong — this change reuses buffers within a fixed 320-slot
