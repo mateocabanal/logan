@@ -130,6 +130,31 @@ mod imp {
         i: i32,
         o: i32,
         gs: i32,
+        /// Per-descriptor activation. Null means "use the function-level shared
+        /// `x`", which is what every caller other than the per-descriptor
+        /// activation path wants.
+        x: *const f32,
+        /// Leading dimension for `x` when `x` is non-null.
+        s: i32,
+    }
+
+    impl Default for ColiMetalMatmulDescRaw {
+        fn default() -> Self {
+            Self {
+                tensor: std::ptr::null_mut(),
+                y: std::ptr::null_mut(),
+                weights: std::ptr::null(),
+                scales: std::ptr::null(),
+                fmt: 0,
+                i: 0,
+                o: 0,
+                gs: 0,
+                x: std::ptr::null(),
+                // 1, not 0: the C side rejects a private-activation descriptor
+                // with a non-positive leading dimension.
+                s: 1,
+            }
+        }
     }
 
     pub struct MetalMatmulDesc<'a> {
@@ -153,6 +178,11 @@ mod imp {
         pub aux_fp16: bool,
         pub i: usize,
         pub o: usize,
+        /// Per-descriptor activation. `None` consumes the shared activation
+        /// passed to `metal_matmul_mlx_affine_multi`; `Some(v)` lets a
+        /// descriptor whose input differs (for example a routed expert's own
+        /// SwiGLU output) join the same command buffer. `v.len() >= i`.
+        pub x: Option<&'a [f32]>,
     }
 
     pub struct MetalWeightDesc<'a> {
@@ -937,13 +967,35 @@ mod imp {
         if !metal_available() || descs.is_empty() || descs.len() > 16 {
             return false;
         }
-        let common_i = descs[0].i;
-        if common_i == 0 || common_i > i32::MAX as usize || x.len() < common_i {
-            return false;
-        }
         let mut raw = Vec::with_capacity(descs.len());
         for d in descs.iter_mut() {
-            if d.i != common_i
+            // A descriptor with its own activation carries its own input and
+            // leading dimension; one without falls back to the shared `x`,
+            // which the C side reads as a single row `[1, I]`. Only the
+            // fallback descriptors must agree on `I`, and the C side enforces
+            // that.
+            let xptr = match d.x {
+                Some(v) => {
+                    if v.len() < d.i {
+                        return false;
+                    }
+                    v.as_ptr()
+                }
+                None if x.len() >= d.i => x.as_ptr(),
+                None if x.is_empty() => std::ptr::null(),
+                None => {
+                    // The shared buffer is only read when at least one
+                    // descriptor falls back to it, and then only at one row
+                    // `[1, I]`. A batch made entirely of private-activation
+                    // descriptors never touches it, so an empty `x` is valid
+                    // there and must not be rejected here.
+                    if x.len() < d.i {
+                        return false;
+                    }
+                    x.as_ptr()
+                }
+            };
+            if d.i == 0
                 || d.o == 0
                 || d.o > i32::MAX as usize
                 || d.y.len() < d.o
@@ -985,6 +1037,8 @@ mod imp {
                 i: d.i as i32,
                 o: d.o as i32,
                 gs: d.group_size as i32,
+                x: xptr,
+                s: 1,
             });
         }
         let ok = unsafe {
@@ -1473,7 +1527,11 @@ mod imp {
                     13 => 8,
                     _ => 0,
                 },
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let ok = unsafe {
             coli_metal_matmul_multi(x.as_ptr(), 1, raw.as_mut_ptr(), raw.len() as i32) == 1
@@ -1570,7 +1628,11 @@ mod imp {
                 i: desc.i as i32,
                 o: desc.o as i32,
                 gs,
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let rc = unsafe {
             coli_metal_llama_layer(
@@ -1670,7 +1732,11 @@ mod imp {
                 i: desc.i as i32,
                 o: desc.o as i32,
                 gs: 64,
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let rc = unsafe {
             coli_metal_spark_layer_encode(
@@ -1744,7 +1810,11 @@ mod imp {
             i: d as i32,
             o: vocab as i32,
             gs: 64,
-        };
+                    // No per-descriptor activation on this path: every descriptor
+            // reads the function-level shared `x`.
+            x: std::ptr::null(),
+            s: 1,
+};
         let rc = unsafe {
             coli_metal_spark_token_end_top1(
                 model_id,
@@ -1794,7 +1864,11 @@ mod imp {
             i: d as i32,
             o: vocab as i32,
             gs: 64,
-        };
+                    // No per-descriptor activation on this path: every descriptor
+            // reads the function-level shared `x`.
+            x: std::ptr::null(),
+            s: 1,
+};
         let rc = unsafe {
             coli_metal_spark_token_end_logits(
                 model_id,
@@ -1881,7 +1955,11 @@ mod imp {
                 i: desc.i as i32,
                 o: desc.o as i32,
                 gs: 64,
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let rc = unsafe {
             coli_metal_spark_prefill_layer_encode(
@@ -1956,7 +2034,11 @@ mod imp {
             i: d as i32,
             o: vocab as i32,
             gs: 64,
-        };
+                    // No per-descriptor activation on this path: every descriptor
+            // reads the function-level shared `x`.
+            x: std::ptr::null(),
+            s: 1,
+};
         let rc = unsafe {
             coli_metal_spark_prefill_end_logits(
                 model_id,
@@ -2043,7 +2125,11 @@ mod imp {
                 i: desc.i as i32,
                 o: desc.o as i32,
                 gs: 64,
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let rc = unsafe {
             coli_metal_spark_layer(
@@ -2263,7 +2349,11 @@ mod imp {
                     16..=20 => dsc.group_size as i32,
                     _ => 0,
                 },
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let rc = unsafe {
             coli_metal_gdn_mxfp4(
@@ -2429,7 +2519,11 @@ mod imp {
                     16..=20 => dsc.group_size as i32,
                     _ => 0,
                 },
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let inject_ptr = inject
             .map(|v| v.as_mut_ptr())
@@ -2510,7 +2604,11 @@ mod imp {
                 i: dsc.i as i32,
                 o: dsc.o as i32,
                 gs: 0,
-            });
+                            // No per-descriptor activation on this path: every descriptor
+                // reads the function-level shared `x`.
+                x: std::ptr::null(),
+                s: 1,
+});
         }
         let rc = unsafe {
             coli_metal_shared_mxfp4(
@@ -3853,6 +3951,11 @@ mod imp {
         pub aux_fp16: bool,
         pub i: usize,
         pub o: usize,
+        /// Per-descriptor activation. `None` consumes the shared activation
+        /// passed to `metal_matmul_mlx_affine_multi`; `Some(v)` lets a
+        /// descriptor whose input differs (for example a routed expert's own
+        /// SwiGLU output) join the same command buffer. `v.len() >= i`.
+        pub x: Option<&'a [f32]>,
     }
 
     pub struct MetalWeightDesc<'a> {

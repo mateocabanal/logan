@@ -74,13 +74,27 @@ typedef struct ColiMetalMatmulDesc {
   int I;
   int O;
   int gs;
+  /*
+   * Optional per-descriptor activation. NULL means "use the shared `x` passed
+   * to coli_metal_matmul_multi" (the original contract — every descriptor
+   * shares one activation). Non-NULL lets an otherwise-incompatible descriptor
+   * join the same command buffer by supplying its own activation, which is
+   * what the routed-expert down projections need: each consumes its own
+   * expert's SwiGLU output, so they cannot share a single input buffer.
+   * When non-NULL, the caller must supply `S` for this descriptor too.
+   */
+  const float *x;
+  int S;
 } ColiMetalMatmulDesc;
 
 /*
- * Encode several independent GEMVs that share the same x[S,I] activation in
- * one command buffer, then wait once and copy each result back. The function
- * updates descs[n].tensor exactly like coli_metal_matmul does, so callers can
- * retain the lazily-created weight/scales wrappers across tokens.
+ * Encode several independent GEMVs in one command buffer, then wait once and
+ * copy each result back. Every descriptor's activation is its own `x`/`S` when
+ * set, and the function-level `x`/`S` otherwise, so descriptors with differing
+ * input widths (and different batch sizes) can be batched together. Only
+ * descriptors that fall back to the shared activation must agree on `I`.
+ * The function updates descs[n].tensor exactly like coli_metal_matmul does, so
+ * callers can retain the lazily-created weight/scales wrappers across tokens.
  * Returns 1 on success, 0 before submit if any descriptor is invalid/unusable.
  */
 int coli_metal_matmul_multi(const float *x, int S,

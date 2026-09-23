@@ -3509,12 +3509,31 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
     matmul_f32_rows(y, x, &w.f, o, i);
 }
 
-/// Encode several resident MLX-affine GEMVs that consume the same activation
-/// in one Metal command buffer. All matrices keep their checkpoint bit width and
-/// group size; unsupported mixtures decline without changing numerical state.
-fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
+/// Encode several resident MLX-affine GEMVs in one Metal command buffer. All
+/// matrices keep their checkpoint bit width and group size; unsupported mixtures
+/// decline without changing numerical state.
+///
+/// `xs[i]` selects descriptor `i`'s activation: `None` consumes the shared `x`
+/// (the original contract, and what every shared-activation caller wants),
+/// `Some(v)` supplies a private activation. Pass `None` for `xs` to mean "every
+/// descriptor uses `x`".
+///
+/// The private-activation form exists for the routed-expert down projections:
+/// each consumes its own expert's SwiGLU output, so they cannot share one input
+/// buffer, but they can still share one command buffer.
+fn matmul_mlx_affine_multi_x(
+    ys: &mut [&mut [f32]],
+    x: &[f32],
+    ws: &[&Wt],
+    xs: Option<&[Option<&[f32]>]>,
+) -> bool {
     if ys.is_empty() || ys.len() != ws.len() {
         return false;
+    }
+    if let Some(xs) = xs {
+        if xs.len() != ws.len() {
+            return false;
+        }
     }
     let mut parts = Vec::with_capacity(ws.len());
     for &w in ws {
@@ -3560,7 +3579,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
     }
 
     let mut descs = Vec::with_capacity(parts.len());
-    for ((y, part), guard) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()) {
+    for (i, ((y, part), guard)) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()).enumerate() {
         let (weights, aux, bits, group_size, aux_fp16, _, input, output) = *part;
         descs.push(logan_metal::MlxAffineMatmulDesc {
             tensor: **guard as *mut logan_metal::ColiMetalTensor,
@@ -3572,6 +3591,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
             aux_fp16,
             i: input,
             o: output,
+            x: xs.and_then(|v| v[i]),
         });
     }
 
@@ -3580,6 +3600,11 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
         **guard = desc.tensor as usize;
     }
     ok
+}
+
+/// Shared-activation form of [`matmul_mlx_affine_multi_x`].
+fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
+    matmul_mlx_affine_multi_x(ys, x, ws, None)
 }
 
 /// Encode several resident MXFP4 GEMVs that consume the same activation in a
@@ -11433,25 +11458,96 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
             EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Phase 2 — batched projections.
+        // Compute phase — batched projections.
         //
-        // Every routed expert in a layer consumes the SAME activation, so all
-        // their gate/up projections share one input width (`d_model`). Encoding
-        // those 2*k GEMVs into a single command buffer, rather than 2*k separate
-        // commit+waitUntilCompleted pairs, removes the per-dispatch stall that
-        // dominates this phase. A 512x2048 4-bit projection moves only ~590 KB,
-        // but a standalone dispatch costs ~278 us; `examples/affine_dispatch_probe`
-        // measures the whole layer at 6683 us serial versus 3552 us with the
-        // gate/up batch, and the two are bit-identical.
+        // Every routed expert in a layer consumes the SAME token activation, so
+        // all 2*k gate/up projections share one input buffer. A standalone MLX
+        // affine dispatch costs ~278 us regardless of size (a 512x2048 4-bit
+        // projection moves only ~590 KB), so on this host the MoE compute phase
+        // is dominated by per-command-buffer overhead rather than data movement.
+        // `examples/affine_dispatch_probe` measures a full layer at 6683 us with
+        // one dispatch per matrix versus 3552 us with the gate/up projections in
+        // a single command buffer, and the two are bit-identical.
         //
-        // The down projections cannot join: each consumes its own expert's
-        // SwiGLU output, and the batch entry point requires one shared activation.
+        // The schedule is therefore:
+        //   phase 1  2*k gate/up, all sharing the token activation -> 1 buffer
+        //   host     SwiGLU on every expert
+        //   phase 2  k down, each consuming its own expert's SwiGLU output
+        //            as a per-descriptor activation              -> 1 buffer
         //
-        // The shared-activation precondition is checked rather than assumed. The
-        // `ExpertSource` trait makes no promise that every call carries the same
-        // input (a delegating pool source may not), and silently computing with
-        // the wrong activation would be a correctness bug, so a mismatch falls
-        // back to the per-matrix path.
+        // Phase 2 needs a per-descriptor activation because the downs consume
+        // different vectors; the C entry point gained that capability for this
+        // change (`ColiMetalMatmulDesc.x`). That takes the layer from 3*k
+        // command buffers (24 at topk 8) to 2.
+        //
+        // The shared-activation precondition is checked, not assumed: the
+        // `ExpertSource` trait does not promise that every call carries the same
+        // input (a delegating pool source may not), and computing with the wrong
+        // activation would be a silent correctness bug. A mismatch falls back to
+        // the per-matrix path.
+        const BATCH_CAP: usize = 16;
+
+        /// Encode `outs[i] = mats[i][role] * activation` in as few command
+        /// buffers as the entry point's descriptor cap allows. `inputs[i]`
+        /// selects descriptor `i`'s activation; `None` entries share `x`.
+        fn batch_role(
+            outs: &mut [Vec<f32>],
+            mats: &[[Wt; 3]],
+            role: usize,
+            x: &[f32],
+            inputs: Option<&[Vec<f32>]>,
+            cap: usize,
+        ) -> bool {
+            if outs.len() != mats.len() || outs.is_empty() {
+                return false;
+            }
+            if let Some(v) = inputs {
+                if v.len() != outs.len() {
+                    return false;
+                }
+            }
+            let mut start = 0usize;
+            while start < outs.len() {
+                let end = (start + cap).min(outs.len());
+                let mut ys_chunk: Vec<&mut [f32]> = Vec::with_capacity(end - start);
+                let mut ws_chunk: Vec<&Wt> = Vec::with_capacity(end - start);
+                let mut xs_chunk: Vec<Option<&[f32]>> = Vec::with_capacity(end - start);
+                let outs_chunk = &mut outs[start..end];
+                let mats_chunk = &mats[start..end];
+                match inputs {
+                    None => {
+                        for (out, m) in outs_chunk.iter_mut().zip(mats_chunk.iter()) {
+                            ys_chunk.push(out.as_mut_slice());
+                            ws_chunk.push(&m[role]);
+                        }
+                    }
+                    Some(v) => {
+                        for ((out, m), inp) in outs_chunk
+                            .iter_mut()
+                            .zip(mats_chunk.iter())
+                            .zip(v[start..end].iter())
+                        {
+                            ys_chunk.push(out.as_mut_slice());
+                            ws_chunk.push(&m[role]);
+                            xs_chunk.push(Some(inp.as_slice()));
+                        }
+                    }
+                }
+                let ok = if inputs.is_none() {
+                    matmul_mlx_affine_multi(&mut ys_chunk, x, &ws_chunk)
+                } else {
+                    // Every descriptor supplies its own activation, so the
+                    // shared slice is never read; an empty one is safe.
+                    matmul_mlx_affine_multi_x(&mut ys_chunk, &[], &ws_chunk, Some(&xs_chunk))
+                };
+                if !ok {
+                    return false;
+                }
+                start = end;
+            }
+            true
+        }
+
         let compute_t0 = std::time::Instant::now();
         let k = calls.len();
         // `LOGAN_EXPERT_BATCH_GATEUP=0` restores the per-matrix dispatch shape.
@@ -11465,44 +11561,13 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
             .all(|c| c.input.len() == calls[0].input.len() && c.input == calls[0].input);
         let mut gate_outs: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_hidden]).collect();
         let mut hiddens: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_hidden]).collect();
-        let mut batched = false;
-        if batch_enabled && shared_input && k > 1 {
-            // The batch entry point takes at most 16 descriptors, all sharing one
-            // activation width. Chunk rather than assume `2*k <= 16`: at topk 8
-            // the 16 gate/up projections fit exactly, but a topk-10 model (the
-            // 512-expert/top-10 Qwen3.8 path) would otherwise hand the entry
-            // point 20 descriptors, get a decline, and silently lose the win.
-            //
-            // Defined as a nested fn so each call takes its output set by
-            // `&mut [..]` and its own `iter_mut`; indexing two shared vectors
-            // from one loop cannot satisfy the borrow checker.
-            fn batch_projections(
-                outs: &mut [Vec<f32>],
-                mats: &[[Wt; 3]],
-                role: usize,
-                x: &[f32],
-                cap: usize,
-            ) -> bool {
-                let mut start = 0usize;
-                while start < outs.len() {
-                    let end = (start + cap).min(outs.len());
-                    let mut ys_chunk: Vec<&mut [f32]> = Vec::with_capacity(end - start);
-                    let mut ws_chunk: Vec<&Wt> = Vec::with_capacity(end - start);
-                    for (i, out) in outs[start..end].iter_mut().enumerate() {
-                        ys_chunk.push(out.as_mut_slice());
-                        ws_chunk.push(&mats[start + i][role]);
-                    }
-                    if !matmul_mlx_affine_multi(&mut ys_chunk, x, &ws_chunk) {
-                        return false;
-                    }
-                    start = end;
-                }
-                true
-            }
-            const BATCH_CAP: usize = 16;
-            batched = batch_projections(&mut gate_outs, &mats_all, 0, &calls[0].input, BATCH_CAP)
-                && batch_projections(&mut hiddens, &mats_all, 1, &calls[0].input, BATCH_CAP);
-        }
+        let mut down_outs: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_model]).collect();
+
+        let mut batched = batch_enabled
+            && shared_input
+            && k > 1
+            && batch_role(&mut gate_outs, &mats_all, 0, &calls[0].input, None, BATCH_CAP)
+            && batch_role(&mut hiddens, &mats_all, 1, &calls[0].input, None, BATCH_CAP);
         if !batched {
             for (i, call) in calls.iter().enumerate() {
                 matmul(&mut gate_outs[i], &call.input, &mats_all[i][0]);
@@ -11514,17 +11579,20 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
                 hiddens[i][index] *= silu(gate_outs[i][index]);
             }
         }
-        let mut outputs = Vec::with_capacity(k);
-        for i in 0..k {
-            let mut output = vec![0.0_f32; d_model];
-            matmul(&mut output, &hiddens[i], &mats_all[i][2]);
-            outputs.push(output);
+        // Phase 2: the downs, now that every SwiGLU output is live.
+        if batched {
+            batched = batch_role(&mut down_outs, &mats_all, 2, &[], Some(&hiddens), BATCH_CAP);
+        }
+        if !batched {
+            for i in 0..k {
+                matmul(&mut down_outs[i], &hiddens[i], &mats_all[i][2]);
+            }
         }
         EXPERT_COMPUTE_NS.fetch_add(
             compute_t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        Ok(outputs)
+        Ok(down_outs)
     }
 }
 

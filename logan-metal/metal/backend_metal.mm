@@ -1410,6 +1410,10 @@ static size_t g_tensor_count, g_tensor_bytes;
 static std::mutex g_op_mtx;
 static id<MTLBuffer> g_multi_x;
 static size_t g_multi_x_cap;
+/* Per-descriptor activations for descriptors that carry their own `x` (used by
+ * the routed-expert down projections, which cannot share one activation). */
+static std::vector<id<MTLBuffer>> g_multi_xs;
+static std::vector<size_t> g_multi_x_caps;
 static std::vector<id<MTLBuffer>> g_multi_outs;
 static std::vector<size_t> g_multi_out_caps;
 
@@ -1801,6 +1805,7 @@ extern "C" void coli_metal_shutdown(void) {
 #endif
   g_resset_obj=nil; g_resset_enabled=false; g_resset_dirty=false;
   g_multi_x=nil; g_multi_x_cap=0;
+  g_multi_xs.clear(); g_multi_x_caps.clear();
   g_multi_outs.clear(); g_multi_out_caps.clear();
   g_gemv=nil; g_queue=nil; g_dev=nil; g_tensor_count=g_tensor_bytes=0;
 }
@@ -2025,29 +2030,61 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
 
 extern "C" int coli_metal_matmul_multi(const float *x, int S,
                                         ColiMetalMatmulDesc *descs, int count) {
-  if (!x || !descs || S <= 0 || count <= 0 || count > 16) return 0;
+  if (!descs || count <= 0 || count > 16) return 0;
   std::lock_guard<std::mutex> lk(g_op_mtx);
   if (!g_dev || !g_queue || !g_gemv) return 0;
 
-  const int I = descs[0].I;
-  if (I <= 0) return 0;
   uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
   @autoreleasepool {
-    size_t x_elems = 0, x_bytes = 0;
-    if ((size_t)S > (size_t)-1 / (size_t)I) return 0;
-    x_elems = (size_t)S * (size_t)I;
-    if (x_elems > (size_t)-1 / sizeof(float)) return 0;
-    x_bytes = x_elems * sizeof(float);
-    if (!ensure_multi_buffer(&g_multi_x, &g_multi_x_cap, x_bytes)) return 0;
-    memcpy([g_multi_x contents], x, x_bytes);
+    /* Decide what the shared `x` has to satisfy BEFORE touching it.
+     *
+     * Descriptors carrying their own activation (`d.x`) ignore `x` entirely, so
+     * a batch made only of those must not read it at all — reading a caller's
+     * empty placeholder is an over-read. Descriptors that fall back to the
+     * shared activation must agree with each other on `I` (the original
+     * contract), and the buffer must be `S*I` floats wide.
+     *
+     * `S` is the shared batch size; a private-activation descriptor supplies its
+     * own `d.S`. */
+    int shared_I = 0;
+    bool any_shared = false;
+    for (int di = 0; di < count; ++di) {
+      ColiMetalMatmulDesc &d = descs[di];
+      if (d.x) {
+        if (d.S <= 0) return 0;
+        continue;
+      }
+      if (!any_shared) {
+        any_shared = true;
+        shared_I = d.I;
+      } else if (d.I != shared_I) {
+        return 0;
+      }
+    }
+    if (any_shared) {
+      if (!x || S <= 0 || shared_I <= 0) return 0;
+    }
 
     if (g_multi_outs.size() < (size_t)count) {
       g_multi_outs.resize((size_t)count);
       g_multi_out_caps.resize((size_t)count);
     }
+    /* Lazily-grown per-descriptor input buffers for the private-activation case. */
+    if (g_multi_xs.size() < (size_t)count) {
+      g_multi_xs.resize((size_t)count);
+      g_multi_x_caps.resize((size_t)count);
+    }
+    /* Upload the shared activation once, now that it is known to be needed and
+     * wide enough. */
+    if (any_shared) {
+      size_t shared_bytes = (size_t)S * (size_t)shared_I * sizeof(float);
+      if (!ensure_multi_buffer(&g_multi_x, &g_multi_x_cap, shared_bytes)) return 0;
+      memcpy([g_multi_x contents], x, shared_bytes);
+    }
+
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
-      if (!d.y || !d.weights || !d.scales || d.I != I || d.O <= 0 ||
+      if (!d.y || !d.weights || !d.scales || d.I <= 0 || d.O <= 0 ||
           d.fmt < 0 || (d.fmt > 4 && d.fmt != 5 && d.fmt != 7 && d.fmt != 8 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14 && d.fmt != 15 && !(d.fmt >= 16 && d.fmt <= 20) && !(d.fmt >= 21 && d.fmt <= 24))) return 0;
 
       ColiMetalTensor *t = d.tensor;
@@ -2078,7 +2115,15 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
         g_tensor_count++; g_tensor_bytes += t->wbytes;
       }
 
-      size_t out_elems = (size_t)S * (size_t)d.O;
+      /* Upload a private activation when one is supplied. */
+      if (d.x) {
+        size_t xb = (size_t)d.S * (size_t)d.I * sizeof(float);
+        if (!ensure_multi_buffer(&g_multi_xs[(size_t)di], &g_multi_x_caps[(size_t)di], xb)) return 0;
+        memcpy([g_multi_xs[(size_t)di] contents], d.x, xb);
+      }
+
+      int dS = d.x ? d.S : S;
+      size_t out_elems = (size_t)dS * (size_t)d.O;
       if (out_elems > (size_t)-1 / sizeof(float) ||
           out_elems > (size_t)std::numeric_limits<int>::max()) return 0;
       if (!ensure_multi_buffer(&g_multi_outs[(size_t)di], &g_multi_out_caps[(size_t)di],
@@ -2091,14 +2136,16 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
       ColiMetalTensor *t = d.tensor;
+      id<MTLBuffer> bx = d.x ? g_multi_xs[(size_t)di] : g_multi_x;
+      int dS = d.x ? d.S : S;
       [e setComputePipelineState:g_gemv];
       [e setBuffer:t->w offset:t->woff atIndex:0];
       [e setBuffer:t->s offset:t->soff atIndex:1];
-      [e setBuffer:g_multi_x offset:0 atIndex:2];
+      [e setBuffer:bx offset:0 atIndex:2];
       [e setBuffer:g_multi_outs[(size_t)di] offset:0 atIndex:3];
-      size_t nt_size = (size_t)S * (size_t)d.O;
+      size_t nt_size = (size_t)dS * (size_t)d.O;
       int NT = (int)nt_size;
-      [e setBytes:&S length:4 atIndex:4];
+      [e setBytes:&dS length:4 atIndex:4];
       [e setBytes:&d.I length:4 atIndex:5];
       [e setBytes:&d.O length:4 atIndex:6];
       [e setBytes:&d.fmt length:4 atIndex:7];
@@ -2117,8 +2164,9 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
 
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
+      int dS = d.x ? d.S : S;
       memcpy(d.y, [g_multi_outs[(size_t)di] contents],
-             (size_t)S * (size_t)d.O * sizeof(float));
+             (size_t)dS * (size_t)d.O * sizeof(float));
     }
   }
   return 1;
