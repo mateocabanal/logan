@@ -89,18 +89,41 @@ print(f"{med:.3f} {v[n // 4]:.3f} {n}")
 run_once() {
   local mode="$1" i="$2"
   local log="$OUT_DIR/${mode}-${i}.log"
+  local err="$OUT_DIR/${mode}-${i}.err"
   env \
     LOGAN_EXPERT_NOCACHE=1 \
+    LOGAN_PROFILE=1 \
     BENCH_TEMP="$TEMP" \
     BENCH_TOP_P=1.0 \
     BENCH_TOP_K=0 \
     BENCH_SEED="$SEED" \
     "$BIN" "$MODEL_DIR" "$TOKENS" "$mode" "$PROMPT" \
-    >"$log" 2>"$OUT_DIR/${mode}-${i}.err"
+    >"$log" 2>"$err"
 
   # A missing metric line is a harness failure, not a slow run.
   grep -q '^BENCH step_ms=' "$log" || {
-    echo "run $i of arm '$mode' emitted no step metrics; see $log and $OUT_DIR/${mode}-${i}.err" >&2
+    echo "run $i of arm '$mode' emitted no step metrics; see $log and $err" >&2
+    exit 1
+  }
+
+  # GPU-ENGAGEMENT GUARD. A broken Metal shader makes every kernel decline and
+  # silently drops the model to the CPU path (~40x slower) while still emitting a
+  # correct token trajectory and a plausible `METRIC` line -- this harness already
+  # banked one such run before it was caught. `meta_share`/`fallback` and a sane
+  # decode time are the tells. LOGAN_PROFILE=1 is therefore forced above so the
+  # line is always present.
+  grep -q 'metal_share=1.000' "$err" || {
+    echo "GPU path NOT engaged (no metal_share=1.000) in run $i of arm '$mode': $err" >&2
+    exit 1
+  }
+  grep -q 'mlx-affine: metal=[0-9]* fallback=0' "$err" || {
+    echo "MLX-affine fell back to CPU in run $i of arm '$mode': $err" >&2
+    exit 1
+  }
+  local dms
+  dms="$(sed -n 's/^BENCH decode_mean_ms=//p' "$log")"
+  awk -v v="$dms" 'BEGIN { exit !(v > 0 && v < 1500) }' || {
+    echo "implausible decode_ms=$dms (expected <1500) in run $i of arm '$mode'" >&2
     exit 1
   }
   sed -n 's/^BENCH step_ms=//p' "$log" | tr ',' '\n' >>"$OUT_DIR/steps-${mode}.txt"
