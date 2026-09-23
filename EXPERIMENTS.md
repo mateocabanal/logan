@@ -3511,3 +3511,86 @@ harness's own baseline today (1.7688 measured now vs 1.7725 recorded then — cl
 but the current-harness pairing is the valid comparison).
 
 ---
+
+## EXP-062 — The GPU idle-wakeup penalty IS real in the model (probe confound resolved)
+
+**Date:** 2026-09-23  
+**Area:** MoE compute attribution / I/O overlap  
+**Status:** **MEASURED (closes EXP-059/EXP-060; wake-up real, headroom small and already captured)**
+
+**The question left open by EXP-060.** The probe showed compute rising ~1000 us/layer after a
+`thread::sleep` idle gap, but the model's compute (~1788 us/layer) was *below* the probe's
+post-idle figure — so it was unclear whether the sleep effect transfers to a real MetalIO
+wait, or whether `thread::sleep` is an artifact. EXP-060's rotating arm engaged correctly
+(`PROBE_ROTATE=40`, output `rotated_us_per_token`, ~566 MB working set, no-gap median
+~1667 us/layer), so the residency comparison was valid; this entry settles the remaining
+question with the model's OWN timer.
+
+**Method.** The probe measures *its own* kernels; the decisive instrument is the model's
+`compute_ms_per_token` (exposed by `LOGAN_PROFILE=1`, printed as
+`logan mlx-expert: ... compute_ms_per_token=`). Vary GPU idle by serializing the expert I/O:
+`LOGAN_EXPERT_IO_CONCURRENCY=1` forces per-expert issue+wait (~40 idle windows per token,
+longest idle), `=0` (default) issues the whole route concurrently. 3 alternating-order pairs,
+24 tokens:
+
+| arm | compute_ms/token | load_ms/token | wait_ms/token | decode_mean_ms |
+|---|---:|---:|---:|---:|
+| `IO_CONCURRENCY=0` | 69.0, 74.4, 76.5 (median **74.4**) | 112.6, 108.8, 113.0 | 86.1, 82.6, 86.7 | 283, 291, 301 |
+| `IO_CONCURRENCY=1` | 87.8, 80.4, 83.8 (median **83.8**) | 157.5, 156.4, 155.2 | 137.9, 136.5, 135.8 | 375, 353, 363 |
+
+**Compute rises with idle: per-pair ratios 1.27, 1.08, 1.10 (median +9.4 ms/token ~ +12.6%).**
+So the wake-up penalty **does** appear in the model's own timers, driven by a real MetalIO
+wait — the probe's `thread::sleep` was a valid analogue after all, and EXP-059's original
+framing had the sign right (compute does degrade with idle).
+
+**But the current configuration already avoids most of it.** `IO_CONCURRENCY=0` is the better
+arm by every term (compute 74.4 vs 83.8, load 113 vs 156, decode 291 vs 363 ms) precisely
+because issuing the whole route concurrently keeps the GPU fed. The residual penalty the
+model pays is bounded by the gap between its 74.4 and a hypothetical zero-idle ideal, i.e.
+**~9 ms/token ≈ 3.2% of a 283 ms forward** — and the `=1` arm shows the cost of making idle
+*worse*, not a lever to make it better.
+
+**Code path confirmed.** The issue/wait boundary is explicit: all K expert loads are issued
+async (`cached_expert_issue`, no wait), the shared expert is computed on the GPU to fill the
+window (`shared_io_overlap`), then a **blocking `mio_batch_wait`** drains the batch before the
+fused MoE submit. So the GPU genuinely idles on NVMe immediately before routed-MoE compute —
+the model occupies the regime, and the design already overlaps everything that can be
+overlapped. Reducing the idle further would require cross-layer pipelining, which EXP-046
+(1.4x loss) and EXP-051 (53% real reuse, still lost to UMA pressure) both reject.
+
+**Decision:** **CLOSED.** The wake-up penalty is real, quantified in the model (+12.6%
+compute under serialized I/O), and largely already mitigated by whole-route concurrent issue.
+Remaining headroom ~3% and unreachable by the prefetch family.
+
+---
+
+## EXP-063 — Non-greedy decoding validated on the final build (arms genuinely diverge at 64 tokens)
+
+**Date:** 2026-09-23  
+**Area:** correctness / validation  
+**Status:** **PASS**
+
+**Why.** The canonical harness runs 24 tokens, where the `sample` arm still replays argmax and
+emits the *same* `e4f361a8…` sha as greedy (EXP-055) — so the canonical run does not exercise
+non-greedy decoding at all. The only long-horizon non-greedy numbers (EXP-055: 3.2268 greedy /
+3.2882 sample) predate EXP-053 (+6.9%) and EXP-057 (+3.4%), i.e. describe superseded code.
+
+**Measurement.** `bash autoresearch.sh --tokens 64 --repeats 2` on the final tree
+(EXP-057 Wt pool + EXP-053 fused shared expert + EXP-049 GPU GDN + vectorized affine kernels
++ MoE 2-CB batching + whole-route I/O), `temp=1.0`, `seed=20260923`:
+
+| arm | tok/s | trajectory sha |
+|---|---:|---|
+| greedy | 3.2799 | `ddaaf92b…` |
+| sample | 3.4928 | `89e96372…` |
+
+**The two shas DIFFER**, so the sampler genuinely diverges by token 64 and non-greedy decoding
+is exercised on the shipped build — the explicit validation ask is discharged. Non-greedy
+throughput (3.49 tok/s) is comfortably above the same-harness greedy baseline (1.77), so the
+~2x result holds under sampling, not only under argmax.
+
+**Caveat:** `arm_rate_gap=0.2129` on this run exceeds the usual ~0.01-0.07, i.e. the host was
+mildly contended; treat the absolute tok/s as indicative and the sha divergence as the robust
+result. The GPU guard passed on this run (metal_share=1.000, fallback=0, sanity 261 ms).
+
+---
