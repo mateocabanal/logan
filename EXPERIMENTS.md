@@ -2970,3 +2970,62 @@ fusion and `off` is the default fused path:
 unfused path.
 
 ---
+
+## EXP-054 — Long-horizon correctness gate for the fused paths; wrap fix deliberately deferred
+
+**Date:** 2026-09-23  
+**Area:** verification / Metal weight upload  
+**Status:** **GATE PASSED** (EXP-053) / **wrap fix DEFERRED**
+
+### A. 96-token equivalence for the fused shared expert
+
+The fused shared-expert path (EXP-053) moves the SwiGLU onto the GPU and runs the
+whole expert in one command buffer, so it is the kind of change that could
+perturb numerics without flipping an early argmax. It was therefore gated the same
+way the vectorized kernels were (EXP-050): a **96-token greedy decode** with the
+fusion on versus off (`QWEN_SHARED_MXFP4_FULL=0`).
+
+Result: the two 96-token streams are **byte-identical** (450 bytes each, `cmp`
+clean). Combined with EXP-050's 128-token kernel-equivalence result, the two
+session changes that alter GPU arithmetic both reproduce the reference trajectory
+over a horizon far longer than the 24-token canonical gate — ~4x more tokens, and
+therefore ~4x more distinct expert routes exercised per layer.
+
+### B. Per-matrix `wrap()` upload: measured, but the fix is deferred on risk grounds
+
+EXP-052 measured the per-matrix Metal weight upload at **+395 us/layer = 1.334x**
+on the MoE compute phase (**~15.8 ms/token**, ~5.6% of the current ~280 ms
+forward). The cause is established: `materialize_plan` hands each of ~960
+matrices/token a fresh unaligned `Vec<u8>` with a null `metal_tensor`, and
+`wrap()` zero-copies only for a 16 KiB-aligned pointer with a page-rounded length,
+so it takes the copying `newBufferWithBytes` path.
+
+**Why it is not being attempted now.** Two candidate mechanisms were investigated
+and both are riskier than their ~5.6% prize on an unattended run:
+
+1. **Registered slabs.** `coli_metal_register`/`resolve()` is the documented
+   zero-copy mechanism, but `resolve()` only succeeds for pointers inside a
+   *registered* slab, and `materialize_plan` copies into `Wt`-owned `Vec`s that
+   are then freed — so registration alone does nothing. The bytes would have to be
+   borrowed from a stable aligned buffer, i.e. an ownership change to
+   `WtBytes::MlxAffine` (it currently owns `Vec<u8>` for weights/scales/biases and
+   is read as `&[u8]` by both the matmul call sites and the multi path).
+2. **A 16 KiB-aligned `Vec`.** Allocating with `posix_memalign` and wrapping via
+   `Vec::from_raw_parts` would satisfy `wrap()`'s alignment test while keeping the
+   type — but such a `Vec` must be deallocated with the *matching* layout, and a
+   default-drop `Vec<u8>` would free it with `Layout::array::<u8>(len)` at align
+   1. That is undefined behaviour, i.e. a silent-corruption class of bug, not a
+   performance one.
+
+Either route is a substantial refactor of a memory-ownership boundary that the
+engine reads through raw pointers into Metal buffers, and this repository's own
+code comments warn that stale pointer-keyed handles serve *wrong weights*. Since
+EXP-052 already records the measurement, the prize, and both mechanisms including
+the alignment/dealloc trap, a future session can implement it deliberately rather
+than an unattended loop attempting it.
+
+**Decision:** measurement **KEPT** as a finding and a candidate; the fix is
+**deferred, not rejected**. The session ends on the committed, verified 1.99x
+state rather than risking a numeric-corruption bug for ~5.6%.
+
+---
