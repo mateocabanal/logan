@@ -3211,3 +3211,78 @@ than attempted unverified.
 command buffers per layer to one (~1.5%; new C API, FP accumulation-order risk).
 
 ---
+
+## EXP-057 — Reusable `Wt` pool: Metal buffers created once per run instead of per token
+
+**Date:** 2026-09-23  
+**Area:** expert materialization / Metal buffer creation  
+**Status:** **KEPT**
+
+**Motivation, measured not assumed.** EXP-052's counters (`coli_metal_wrap_stats`)
+showed the expert path creates **540 MiB of MTLBuffer objects per decode token**
+(13.5 MiB/layer, 1920 `wrap()` calls/token) at essentially **zero copy bytes**
+(`copied_bytes` flat at 332 800 for a whole run). The buffers are created only
+because `materialize_plan` builds fresh `Wt`s every token, and the probe's
+warm-vs-cold handle arms isolate that creation at ~395 us/layer (~15.8 ms/token).
+
+**Change:** one reusable `[Wt; 3]` per `(layer, route index)` in
+`MlxLocalExpertSource`, refilled in place (`refill_plan_into`) and returned to the
+pool after the compute phase. The `Wt`'s `Vec`s are overwritten at the same address
+and length, and `metal_tensor` is deliberately left untouched so the C side resolves
+its cached wrapper instead of calling `wrap()` again — i.e. the pool saves the
+buffer/tensor *creation*, not the bytes.
+
+**Why in-place overwrite is correct:** `wrap()` uses `newBufferWithBytesNoCopy` with
+no deallocator, so the MTLBuffer aliases the `Vec`'s memory; overwriting that memory
+in place is exactly what the GPU observes. This is the same mechanism the in-repo
+registered-slab comment relies on ("a pointer-keyed handle stays correct even when
+the caller reuses the slab for different weights").
+
+**Bounds.** Keyed by `(layer, route index)` — not by expert, which would grow without
+bound — so the pool is hard-capped at `layers x topk` = 320 entries (~540 MB). The
+put-back additionally requires `calls.len() <= topk`, so a batched-prefill call site
+(one entry per row x rank) bypasses the pool entirely rather than proliferating keys.
+
+**Not a residency cache.** No expert identity or bytes survive a token: every slot is
+overwritten before use. That is why this does **not** inherit EXP-019's or EXP-051's
+UMA-pressure rejection — both of those retained a growing set of experts.
+
+**Measured result:**
+
+| counter | pool OFF | pool ON |
+|---|---:|---:|
+| `wrap()` calls per run | ~96 700 | **2 622** |
+| `bytes_created` per run | ~26 GB | **2.24 GB** |
+| pool hits / misses | — | 13 120 / 320 (97.6%) |
+
+The 320 misses are exactly one token's routes filling the pool; every later token
+hits. `wrap()` calls and `bytes_created` are **flat across token counts** with the
+pool on, which is the direct confirmation that the buffers are created once.
+
+**Correctness gates (all passed):**
+- 24-token greedy trajectory byte-identical (`e4f361a8…`), with the pool on and off.
+- **128-token greedy trajectory byte-identical between pool ON and OFF** — the
+  decisive gate, because the aliasing risk here is a stale-weight read that could
+  survive a short run without flipping an argmax.
+- `logan-metal` 5 / `logan-qwen4` 95 tests pass.
+
+**Paired A/B** (5 pairs, alternating arm order, 24 tokens, one binary):
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| pool off | 269.69 | 3.7080 |
+| pool on | 260.91 | 3.8327 |
+
+**1.0336x**. Canonical harness: **3.8309 tok/s** (2.16x over the 1.7725 baseline),
+`arm_rate_gap` 0.0139, `greedy_trajectory_sha` unchanged.
+
+**Decision:** **KEPT, default ON** (`LOGAN_EXPERT_WT_POOL=0` opts out).
+
+**Note superseding the earlier closure claim:** EXP-056 originally closed this branch
+on the premise that avoiding these creations required *residency*, which had been
+rejected. That premise was wrong — this change reuses buffers within a fixed 320-slot
+pool with no retention, so neither rejection applied. The 540 MiB/token figure was
+the signal that a third design existed; measuring the allocation volume (rather than
+reasoning about the fix) is what found it.
+
+---

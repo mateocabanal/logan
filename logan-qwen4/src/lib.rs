@@ -10171,6 +10171,14 @@ impl Model {
             // and what remains is buffer-object creation, which only residency
             // could avoid (EXP-019/051/052).
             let (wrap_calls, wrap_zc, wrap_bytes, wrap_created) = logan_metal::wrap_stats();
+            let (pool_hits, pool_misses, pool_stores) = (
+                WT_POOL_HITS.load(std::sync::atomic::Ordering::Relaxed),
+                WT_POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+                WT_POOL_STORES.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            eprintln!(
+                "logan wt-pool: hits={pool_hits} misses={pool_misses} stores={pool_stores}"
+            );
             eprintln!(
                 "logan metal-wrap: calls={wrap_calls} zero_copy={wrap_zc} \
                  copied_bytes={wrap_bytes} bytes_created={wrap_created}"
@@ -10817,6 +10825,10 @@ pub(crate) struct MlxLocalExpertSource {
     /// retained a growing set of experts.
     wt_pool: std::collections::HashMap<(u32, usize), [Wt; 3]>,
     wt_pool_on: bool,
+    /// Maximum `calls.len()` the pool will accept (decode shape = `topk`). A
+    /// larger batch (batched prefill) bypasses the pool so its `(layer, i)` keys
+    /// cannot proliferate and grow it without bound.
+    pool_rank_cap: usize,
     pending: std::collections::HashMap<(u32, usize), MlxPendingExpert>,
     pending_order: std::collections::VecDeque<(u32, usize)>,
     pending_cap: usize,
@@ -10880,7 +10892,7 @@ impl Drop for MlxLocalExpertSource {
 }
 
 impl MlxLocalExpertSource {
-    fn new(st: StFile, experts: usize) -> Result<Self, String> {
+    fn new(st: StFile, experts: usize, topk: usize) -> Result<Self, String> {
         // Canonical engine-wide flags use LOGAN_* because this I/O policy
         // belongs to the source/runtime contract, not to Qwen. Keep the QWEN_*
         // spellings as compatibility aliases for EXP-028 scripts.
@@ -10924,7 +10936,20 @@ impl MlxLocalExpertSource {
                 plans: std::collections::HashMap::new(),
             },
             wt_pool: std::collections::HashMap::new(),
-            wt_pool_on: crate::env_flag("LOGAN_EXPERT_WT_POOL"),
+            // Default ON. Measured: `wrap()` created 540 MiB of MTLBuffer objects
+            // per decode token (1920 creations, ~zero copy bytes); the pool holds
+            // one `[Wt; 3]` per (layer, route index) and refills them in place, so
+            // the buffers and tensor objects are created once and reused. Paired
+            // A/B: 269.69 -> 260.91 ms/token (1.0336x), token-identical, with
+            // `wrap()` calls falling from ~96 700 to 2622 per run and
+            // `bytes_created` from ~26 GB to 2.24 GB. Not a residency cache: no
+            // expert identity or bytes survive a token, and the pool is hard-capped
+            // at layers x topk (320) entries, so it does not inherit EXP-019's or
+            // EXP-051's UMA-pressure rejection.
+            wt_pool_on: std::env::var("LOGAN_EXPERT_WT_POOL")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true),
+            pool_rank_cap: topk.max(1),
         })
     }
 
@@ -11390,7 +11415,7 @@ impl MlxLocalExpertSource {
         d_hidden: usize,
     ) -> Result<[Wt; 3], String> {
         let fetch = self.issue_demand_expert(layer, expert, d_model, d_hidden)?;
-        self.collect_demand_expert(fetch)
+        self.collect_demand_expert(fetch, (layer, 0))
     }
 
     /// Submit (but do not wait for) one expert's demand fetch.
@@ -11450,7 +11475,11 @@ impl MlxLocalExpertSource {
     ///
     /// The whole function is inside the load envelope, so `wait_ms` is a strict
     /// child of `load_ms` and the remainder is materialization.
-    fn collect_demand_expert(&mut self, fetch: DemandFetch) -> Result<[Wt; 3], String> {
+    fn collect_demand_expert(
+        &mut self,
+        fetch: DemandFetch,
+        slot_key: (u32, usize),
+    ) -> Result<[Wt; 3], String> {
         let (slot, event, plan) = match fetch {
             DemandFetch::Ready(mats) => return Ok(mats),
             DemandFetch::Pending(pending) => (pending.slot, pending.event, pending.plan),
@@ -11480,11 +11509,32 @@ impl MlxLocalExpertSource {
         // Copying the bytes out promptly and then materializing from the copy is
         // faster than materializing directly out of the slot (EXP-048).
         let mat_t0 = std::time::Instant::now();
-        let mats = Self::materialize_plan(&plan, &raw);
+        let mats = if self.wt_pool_on {
+            // Key by (layer, route index): geometry is fixed per layer, so the
+            // slot always refills and the pool is hard-bounded at layers x topk
+            // (320) entries. Keying by expert would grow without bound.
+            match self.wt_pool.remove(&slot_key) {
+                Some(mut slot) => {
+                    if Self::refill_plan_into(&mut slot, &plan, &raw) {
+                        WT_POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        slot
+                    } else {
+                        WT_POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Self::materialize_plan(&plan, &raw)?
+                    }
+                }
+                None => {
+                    WT_POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Self::materialize_plan(&plan, &raw)?
+                }
+            }
+        } else {
+            Self::materialize_plan(&plan, &raw)?
+        };
         let mat_ns = mat_t0.elapsed().as_nanos() as u64;
         EXPERT_MATERIALIZE_NS.fetch_add(mat_ns, std::sync::atomic::Ordering::Relaxed);
         EXPERT_LOAD_NS.fetch_add(mat_ns, std::sync::atomic::Ordering::Relaxed);
-        mats
+        Ok(mats)
     }
 
     /// Uncached POSIX read of one expert's three matrices. The dedicated
@@ -11621,7 +11671,7 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
                 .map_err(crate::pool::PoolError::from)?
             };
             mats_all.push(
-                self.collect_demand_expert(fetch)
+                self.collect_demand_expert(fetch, (call.layer, index))
                     .map_err(crate::pool::PoolError::from)?,
             );
             EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -11761,6 +11811,28 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
             compute_t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // Put the materialized matrices back into the per-slot pool so the next
+        // token reuses their Metal buffers and tensor objects instead of creating
+        // them again (540 MiB of buffer objects per token otherwise).
+        //
+        // Keyed by `(layer, route index)` to match the take side exactly; using the
+        // expert id here would never match and the pool would read as a false
+        // negative. The pool is hard-bounded by layers x topk (320 entries), so
+        // there is no unbounded growth.
+        // Bound the pool by construction. In decode `calls.len()` is one per rank
+        // (topk), so keys stay under `layers x topk`; a batched-prefill call site
+        // builds one entry per (row, rank), which would make `(layer, i)` keys
+        // proliferate and the pool grow without bound. Skipping the pool for any
+        // non-decode-shaped batch keeps it hard-capped at 320 entries (~540 MB)
+        // while leaving prefill on the established fresh-materialize path.
+        if self.wt_pool_on && self.pool_rank_cap > 0 && calls.len() <= self.pool_rank_cap {
+            for (i, m) in mats_all.into_iter().enumerate() {
+                if let Some(call) = calls.get(i) {
+                    self.wt_pool.insert((call.layer, i), m);
+                }
+            }
+            WT_POOL_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(down_outs)
     }
 }
@@ -11768,6 +11840,10 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
 static EXPERT_LOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXPERT_COMPUTE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXPERT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `Wt` pool outcome counters (meaningful only when `LOGAN_EXPERT_WT_POOL=1`).
+static WT_POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WT_POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WT_POOL_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Decomposition of the expert `load_ms` term, which the EXP-029-corrected
 /// attribution showed is far larger than the measured MetalIO wait. Separating
 /// planning, slot setup and the wait shows which one actually costs.
@@ -11886,7 +11962,7 @@ impl Model {
         let streamed_mlx_experts = mlx_switch_layout && pool.is_none();
         let local_mlx_expert_source: Option<Box<dyn crate::pool::ExpertSource>> =
             if streamed_mlx_experts {
-                Some(Box::new(MlxLocalExpertSource::new(st.clone(), cfg.experts)?))
+                Some(Box::new(MlxLocalExpertSource::new(st.clone(), cfg.experts, cfg.topk)?))
             } else {
                 None
             };
@@ -13804,7 +13880,7 @@ mod tests {
             &[("model-00001-of-00001.safetensors", tensors)],
         );
         let st = StFile::open_dir(&dir).unwrap();
-        let mut source = MlxLocalExpertSource::new(st, experts).expect("MLX expert source");
+        let mut source = MlxLocalExpertSource::new(st, experts, 8).expect("MLX expert source");
         let input = vec![1.0_f32; cols];
         let outs = source
             .eval(
