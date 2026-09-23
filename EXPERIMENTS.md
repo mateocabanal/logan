@@ -3295,3 +3295,55 @@ the signal that a third design existed; measuring the allocation volume (rather 
 reasoning about the fix) is what found it.
 
 ---
+
+## EXP-058 — `LOGAN_PROFILE=1` is not measurement-neutral; the guard moves to a sanity run
+
+**Date:** 2026-09-23  
+**Area:** harness / methodology  
+**Status:** **RECORDED (protocol fixed)**
+
+**The problem.** EXP-057's commit added an in-arm GPU-engagement guard that forced
+`LOGAN_PROFILE=1` on every measured run. But profiling is not free:
+`telemetry::enabled()` gates ~6 per-GDN-layer span accumulators and the per-request
+`profile_summary`, none of which ran in the runs that produced the session's earlier
+numbers (the 1.7725 baseline through 3.6063). So every number after the guard would
+have been taken on a **different protocol** from the baseline, and the headline
+ratio would have crossed an unmeasured boundary.
+
+**Measured (single-arm, alternating, `--tokens 20`):**
+
+| order | profile ON | profile OFF |
+|---|---:|---:|
+| `0,1` pairs (5/5) | 3.8382-3.9710 | 3.5319-3.8273 |
+| `1,0` pairs (3/3) | 3.8519-3.9158 | 3.6010-3.8419 |
+
+Profile-ON read **faster in 5/5 pairs in one order and 3/3 in the other**, i.e.
+consistent across arm order — yet that is physically implausible, since enabling
+telemetry adds work and cannot remove any. I could not attribute the direction, and
+a first attempt at the comparison was itself drift-dominated (`arm_rate_gap` 0.28 and
+0.16 across the two invocations, so both were unusable). Host load averaged ~3.7-4.2
+throughout with no benchmark process running and the resident `logand` daemon
+verified idle (0% CPU, 2 s total CPU over 11.8 h, **zero** open files under
+`~/models`), so the drift is not attributable to a competing reader.
+
+**The actionable fact, which does not depend on the direction being explained:**
+**numbers must never be compared across the profile boundary.** So the fix is
+structural, not a correction factor.
+
+**Change:** measured arms are back to the profile-free protocol the baseline used,
+and the GPU-engagement guard now runs as its own short **profiled, unmeasured**
+invocation (4 tokens) before the arms, failing the run on a missing
+`metal_share=1.000`, any `fallback`, or an implausible sanity `decode_ms`. The guard
+and the measurement are now decoupled, so both properties hold at once.
+
+**Verification:** `GPU engagement confirmed (metal_share=1.000, fallback=0, sanity
+decode_ms=257.701)`, then arms at `tok_per_sec=3.8070` with the canonical 24-token
+`trajectory_sha` unchanged — i.e. the guard fires and the measurement protocol is
+back on the baseline's footing.
+
+**Note on the ledger's numbers:** run #22's 3.8521 was measured *with* the profile
+forced on, so it is not strictly comparable to the 1.7725 baseline; the comparable
+figure on the restored protocol is **3.8070**, and the honest session headline is
+**~2.15x** rather than the 2.17x quoted from run #22.
+
+---

@@ -90,9 +90,14 @@ run_once() {
   local mode="$1" i="$2"
   local log="$OUT_DIR/${mode}-${i}.log"
   local err="$OUT_DIR/${mode}-${i}.err"
+  # Measurement runs are PROFILE-FREE, which is the protocol the 1.7725 baseline
+  # was taken on. Profiling is not neutral here: same-code canonical runs read
+  # ~3.55-3.66 with LOGAN_PROFILE on versus ~3.62 with it off, consistently in
+  # both arm orders, so enabling it for the measured arms would make numbers
+  # incomparable to the baseline. The GPU-engagement guard therefore runs on a
+  # separate, unmeasured sanity invocation instead (see the guard block below).
   env \
     LOGAN_EXPERT_NOCACHE=1 \
-    LOGAN_PROFILE=1 \
     BENCH_TEMP="$TEMP" \
     BENCH_TOP_P=1.0 \
     BENCH_TOP_K=0 \
@@ -112,14 +117,6 @@ run_once() {
   # banked one such run before it was caught. `meta_share`/`fallback` and a sane
   # decode time are the tells. LOGAN_PROFILE=1 is therefore forced above so the
   # line is always present.
-  grep -q 'metal_share=1.000' "$err" || {
-    echo "GPU path NOT engaged (no metal_share=1.000) in run $i of arm '$mode': $err" >&2
-    exit 1
-  }
-  grep -q 'mlx-affine: metal=[0-9]* fallback=0' "$err" || {
-    echo "MLX-affine fell back to CPU in run $i of arm '$mode': $err" >&2
-    exit 1
-  }
   local dms
   dms="$(sed -n 's/^BENCH decode_mean_ms=//p' "$log")"
   awk -v v="$dms" 'BEGIN { exit !(v > 0 && v < 1500) }' || {
@@ -157,6 +154,33 @@ report_arm() {
 
   echo "RESULT $mode median_ms=$median p25_ms=$p25 pooled_steps=$count tok_s=$tok_s trajectory_sha=$sha"
   printf '%s %s %s\n' "$mode" "$tok_s" "$median" >>"$OUT_DIR/summary.tsv"
+}
+
+# --- GPU-ENGAGEMENT SANITY CHECK (unmeasured) --------------------------------
+# A broken Metal shader makes every kernel decline and silently drops the model to
+# the CPU path (~40x slower) while still emitting a correct token trajectory and a
+# plausible METRIC line; this harness banked exactly one such run before the check
+# existed. It is done as its own short PROFILED invocation so the measured arms
+# above stay on the profile-free protocol the baseline used.
+{
+  env LOGAN_EXPERT_NOCACHE=1 LOGAN_PROFILE=1 BENCH_TEMP=1.0 BENCH_TOP_P=1.0 \
+    BENCH_TOP_K=0 BENCH_SEED="$SEED" \
+    "$BIN" "$MODEL_DIR" 4 greedy "$PROMPT" \
+    >"$OUT_DIR/sanity.log" 2>"$OUT_DIR/sanity.err" || true
+  if ! grep -q 'metal_share=1.000' "$OUT_DIR/sanity.err"; then
+    echo "GPU path NOT engaged (no metal_share=1.000); see $OUT_DIR/sanity.err" >&2
+    exit 1
+  fi
+  if ! grep -q 'mlx-affine: metal=[0-9]* fallback=0' "$OUT_DIR/sanity.err"; then
+    echo "MLX-affine fell back to CPU; see $OUT_DIR/sanity.err" >&2
+    exit 1
+  fi
+  sanity_ms="$(sed -n 's/^BENCH decode_mean_ms=//p' "$OUT_DIR/sanity.log")"
+  if ! awk -v v="$sanity_ms" 'BEGIN { exit !(v > 0 && v < 1500) }'; then
+    echo "implausible sanity decode_ms=$sanity_ms (expected <1500): GPU likely idle/absent" >&2
+    exit 1
+  fi
+  echo "  GPU engagement confirmed (metal_share=1.000, fallback=0, sanity decode_ms=$sanity_ms)"
 }
 
 rm -f "$OUT_DIR"/steps-*.txt "$OUT_DIR"/ids-*.txt
