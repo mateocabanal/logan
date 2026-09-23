@@ -2721,3 +2721,29 @@ memory system. So:
 re-opened as "obvious headroom".
 
 ---
+
+## EXP-051 — Expert residency cache on raw MLX, re-tested: still a loss (EXP-019 confirmed)
+
+**Date:** 2026-09-23  
+**Area:** routed MoE / storage  
+**Status:** **REJECTED**
+
+**Why re-test:** EXP-019 rejected an expert LRU on the raw-MLX path (`QWEN_MLX_EXPERT_CACHE_PER_LAYER`, every capacity regressed). That was measured when the path was **dispatch-bound** — ~1191 synchronous affine dispatches per forward made the `load` term irrelevant. This session removed that (EXP-037/038) and made the kernels ~2.7x faster (EXP-040..045), so storage became the largest single term again (`wait` ~74 ms/token against ~512 MB of expert bytes per token, i.e. ~7 GB/s — plausibly at the SSD's limit). The tradeoff that EXP-019 measured no longer held in the same form, so it was re-measured rather than assumed.
+
+**Implementation:** a `(layer, expert)` -> (raw MetalIO bytes, I/O plan) cache in `MlxLocalExpertSource`. Raw bytes rather than materialized `Wt`s, because the cache's job is to skip the **SSD read** (the dominant term); materialization still runs on a hit. Two correctness/robustness issues were handled explicitly:
+
+1. The residency lookup runs **before** the fetch-issue loop, so only misses are issued. Looking up after issuing would leave a pre-issued `DemandFetch::Pending` uncollected on a hit, and since `DemandFetch` has no `Drop` its MetalIO slot would never be freed — at ~50-70% route overlap that leaks hundreds of 1.6 MB slots per token.
+2. Any fetch issued but superseded by a hit is explicitly `mio_discard_slot`-ed.
+
+**Paired A/B** (5 pairs, alternating arm order, 24 tokens):
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| residency off | 283.75 | 3.5243 |
+| residency 512 experts (~1.2 GB) | 298.42 | 3.3510 |
+
+**0.9508x — 5% SLOWER.** A capacity screen agrees: cap 0 read 280.2/296.1 ms, cap 64 read 302.7/293.0, cap 320 read 331.2/296.9 — no capacity won, and larger caps were progressively worse (cap 2048 read 319.1 ms).
+
+**Decision:** **REJECTED and reverted.** This is now a two-time-confirmed rejection on this host: an expert residency cache costs more than it saves. The mechanism is consistent with EXP-019's and EXP-032/046's shared finding — this 16 GiB UMA host has no headroom for holding ~1.2 GB of extra resident bytes while the GDN/attention/expert kernels run against the same memory system, so every attempt to trade memory for I/O loses. Treat "cache more experts" as closed, not as unexplored headroom.
+
+---
