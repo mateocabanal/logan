@@ -257,6 +257,48 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
         acc += dot(w0, xv0) * sc + bi * (xv0.x + xv0.y + xv0.z + xv0.w);
         acc += dot(w1, xv1) * sc + bi * (xv1.x + xv1.y + xv1.z + xv1.w);
       }
+#ifdef MLX5_SCALAR
+    } else if (false) {
+#else
+    } else if (qbits == 5 && (gsz & 31) == 0) {
+#endif
+      // Vectorized 5-bit path. 32 five-bit codes occupy exactly 160 bits = 5
+      // uint32 words, so one lane owns a 32-column chunk. Each code is extracted
+      // from the word that contains it; only codes whose bit offset crosses a
+      // 32-bit boundary need two words, and the final code (bit 155) ends
+      // exactly on the chunk boundary. `gsz` a multiple of 32 keeps a chunk
+      // inside one group, so one scale/bias pair covers the whole vector.
+      // Covers the GDN output projection and the attention output projection.
+      int I32 = I / 32;
+      for (int c = slane; c < I32; c += 32) {
+        int base = c * 32;
+        device const uint* ww = wr + (long)c * 5;
+        uint w0 = ww[0], w1 = ww[1], w2 = ww[2], w3 = ww[3], w4 = ww[4];
+        int g = base / gsz;
+        float sc = aux_half ? float(as_type<half>(scl[g]))
+                            : as_type<float>((uint)scl[g] << 16);
+        float bi = aux_half ? float(as_type<half>(bia[g]))
+                            : as_type<float>((uint)bia[g] << 16);
+        float dot5 = 0.0f;
+        float xs = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+          int bit = 5 * j;
+          int word = bit >> 5;
+          int sh = bit & 31;
+          uint wi = word == 0 ? w0 : (word == 1 ? w1 : (word == 2 ? w2 : (word == 3 ? w3 : w4)));
+          uint code;
+          if (sh + 5 <= 32 || word >= 4) {
+            code = (wi >> sh) & 31u;
+          } else {
+            uint wn = word == 0 ? w1 : (word == 1 ? w2 : (word == 2 ? w3 : w4));
+            code = ((wi >> sh) | (wn << (32 - sh))) & 31u;
+          }
+          float xv = xr[base + j];
+          dot5 += float(code) * xv;
+          xs += xv;
+        }
+        acc += dot5 * sc + bi * xs;
+      }
 #ifdef MLX6_SCALAR
     } else if (false) {
 #else
@@ -1776,6 +1818,8 @@ extern "C" int coli_metal_init(void) {
     if (const char *e = getenv("LOGAN_MLX8_SCALAR")) mlx8_scalar = (e[0] != 0 && e[0] != '0');
     bool mlx6_scalar = false;
     if (const char *e = getenv("LOGAN_MLX6_SCALAR")) mlx6_scalar = (e[0] != 0 && e[0] != '0');
+    bool mlx5_scalar = false;
+    if (const char *e = getenv("LOGAN_MLX5_SCALAR")) mlx5_scalar = (e[0] != 0 && e[0] != '0');
     {
       const std::string marker = "#include <metal_stdlib>";
       size_t at = shader_src.find(marker);
@@ -1784,6 +1828,7 @@ extern "C" int coli_metal_init(void) {
         if (mlx4_scalar) defs += "\n#define MLX4_SCALAR 1\n";
         if (mlx8_scalar) defs += "\n#define MLX8_SCALAR 1\n";
         if (mlx6_scalar) defs += "\n#define MLX6_SCALAR 1\n";
+        if (mlx5_scalar) defs += "\n#define MLX5_SCALAR 1\n";
         if (!defs.empty()) shader_src.insert(at + marker.size(), defs);
       }
     }
