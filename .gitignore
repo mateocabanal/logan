@@ -130,4 +130,7 @@ target/
 # local autonomous-agent / research scratch; never repository artifacts
 /.dream-rsi/
 /task/
+/.pairbridge/
+/.ane-src/
+/.perf_runs/
 .DS_Store

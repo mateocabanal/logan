@@ -94,6 +94,9 @@ fn main() -> Result<(), String> {
         .collect();
 
     let mut final_logits = Vec::new();
+    // This probe feeds every forward as a decode step (no prompt prefill), so
+    // its window opens at the first one.
+    model.begin_decode_measurement();
     let inference_t0 = Instant::now();
     for (pos, token) in tokens.into_iter().enumerate() {
         let before = model.runtime_stats();

@@ -121,6 +121,27 @@ pub type PoolError = String;
 /// time per the comments in `pool.rs`), and `Send` so an embedder can move it
 /// behind a lock or a channel.
 pub trait ExpertSource: Send {
+    /// Whether this source can stage expert weights before an activation is
+    /// available. Remote pools and ordinary synchronous readers return false;
+    /// raw MLX/safetensors can return true when MetalIO is active.
+    fn supports_prefetch(&self) -> bool {
+        false
+    }
+
+    /// Best-effort non-blocking expert staging. This changes only transfer
+    /// timing: native routing remains authoritative and `eval` must still
+    /// produce the exact requested expert outputs. The default is deliberately
+    /// inert so existing/remote sources remain source-compatible.
+    fn prefetch(
+        &mut self,
+        _layer: u32,
+        _experts: &[u32],
+        _d_model: usize,
+        _d_hidden: usize,
+    ) -> Result<usize, PoolError> {
+        Ok(0)
+    }
+
     /// Evaluate each call and return outputs positionally aligned with `calls`.
     ///
     /// Must return exactly `calls.len()` vectors, each `d_model` long: the

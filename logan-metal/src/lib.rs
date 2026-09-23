@@ -149,6 +149,8 @@ mod imp {
         pub aux: &'a [u8],
         pub bits: u8,
         pub group_size: usize,
+        /// True when MLX affine scale/bias sidecars are IEEE fp16 rather than BF16.
+        pub aux_fp16: bool,
         pub i: usize,
         pub o: usize,
     }
@@ -289,6 +291,18 @@ mod imp {
             eps: f32,
         ) -> i32;
         fn coli_metal_gdn_mxfp4_drop_model(model_id: u64);
+        fn coli_metal_hc_mix(
+            model_id: u64,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            normed: *const f32,
+            out: *mut f32,
+            inject: *mut f32,
+            d: i32,
+            hc: i32,
+            lr: i32,
+        ) -> i32;
+        fn coli_metal_hc_drop_model(model_id: u64);
         fn coli_metal_spark_layer(
             model_id: u64,
             layer: i32,
@@ -800,9 +814,37 @@ mod imp {
 
     /// Native MLX affine GEMV over the checkpoint's packed U32 bitstream.
     /// `aux` is `[BF16 scales][BF16 biases]`, each `[O, I/group_size]`.
-    /// Formats 16..19 map to 4/5/6/8-bit respectively; fmt15 remains the
-    /// legacy Spark affine-8/group-64 contract.
-    pub fn metal_matmul_mlx_affine(
+    /// Formats 16..19 map to 4/5/6/8-bit respectively; experimental fmt20 is
+    /// the Flash-MoE-inspired specialized Q4 nibble/FMA path.
+    fn mlx_affine_fmt(bits: u8, q4_fma: bool, aux_fp16: bool) -> Option<i32> {
+        if aux_fp16 {
+            // 21..24 mirror generic MLX affine 16..19 but decode the
+            // scale/bias sidecars as IEEE fp16. Keep the Q4-FMA experiment
+            // BF16-only until it has its own fp16 qualification.
+            return match bits {
+                4 => Some(21),
+                5 => Some(22),
+                6 => Some(23),
+                8 => Some(24),
+                _ => None,
+            };
+        }
+        match bits {
+            4 => Some(if q4_fma { 20 } else { 16 }),
+            5 => Some(17),
+            6 => Some(18),
+            8 => Some(19),
+            _ => None,
+        }
+    }
+
+    fn q4_fma_enabled() -> bool {
+        std::env::var("LOGAN_Q4_FMA")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    }
+
+    fn metal_matmul_mlx_affine_impl(
         tensor: &mut *mut ColiMetalTensor,
         y: &mut [f32],
         x: &[f32],
@@ -810,8 +852,10 @@ mod imp {
         aux: &[u8],
         bits: u8,
         group_size: usize,
+        aux_fp16: bool,
         i: usize,
         o: usize,
+        q4_fma: bool,
     ) -> bool {
         if !metal_available()
             || i == 0
@@ -823,12 +867,8 @@ mod imp {
         {
             return false;
         }
-        let fmt = match bits {
-            4 => 16,
-            5 => 17,
-            6 => 18,
-            8 => 19,
-            _ => return false,
+        let Some(fmt) = mlx_affine_fmt(bits, q4_fma, aux_fp16) else {
+            return false;
         };
         let row_bits = match i.checked_mul(bits as usize) {
             Some(v) if v % 32 == 0 => v,
@@ -866,6 +906,33 @@ mod imp {
         }
     }
 
+    pub fn metal_matmul_mlx_affine(
+        tensor: &mut *mut ColiMetalTensor,
+        y: &mut [f32],
+        x: &[f32],
+        weights: &[u8],
+        aux: &[u8],
+        bits: u8,
+        group_size: usize,
+        aux_fp16: bool,
+        i: usize,
+        o: usize,
+    ) -> bool {
+        metal_matmul_mlx_affine_impl(
+            tensor,
+            y,
+            x,
+            weights,
+            aux,
+            bits,
+            group_size,
+            aux_fp16,
+            i,
+            o,
+            q4_fma_enabled(),
+        )
+    }
+
     pub fn metal_matmul_mlx_affine_multi(x: &[f32], descs: &mut [MlxAffineMatmulDesc<'_>]) -> bool {
         if !metal_available() || descs.is_empty() || descs.len() > 16 {
             return false;
@@ -886,12 +953,8 @@ mod imp {
             {
                 return false;
             }
-            let fmt = match d.bits {
-                4 => 16,
-                5 => 17,
-                6 => 18,
-                8 => 19,
-                _ => return false,
+            let Some(fmt) = mlx_affine_fmt(d.bits, q4_fma_enabled(), d.aux_fp16) else {
+                return false;
             };
             let row_bits = match d.i.checked_mul(d.bits as usize) {
                 Some(v) if v % 32 == 0 => v,
@@ -936,8 +999,8 @@ mod imp {
     #[cfg(test)]
     mod mlx_affine_tests {
         use super::{
-            ColiMetalTensor, MetalWeightDesc, MlxAffineMatmulDesc, gdn_mxfp4, gdn_mxfp4_drop_model,
-            metal_init, metal_matmul_mlx_affine, metal_matmul_mlx_affine_multi,
+            gdn_mxfp4, gdn_mxfp4_drop_model, metal_init, metal_matmul_mlx_affine,
+            metal_matmul_mlx_affine_multi, ColiMetalTensor, MetalWeightDesc, MlxAffineMatmulDesc,
         };
 
         fn bf16(v: f32) -> [u8; 2] {
@@ -1141,6 +1204,7 @@ mod imp {
                     aux: &a5,
                     bits: 5,
                     group_size: 128,
+                    aux_fp16: false,
                     i: I,
                     o: 2,
                 },
@@ -1151,6 +1215,7 @@ mod imp {
                     aux: &a6,
                     bits: 6,
                     group_size: 64,
+                    aux_fp16: false,
                     i: I,
                     o: 3,
                 },
@@ -1224,6 +1289,7 @@ mod imp {
                         &aux,
                         bits,
                         group_size,
+                        false,
                         I,
                         O,
                     ),
@@ -1241,6 +1307,100 @@ mod imp {
                         expected[row]
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn q4_fma_variant_matches_reference_and_baseline() {
+            assert!(
+                metal_init(),
+                "Metal backend must initialize on Apple Silicon"
+            );
+            const O: usize = 5;
+            const I: usize = 256;
+            const GROUP: usize = 64;
+            let x: Vec<f32> = (0..I)
+                .map(|i| ((i as i32 % 19) - 9) as f32 * 0.03125)
+                .collect();
+            let groups = I / GROUP;
+            let mut weights = Vec::new();
+            let mut scale_bytes = Vec::new();
+            let mut bias_bytes = Vec::new();
+            let mut expected = vec![0.0_f32; O];
+            for row in 0..O {
+                let codes: Vec<u32> = (0..I)
+                    .map(|col| (row as u32 * 13 + col as u32 * 9 + 5) & 0xF)
+                    .collect();
+                weights.extend_from_slice(&pack_codes(&codes, 4));
+                for group in 0..groups {
+                    let scale = 0.03125 * (row + group + 1) as f32;
+                    let bias = -0.1875 + 0.015625 * (row + group) as f32;
+                    scale_bytes.extend_from_slice(&bf16(scale));
+                    bias_bytes.extend_from_slice(&bf16(bias));
+                    let start = group * GROUP;
+                    for col in start..start + GROUP {
+                        expected[row] += (codes[col] as f32 * scale + bias) * x[col];
+                    }
+                }
+            }
+            let mut aux = scale_bytes;
+            aux.extend_from_slice(&bias_bytes);
+            let mut baseline = vec![0.0_f32; O];
+            let mut candidate = vec![0.0_f32; O];
+            let mut baseline_tensor: *mut ColiMetalTensor = std::ptr::null_mut();
+            let mut candidate_tensor: *mut ColiMetalTensor = std::ptr::null_mut();
+            assert!(super::metal_matmul_mlx_affine_impl(
+                &mut baseline_tensor,
+                &mut baseline,
+                &x,
+                &weights,
+                &aux,
+                4,
+                GROUP,
+                false,
+                I,
+                O,
+                false,
+            ));
+            assert!(super::metal_matmul_mlx_affine_impl(
+                &mut candidate_tensor,
+                &mut candidate,
+                &x,
+                &weights,
+                &aux,
+                4,
+                GROUP,
+                false,
+                I,
+                O,
+                true,
+            ));
+            if !baseline_tensor.is_null() {
+                unsafe { super::coli_metal_tensor_free(baseline_tensor) };
+            }
+            if !candidate_tensor.is_null() {
+                unsafe { super::coli_metal_tensor_free(candidate_tensor) };
+            }
+            for row in 0..O {
+                let tol = 3e-3_f32.max(expected[row].abs() * 3e-4);
+                assert!(
+                    (baseline[row] - expected[row]).abs() <= tol,
+                    "baseline row={row}: gpu={} ref={} tol={tol}",
+                    baseline[row],
+                    expected[row]
+                );
+                assert!(
+                    (candidate[row] - expected[row]).abs() <= tol,
+                    "fma row={row}: gpu={} ref={} tol={tol}",
+                    candidate[row],
+                    expected[row]
+                );
+                assert!(
+                    (candidate[row] - baseline[row]).abs() <= tol,
+                    "row={row}: fma={} baseline={} tol={tol}",
+                    candidate[row],
+                    baseline[row]
+                );
             }
         }
     }
@@ -2010,7 +2170,7 @@ mod imp {
                 && dsc.fmt != 12
                 && dsc.fmt != 13
                 && dsc.fmt != 14
-                && !(16..=19).contains(&dsc.fmt))
+                && !(16..=20).contains(&dsc.fmt))
                 || dsc.i == 0
                 || dsc.o == 0
                 || dsc.i > i32::MAX as usize
@@ -2025,9 +2185,9 @@ mod imp {
                         .saturating_mul(std::mem::size_of::<u16>()),
                     0,
                 )
-            } else if (16..=19).contains(&dsc.fmt) {
+            } else if (16..=20).contains(&dsc.fmt) {
                 let bits = match dsc.fmt {
-                    16 => 4usize,
+                    16 | 20 => 4usize,
                     17 => 5,
                     18 => 6,
                     19 => 8,
@@ -2100,7 +2260,7 @@ mod imp {
                     11 | 14 => 32,
                     12 => 16,
                     13 => 8,
-                    16..=19 => dsc.group_size as i32,
+                    16..=20 => dsc.group_size as i32,
                     _ => 0,
                 },
             });
@@ -2138,6 +2298,168 @@ mod imp {
     pub fn gdn_mxfp4_drop_model(model_id: u64) {
         if model_id != 0 {
             unsafe { coli_metal_gdn_mxfp4_drop_model(model_id) };
+        }
+    }
+
+    /// Qwen4 HyperConnection projection island. The caller supplies the
+    /// canonical grouped-RMSNorm result so the existing f64 reduction order is
+    /// preserved during qualification. The down/up/injection projections and
+    /// all activation/mixing intermediates stay inside one Metal command buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_mix(
+        model_id: u64,
+        descs: &mut [MetalWeightDesc<'_>],
+        normed: &[f32],
+        out: &mut [f32],
+        inject: Option<&mut [f32]>,
+        d: usize,
+        hc: usize,
+        lr: usize,
+    ) -> Result<Option<()>, ()> {
+        if !metal_available()
+            || model_id == 0
+            || !(descs.len() == 2 || descs.len() == 3)
+            || d == 0
+            || hc == 0
+            || lr == 0
+            || d > i32::MAX as usize
+            || hc > i32::MAX as usize
+            || lr > i32::MAX as usize
+        {
+            return Ok(None);
+        }
+        let Some(hcd) = d.checked_mul(hc) else {
+            return Ok(None);
+        };
+        if hcd > i32::MAX as usize || normed.len() < hcd || out.len() < d {
+            return Ok(None);
+        }
+        if descs.len() == 3 && inject.as_ref().is_none_or(|v| v.len() < hc) {
+            return Ok(None);
+        }
+        let expected = [(hcd, lr), (lr, hcd), (hcd, hc)];
+        let mut raw = Vec::with_capacity(descs.len());
+        for (dsc, &(ei, eo)) in descs.iter_mut().zip(expected.iter()) {
+            if dsc.i != ei || dsc.o != eo {
+                return Ok(None);
+            }
+            let (weight_bytes, scale_bytes) = if dsc.fmt == 5 {
+                (
+                    dsc.o
+                        .saturating_mul(dsc.i)
+                        .saturating_mul(std::mem::size_of::<u16>()),
+                    0,
+                )
+            } else if (16..=20).contains(&dsc.fmt) {
+                let bits = match dsc.fmt {
+                    16 | 20 => 4usize,
+                    17 => 5,
+                    18 => 6,
+                    19 => 8,
+                    _ => unreachable!(),
+                };
+                if dsc.group_size == 0
+                    || dsc.i % dsc.group_size != 0
+                    || dsc.i.checked_mul(bits).is_none_or(|v| v % 32 != 0)
+                {
+                    return Ok(None);
+                }
+                (
+                    dsc.o.saturating_mul(dsc.i.saturating_mul(bits) / 8),
+                    2usize
+                        .saturating_mul(dsc.o)
+                        .saturating_mul(dsc.i / dsc.group_size)
+                        .saturating_mul(std::mem::size_of::<u16>()),
+                )
+            } else if (11..=14).contains(&dsc.fmt) {
+                let block = match dsc.fmt {
+                    11 | 14 => 32,
+                    12 => 16,
+                    13 => 8,
+                    _ => unreachable!(),
+                };
+                let base = dsc.o.saturating_mul(dsc.i);
+                let weights = if dsc.fmt == 14 {
+                    base.saturating_add(dsc.o.saturating_mul(dsc.i.div_ceil(32)).saturating_mul(3))
+                } else {
+                    base
+                };
+                (
+                    weights,
+                    dsc.o
+                        .saturating_mul(dsc.i.div_ceil(block))
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                )
+            } else if matches!(dsc.fmt, 7 | 9 | 10) {
+                let planes = if dsc.fmt == 10 {
+                    3
+                } else if dsc.fmt == 9 {
+                    2
+                } else {
+                    1
+                };
+                (
+                    planes * dsc.o.saturating_mul(dsc.i.div_ceil(2)),
+                    planes * dsc.o.saturating_mul(dsc.i.div_ceil(32)),
+                )
+            } else {
+                return Ok(None);
+            };
+            if dsc.weights.len() < weight_bytes || dsc.scales.len() < scale_bytes {
+                return Ok(None);
+            }
+            static BF16_DUMMY_SCALE_HC: [f32; 1] = [1.0];
+            let scale_ptr = if dsc.fmt == 5 {
+                BF16_DUMMY_SCALE_HC.as_ptr()
+            } else {
+                dsc.scales.as_ptr() as *const f32
+            };
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: dsc.tensor,
+                y: std::ptr::null_mut(),
+                weights: dsc.weights.as_ptr() as *const c_void,
+                scales: scale_ptr,
+                fmt: dsc.fmt,
+                i: dsc.i as i32,
+                o: dsc.o as i32,
+                gs: match dsc.fmt {
+                    11 | 14 => 32,
+                    12 => 16,
+                    13 => 8,
+                    16..=20 => dsc.group_size as i32,
+                    _ => 0,
+                },
+            });
+        }
+        let inject_ptr = inject
+            .map(|v| v.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let rc = unsafe {
+            coli_metal_hc_mix(
+                model_id,
+                raw.as_mut_ptr(),
+                raw.len() as i32,
+                normed.as_ptr(),
+                out.as_mut_ptr(),
+                inject_ptr,
+                d as i32,
+                hc as i32,
+                lr as i32,
+            )
+        };
+        for (dsc, r) in descs.iter_mut().zip(raw.iter()) {
+            dsc.tensor = r.tensor;
+        }
+        match rc {
+            r if r > 0 => Ok(Some(())),
+            0 => Ok(None),
+            _ => Err(()),
+        }
+    }
+
+    pub fn hc_drop_model(model_id: u64) {
+        if model_id != 0 {
+            unsafe { coli_metal_hc_drop_model(model_id) };
         }
     }
 
@@ -2324,6 +2646,7 @@ mod imp {
         pub fn metalio_batch_barrier() -> i64;
         pub fn metalio_batch_wait(event_value: i64, slots: *const i32, count: i32) -> i32;
         pub fn metalio_slot_consumed(slot: i32);
+        pub fn metalio_prefetch_demanded(slot: i32);
         pub fn metalio_stats(out: *mut ColiMetalioStats);
     }
 
@@ -2338,6 +2661,8 @@ mod imp {
         pub prefetch_loads: u64,
         pub prefetch_used: u64,
         pub prefetch_wasted: u64,
+        pub prefetch_ready_at_demand: u64,
+        pub prefetch_late_at_demand: u64,
         pub outstanding: u64,
         pub peak_outstanding: u64,
         pub latency_samples: u64,
@@ -2377,9 +2702,10 @@ mod imp {
     }
 
     /// The crate keeps ONE MTLIOFileHandle per shard file for the process
-    /// lifetime (the C table hard-caps at METALIO_MAX_FILES=64; re-adding per
-    /// miss would exhaust it and every load after the 64th would fall back to
-    /// pread forever).
+    /// lifetime. The native table is deliberately large enough for first-class
+    /// sharded safetensors checkpoints (Qwen3.8-class exports can exceed 128
+    /// shards); re-adding per miss would still waste handles and eventually
+    /// force a POSIX fallback.
     static MIO_FILES: std::sync::Mutex<Option<std::collections::HashMap<String, i32>>> =
         std::sync::Mutex::new(None);
 
@@ -2401,6 +2727,160 @@ mod imp {
         }
         map.insert(path.to_string(), fid);
         Some(fid)
+    }
+
+    /// Engine-neutral MetalIO range. Unlike the legacy COLI helper, one
+    /// request may span several source files and place each range at an
+    /// arbitrary destination offset. That is what lets native .logan,
+    /// safetensors/MLX, and legacy package readers share the same I/O engine.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MioRegion {
+        pub file: i32,
+        pub src_off: u64,
+        pub bytes: usize,
+        pub dst_off: usize,
+    }
+
+    fn mio_load_regions_kind(regions: &[MioRegion], kind: i32) -> Option<(i32, i64)> {
+        if !mio_init() || regions.is_empty() {
+            return None;
+        }
+        let capacity = regions.iter().try_fold(0usize, |high, region| {
+            region
+                .dst_off
+                .checked_add(region.bytes)
+                .map(|end| high.max(end))
+        })?;
+        if capacity == 0 {
+            return None;
+        }
+        let slot = unsafe { metalio_slot_alloc(capacity) };
+        if slot < 0 {
+            return None;
+        }
+        let native: Vec<ColiMetalioRegion> = regions
+            .iter()
+            .map(|region| ColiMetalioRegion {
+                file: region.file,
+                src_off: region.src_off,
+                bytes: region.bytes,
+                dst_off: region.dst_off as u64,
+            })
+            .collect();
+        let event = unsafe { metalio_loadv(slot, native.as_ptr(), native.len() as i32, kind) };
+        if event < 0 {
+            unsafe { metalio_slot_free(slot) };
+            return None;
+        }
+        Some((slot, event))
+    }
+
+    /// Submit arbitrary file ranges through MetalIO. `speculative` controls
+    /// RouteScout accounting only; the physical I/O path is identical.
+    pub fn mio_load_regions(
+        regions: &[MioRegion],
+        speculative: bool,
+    ) -> Option<(i32, i64)> {
+        mio_load_regions_kind(regions, if speculative { 2 } else { 1 })
+    }
+
+    /// Turn one completed MetalIO slot back into ordinary bytes and release the
+    /// slot. Raw MLX currently copies from shared MTLBuffer into its native
+    /// quantized `Wt` representation before dispatch; the I/O itself remains
+    /// asynchronous and bypasses the POSIX page-cache path.
+    pub fn mio_finish_slot(
+        slot: i32,
+        event: i64,
+        used_bytes: usize,
+        speculative: bool,
+    ) -> Option<Vec<u8>> {
+        if slot < 0 || event <= 0 {
+            return None;
+        }
+        if speculative {
+            unsafe { metalio_prefetch_demanded(slot) };
+        }
+        if unsafe { metalio_wait(event) } != 0 {
+            unsafe { metalio_slot_free(slot) };
+            return None;
+        }
+        let capacity = unsafe { metalio_slot_bytes(slot) };
+        if used_bytes > capacity {
+            unsafe { metalio_slot_free(slot) };
+            return None;
+        }
+        let ptr = unsafe { metalio_slot_ptr(slot) } as *const u8;
+        if ptr.is_null() {
+            unsafe { metalio_slot_free(slot) };
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, used_bytes) }.to_vec();
+        if speculative {
+            unsafe { metalio_slot_consumed(slot) };
+        }
+        unsafe { metalio_slot_free(slot) };
+        Some(bytes)
+    }
+
+    /// Release a speculative/demand slot without consuming it. MetalIO records
+    /// an unused speculative slot as wasted, which is useful RouteScout data.
+    pub fn mio_discard_slot(slot: i32) {
+        if slot >= 0 {
+            unsafe { metalio_slot_free(slot) };
+        }
+    }
+
+    #[cfg(test)]
+    mod metalio_range_tests {
+        use super::{mio_file, mio_finish_slot, mio_load_regions, MioRegion};
+
+        #[test]
+        fn vectored_load_can_span_two_source_files() {
+            let root = std::env::temp_dir().join(format!(
+                "logan-metalio-ranges-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let a = root.join("a.bin");
+            let b = root.join("b.bin");
+            let a_bytes: Vec<u8> = (0..=127).collect();
+            let b_bytes: Vec<u8> = (128..=255).collect();
+            std::fs::write(&a, &a_bytes).unwrap();
+            std::fs::write(&b, &b_bytes).unwrap();
+
+            let Some(a_id) = mio_file(a.to_str().unwrap()) else {
+                // MetalIO is an optional platform capability even on macOS;
+                // the production path falls back rather than treating this as
+                // model corruption.
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            };
+            let Some(b_id) = mio_file(b.to_str().unwrap()) else {
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            };
+            let regions = [
+                MioRegion {
+                    file: a_id,
+                    src_off: 11,
+                    bytes: 13,
+                    dst_off: 0,
+                },
+                MioRegion {
+                    file: b_id,
+                    src_off: 7,
+                    bytes: 17,
+                    dst_off: 13,
+                },
+            ];
+            let (slot, event) = mio_load_regions(&regions, false).expect("MetalIO range load");
+            let got = mio_finish_slot(slot, event, 30, false).expect("MetalIO completion");
+            let mut expected = a_bytes[11..24].to_vec();
+            expected.extend_from_slice(&b_bytes[7..24]);
+            assert_eq!(got, expected);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// Stream (offset, bytes) regions of one expert into a fresh slot, packed
@@ -3369,6 +3849,8 @@ mod imp {
         pub aux: &'a [u8],
         pub bits: u8,
         pub group_size: usize,
+        /// True when MLX affine scale/bias sidecars are IEEE fp16 rather than BF16.
+        pub aux_fp16: bool,
         pub i: usize,
         pub o: usize,
     }
@@ -3413,6 +3895,7 @@ mod imp {
         _aux: &[u8],
         _bits: u8,
         _group_size: usize,
+        _aux_fp16: bool,
         _i: usize,
         _o: usize,
     ) -> bool {
@@ -3615,6 +4098,28 @@ mod imp {
     pub fn mio_file(_path: &str) -> Option<i32> {
         None
     }
+    #[derive(Debug, Clone, Copy)]
+    pub struct MioRegion {
+        pub file: i32,
+        pub src_off: u64,
+        pub bytes: usize,
+        pub dst_off: usize,
+    }
+    pub fn mio_load_regions(
+        _regions: &[MioRegion],
+        _speculative: bool,
+    ) -> Option<(i32, i64)> {
+        None
+    }
+    pub fn mio_finish_slot(
+        _slot: i32,
+        _event: i64,
+        _used_bytes: usize,
+        _speculative: bool,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+    pub fn mio_discard_slot(_slot: i32) {}
     pub fn mio_load_expert(_fid: i32, _regions: &[(u64, usize)]) -> Option<(i32, i64)> {
         None
     }
@@ -3629,6 +4134,8 @@ mod imp {
         pub prefetch_loads: u64,
         pub prefetch_used: u64,
         pub prefetch_wasted: u64,
+        pub prefetch_ready_at_demand: u64,
+        pub prefetch_late_at_demand: u64,
         pub outstanding: u64,
         pub peak_outstanding: u64,
         pub latency_samples: u64,
@@ -3645,6 +4152,8 @@ mod imp {
                 prefetch_loads: 0,
                 prefetch_used: 0,
                 prefetch_wasted: 0,
+                prefetch_ready_at_demand: 0,
+                prefetch_late_at_demand: 0,
                 outstanding: 0,
                 peak_outstanding: 0,
                 latency_samples: 0,
@@ -3659,6 +4168,7 @@ mod imp {
     pub fn metalio_wait(_ev: i64) -> i32 {
         -1
     }
+    pub unsafe fn metalio_prefetch_demanded(_slot: i32) {}
     pub fn metalio_slot_free(_slot: i32) {}
     pub fn metalio_slot_ptr(_slot: i32) -> *mut std::os::raw::c_void {
         std::ptr::null_mut()
@@ -3759,6 +4269,21 @@ mod imp {
     ) -> i32 {
         0
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_mix(
+        _model_id: u64,
+        _descs: &mut [MetalWeightDesc<'_>],
+        _normed: &[f32],
+        _out: &mut [f32],
+        _inject: Option<&mut [f32]>,
+        _d: usize,
+        _hc: usize,
+        _lr: usize,
+    ) -> Result<Option<()>, ()> {
+        Ok(None)
+    }
+    pub fn hc_drop_model(_model_id: u64) {}
+
     pub fn shared_mxfp4(
         _model_id: u64,
         _layer: usize,

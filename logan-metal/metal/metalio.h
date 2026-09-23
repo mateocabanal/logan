@@ -91,6 +91,9 @@ int metalio_batch_wait(int64_t event_value, const int *slots, int count);
  * wasted when it is evicted/replaced before use (prefetch_wasted). */
 void metalio_slot_consumed(int slot);
 void metalio_prefetch_done(int slot);
+/* Non-blocking first-demand probe for a speculative slot. Records whether
+ * the exact backing MTLIOCommandBuffer had completed before demand. */
+void metalio_prefetch_demanded(int slot);
 
 /* --- metrics ------------------------------------------------------------- */
 typedef struct {
@@ -101,6 +104,8 @@ typedef struct {
     uint64_t prefetch_loads;        /* loads marked as prefetch */
     uint64_t prefetch_used;         /* prefetched slots consumed by compute */
     uint64_t prefetch_wasted;       /* prefetched slots evicted unused */
+    uint64_t prefetch_ready_at_demand; /* speculative load complete before first demand */
+    uint64_t prefetch_late_at_demand;  /* speculative load still in flight at first demand */
     uint64_t outstanding;           /* loads enqueued, not yet natively completed */
     uint64_t peak_outstanding;
     uint64_t latency_samples;

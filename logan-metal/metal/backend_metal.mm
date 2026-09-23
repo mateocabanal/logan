@@ -177,9 +177,40 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
       float x0=xr[ii], x1=xr[ii+1];
       acc += sc*(float(q.x)*x0 + float(q.y)*x1) + bi*(x0+x1);
     }
-  } else if (fmt >= 16 && fmt <= 19) {              // Generic native MLX affine: packed U32
-                                                     // LSB-first bitstream + BF16 scales/biases.
-    int qbits = (fmt == 16) ? 4 : ((fmt == 17) ? 5 : ((fmt == 18) ? 6 : 8));
+  } else if (fmt == 20) {                            // Experimental MLX affine Q4 FMA path.
+                                                     // Low nibble is the first code, high nibble
+                                                     // the second. Process two inputs/lane and
+                                                     // reuse each group's BF16 scale and bias.
+    if (gsz <= 0 || (I % gsz) != 0) return;
+    int ng = I / gsz;
+    int rb = I / 2;
+    device const uchar* wr = w + (long)o * rb;
+    device const ushort* aux = (device const ushort*)scale;
+    device const ushort* scl = aux + (long)o * ng;
+    device const ushort* bia = aux + (long)O * ng + (long)o * ng;
+    for (int i = int(slane) * 2; i < I; i += 64) {
+      uchar packed = wr[i >> 1];
+      int g0 = i / gsz;
+      float sc0 = as_type<float>((uint)scl[g0] << 16);
+      float bi0 = as_type<float>((uint)bia[g0] << 16);
+      float x0 = xr[i];
+      acc += fma(float(packed & 0xFu), sc0 * x0, bi0 * x0);
+      if (i + 1 < I) {
+        int g1 = (i + 1) / gsz;
+        float sc1 = (g1 == g0) ? sc0 : as_type<float>((uint)scl[g1] << 16);
+        float bi1 = (g1 == g0) ? bi0 : as_type<float>((uint)bia[g1] << 16);
+        float x1 = xr[i + 1];
+        acc += fma(float(packed >> 4), sc1 * x1, bi1 * x1);
+      }
+    }
+  } else if ((fmt >= 16 && fmt <= 19) || (fmt >= 21 && fmt <= 24)) {
+                                                     // Generic native MLX affine: packed U32
+                                                     // LSB-first bitstream + 16-bit scales/biases.
+                                                     // 16..19 = BF16, 21..24 = IEEE FP16.
+    bool aux_half = fmt >= 21;
+    int qbits = (fmt == 16 || fmt == 21) ? 4
+              : ((fmt == 17 || fmt == 22) ? 5
+              : ((fmt == 18 || fmt == 23) ? 6 : 8));
     if (gsz <= 0 || (I % gsz) != 0) return;
     int ng = I / gsz;
     int rb = (I * qbits) / 8;
@@ -196,8 +227,10 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
       if (sh + qbits > 32) code |= wr[wi + 1] << (32 - sh);
       code &= mask;
       int g = i / gsz;
-      float sc = as_type<float>((uint)scl[g] << 16);
-      float bi = as_type<float>((uint)bia[g] << 16);
+      float sc = aux_half ? float(as_type<half>(scl[g]))
+                          : as_type<float>((uint)scl[g] << 16);
+      float bi = aux_half ? float(as_type<half>(bia[g]))
+                          : as_type<float>((uint)bia[g] << 16);
       acc += (float(code) * sc + bi) * xr[i];
     }
   } else if (fmt == 8) {                            // fp8 e4m3 passthrough: one raw byte per
@@ -278,7 +311,7 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
   }
   acc = simd_sum(acc);
   // Quantized/grouped formats fold scale into acc; raw BF16 fmt==5 has no scale.
-  if (slane == 0) y[row] = (fmt == 4 || fmt == 5 || fmt == 7 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 11 || fmt == 12 || fmt == 13 || fmt == 14 || fmt == 15 || (fmt >= 16 && fmt <= 19)) ? acc : acc * scale[o];
+  if (slane == 0) y[row] = (fmt == 4 || fmt == 5 || fmt == 7 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 11 || fmt == 12 || fmt == 13 || fmt == 14 || fmt == 15 || (fmt >= 16 && fmt <= 20) || (fmt >= 21 && fmt <= 24)) ? acc : acc * scale[o];
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -804,7 +837,42 @@ kernel void qwen_gdn_conv_recur_norm_mx(
   normed[(long)h * vd + d] = norm_w[d] * (outv * norm_inv[local_head]) * gate;
 }
 
+// Qwen4 HyperConnection projection island. The grouped RMSNorm remains on the
+// host for the first qualification pass so its f64 accumulation/order stays
+// identical; every projection/activation/mix intermediate after that remains
+// GPU-resident until the final mixed vector and optional injection weights.
+kernel void qwen_hc_silu_scale(device float *lo [[buffer(0)]],
+                               constant int &n [[buffer(1)]],
+                               constant float &inv_hc [[buffer(2)]],
+                               uint i [[thread_position_in_grid]]) {
+  if (i >= (uint)n) return;
+  float v = lo[i] * inv_hc;
+  lo[i] = v / (1.0f + exp(-v));
+}
 
+kernel void qwen_hc_finish(device const float *normed [[buffer(0)]],
+                           device const float *hi [[buffer(1)]],
+                           device const float *inj_raw [[buffer(2)]],
+                           device float *out [[buffer(3)]],
+                           device float *inject [[buffer(4)]],
+                           constant int &D [[buffer(5)]],
+                           constant int &HC [[buffer(6)]],
+                           constant int &has_inject [[buffer(7)]],
+                           uint d [[thread_position_in_grid]]) {
+  if (d >= (uint)D) return;
+  const float inv_hc = 1.0f / float(HC);
+  float acc = out[d];
+  for (int g = 0; g < HC; ++g) {
+    const long i = (long)g * D + d;
+    const float mix = 1.0f / (1.0f + exp(-hi[i]));
+    acc += mix * normed[i] * inv_hc;
+  }
+  out[d] = acc;
+  if (has_inject && d < (uint)HC) {
+    const float v = inj_raw[d] * inv_hc;
+    inject[d] = 2.0f / (1.0f + exp(-v));
+  }
+}
 
 // MLX-style affine-8 QMV for decode: two SIMDgroups/threadgroup, four output
 // rows per SIMDgroup. Each lane loads 8 activation values once per 256-wide K
@@ -1327,6 +1395,7 @@ static id<MTLBuffer> fwht_signs(int n) {
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
 static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
 static id<MTLComputePipelineState> g_kda_conv_silu, g_kda_l2_norm, g_kda_state, g_qwen_gdn_recur;
+static id<MTLComputePipelineState> g_qwen_hc_silu, g_qwen_hc_finish;
 static id<MTLComputePipelineState> g_sp_qmv, g_sp_qmm, g_sp_round, g_sp_rms, g_sp_qkv_final, g_sp_copy, g_sp_rescopy, g_sp_resid, g_sp_rope, g_sp_rope_batch, g_sp_store, g_sp_store_batch, g_sp_score, g_sp_softmax, g_sp_ctxgate, g_sp_attn_batch, g_sp_gelu, g_sp_argmax, g_sp_prms_f2b, g_sp_prms_bf16, g_sp_prescopy_bf16, g_sp_presid_bf16, g_sp_pgelu_bf16;
 static id<MTLComputePipelineState> g_llama_rope, g_llama_store, g_llama_score, g_llama_ctx;
 static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
@@ -1523,8 +1592,11 @@ static size_t fmt_bytes(int fmt, int I, int O) {
   if (fmt >= 11 && fmt <= 13) return (size_t)O * I; // block-scaled int8
   if (fmt == 14) return (size_t)O * I + (size_t)O * ((I + 31) / 32) * 3u; // q8 + bf16 residual + u8 index
   if (fmt == 15) return (size_t)O * I;          // Spark/MLX affine-8
-  if (fmt >= 16 && fmt <= 19) {                 // Generic MLX affine 4/5/6/8-bit U32 bitstream
-    int bits = (fmt == 16) ? 4 : ((fmt == 17) ? 5 : ((fmt == 18) ? 6 : 8));
+  if ((fmt >= 16 && fmt <= 20) || (fmt >= 21 && fmt <= 24)) {
+    // MLX affine: 16..19 BF16 aux, 20 BF16 Q4-FMA, 21..24 FP16 aux.
+    int bits = (fmt == 16 || fmt == 20 || fmt == 21) ? 4
+             : ((fmt == 17 || fmt == 22) ? 5
+             : ((fmt == 18 || fmt == 23) ? 6 : 8));
     return (size_t)O * (((size_t)I * bits + 7u) / 8u);
   }
   return (size_t)O * I * sizeof(float);
@@ -1551,7 +1623,8 @@ static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
   }
   if (fmt == 14) return (size_t)O * (size_t)((I + 31) / 32) * sizeof(float);
   if (fmt == 15) return (size_t)2 * O * ((I + 63) / 64) * sizeof(uint16_t);
-  if (fmt >= 16 && fmt <= 19) return (size_t)2 * O * ((I + gs - 1) / gs) * sizeof(uint16_t);
+  if ((fmt >= 16 && fmt <= 20) || (fmt >= 21 && fmt <= 24))
+    return (size_t)2 * O * ((I + gs - 1) / gs) * sizeof(uint16_t);
   return (size_t)O * sizeof(float);
 }
 
@@ -1588,6 +1661,7 @@ extern "C" int coli_metal_init(void) {
     g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
     g_kda_conv_silu=P("kda_conv_silu"); g_kda_l2_norm=P("kda_l2_norm"); g_kda_state=P("kda_state");
     g_qwen_gdn_recur=P("qwen_gdn_conv_recur_norm_mx");
+    g_qwen_hc_silu=P("qwen_hc_silu_scale"); g_qwen_hc_finish=P("qwen_hc_finish");
     g_sp_qmv=P("spark_qmv_affine8_fast"); g_sp_qmm=P("spark_qmm_affine8_t16o8");
     g_sp_round=P("spark_round"); g_sp_rms=P("spark_rmsnorm_bf16"); g_sp_qkv_final=P("spark_qkv_finalize"); g_sp_copy=P("spark_copy"); g_sp_rescopy=P("spark_residual_copy");
     g_sp_resid=P("spark_residual"); g_sp_rope=P("spark_rope"); g_sp_rope_batch=P("spark_rope_batch");
@@ -1598,7 +1672,7 @@ extern "C" int coli_metal_init(void) {
     g_sp_prescopy_bf16=P("spark_residual_copy_bf16"); g_sp_presid_bf16=P("spark_residual_bf16"); g_sp_pgelu_bf16=P("spark_gelu_mul_bf16");
     g_llama_rope=P("llama_qkv_rope"); g_llama_store=P("llama_cache_store");
     g_llama_score=P("llama_attn_score"); g_llama_ctx=P("llama_attn_ctx");
-    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state||!g_qwen_gdn_recur||
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p||!g_kda_conv_silu||!g_kda_l2_norm||!g_kda_state||!g_qwen_gdn_recur||!g_qwen_hc_silu||!g_qwen_hc_finish||
        !g_sp_qmv||!g_sp_qmm||!g_sp_round||!g_sp_rms||!g_sp_qkv_final||!g_sp_copy||!g_sp_rescopy||!g_sp_resid||!g_sp_rope||!g_sp_rope_batch||!g_sp_store||!g_sp_store_batch||!g_sp_score||!g_sp_softmax||!g_sp_ctxgate||!g_sp_attn_batch||!g_sp_gelu||!g_sp_argmax||!g_sp_prms_f2b||!g_sp_prms_bf16||!g_sp_prescopy_bf16||!g_sp_presid_bf16||!g_sp_pgelu_bf16||!g_llama_rope||!g_llama_store||!g_llama_score||!g_llama_ctx){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
     // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
     // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
@@ -1892,7 +1966,7 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int gs) {
   /* Explicit allow-list entries beyond the legacy 0..4 range. */
-  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 5 && fmt != 7 && fmt != 8 && fmt != 9 && fmt != 10 && fmt != 11 && fmt != 12 && fmt != 13 && fmt != 14 && fmt != 15 && !(fmt >= 16 && fmt <= 19))) return 0;
+  if (!g_dev || fmt < 0 || (fmt > 4 && fmt != 5 && fmt != 7 && fmt != 8 && fmt != 9 && fmt != 10 && fmt != 11 && fmt != 12 && fmt != 13 && fmt != 14 && fmt != 15 && !(fmt >= 16 && fmt <= 20) && !(fmt >= 21 && fmt <= 24))) return 0;
   uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
   @autoreleasepool {
       ColiMetalTensor *t = *tp;
@@ -1974,7 +2048,7 @@ extern "C" int coli_metal_matmul_multi(const float *x, int S,
     for (int di = 0; di < count; ++di) {
       ColiMetalMatmulDesc &d = descs[di];
       if (!d.y || !d.weights || !d.scales || d.I != I || d.O <= 0 ||
-          d.fmt < 0 || (d.fmt > 4 && d.fmt != 5 && d.fmt != 7 && d.fmt != 8 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14 && d.fmt != 15 && !(d.fmt >= 16 && d.fmt <= 19))) return 0;
+          d.fmt < 0 || (d.fmt > 4 && d.fmt != 5 && d.fmt != 7 && d.fmt != 8 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14 && d.fmt != 15 && !(d.fmt >= 16 && d.fmt <= 20) && !(d.fmt >= 21 && d.fmt <= 24))) return 0;
 
       ColiMetalTensor *t = d.tensor;
       if (t && (t->fmt != d.fmt || t->I != d.I || t->O != d.O)) return 0;
@@ -2736,7 +2810,7 @@ static QwenGdnMxCtx *qwen_gdn_mx_ctx_locked(
 }
 
 static ColiMetalTensor *qwen_gdn_mx_tensor(ColiMetalMatmulDesc &d) {
-  if (!d.weights || !d.scales || (d.fmt != 5 && d.fmt != 7 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14 && !(d.fmt >= 16 && d.fmt <= 19)) || d.I <= 0 || d.O <= 0) return nullptr;
+  if (!d.weights || !d.scales || (d.fmt != 5 && d.fmt != 7 && d.fmt != 9 && d.fmt != 10 && d.fmt != 11 && d.fmt != 12 && d.fmt != 13 && d.fmt != 14 && !(d.fmt >= 16 && d.fmt <= 20) && !(d.fmt >= 21 && d.fmt <= 24)) || d.I <= 0 || d.O <= 0) return nullptr;
   ColiMetalTensor *t = d.tensor;
   if (t) {
     if (t->fmt != d.fmt || t->I != d.I || t->O != d.O || t->gs != d.gs) return nullptr;
@@ -2779,6 +2853,140 @@ static void qwen_gdn_mx_encode_gemv(id<MTLComputeCommandEncoder> e,
             threadsPerThreadgroup:MTLSizeMake(128,1,1)];
 }
 
+struct QwenHcCtx {
+  uint64_t model_id = 0;
+  int D = 0, HC = 0, LR = 0;
+  id<MTLBuffer> normed = nil, out = nil, inject = nil;
+  id<MTLBuffer> lo = nil, hi = nil, inj_raw = nil;
+};
+static std::vector<QwenHcCtx *> g_qwen_hc_ctxs;
+
+static QwenHcCtx *qwen_hc_ctx_locked(uint64_t model_id, int D, int HC, int LR) {
+  if (!g_dev || !g_queue || !g_qwen_hc_silu || !g_qwen_hc_finish ||
+      model_id == 0 || D <= 0 || HC <= 0 || LR <= 0)
+    return nullptr;
+  for (QwenHcCtx *ctx : g_qwen_hc_ctxs) {
+    if (!ctx || ctx->model_id != model_id) continue;
+    if (ctx->D != D || ctx->HC != HC || ctx->LR != LR) return nullptr;
+    return ctx;
+  }
+  const size_t hcd = (size_t)D * (size_t)HC;
+  if (hcd > SIZE_MAX / sizeof(float)) return nullptr;
+  QwenHcCtx *ctx = new (std::nothrow) QwenHcCtx();
+  if (!ctx) return nullptr;
+  ctx->model_id = model_id; ctx->D = D; ctx->HC = HC; ctx->LR = LR;
+  ctx->normed = [g_dev newBufferWithLength:hcd*sizeof(float) options:MTLResourceStorageModeShared];
+  ctx->out = [g_dev newBufferWithLength:(size_t)D*sizeof(float) options:MTLResourceStorageModeShared];
+  ctx->inject = [g_dev newBufferWithLength:(size_t)HC*sizeof(float) options:MTLResourceStorageModeShared];
+  ctx->lo = [g_dev newBufferWithLength:(size_t)LR*sizeof(float) options:MTLResourceStorageModePrivate];
+  ctx->hi = [g_dev newBufferWithLength:hcd*sizeof(float) options:MTLResourceStorageModePrivate];
+  ctx->inj_raw = [g_dev newBufferWithLength:(size_t)HC*sizeof(float) options:MTLResourceStorageModePrivate];
+  if (!ctx->normed || !ctx->out || !ctx->inject || !ctx->lo || !ctx->hi || !ctx->inj_raw) {
+    delete ctx; return nullptr;
+  }
+  g_qwen_hc_ctxs.push_back(ctx);
+  return ctx;
+}
+
+extern "C" int coli_metal_hc_mix(uint64_t model_id,
+                                  ColiMetalMatmulDesc *descs, int count,
+                                  const float *normed, float *out, float *inject,
+                                  int D, int HC, int LR) {
+  if (!g_dev || !g_queue || !descs || (count != 2 && count != 3) ||
+      !normed || !out || D <= 0 || HC <= 0 || LR <= 0)
+    return 0;
+  const int64_t hcd64 = (int64_t)D * HC;
+  if (hcd64 <= 0 || hcd64 > INT_MAX) return 0;
+  const int HCD = (int)hcd64;
+  const int expected_I[3] = {HCD, LR, HCD};
+  const int expected_O[3] = {LR, HCD, HC};
+  for (int i = 0; i < count; ++i) {
+    if (descs[i].I != expected_I[i] || descs[i].O != expected_O[i]) return 0;
+  }
+
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    QwenHcCtx *ctx = qwen_hc_ctx_locked(model_id, D, HC, LR);
+    if (!ctx) return 0;
+    ColiMetalTensor *wt[3] = {};
+    for (int i = 0; i < count; ++i) {
+      wt[i] = qwen_gdn_mx_tensor(descs[i]);
+      if (!wt[i]) return 0;
+    }
+    memcpy(ctx->normed.contents, normed, (size_t)HCD*sizeof(float));
+    memcpy(ctx->out.contents, out, (size_t)D*sizeof(float));
+
+    uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+
+    id<MTLComputeCommandEncoder> first = [cb computeCommandEncoder];
+    if (!first) return 0;
+    qwen_gdn_mx_encode_gemv(first, wt[0], ctx->normed, ctx->lo, HCD, LR);
+    if (count == 3)
+      qwen_gdn_mx_encode_gemv(first, wt[2], ctx->normed, ctx->inj_raw, HCD, HC);
+    [first endEncoding];
+
+    id<MTLComputeCommandEncoder> act = [cb computeCommandEncoder];
+    if (!act) return 0;
+    [act setComputePipelineState:g_qwen_hc_silu];
+    [act setBuffer:ctx->lo offset:0 atIndex:0];
+    [act setBytes:&LR length:4 atIndex:1];
+    float inv_hc = 1.0f / (float)HC;
+    [act setBytes:&inv_hc length:sizeof(float) atIndex:2];
+    [act dispatchThreads:MTLSizeMake((NSUInteger)LR,1,1)
+          threadsPerThreadgroup:MTLSizeMake((NSUInteger)MIN(LR,256),1,1)];
+    [act endEncoding];
+
+    id<MTLComputeCommandEncoder> up = [cb computeCommandEncoder];
+    if (!up) return 0;
+    qwen_gdn_mx_encode_gemv(up, wt[1], ctx->lo, ctx->hi, LR, HCD);
+    [up endEncoding];
+
+    id<MTLComputeCommandEncoder> finish = [cb computeCommandEncoder];
+    if (!finish) return 0;
+    [finish setComputePipelineState:g_qwen_hc_finish];
+    [finish setBuffer:ctx->normed offset:0 atIndex:0];
+    [finish setBuffer:ctx->hi offset:0 atIndex:1];
+    [finish setBuffer:ctx->inj_raw offset:0 atIndex:2];
+    [finish setBuffer:ctx->out offset:0 atIndex:3];
+    [finish setBuffer:ctx->inject offset:0 atIndex:4];
+    [finish setBytes:&D length:4 atIndex:5];
+    [finish setBytes:&HC length:4 atIndex:6];
+    int has_inject = count == 3 ? 1 : 0;
+    [finish setBytes:&has_inject length:4 atIndex:7];
+    [finish dispatchThreads:MTLSizeMake((NSUInteger)D,1,1)
+             threadsPerThreadgroup:MTLSizeMake((NSUInteger)MIN(D,256),1,1)];
+    [finish endEncoding];
+
+    if (t0) { uint64_t t1=mnow_ns(); g_metal_prof.encode_ns += t1-t0; t0=t1; }
+    [cb commit];
+    if (t0) { uint64_t t1=mnow_ns(); g_metal_prof.submit_ns += t1-t0; t0=t1; }
+    [cb waitUntilCompleted];
+    if (t0) g_metal_prof.wait_ns += mnow_ns()-t0;
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+      fprintf(stderr, "[metal-hc] command failed after submission: %s\n",
+              cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+      return -1;
+    }
+    memcpy(out, ctx->out.contents, (size_t)D*sizeof(float));
+    if (count == 3 && inject)
+      memcpy(inject, ctx->inject.contents, (size_t)HC*sizeof(float));
+    return 1;
+  }
+}
+
+extern "C" void coli_metal_hc_drop_model(uint64_t model_id) {
+  if (!model_id) return;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  for (auto it = g_qwen_hc_ctxs.begin(); it != g_qwen_hc_ctxs.end();) {
+    QwenHcCtx *ctx = *it;
+    if (ctx && ctx->model_id == model_id) {
+      delete ctx; it = g_qwen_hc_ctxs.erase(it);
+    } else ++it;
+  }
+}
+
 extern "C" int coli_metal_gdn_mxfp4(
     uint64_t model_id, int layer, ColiMetalMatmulDesc *descs, int count,
     const float *x, float *out,
@@ -2798,7 +3006,7 @@ extern "C" int coli_metal_gdn_mxfp4(
   const int expected_I[5] = {D,D,D,D,vdim};
   const int expected_O[5] = {C,vdim,vheads,vheads,D};
   for (int i = 0; i < 5; ++i)
-    if ((descs[i].fmt != 5 && descs[i].fmt != 7 && descs[i].fmt != 9 && descs[i].fmt != 10 && descs[i].fmt != 11 && descs[i].fmt != 12 && descs[i].fmt != 13 && descs[i].fmt != 14 && !(descs[i].fmt >= 16 && descs[i].fmt <= 19)) || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
+    if ((descs[i].fmt != 5 && descs[i].fmt != 7 && descs[i].fmt != 9 && descs[i].fmt != 10 && descs[i].fmt != 11 && descs[i].fmt != 12 && descs[i].fmt != 13 && descs[i].fmt != 14 && !(descs[i].fmt >= 16 && descs[i].fmt <= 20) && !(descs[i].fmt >= 21 && descs[i].fmt <= 24)) || descs[i].I != expected_I[i] || descs[i].O != expected_O[i])
       return 0;
 
   std::lock_guard<std::mutex> lk(g_op_mtx);

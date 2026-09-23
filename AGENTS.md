@@ -42,3 +42,11 @@ This repository uses the OpenAI latest-model guidance as the baseline for coding
 - Preserve token-identity/correctness gates when changing runtime or kernel behavior.
 - Keep benchmark conditions comparable and record any environment or model differences that affect interpretation.
 - Do not generalize OpenAI API parameter restrictions to Logan's local model samplers. Model-specific decoding settings remain governed by the model/runtime being served.
+
+
+## Experiment ledger
+
+- Every non-trivial performance, architecture, quantization, accelerator, storage, cache, scheduling, or kernel experiment MUST be recorded in EXPERIMENTS.md.
+- Create/update the experiment entry in the same change that implements or measures it. Record failed and inconclusive experiments, not only wins.
+- Use an explicit hypothesis, baseline, correctness gate, comparable A/B measurements, status, and keep/reject rationale.
+- Do not enable an experimental performance path by default until its ledger entry has a repeatable correctness-preserving win. If a path is rejected, remove the losing production code/flag when practical while retaining the ledger record.

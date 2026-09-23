@@ -306,6 +306,9 @@ fn generate_from_logits_mtp_block(
         return Ok(Vec::new());
     }
 
+    // Decode boundary: the caller has evaluated the full prompt (and the
+    // drafter has caught up), so counter deltas from here are decode-only.
+    model.begin_decode_measurement();
     let block_cap = mtp_block_len();
     let mut out = Vec::with_capacity(max_new);
     let mut current = argmax(&logits);
@@ -458,6 +461,10 @@ fn generate_from_logits(
     prompt_len: usize,
     max_new: usize,
 ) -> Vec<u32> {
+    // Decode boundary: the caller has already evaluated the final prompt
+    // forward, so this helper is the exact point after which every reported
+    // counter should measure decode only.
+    model.begin_decode_measurement();
     let mut out = Vec::with_capacity(max_new);
     for step in 0..max_new {
         let next = argmax(&logits);
@@ -508,6 +515,14 @@ pub fn run_greedy_cached_coli(
     max_new: usize,
 ) -> Result<Vec<u32>, String> {
     apply_max_performance_defaults();
+    if std::env::var("LOGAN_SUPPRESS_LEGACY_FORMAT_WARNING")
+        .map(|v| v == "0" || v.is_empty())
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "[logan] legacy COLI package: supported for compatibility; .logan is the canonical compiled format"
+        );
+    }
 
     let profile = logan_core::telemetry::enabled();
     let total_t0 = Instant::now();
@@ -622,7 +637,6 @@ pub fn run_greedy_cached_coli(
     }
     Ok(out)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

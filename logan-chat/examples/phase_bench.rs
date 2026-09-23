@@ -47,6 +47,7 @@ fn main() -> Result<(), String> {
     }
     let mut out = Vec::new();
     let mut decode_ms = 0.0;
+    model.begin_decode_measurement();
     for i in 0..n {
         if logits.iter().any(|x| !x.is_finite()) {
             return Err("nonfinite logits".into());

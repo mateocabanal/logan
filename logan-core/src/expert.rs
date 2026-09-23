@@ -86,6 +86,15 @@ impl<V: Slot> ExpertStore<V> {
         self.cap
     }
 
+    /// Per-layer capacity when this store is layer-partitioned.
+    ///
+    /// Speculative residency policies use this to avoid stealing one of the
+    /// slots required by the authoritative top-k route. Global-LRU stores
+    /// return None because they do not provide a per-layer headroom guarantee.
+    pub fn per_layer_capacity(&self) -> Option<usize> {
+        self.layer_cap
+    }
+
     /// Get a cached expert, promoting it to MRU. None on miss.
     pub fn get(&mut self, key: (u32, u32)) -> Option<&V> {
         let &idx = self.map.get(&key)?;
@@ -113,6 +122,24 @@ impl<V: Slot> ExpertStore<V> {
         self.unlink(idx);
         self.push_front(idx);
         true
+    }
+
+    /// Remove a resident value without releasing its underlying slot.
+    ///
+    /// This is intentionally telemetry-neutral: it is an ownership transfer,
+    /// not a demand hit, miss, or eviction. Speculation caches use it to adopt
+    /// a prefetched physical slot into the authoritative residency cache when
+    /// the router actually requests that expert.
+    pub fn take(&mut self, key: (u32, u32)) -> Option<V> {
+        let idx = self.map.remove(&key)?;
+        self.unlink(idx);
+        let node = self.slab[idx].take().expect("expert store map/slab mismatch");
+        if self.layer_cap.is_some() {
+            if let Some(count) = self.layer_counts.get_mut(&key.0) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        Some(node.value)
     }
 
     /// Insert (or replace) an expert, evicting LRU when over capacity.
@@ -362,9 +389,9 @@ mod tests {
         );
         assert!(s.peek((0, 0)).is_some());
         assert_eq!(s.hits, 0); // peek is not a hit
-        // Peek must NOT promote: (0,1) was inserted second so it is MRU;
-        // (0,0) is still LRU. Inserting a third key evicts (0,0), proving
-        // the peek didn't touch the recency order.
+                               // Peek must NOT promote: (0,1) was inserted second so it is MRU;
+                               // (0,0) is still LRU. Inserting a third key evicts (0,0), proving
+                               // the peek didn't touch the recency order.
         let (evicted, _) = s.insert(
             (2, 0),
             FakeSlot {
@@ -502,6 +529,44 @@ mod tests {
         );
         assert_eq!(evicted.unwrap().key, (0, 1));
         assert!(s.peek((0, 0)).is_some());
+    }
+
+    #[test]
+    fn take_transfers_without_counting_or_releasing() {
+        let mut s: ExpertStore<FakeSlot> = ExpertStore::new_layered(2, 2);
+        s.insert(
+            (1, 7),
+            FakeSlot {
+                key: (1, 7),
+                released: false,
+            },
+        );
+        let misses = s.misses;
+        let hits = s.hits;
+        let value = s.take((1, 7)).expect("resident expert");
+        assert_eq!(value.key, (1, 7));
+        assert!(!value.released);
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.hits, hits);
+        assert_eq!(s.misses, misses);
+
+        // The layer count must also be decremented: two fresh entries fit
+        // without evicting after ownership transfer.
+        s.insert(
+            (1, 8),
+            FakeSlot {
+                key: (1, 8),
+                released: false,
+            },
+        );
+        let (evicted, _) = s.insert(
+            (1, 9),
+            FakeSlot {
+                key: (1, 9),
+                released: false,
+            },
+        );
+        assert!(evicted.is_none());
     }
 
     #[test]

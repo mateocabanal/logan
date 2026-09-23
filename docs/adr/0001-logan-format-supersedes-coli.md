@@ -1,7 +1,7 @@
 # ADR 0001 — `.logan` replaces COLI as the canonical compiled model format
 
 **Date:** 2026-09-09
-**Status:** Proposed — pending owner review
+**Status:** Accepted — owner-approved 2026-09-22
 **Author:** Mateo + Hermes
 **Related:** #37 (umbrella), #43, #56, #68, #81, #82, #83, #84, #85, #93
 **Note:** Logan had no ADR convention before this record. This is the first, using a minimal format
@@ -43,9 +43,14 @@ Three facts about the current state forced this decision:
 4. **The artifact carries a mandatory, package-local, digest-bound physical plan** (backing, residency, access
    class, transfer path, capability requirements, declared costs, and any compiler-approved alternatives).
    The runtime validates it at startup and may choose only timing within its declared bounds.
-5. **COLI remains temporarily supported.** The legacy reader and the existing runtime path stay in place,
-   unchanged, through the migration. COLI is not removed or broadly deprecated by this ADR.
-6. **No implementation begins before owner review of the design.**
+5. **COLI is deprecated but remains temporarily supported.** The legacy reader and existing runtime path
+   stay available for old artifacts and parity work during migration, but new architecture and new source-neutral
+   runtime work must not depend on COLI-specific records or naming.
+6. **Safetensors/MLX remain first-class input/runtime sources.** Native `.logan` is the preferred compiled
+   artifact, not a requirement that users convert open checkpoints before Logan can run them. Source adapters may
+   share MetalIO, residency, scheduling and RouteScout through engine-neutral interfaces.
+7. **Implementation is authorized.** Owner review was completed on 2026-09-22; staged migration may proceed
+   while preserving correctness gates and legacy artifact readability.
 
 ## Consequences
 
@@ -85,4 +90,6 @@ model; a pure content-addressed store; an LSM-tree substrate for the sparse tabl
 
 ## Status
 
-Proposed. Requires owner review. No code changed.
+Accepted on 2026-09-22. COLI is now a deprecated legacy compatibility format; `.logan` is the canonical
+compiled-format direction. Raw safetensors/MLX remains a supported first-class runtime source rather than a
+second-class import path.

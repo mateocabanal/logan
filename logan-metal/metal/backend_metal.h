@@ -116,6 +116,15 @@ int coli_metal_gdn_mxfp4(uint64_t model_id, int layer,
                          int output_gate, float eps);
 void coli_metal_gdn_mxfp4_drop_model(uint64_t model_id);
 
+/* Qwen4 HyperConnection projection island. `normed` is the grouped-RMSNorm
+ * result from the caller; descs=[down,up] or [down,up,inject]. All projection
+ * and activation intermediates remain GPU-resident until `out`/`inject`. */
+int coli_metal_hc_mix(uint64_t model_id,
+                      ColiMetalMatmulDesc *descs, int count,
+                      const float *normed, float *out, float *inject,
+                      int D, int HC, int LR);
+void coli_metal_hc_drop_model(uint64_t model_id);
+
 /* Qwen shared expert MXFP4 MLP: descs=[gate_proj, up_proj, down_proj].
  * gate/up, SwiGLU and down projection execute in one command buffer. The
  * checkpoint's separate scalar shared-expert gate is intentionally computed

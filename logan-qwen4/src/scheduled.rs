@@ -179,7 +179,19 @@ impl QwenExecutor {
                 }
                 let run_started = std::time::Instant::now();
                 let mut generated = 0usize;
+                let mut decode_boundary_taken = false;
                 while let Ok(request) = receiver.recv() {
+                    // The first authoritative decode op is the boundary: prompt
+                    // prefill (OP_PREFILL) and every expert load issued to serve
+                    // it are excluded from the reported per-token counters.
+                    if !decode_boundary_taken {
+                        if let Some(model) = model.as_mut() {
+                            if matches!(decode_op(&request.action.payload), Ok((OP_DECODE, _, _))) {
+                                model.begin_decode_measurement();
+                                decode_boundary_taken = true;
+                            }
+                        }
+                    }
                     let result = match model.as_mut() {
                         Some(model) => execute_op(model, &plan, &request.action.payload),
                         None => Err("scheduled model failed to load".into()),

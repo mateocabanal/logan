@@ -517,6 +517,26 @@ fn run() -> logan_compiler::Result<()> {
                     })
                 })
                 .collect();
+            // Native GGUF is a file source rather than a package directory.
+            // Dispatch it before looking for config.json; the first split shard
+            // discovers the remaining shards from GGUF split metadata.
+            #[cfg(feature = "runtime")]
+            if package
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+            {
+                let out =
+                    logan_qwen4::run_greedy_gguf(&package, &prompt_ids, max_new).map_err(|e| {
+                        logan_compiler::ColicError::Unsupported {
+                            stage: "run",
+                            detail: e,
+                        }
+                    })?;
+                println!("generated: {out:?}");
+                return Ok(());
+            }
+
             // Architecture dispatch (engine-neutral): read the package's
             // config.json model_type and hand the decode to the matching
             // engine crate. Both engines share the core (storage, LRU,

@@ -147,7 +147,11 @@ fn main() {
             .unwrap_or_else(|_| "8".into())
             .parse()
             .unwrap();
-        let t0 = std::time::Instant::now();
+        // Time the actual forwards. The previous version started the clock
+        // after the prompt-last forward and stopped after the final sampling
+        // step, so one sample had no forward at all and every entry was shifted
+        // relative to the token it claimed to measure.
+        let setup_t0 = std::time::Instant::now();
         let mut model = model;
         // Prompt tokens except the last are prefilled without logits; the final
         // prompt forward is what predicts the first new token. Refeeding it
@@ -158,8 +162,15 @@ fn main() {
             }
             model.prefill_token(t as usize, i);
         }
+        let prefill_ms = setup_t0.elapsed().as_secs_f64() * 1e3;
+
         let mut logits = model.forward_token(*prompt.last().unwrap() as usize, prompt.len() - 1);
+        // Decode boundary: everything before this point (model load + prompt
+        // prefill + the final prompt forward) is excluded from the per-token
+        // figures reported below.
+        model.begin_decode_measurement();
         let mut out: Vec<u32> = Vec::with_capacity(max_new);
+        let mut forward_ms: Vec<f64> = Vec::with_capacity(max_new);
         for step in 0..max_new {
             let next = logits
                 .iter()
@@ -169,14 +180,43 @@ fn main() {
                 .unwrap();
             out.push(next);
             if step + 1 < max_new {
+                let fwd_t0 = std::time::Instant::now();
                 logits = model.forward_token(next as usize, prompt.len() + step);
+                forward_ms.push(fwd_t0.elapsed().as_secs_f64() * 1e3);
             }
+        }
+        let total_ms = setup_t0.elapsed().as_secs_f64() * 1e3;
+        // Steady-state decode is the mean of the measured forwards; total_ms
+        // also contains model load and prompt prefill and must not be used as a
+        // per-token figure.
+        let decode_ms = if forward_ms.is_empty() {
+            0.0
+        } else {
+            forward_ms.iter().sum::<f64>() / forward_ms.len() as f64
+        };
+        model.profile_summary(forward_ms.len(), total_ms);
+        if std::env::var("QWEN_TOKEN_TIMING")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            let detail = forward_ms
+                .iter()
+                .map(|ms| format!("{ms:.1}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "logan decode: prefill_ms={prefill_ms:.1} forwards={} decode_ms_per_token={decode_ms:.1}",
+                forward_ms.len()
+            );
+            eprintln!("logan token-ms: {detail}");
         }
         if logan_core::telemetry::enabled() {
             eprintln!(
-                "logan qwen4: tokens={} total={:.1} ms/tok",
+                "logan qwen4: tokens={} decode={:.1} ms/tok prefill={:.1} ms total={:.1} ms",
                 out.len(),
-                t0.elapsed().as_secs_f64() * 1e3 / out.len().max(1) as f64
+                decode_ms,
+                prefill_ms,
+                total_ms
             );
         }
         println!("generated: {out:?}");

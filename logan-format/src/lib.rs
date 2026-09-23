@@ -1,6 +1,11 @@
-//! COLI CSF artifact framing shared by the `colic` compiler and the future Rust
-//! inference runtime: checksums, manifest/data-shard constants, and the
-//! package reader. No unsafe code, no dependency on compiler internals.
+//! Legacy COLI compatibility framing and reader.
+//!
+//! New compiled artifacts use the `.logan` v1 format implemented by the
+//! `logan-artifact` crate. COLI remains readable for existing packages and
+//! parity/oracle work, but new runtime architecture must not depend on its
+//! record model.
+//!
+//! No unsafe code, no dependency on compiler internals.
 #![forbid(unsafe_code)]
 
 pub mod codecs;

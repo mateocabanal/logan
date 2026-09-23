@@ -39,6 +39,7 @@ static _Atomic int g_reuse_slots = 0;
 /* --- metrics (atomics, lock-free reads via relaxed) ---------------------- */
 static _Atomic uint64_t m_loads, m_bytes, m_waits, m_fails;
 static _Atomic uint64_t m_prefetch_loads, m_prefetch_used, m_prefetch_wasted;
+static _Atomic uint64_t m_prefetch_ready_at_demand, m_prefetch_late_at_demand;
 static _Atomic uint64_t m_outstanding, m_peak_outstanding;
 static _Atomic uint64_t m_lat_samples;
 static _Atomic uint64_t m_lat_total_us;
@@ -62,7 +63,7 @@ static id<MTLSharedEvent> g_batch_ev;
 static uint64_t g_batch_ev_val;
 
 /* file handles: [file id] -> MTLIOFileHandle */
-#define METALIO_MAX_FILES 64
+#define METALIO_MAX_FILES 512
 static id<MTLIOFileHandle> g_files[METALIO_MAX_FILES];
 static int g_nfiles;
 
@@ -82,6 +83,7 @@ static struct {
     int in_use;
     _Atomic int64_t last_event;    /* public ticket of the most recent load */
     _Atomic int64_t consumed;      /* event value already consumed by compute (prefetch_used) */
+    _Atomic int64_t demand_probed; /* last event classified ready/late at first demand */
     int last_kind;                 /* ColiMetalioKind for last_event */
 } g_slots[METALIO_MAX_SLOTS];
 static int g_nslots;
@@ -208,6 +210,7 @@ int metalio_slot_alloc(size_t max_bytes){
                 g_slots[sid].in_use = 1;
                 atomic_store_explicit(&g_slots[sid].last_event, 0, memory_order_relaxed);
                 atomic_store_explicit(&g_slots[sid].consumed, 0, memory_order_relaxed);
+                atomic_store_explicit(&g_slots[sid].demand_probed, 0, memory_order_relaxed);
                 g_slots[sid].last_kind = MIO_LOAD_DEMAND;
                 verbose("slot_alloc: id=%d bytes=%zu %s", sid, g_slots[sid].bytes,
                         reuse && old_bytes >= len ? "reused" : "new");
@@ -305,6 +308,7 @@ int64_t metalio_loadv(int slot, const ColiMetalioRegion *regions, int count,
             [ioCB signalEvent:g_ev value:v];
             g_slots[slot].last_cb = ioCB;
             atomic_store_explicit(&g_slots[slot].last_event, (int64_t)v, memory_order_relaxed);
+            atomic_store_explicit(&g_slots[slot].demand_probed, 0, memory_order_relaxed);
             g_slots[slot].last_kind = kind;
             ev = (int64_t)v;
             atomic_fetch_add_explicit(&m_loads, 1, memory_order_relaxed);
@@ -460,6 +464,30 @@ void metalio_slot_consumed(int slot){
     }
 }
 
+void metalio_prefetch_demanded(int slot){
+    if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return;
+    if (slot < 0 || slot >= g_nslots) return;
+
+    int classify = 0; /* 1=ready, 2=late */
+    [g_lock lock];
+    if (g_slots[slot].in_use && g_slots[slot].last_kind == MIO_LOAD_SPEC) {
+        int64_t ev = atomic_load_explicit(&g_slots[slot].last_event, memory_order_relaxed);
+        int64_t cons = atomic_load_explicit(&g_slots[slot].consumed, memory_order_relaxed);
+        int64_t probed = atomic_load_explicit(&g_slots[slot].demand_probed, memory_order_relaxed);
+        if (ev > 0 && ev > cons && ev > probed && g_slots[slot].last_cb) {
+            id<MTLIOCommandBuffer> cb = g_slots[slot].last_cb;
+            classify = cb.status == MTLIOStatusComplete ? 1 : 2;
+            atomic_store_explicit(&g_slots[slot].demand_probed, ev, memory_order_relaxed);
+        }
+    }
+    [g_lock unlock];
+
+    if (classify == 1)
+        atomic_fetch_add_explicit(&m_prefetch_ready_at_demand, 1, memory_order_relaxed);
+    else if (classify == 2)
+        atomic_fetch_add_explicit(&m_prefetch_late_at_demand, 1, memory_order_relaxed);
+}
+
 void metalio_prefetch_done(int slot){
     if (slot < 0 || slot >= g_nslots) return;
     int64_t ev = atomic_load_explicit(&g_slots[slot].last_event, memory_order_relaxed);
@@ -478,6 +506,10 @@ void metalio_stats(ColiMetalioStats *out){
     out->prefetch_loads = atomic_load_explicit(&m_prefetch_loads, memory_order_relaxed);
     out->prefetch_used = atomic_load_explicit(&m_prefetch_used, memory_order_relaxed);
     out->prefetch_wasted = atomic_load_explicit(&m_prefetch_wasted, memory_order_relaxed);
+    out->prefetch_ready_at_demand =
+        atomic_load_explicit(&m_prefetch_ready_at_demand, memory_order_relaxed);
+    out->prefetch_late_at_demand =
+        atomic_load_explicit(&m_prefetch_late_at_demand, memory_order_relaxed);
     out->outstanding = atomic_load_explicit(&m_outstanding, memory_order_relaxed);
     out->peak_outstanding = atomic_load_explicit(&m_peak_outstanding, memory_order_relaxed);
     out->latency_samples = atomic_load_explicit(&m_lat_samples, memory_order_relaxed);

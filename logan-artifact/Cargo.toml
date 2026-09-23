@@ -1,0 +1,9 @@
+[package]
+name = "logan-artifact"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32c = "0.6"

@@ -16,7 +16,8 @@ optimized for the current hardware.
 | Crate | Role |
 |---|---|
 | `logan-abi` | Stable ABI identities: target registry, semantic IDs, representation contracts (generated from `abi/coli-target-registry.toml`) |
-| `logan-format` | COLI CSF artifact framing: checksums, manifest/data-shard constants, package reader |
+| `logan-artifact` | Canonical `.logan` v1 framing: safe manifest/table reader-writer and structural validation |
+| `logan-format` | Legacy COLI compatibility reader/framing for existing compiled packages |
 | `logan-compiler` | The compiler (`logan` binary): machine probe, physical IR, memory planner, quant (exact / MXFP4-Apple8 / INT4-G32), rANS codec, package emission |
 | `logan-qwen` | Scalar Qwen MoE reference (C-identical numerics, token-identity gated) |
 | `logan-qwen4` | Hybrid Qwen runtime: Qwen3-Next / **Qwen3-Coder-Next** plus Qwen4 (Qwen3.8-Flash-Next / Qwen4Exp), with Gated DeltaNet, sparse MoE and **Metal/MetalIO direct execution**; Qwen4 additionally enables hyper connections, QSA and PLE |
@@ -30,8 +31,16 @@ kernels over page-aligned zero-copy weights. Every Metal entry point declines
 cleanly to the CPU reference path when unavailable; the two paths are
 token-identical by gate.
 
-Env gates (all default ON, `=0` opts out): `QWEN_GDN_METAL`,
-`QWEN_APPLE8_DIRECT`, `QWEN_APPLE8_OVERLAP`.
+Env gates for the established Apple8 package path (default ON, `=0` opts
+out): `QWEN_GDN_METAL`, `QWEN_APPLE8_DIRECT`, `QWEN_APPLE8_OVERLAP`.
+
+Raw safetensors/MLX is also a first-class runtime source. Routed experts can
+be forced through the real SSD path with
+`LOGAN_EXPERT_NOCACHE=1` (macOS `F_NOCACHE` on expert-only descriptors);
+that mode automatically uses MetalIO when available. MetalIO without
+disabling the page cache is opt-in with `LOGAN_EXPERT_METALIO=1`, and
+`LOGAN_EXPERT_PREFETCH_SLOTS=N` bounds speculative expert slots. RouteScout
+uses the same source-neutral prefetch seam; none of these paths require COLI.
 
 ## Build & test
 
@@ -52,7 +61,7 @@ Repository-agent and chat-harness behavior is aligned with the applicable parts 
 # tiny fixture gate (deterministic, committed):
 cargo run --release -p logan-qwen4 -- fixtures/qwen4_moe_tiny
 
-# compile a checkpoint into a COLI package:
+# Legacy compiled-package emission during the .logan dual-emit migration:
 target/release/logan compile MODEL_DIR --target native --quant exact \
   --codec none --opt default -o OUT.coli --verify
 

@@ -1020,6 +1020,101 @@ pub fn parallel_dense_packed_fp16_io(
     Ok(MilProgram::new(body))
 }
 
+/// Build RouteScout's fixed-shape FP16 MLP for direct ANE execution.
+///
+/// The graph is intentionally limited to dense 1x1 convolutions and ReLUs:
+/// `I -> H -> L -> O`. Temporal state, expert embeddings, layer-specific
+/// adapters, and online bias live outside the ANE graph. Keeping this island
+/// static makes it reusable across every Qwen MoE layer and avoids dynamic
+/// gather/control-flow operations in the private ANE compiler.
+///
+/// Inputs and outputs use fp16 IOSurface storage directly. `spatial` is the
+/// fixed prediction batch carried in the last tensor dimension; current M2
+/// qualification requires it to be at least 16 and aligned to 16.
+pub fn route_scout_mlp_fp16(
+    in_features: usize,
+    hidden_features: usize,
+    latent_features: usize,
+    out_features: usize,
+    spatial: usize,
+    w0_fp16: &[u16],
+    w1_fp16: &[u16],
+    w2_fp16: &[u16],
+) -> Result<MilProgram> {
+    if in_features == 0
+        || hidden_features == 0
+        || latent_features == 0
+        || out_features == 0
+        || spatial == 0
+    {
+        return Err(AneError::InvalidArgument(
+            "RouteScout MLP dimensions must be non-zero".into(),
+        ));
+    }
+    if spatial < 16 || spatial % 16 != 0 {
+        return Err(AneError::InvalidArgument(format!(
+            "RouteScout spatial dimension {spatial} must be >= 16 and a multiple of 16"
+        )));
+    }
+
+    let expected0 = hidden_features
+        .checked_mul(in_features)
+        .ok_or_else(|| AneError::InvalidArgument("RouteScout W0 shape overflow".into()))?;
+    let expected1 = latent_features
+        .checked_mul(hidden_features)
+        .ok_or_else(|| AneError::InvalidArgument("RouteScout W1 shape overflow".into()))?;
+    let expected2 = out_features
+        .checked_mul(latent_features)
+        .ok_or_else(|| AneError::InvalidArgument("RouteScout W2 shape overflow".into()))?;
+    for (name, got, expected) in [
+        ("W0", w0_fp16.len(), expected0),
+        ("W1", w1_fp16.len(), expected1),
+        ("W2", w2_fp16.len(), expected2),
+    ] {
+        if got != expected {
+            return Err(AneError::InvalidArgument(format!(
+                "RouteScout {name} has {got} fp16 weights, expected {expected}"
+            )));
+        }
+    }
+
+    const WEIGHT_PATH: &str = "@model_path/weights/routescout.bin";
+    let mut blob = BlobV2Builder::new();
+    let o0 = blob.push_fp16(w0_fp16)?.get();
+    let o1 = blob.push_fp16(w1_fp16)?.get();
+    let o2 = blob.push_fp16(w2_fp16)?.get();
+
+    let text = format!(
+        r#"program(1.3)
+[buildInfo = dict<string, string>({{{{"coremlc-component-MIL", "3510.2.1"}}, {{"coremlc-version", "3505.4.1"}}, {{"coremltools-component-milinternal", ""}}, {{"coremltools-version", "9.0"}}}})]
+{{
+ func main<ios18>(tensor<fp32, [1, {in_features}, 1, {spatial}]> x) {{
+  string to_fp16 = const()[name = string("to_fp16"), val = string("fp16")];
+  tensor<fp16, [1, {in_features}, 1, {spatial}]> x16 = cast(dtype = to_fp16, x = x)[name = string("route_cast_in")];
+  string c_pad_type = const()[name = string("c_pad_type"), val = string("valid")];
+  tensor<int32, [2]> c_strides = const()[name = string("c_strides"), val = tensor<int32, [2]>([1, 1])];
+  tensor<int32, [4]> c_pad = const()[name = string("c_pad"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+  tensor<int32, [2]> c_dilations = const()[name = string("c_dilations"), val = tensor<int32, [2]>([1, 1])];
+  int32 c_groups = const()[name = string("c_groups"), val = int32(1)];
+  tensor<fp16, [{hidden_features}, {in_features}, 1, 1]> W0 = const()[name = string("W0"), val = tensor<fp16, [{hidden_features}, {in_features}, 1, 1]>(BLOBFILE(path = string("{WEIGHT_PATH}"), offset = uint64({o0})))];
+  tensor<fp16, [1, {hidden_features}, 1, {spatial}]> h0 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W0, x = x16)[name = string("route_fc0")];
+  tensor<fp16, [1, {hidden_features}, 1, {spatial}]> r0 = relu(x = h0)[name = string("route_relu0")];
+  tensor<fp16, [{latent_features}, {hidden_features}, 1, 1]> W1 = const()[name = string("W1"), val = tensor<fp16, [{latent_features}, {hidden_features}, 1, 1]>(BLOBFILE(path = string("{WEIGHT_PATH}"), offset = uint64({o1})))];
+  tensor<fp16, [1, {latent_features}, 1, {spatial}]> h1 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W1, x = r0)[name = string("route_fc1")];
+  tensor<fp16, [1, {latent_features}, 1, {spatial}]> r1 = relu(x = h1)[name = string("route_relu1")];
+  tensor<fp16, [{out_features}, {latent_features}, 1, 1]> W2 = const()[name = string("W2"), val = tensor<fp16, [{out_features}, {latent_features}, 1, 1]>(BLOBFILE(path = string("{WEIGHT_PATH}"), offset = uint64({o2})))];
+  tensor<fp16, [1, {out_features}, 1, {spatial}]> y16 = conv(dilations = c_dilations, groups = c_groups, pad = c_pad, pad_type = c_pad_type, strides = c_strides, weight = W2, x = r1)[name = string("route_fc2")];
+  string to_fp32 = const()[name = string("to_fp32"), val = string("fp32")];
+  tensor<fp32, [1, {out_features}, 1, {spatial}]> y = cast(dtype = to_fp32, x = y16)[name = string("route_cast_out")];
+ }} -> (y);
+}}
+"#
+    );
+
+    Ok(MilProgram::new(text)
+        .with_weight(WeightBlob::new(WEIGHT_PATH, blob.into_bytes()).descriptor_offset(0)))
+}
+
 /// Weight-free fp32 -> fp16 -> ReLU -> fp32 fixture.
 ///
 /// It is intentionally simple and contains no BLOBFILE constants, making it a

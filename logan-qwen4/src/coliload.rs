@@ -720,6 +720,7 @@ impl Model {
             ple_shards: None,
             coli: Some(src.clone()),
             gguf: None,
+            gguf_expert_store: None,
             gdn_v_tiled: false,
             rope_interleaved: false,
             embed: load_wt(src, "embed.weight", cfg.vocab, cfg.hidden)?,
@@ -860,11 +861,35 @@ impl Model {
             ],
             expert_plan,
             expert_store: make_expert_store(runtime_layers, cfg.topk),
+            route_spec_store: crate::make_route_spec_store(),
             spans: logan_core::telemetry::TokenSpans::default(),
+            decode_baseline: None,
             route_prev: (0..runtime_layers).map(|_| Vec::new()).collect(),
             route_overlap_common: vec![0; runtime_layers],
             route_overlap_total: vec![0; runtime_layers],
             route_overlap_pairs: vec![0; runtime_layers],
+            route_spatial_prev: Vec::new(),
+            route_token_routes: (0..runtime_layers).map(|_| Vec::new()).collect(),
+            route_predict_horizon: std::env::var("QWEN_ROUTE_PREDICT_HORIZON")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0),
+            route_spatial_common: vec![0; runtime_layers],
+            route_spatial_total: vec![0; runtime_layers],
+            route_spatial_pairs: vec![0; runtime_layers],
+            route_spatial_top1_hits: vec![0; runtime_layers],
+            route_spatial_top1_total: vec![0; runtime_layers],
+            route_predictor: if crate::env_flag("QWEN_ROUTE_PREDICT")
+                || crate::env_flag("QWEN_ROUTE_PREDICT_PREFETCH")
+            {
+                Some(crate::route_predictor::RoutePredictor::new(
+                    runtime_layers,
+                    cfg.experts,
+                ))
+            } else {
+                None
+            },
+            route_predict_prefetch: crate::env_flag("QWEN_ROUTE_PREDICT_PREFETCH"),
             metal_model_id: next_metal_model_id(),
             metal_direct: direct_ok
                 && std::env::var("QWEN_APPLE8_DIRECT")

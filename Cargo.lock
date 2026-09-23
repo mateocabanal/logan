@@ -962,6 +962,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "logan-artifact"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+]
+
+[[package]]
 name = "logan-chat"
 version = "0.1.0"
 dependencies = [

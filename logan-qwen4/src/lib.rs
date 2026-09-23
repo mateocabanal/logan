@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod coliload;
 pub mod colisource;
+mod gguf_iq_tables;
 mod ggufload;
 pub mod ggufsource;
 pub use ggufload::load_cfg_gguf;
@@ -21,6 +22,7 @@ pub mod mlx_affine_cuda;
 pub mod mtp;
 pub mod plan;
 pub mod pool;
+mod route_predictor;
 pub mod scheduled;
 
 use logan_core::expert::Slot as _; // for SlotExpert::release
@@ -40,6 +42,163 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false)
+}
+
+struct RouteScoutTraceSink {
+    writer: std::io::BufWriter<std::fs::File>,
+    event: u64,
+}
+
+struct RouteScoutHiddenTraceSink {
+    writer: std::io::BufWriter<std::fs::File>,
+    hidden: usize,
+    event: u64,
+}
+
+fn route_scout_hidden_trace_record(layers: usize, layer: usize, x: &[f32]) {
+    use std::io::Write as _;
+
+    static SINK: std::sync::OnceLock<std::sync::Mutex<Option<RouteScoutHiddenTraceSink>>> =
+        std::sync::OnceLock::new();
+
+    let sink = SINK.get_or_init(|| {
+        let Some(path) = std::env::var_os("QWEN_ROUTESCOUT_HIDDEN_PATH") else {
+            return std::sync::Mutex::new(None);
+        };
+        let result = (|| -> Result<RouteScoutHiddenTraceSink, std::io::Error> {
+            let file = std::fs::File::create(&path)?;
+            let mut writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+            writer.write_all(b"RSCHID1\0")?;
+            writer.write_all(&(layers as u32).to_le_bytes())?;
+            writer.write_all(&(x.len() as u32).to_le_bytes())?;
+            Ok(RouteScoutHiddenTraceSink {
+                writer,
+                hidden: x.len(),
+                event: 0,
+            })
+        })();
+        match result {
+            Ok(sink) => std::sync::Mutex::new(Some(sink)),
+            Err(error) => {
+                eprintln!(
+                    "logan routescout: failed to open QWEN_ROUTESCOUT_HIDDEN_PATH: {error}"
+                );
+                std::sync::Mutex::new(None)
+            }
+        }
+    });
+
+    let Ok(mut guard) = sink.lock() else {
+        return;
+    };
+    let Some(sink) = guard.as_mut() else {
+        return;
+    };
+    if x.len() != sink.hidden || layer > u16::MAX as usize {
+        return;
+    }
+
+    let event = sink.event;
+    sink.event = sink.event.saturating_add(1);
+    if sink.writer.write_all(&event.to_le_bytes()).is_err()
+        || sink.writer.write_all(&(layer as u16).to_le_bytes()).is_err()
+    {
+        return;
+    }
+    for &value in x {
+        if sink.writer.write_all(&value.to_le_bytes()).is_err() {
+            return;
+        }
+    }
+    if layer + 1 == layers {
+        let _ = sink.writer.flush();
+    }
+}
+
+fn route_scout_trace_record(
+    layers: usize,
+    experts: usize,
+    topk: usize,
+    layer: usize,
+    idx: &[usize],
+    val: &[f32],
+    wsum: f32,
+) {
+    use std::io::Write as _;
+
+    static SINK: std::sync::OnceLock<std::sync::Mutex<Option<RouteScoutTraceSink>>> =
+        std::sync::OnceLock::new();
+
+    let sink = SINK.get_or_init(|| {
+        let Some(path) = std::env::var_os("QWEN_ROUTESCOUT_TRACE_PATH") else {
+            return std::sync::Mutex::new(None);
+        };
+        let result = (|| -> Result<RouteScoutTraceSink, std::io::Error> {
+            let file = std::fs::File::create(&path)?;
+            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+            writeln!(
+                writer,
+                "# routescout-v1\tlayers={layers}\texperts={experts}\ttopk={topk}"
+            )?;
+            Ok(RouteScoutTraceSink { writer, event: 0 })
+        })();
+        match result {
+            Ok(sink) => std::sync::Mutex::new(Some(sink)),
+            Err(error) => {
+                eprintln!(
+                    "logan routescout: failed to open QWEN_ROUTESCOUT_TRACE_PATH: {error}"
+                );
+                std::sync::Mutex::new(None)
+            }
+        }
+    });
+
+    let Ok(mut guard) = sink.lock() else {
+        return;
+    };
+    let Some(sink) = guard.as_mut() else {
+        return;
+    };
+
+    let k = topk.min(idx.len()).min(val.len());
+    if k == 0 {
+        return;
+    }
+    let entropy = val
+        .iter()
+        .copied()
+        .filter(|&p| p > 0.0 && p.is_finite())
+        .map(|p| -p * p.ln())
+        .sum::<f32>();
+    let margin = if val.len() >= 2 { val[0] - val[1] } else { val[0] };
+    let denom = if wsum > 0.0 && wsum.is_finite() {
+        wsum
+    } else {
+        val[..k].iter().sum::<f32>().max(f32::MIN_POSITIVE)
+    };
+
+    let event = sink.event;
+    sink.event = sink.event.saturating_add(1);
+    if write!(
+        sink.writer,
+        "{event}\t{layer}\t{entropy:.9}\t{margin:.9}\t{wsum:.9}"
+    )
+    .is_err()
+    {
+        return;
+    }
+    for i in 0..k {
+        let weight = val[i] / denom;
+        if write!(sink.writer, "\t{}:{weight:.9}", idx[i]).is_err() {
+            return;
+        }
+    }
+    let _ = writeln!(sink.writer);
+    // Decode emits one complete 0..layers-1 cycle per token. Flushing at the
+    // cycle boundary keeps traces recoverable after an interrupted long run.
+    if layer + 1 == layers {
+        let _ = sink.writer.flush();
+    }
 }
 
 fn is_ple_ngram_weight(name: &str) -> bool {
@@ -96,6 +255,10 @@ pub struct StFile {
     // share the same open handles: the table stays file-backed, and a second
     // reader must not re-open 128 shard files. Clone is a refcount bump.
     files: std::sync::Arc<Vec<std::sync::Mutex<std::fs::File>>>,
+    /// Stable shard paths in the same order as `files`. Raw MLX expert
+    /// streaming uses these to create dedicated uncached descriptors and
+    /// MetalIO file handles without changing dense/static reads.
+    paths: std::sync::Arc<Vec<std::path::PathBuf>>,
     /// name -> (shard index, shape, dtype, payload offset, payload length)
     tensors:
         std::sync::Arc<std::collections::HashMap<String, (usize, Vec<u64>, String, usize, usize)>>,
@@ -106,6 +269,7 @@ impl Clone for StFile {
     fn clone(&self) -> Self {
         Self {
             files: std::sync::Arc::clone(&self.files),
+            paths: std::sync::Arc::clone(&self.paths),
             tensors: std::sync::Arc::clone(&self.tensors),
         }
     }
@@ -306,6 +470,7 @@ impl StFile {
         }
         Ok(StFile {
             files: std::sync::Arc::new(vec![std::sync::Mutex::new(file)]),
+            paths: std::sync::Arc::new(vec![path.to_path_buf()]),
             tensors: std::sync::Arc::new(tensors),
         })
     }
@@ -329,6 +494,7 @@ impl StFile {
     pub fn open_dir(dir: &Path) -> Result<StFile, String> {
         let index = dir.join("model.safetensors.index.json");
         let mut files = Vec::new();
+        let mut paths = Vec::new();
         let mut tensors = std::collections::HashMap::new();
 
         if index.is_file() {
@@ -350,6 +516,7 @@ impl StFile {
                 let path = dir.join(shard);
                 let (file, entries) = parse_shard(&path)?;
                 files.push(std::sync::Mutex::new(file));
+                paths.push(path.clone());
                 shard_id.insert((*shard).to_string(), i);
                 for (name, shape, dtype, off, len) in entries {
                     register(&mut tensors, i, name, shape, dtype, off, len);
@@ -370,6 +537,7 @@ impl StFile {
             }
             let (file, entries) = parse_shard(&single)?;
             files.push(std::sync::Mutex::new(file));
+            paths.push(single.clone());
             for (name, shape, dtype, off, len) in entries {
                 register(&mut tensors, 0, name, shape, dtype, off, len);
             }
@@ -378,6 +546,7 @@ impl StFile {
         // Shard count is recoverable from the map, so a caller can report it.
         Ok(StFile {
             files: std::sync::Arc::new(files),
+            paths: std::sync::Arc::new(paths),
             tensors: std::sync::Arc::new(tensors),
         })
     }
@@ -385,6 +554,67 @@ impl StFile {
     /// How many shard files back this checkpoint.
     pub fn shard_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// Re-open the same safetensors shards for streaming work. This keeps
+    /// dense/static checkpoint reads on their ordinary cached descriptors while
+    /// routed experts can use macOS F_NOCACHE without globally poisoning the
+    /// checkpoint's page-cache behaviour.
+    fn fork_for_streaming(&self, nocache: bool) -> Result<Self, String> {
+        let mut files = Vec::with_capacity(self.paths.len());
+        for path in self.paths.iter() {
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            #[cfg(target_os = "macos")]
+            if nocache {
+                use std::os::fd::AsRawFd as _;
+                let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+                if rc != 0 {
+                    return Err(format!(
+                        "{}: F_NOCACHE failed: {}",
+                        path.display(),
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = nocache;
+            files.push(std::sync::Mutex::new(file));
+        }
+        Ok(Self {
+            files: std::sync::Arc::new(files),
+            paths: std::sync::Arc::clone(&self.paths),
+            tensors: std::sync::Arc::clone(&self.tensors),
+        })
+    }
+
+    fn shard_path(&self, shard: usize) -> Option<&Path> {
+        self.paths.get(shard).map(std::path::PathBuf::as_path)
+    }
+
+    /// Return the physical file range for a bounded slice of one tensor.
+    fn tensor_region(
+        &self,
+        name: &str,
+        within: usize,
+        len: usize,
+    ) -> Result<(usize, u64, usize), String> {
+        let (shard, _shape, _dtype, offset, total) = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        let end = within
+            .checked_add(len)
+            .ok_or_else(|| format!("{name}: requested byte range overflows"))?;
+        if end > *total {
+            return Err(format!(
+                "{name}: requested byte range {within}..{end} exceeds payload length {total}"
+            ));
+        }
+        let absolute = offset
+            .checked_add(within)
+            .ok_or_else(|| format!("{name}: absolute byte offset overflows"))?;
+        Ok((*shard, absolute as u64, len))
     }
 
     /// Distinct payload dtypes present, for diagnostics.
@@ -1050,6 +1280,9 @@ pub enum WtBytes {
         biases: Vec<u8>,
         bits: u8,
         group_size: usize,
+        /// True when the affine scale/bias sidecars are IEEE fp16. False
+        /// means BF16. The packed integer weights are identical either way.
+        aux_fp16: bool,
         /// Lazily materialized `[scales][biases]` sidecar expected by Metal.
         /// Keeping the source vectors separate preserves the CPU oracle without
         /// paying a concatenation/allocation on every token.
@@ -1071,6 +1304,14 @@ pub enum WtBytes {
     /// requantized; CPU and CUDA kernels consume the source representation.
     Gguf {
         weights: Vec<u8>,
+        dtype: ggufsource::GgmlType,
+    },
+    /// Read-only mmap-backed GGUF tensor. The source keeps the shard mappings
+    /// alive; this variant owns only lightweight metadata and never copies the
+    /// tensor payload into the heap.
+    GgufMapped {
+        source: ggufsource::GgufSource,
+        name: String,
         dtype: ggufsource::GgmlType,
     },
 }
@@ -1097,6 +1338,7 @@ impl Clone for WtBytes {
                 biases,
                 bits,
                 group_size,
+                aux_fp16,
                 ..
             } => Self::MlxAffine {
                 weights: weights.clone(),
@@ -1104,6 +1346,7 @@ impl Clone for WtBytes {
                 biases: biases.clone(),
                 bits: *bits,
                 group_size: *group_size,
+                aux_fp16: *aux_fp16,
                 metal_aux: std::sync::OnceLock::new(),
                 metal_tensor: std::sync::Mutex::new(0),
                 cuda_resident: std::sync::Mutex::new(None),
@@ -1125,6 +1368,15 @@ impl Clone for WtBytes {
                 weights: weights.clone(),
                 dtype: *dtype,
             },
+            Self::GgufMapped {
+                source,
+                name,
+                dtype,
+            } => Self::GgufMapped {
+                source: source.clone(),
+                name: name.clone(),
+                dtype: *dtype,
+            },
         }
     }
 }
@@ -1136,7 +1388,7 @@ impl Drop for WtBytes {
             | Self::Mxfp4 { metal_tensor, .. }
             | Self::MlxAffine { metal_tensor, .. }
             | Self::Q8Block { metal_tensor, .. } => Some(metal_tensor),
-            Self::Gguf { .. } => None,
+            Self::Gguf { .. } | Self::GgufMapped { .. } => None,
         };
         if let Some(metal_tensor) = metal_tensor {
             let raw = std::mem::take(
@@ -1170,7 +1422,8 @@ impl Wt {
             WtBytes::Mxfp4 { .. }
             | WtBytes::MlxAffine { .. }
             | WtBytes::Q8Block { .. }
-            | WtBytes::Gguf { .. } => None,
+            | WtBytes::Gguf { .. }
+            | WtBytes::GgufMapped { .. } => None,
         }
     }
 
@@ -1241,8 +1494,18 @@ impl Wt {
                 biases,
                 bits,
                 group_size,
+                aux_fp16,
                 ..
-            } => mlx_affine_row_f32(weights, scales, biases, self.i, row, *bits, *group_size),
+            } => mlx_affine_row_f32(
+                weights,
+                scales,
+                biases,
+                self.i,
+                row,
+                *bits,
+                *group_size,
+                *aux_fp16,
+            ),
             WtBytes::Q8Block {
                 weights,
                 scales,
@@ -1280,6 +1543,21 @@ impl Wt {
                 let start = row * row_bytes;
                 ggufsource::decode_row(*dtype, &weights[start..start + row_bytes], self.i)
                     .expect("validated GGUF row")
+            }
+            WtBytes::GgufMapped {
+                source,
+                name,
+                dtype,
+            } => {
+                let weights = source
+                    .mapped_tensor(name)
+                    .expect("GGUF mapped tensor became unavailable");
+                let row_bytes = dtype
+                    .stored_bytes(self.i as u64)
+                    .expect("validated GGUF row geometry") as usize;
+                let start = row * row_bytes;
+                ggufsource::decode_row(*dtype, &weights[start..start + row_bytes], self.i)
+                    .expect("validated mapped GGUF row")
             }
         }
     }
@@ -1482,6 +1760,17 @@ impl Layer {
     }
 }
 
+pub(crate) struct GgufCachedExpert {
+    mats: [Wt; 3],
+}
+
+impl logan_core::expert::Slot for GgufCachedExpert {
+    fn release(&mut self) {
+        // Plain Rust-owned GGML byte vectors: dropping the evicted cache value
+        // releases them. No external MetalIO handle needs explicit teardown.
+    }
+}
+
 pub struct Model {
     cfg: Cfg,
     /// Sharded PLE n-gram table, when the checkpoint stores it as shards.
@@ -1511,6 +1800,10 @@ pub struct Model {
     /// Native GGUF source. Dense quantized weights are resident as their
     /// original GGML blocks; routed experts and PLE rows remain file-backed.
     gguf: Option<ggufsource::GgufSource>,
+    /// Layer-partitioned demand cache for native GGUF routed experts. Each
+    /// entry owns one expert's gate/up/down matrices in their original mixed
+    /// GGML quantization. None outside the GGUF path.
+    gguf_expert_store: Option<logan_core::expert::ExpertStore<GgufCachedExpert>>,
     /// GGUF Qwen4Exp reorders GDN V heads from HF grouped order to tiled
     /// broadcast order. Keeping that layout at runtime avoids rewriting any
     /// quantized matrix bytes; K-head selection becomes h % kheads.
@@ -1568,8 +1861,23 @@ pub struct Model {
     expert_plan: Option<crate::plan::Plan>,
     /// LRU expert store (engine-neutral core; slot-owning values).
     expert_store: logan_core::expert::ExpertStore<crate::colisource::SlotExpert>,
+    /// Optional tiny shared cache for speculative expert loads. Predictions
+    /// land here instead of displacing authoritative per-layer residency; a
+    /// real demand adopts the same physical MetalIO slot into the main cache.
+    route_spec_store: Option<logan_core::expert::ExpertStore<crate::colisource::SlotExpert>>,
     /// Per-token telemetry accumulator (LOGAN_PROFILE=1).
     spans: logan_core::telemetry::TokenSpans,
+    /// Decode-boundary baseline for the *normalized* telemetry in
+    /// `profile_summary`. Counters (spans, MLX expert calls/ns, affine
+    /// dispatch counts, MetalIO loads/bytes/prefetch) accumulate across
+    /// prefill AND decode, but the reported per-token figures divide by the
+    /// measured decode forward count. Snapshotting all of them once at the
+    /// last prompt forward lets the summary report a true decode-window delta.
+    ///
+    /// `None` until `begin_decode_measurement`; `profile_summary` falls back to
+    /// lifetime totals (and says so) when it was never taken, so callers that
+    /// do not delimit a window keep their previous behaviour.
+    decode_baseline: Option<DecodeBaseline>,
     /// Previous routed top-k per layer + overlap counters. This is cheap
     /// correctness-neutral instrumentation used to size layer-local expert
     /// residency from observed temporal locality rather than guesswork.
@@ -1577,6 +1885,31 @@ pub struct Model {
     route_overlap_common: Vec<u64>,
     route_overlap_total: Vec<u64>,
     route_overlap_pairs: Vec<u64>,
+    /// Same-token overlap between adjacent MoE layers. Index li compares the
+    /// current route of layer li against layer li-1; index 0 is unused.
+    route_spatial_prev: Vec<usize>,
+    /// Current token's authoritative routed top-k for every layer already
+    /// completed. EXP-036 uses this to train a *direct* source->target spatial
+    /// table for horizons greater than zero instead of misapplying the adjacent
+    /// layer table to an earlier source distribution.
+    route_token_routes: Vec<Vec<usize>>,
+    /// Direct RouteScout horizon. H=0 means the target layer is the current
+    /// layer and spatial evidence comes from the immediately previous layer.
+    /// H>0 predicts target=li+H while training target's spatial table from
+    /// source=target-(H+1), matching the evidence actually available before li.
+    route_predict_horizon: usize,
+    route_spatial_common: Vec<u64>,
+    route_spatial_total: Vec<u64>,
+    route_spatial_pairs: Vec<u64>,
+    /// Budget-1 spatial predictor confidence: whether the previous layer's
+    /// top-1 expert also appears in this layer's authoritative top-k.
+    route_spatial_top1_hits: Vec<u64>,
+    route_spatial_top1_total: Vec<u64>,
+    /// Optional bounded online predictor for the next routed expert set.
+    /// It observes only routes the model already chose; it can affect load
+    /// timing through speculative prefetch but never changes router output.
+    route_predictor: Option<route_predictor::RoutePredictor>,
+    route_predict_prefetch: bool,
     /// Process-unique owner identity for native model-scoped resources. The
     /// native GDN cache is keyed by this ID + layer, never by layer alone.
     metal_model_id: u64,
@@ -1887,6 +2220,24 @@ fn bf16_simd_calls() -> u64 {
 #[cfg(all(test, target_arch = "x86_64"))]
 fn bf16_simd_calls() -> u64 {
     logan_core::math_x86::bf16_calls()
+}
+
+/// MLX affine (oQ) GEMV dispatch counters.
+///
+/// `metal` and `simd` are separate counters because a correct Metal kernel that
+/// never gets reached and a fallback that is silently always taken look
+/// identical from timing alone: both show up as "slow decode". Only the pair
+/// distinguishes "wired" from "advertised", the same reason BF16 keeps its own
+/// counter.
+static MLX_AFFINE_METAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MLX_AFFINE_FALLBACK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (metal_dispatches, scalar_fallbacks) for the MLX affine GEMV.
+pub fn mlx_affine_dispatch_counts() -> (u64, u64) {
+    (
+        MLX_AFFINE_METAL_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        MLX_AFFINE_FALLBACK_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Whether this host can run the accelerated bf16 kernel at all.
@@ -2835,9 +3186,14 @@ fn available_threads() -> usize {
     })
 }
 
-fn mlx_affine_bf16_at(bytes: &[u8], index: usize) -> f32 {
+fn mlx_affine_param_at(bytes: &[u8], index: usize, fp16: bool) -> f32 {
     let off = index * 2;
-    f32::from_bits((u16::from_le_bytes([bytes[off], bytes[off + 1]]) as u32) << 16)
+    let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+    if fp16 {
+        ggufsource::f16_to_f32(bits)
+    } else {
+        f32::from_bits((bits as u32) << 16)
+    }
 }
 
 fn mlx_affine_code(row: &[u8], column: usize, bits: u8) -> u32 {
@@ -2863,6 +3219,7 @@ fn mlx_affine_row_f32(
     row: usize,
     bits: u8,
     group_size: usize,
+    aux_fp16: bool,
 ) -> Vec<f32> {
     debug_assert!(matches!(bits, 4 | 5 | 6 | 8));
     debug_assert!(group_size > 0 && columns % group_size == 0);
@@ -2874,8 +3231,9 @@ fn mlx_affine_row_f32(
     (0..columns)
         .map(|column| {
             let group = row * groups + column / group_size;
-            mlx_affine_code(wr, column, bits) as f32 * mlx_affine_bf16_at(scales, group)
-                + mlx_affine_bf16_at(biases, group)
+            mlx_affine_code(wr, column, bits) as f32
+                * mlx_affine_param_at(scales, group, aux_fp16)
+                + mlx_affine_param_at(biases, group, aux_fp16)
         })
         .collect()
 }
@@ -2890,6 +3248,7 @@ fn matmul_mlx_affine_storage(
     i: usize,
     bits: u8,
     group_size: usize,
+    aux_fp16: bool,
 ) {
     debug_assert_eq!(x.len(), i);
     debug_assert_eq!(y.len(), o);
@@ -2908,11 +3267,61 @@ fn matmul_mlx_affine_storage(
         for column in 0..i {
             let group = row * groups + column / group_size;
             let value = mlx_affine_code(wr, column, bits) as f32
-                * mlx_affine_bf16_at(scales, group)
-                + mlx_affine_bf16_at(biases, group);
+                * mlx_affine_param_at(scales, group, aux_fp16)
+                + mlx_affine_param_at(biases, group, aux_fp16);
             sum += value * x[column];
         }
         y[row] = sum;
+    }
+}
+
+fn matmul_gguf_bytes(
+    y: &mut [f32],
+    x: &[f32],
+    weights: &[u8],
+    dtype: ggufsource::GgmlType,
+    o: usize,
+    i: usize,
+) {
+    let row_bytes = dtype
+        .stored_bytes(i as u64)
+        .expect("validated GGUF row geometry") as usize;
+    debug_assert_eq!(weights.len(), row_bytes * o);
+
+    if dtype == ggufsource::GgmlType::Q4K
+        && ggufsource::cuda_q4k::q4k_dot_row(y, x, weights, o, i).is_some()
+    {
+        return;
+    }
+
+    let parallel = o * i >= 1_000_000
+        && std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            > 1;
+    if parallel {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk = o.div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (chunk_idx, ys) in y.chunks_mut(chunk).enumerate() {
+                let first_row = chunk_idx * chunk;
+                scope.spawn(move || {
+                    for (local_row, dst) in ys.iter_mut().enumerate() {
+                        let row = first_row + local_row;
+                        let raw = &weights[row * row_bytes..(row + 1) * row_bytes];
+                        *dst = ggufsource::dot_row(dtype, raw, x)
+                            .expect("validated GGUF quantized row");
+                    }
+                });
+            }
+        });
+    } else {
+        for (row, dst) in y.iter_mut().enumerate() {
+            let raw = &weights[row * row_bytes..(row + 1) * row_bytes];
+            *dst = ggufsource::dot_row(dtype, raw, x).expect("validated GGUF quantized row");
+        }
     }
 }
 
@@ -2970,11 +3379,12 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                 biases,
                 bits,
                 group_size,
+                aux_fp16,
                 metal_aux,
                 metal_tensor,
                 cuda_resident,
             } => {
-                if mlx_affine_cuda::matmul(
+                if !*aux_fp16 && mlx_affine_cuda::matmul(
                     cuda_resident,
                     y,
                     x,
@@ -3006,15 +3416,29 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                     aux,
                     *bits,
                     *group_size,
+                    *aux_fp16,
                     i,
                     o,
                 ) {
                     *handle = tensor as usize;
+                    MLX_AFFINE_METAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
                 *handle = tensor as usize;
                 drop(handle);
-                matmul_mlx_affine_storage(y, x, weights, scales, biases, o, i, *bits, *group_size);
+                MLX_AFFINE_FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                matmul_mlx_affine_storage(
+                    y,
+                    x,
+                    weights,
+                    scales,
+                    biases,
+                    o,
+                    i,
+                    *bits,
+                    *group_size,
+                    *aux_fp16,
+                );
             }
             WtBytes::Q8Block {
                 weights,
@@ -3048,64 +3472,17 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                 matmul_q8_block_bytes(y, x, weights, scales, o, i, *block, *residuals);
             }
             WtBytes::Gguf { weights, dtype } => {
-                let row_bytes = dtype
-                    .stored_bytes(i as u64)
-                    .expect("validated GGUF row geometry") as usize;
-                debug_assert_eq!(weights.len(), row_bytes * o);
-                // Q4_K on a CUDA device, tried before the CPU path. The whole
-                // `[o, i]` GEMV is one launch with one thread per output row,
-                // and every element of `y` is written by the thread that owns
-                // that row and nothing else touches it -- the same shape as the
-                // per-row arms below, just executed on the device. So the result
-                // ordering is identical and the row loop can be skipped
-                // entirely rather than having each row try the device.
-                //
-                // Placed after the assertion above so BOTH paths are guarded by
-                // it: `debug_assert_eq!` has already run by the time this is
-                // reached, and the oracle keeps its own per-row checks below.
-                //
-                // `None` is a refusal, not an error. `q4k_dot_row` declines a
-                // ragged `i`, a buffer shorter than the row geometry, a busy or
-                // absent device, and anything else it cannot express; each falls
-                // through to the oracle exactly as if the backend were absent.
-                // The opt-in being unset makes it refuse unconditionally: the
-                // backend is measured slower than the CPU at these shapes, so
-                // the default is off (see `cuda_q4k`'s module header).
-                if *dtype == ggufsource::GgmlType::Q4K
-                    && ggufsource::cuda_q4k::q4k_dot_row(y, x, weights, o, i).is_some()
-                {
-                    return;
-                }
-                let parallel = o * i >= 1_000_000
-                    && std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1)
-                        > 1;
-                if parallel {
-                    let workers = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
-                    let chunk = o.div_ceil(workers);
-                    std::thread::scope(|scope| {
-                        for (chunk_idx, ys) in y.chunks_mut(chunk).enumerate() {
-                            let first_row = chunk_idx * chunk;
-                            scope.spawn(move || {
-                                for (local_row, dst) in ys.iter_mut().enumerate() {
-                                    let row = first_row + local_row;
-                                    let raw = &weights[row * row_bytes..(row + 1) * row_bytes];
-                                    *dst = ggufsource::dot_row(*dtype, raw, x)
-                                        .expect("validated GGUF quantized row");
-                                }
-                            });
-                        }
-                    });
-                } else {
-                    for (row, dst) in y.iter_mut().enumerate() {
-                        let raw = &weights[row * row_bytes..(row + 1) * row_bytes];
-                        *dst = ggufsource::dot_row(*dtype, raw, x)
-                            .expect("validated GGUF quantized row");
-                    }
-                }
+                matmul_gguf_bytes(y, x, weights, *dtype, o, i);
+            }
+            WtBytes::GgufMapped {
+                source,
+                name,
+                dtype,
+            } => {
+                let weights = source
+                    .mapped_tensor(name)
+                    .expect("GGUF mapped tensor became unavailable");
+                matmul_gguf_bytes(y, x, weights, *dtype, o, i);
             }
         }
         return;
@@ -3147,6 +3524,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
             biases,
             bits,
             group_size,
+            aux_fp16,
             metal_aux,
             metal_tensor,
             ..
@@ -3165,6 +3543,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
             aux.as_slice(),
             *bits,
             *group_size,
+            *aux_fp16,
             metal_tensor,
             w.i,
             w.o,
@@ -3172,7 +3551,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
     }
 
     let mut guards = Vec::with_capacity(parts.len());
-    for (_, _, _, _, metal_tensor, _, _) in &parts {
+    for (_, _, _, _, _, metal_tensor, _, _) in &parts {
         guards.push(
             metal_tensor
                 .lock()
@@ -3182,7 +3561,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
 
     let mut descs = Vec::with_capacity(parts.len());
     for ((y, part), guard) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()) {
-        let (weights, aux, bits, group_size, _, input, output) = *part;
+        let (weights, aux, bits, group_size, aux_fp16, _, input, output) = *part;
         descs.push(logan_metal::MlxAffineMatmulDesc {
             tensor: **guard as *mut logan_metal::ColiMetalTensor,
             y: &mut **y,
@@ -3190,6 +3569,7 @@ fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool
             aux,
             bits,
             group_size,
+            aux_fp16,
             i: input,
             o: output,
         });
@@ -3298,16 +3678,36 @@ fn gdn_metal_weight_view(w: &Wt) -> Option<GdnMetalWeightView<'_>> {
             biases,
             bits,
             group_size,
+            aux_fp16,
             metal_aux,
             metal_tensor,
             ..
         } => {
-            let fmt = match *bits {
-                4 => 16,
-                5 => 17,
-                6 => 18,
-                8 => 19,
-                _ => return None,
+            let fmt = if *aux_fp16 {
+                match *bits {
+                    4 => 21,
+                    5 => 22,
+                    6 => 23,
+                    8 => 24,
+                    _ => return None,
+                }
+            } else {
+                match *bits {
+                    4 => {
+                        if std::env::var("LOGAN_Q4_FMA")
+                            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                            .unwrap_or(false)
+                        {
+                            20
+                        } else {
+                            16
+                        }
+                    }
+                    5 => 17,
+                    6 => 18,
+                    8 => 19,
+                    _ => return None,
+                }
             };
             let aux = metal_aux.get_or_init(|| {
                 let mut combined = Vec::with_capacity(scales.len() + biases.len());
@@ -5998,14 +6398,43 @@ impl Model {
         ei: i32,
         speculative: bool,
     ) -> Option<std::rc::Rc<crate::colisource::SlotRef>> {
+        let key = (li as u32, ei as u32);
         // Demand hits promote/count; speculative probes deliberately do not
-        // perturb hit-rate telemetry or recency when the expert is resident.
+        // perturb authoritative hit-rate telemetry or recency.
         if speculative {
-            if let Some(v) = self.expert_store.peek((li as u32, ei as u32)) {
+            if let Some(v) = self.expert_store.peek(key) {
                 return Some(std::rc::Rc::new(v.ref_view()));
             }
-        } else if let Some(v) = self.expert_store.get((li as u32, ei as u32)) {
-            return Some(std::rc::Rc::new(v.ref_view()));
+            if let Some(v) = self
+                .route_spec_store
+                .as_ref()
+                .and_then(|store| store.peek(key))
+            {
+                return Some(std::rc::Rc::new(v.ref_view()));
+            }
+        } else {
+            if let Some(v) = self.expert_store.get(key) {
+                // If this resident slot originated from speculative MetalIO,
+                // classify whether its exact I/O command had already completed
+                // at first demand. This is a non-blocking status probe only.
+                unsafe { crate::ffi::metalio_prefetch_demanded(v.slot) };
+                return Some(std::rc::Rc::new(v.ref_view()));
+            }
+
+            // A prediction cache hit transfers ownership of the exact already-
+            // loaded MetalIO slot into authoritative residency. No reload.
+            let adopted = self
+                .route_spec_store
+                .as_mut()
+                .and_then(|store| store.take(key));
+            if let Some(se) = adopted {
+                unsafe { crate::ffi::metalio_prefetch_demanded(se.slot) };
+                let (mut evicted, v) = self.expert_store.insert(key, se);
+                if let Some(mut e) = evicted.take() {
+                    e.release();
+                }
+                return Some(std::rc::Rc::new(v.ref_view()));
+            }
         }
         let coli = self.coli.as_ref()?;
         let planned = self
@@ -6068,9 +6497,21 @@ impl Model {
             })
         })();
         let se = se?;
-        // LRU insert; the returned ref is the fresh value (no hit bump —
-        // hits measure genuine reuse only). Evicted slot released by drop.
-        let (mut evicted, v) = self.expert_store.insert((li as u32, ei as u32), se);
+        if speculative && self.route_spec_store.is_some() {
+            let store = self
+                .route_spec_store
+                .as_mut()
+                .expect("spec store checked above");
+            let (mut evicted, v) = store.insert(key, se);
+            if let Some(mut e) = evicted.take() {
+                e.release();
+            }
+            return Some(std::rc::Rc::new(v.ref_view()));
+        }
+
+        // Authoritative LRU insert; the returned ref is the fresh value (no
+        // hit bump — hits measure genuine reuse only). Evicted slot released.
+        let (mut evicted, v) = self.expert_store.insert(key, se);
         if let Some(mut e) = evicted.take() {
             e.release();
         }
@@ -6139,17 +6580,37 @@ impl Model {
         })
     }
 
+    /// Source-neutral speculative expert issue. Legacy COLI keeps its slot
+    /// cache; first-class sources such as raw MLX/safetensors stage through the
+    /// ExpertSource contract instead.
+    fn prefetch_routed_expert(&mut self, li: usize, ei: usize) -> bool {
+        if self.coli.is_some() {
+            return self
+                .cached_expert_issue(li as i32, ei as i32, true)
+                .is_some();
+        }
+        let d_model = self.cfg.hidden;
+        let d_hidden = self.cfg.moe_inter;
+        let Some(source) = self.expert_source.as_mut() else {
+            return false;
+        };
+        if !source.supports_prefetch() {
+            return false;
+        }
+        source
+            .prefetch(li as u32, &[ei as u32], d_model, d_hidden)
+            .map(|issued| issued > 0)
+            .unwrap_or(false)
+    }
+
     /// Issue the previous token's route early while the temporal block runs.
-    /// With 8/layer residency this is normally a zero-I/O probe (the whole
-    /// previous route is retained); it remains useful as an opt-in policy for
-    /// smaller/global caches and records speculative MetalIO separately.
     fn prefetch_previous_route_now(&mut self, li: usize) {
         if self.sched_mode {
             return;
         }
         let previous = self.route_prev[li].clone();
         for ei in previous {
-            let _ = self.cached_expert_issue(li as i32, ei as i32, true);
+            let _ = self.prefetch_routed_expert(li, ei);
         }
     }
 
@@ -6161,6 +6622,134 @@ impl Model {
             return;
         }
         self.prefetch_previous_route_now(li);
+    }
+
+    fn route_speculation_has_headroom(&self) -> bool {
+        self.expert_source
+            .as_ref()
+            .is_some_and(|source| source.supports_prefetch())
+            || self.route_spec_store.is_some()
+            || self
+                .expert_store
+                .per_layer_capacity()
+                .map(|capacity| capacity > self.cfg.topk)
+                .unwrap_or_else(|| {
+                    self.expert_store.capacity() > self.cfg.layers.saturating_mul(self.cfg.topk)
+                })
+    }
+
+    /// Predict likely *cold arrivals* before this token's router executes.
+    ///
+    /// Previous-route experts are normally resident already, so predicting the
+    /// whole next top-k just risks evicting useful weights. The online model
+    /// therefore predicts only experts that were absent from the previous route.
+    /// QWEN_ROUTE_PREDICT_BUDGET caps how many arrivals may be predicted per
+    /// layer/token (default 1). Prediction never changes router output or MoE
+    /// arithmetic.
+    fn prepare_route_prediction(&mut self, li: usize) {
+        if self.sched_mode || self.route_predictor.is_none() {
+            self.prefetch_previous_route(li);
+            return;
+        }
+
+        let budget = std::env::var("QWEN_ROUTE_PREDICT_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .min(self.cfg.topk);
+        let (target, predicted, confident) = self.route_predict_plan(li, budget);
+
+        if self.route_predict_prefetch && confident && self.route_speculation_has_headroom() {
+            // The speculative read is always issued for the layer that will
+            // consume it, so a horizon prediction is not wasted on the current
+            // layer's already-decided route.
+            for ei in predicted {
+                let _ = self.prefetch_routed_expert(target, ei);
+            }
+        } else if !self.route_predict_prefetch {
+            self.prefetch_previous_route(li);
+        }
+    }
+
+    /// Predict cold arrivals for this layer, optionally for a **future** layer.
+    ///
+    /// `QWEN_ROUTE_PREDICT_HORIZON=N` predicts for layer `li + N` instead of
+    /// `li`, using the target layer's own transition tables driven by the
+    /// current token's evidence. Same-layer prediction issues I/O immediately
+    /// before the demand that needs it, which is the minimum possible lead time;
+    /// a horizon of 1..4 gives the read the earlier layers' compute to complete
+    /// in. Note the residency cache is keyed by `(layer, expert)`, so a
+    /// cross-layer prediction is only useful if the target layer will actually
+    /// consume it — which is exactly what the horizon's precision measures.
+    ///
+    /// `QWEN_ROUTE_PREDICT_BUDGET_MAX=N` (with `QWEN_ROUTE_PREDICT_BUDGET=1`)
+    /// enables a **graded** budget: instead of the binary per-layer precision
+    /// gate, the number of experts read is chosen from the candidate ranking's
+    /// own shape — 1 for a single clear winner, more only when the top scores are
+    /// tightly grouped. That is the policy EXP-031 identified as missing.
+    fn route_predict_plan(
+        &mut self,
+        li: usize,
+        budget: usize,
+    ) -> (usize, Vec<usize>, bool) {
+        let use_spatial = std::env::var("QWEN_ROUTE_PREDICT_SPATIAL")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(true);
+        let spatial_previous = if use_spatial && li > 0 {
+            self.route_spatial_prev.clone()
+        } else {
+            Vec::new()
+        };
+
+        let horizon = self.route_predict_horizon;
+        let Some(target) = li.checked_add(horizon) else {
+            return (li, Vec::new(), false);
+        };
+        if target >= self.cfg.layers {
+            return (li, Vec::new(), false);
+        }
+        // At the start of layer li, the newest same-token route available is
+        // layer li-1. For target=li+H, that is exactly target-(H+1), i.e. the
+        // source distribution used to train EXP-036's direct cross-layer table.
+        // The previous-token target route remains the exclusion set for cold
+        // arrivals at the eventual demand layer.
+        let target_previous = self.route_prev.get(target).cloned().unwrap_or_default();
+        let target_spatial = spatial_previous;
+
+        let (predicted, confident) = {
+            let predictor = self
+                .route_predictor
+                .as_mut()
+                .expect("route predictor checked above");
+            // Statistics are read for the TARGET layer: at a horizon the gate
+            // must judge the layer whose arrivals are being predicted, not the
+            // layer currently executing.
+            let (correct, issued, _actual, pairs) = predictor.layer_stats_at(target);
+            let min_samples = std::env::var("QWEN_ROUTE_PREDICT_MIN_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(16);
+            let min_precision = std::env::var("QWEN_ROUTE_PREDICT_MIN_PRECISION")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.50)
+                .clamp(0.0, 1.0);
+            let confidence_gate = std::env::var("QWEN_ROUTE_PREDICT_CONFIDENCE_GATE")
+                .map(|value| value != "0" && !value.is_empty())
+                .unwrap_or(true);
+            let precision = if issued == 0 {
+                0.0
+            } else {
+                correct as f64 / issued as f64
+            };
+            let confident = !confidence_gate
+                || (pairs >= min_samples && issued > 0 && precision >= min_precision);
+            (
+                predictor.predict_arrivals(target, &target_previous, &target_spatial, budget),
+                confident,
+            )
+        };
+        (target, predicted, confident)
     }
 
     /// Phase 2 (drain): wait for a previously-issued expert's MetalIO event.
@@ -6464,13 +7053,47 @@ impl Model {
         (idx, val, wsum)
     }
 
+    /// Learn same-token adjacent-layer route correlation from a layer-major
+    /// prompt chunk without issuing speculative I/O. This lets decode enter
+    /// with a confidence estimate learned from the prompt even though prefill
+    /// itself processes all rows of one layer before moving to the next.
+    fn observe_spatial_route_batch(
+        &mut self,
+        li: usize,
+        previous_layer_routes: &mut Vec<Vec<usize>>,
+        current_layer_routes: Vec<Vec<usize>>,
+    ) {
+        if li > 0 && previous_layer_routes.len() == current_layer_routes.len() {
+            for (previous, current) in previous_layer_routes
+                .iter()
+                .zip(current_layer_routes.iter())
+            {
+                if previous.is_empty() || current.is_empty() || previous.len() != current.len() {
+                    continue;
+                }
+                let common = current
+                    .iter()
+                    .filter(|&&expert| previous.contains(&expert))
+                    .count() as u64;
+                self.route_spatial_common[li] += common;
+                self.route_spatial_total[li] += current.len() as u64;
+                self.route_spatial_pairs[li] += 1;
+                self.route_spatial_top1_total[li] += 1;
+                if current.contains(&previous[0]) {
+                    self.route_spatial_top1_hits[li] += 1;
+                }
+            }
+        }
+        *previous_layer_routes = current_layer_routes;
+    }
+
     fn route_topk(&mut self, layer: &Layer, x: &[f32]) -> (Vec<usize>, Vec<f32>, f32) {
         self.route_topk_n(layer, x, self.cfg.experts, self.cfg.topk)
     }
 
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
         let (idx, val, wsum) = self.route_topk(layer, x);
-        self.moe_token_routed(layer, li, x, out, &idx, &val, wsum);
+        self.moe_token_routed(layer, li, x, out, &idx, &val, wsum, true);
     }
 
     fn moe_token_routed(
@@ -6482,15 +7105,46 @@ impl Model {
         idx: &[usize],
         val: &[f32],
         wsum: f32,
+        allow_spatial_prefetch: bool,
     ) {
         let c = self.cfg.clone();
         let k = c.topk;
         let d = c.hidden;
 
         let current_route = &idx[..k.min(idx.len())];
+        if env_flag("QWEN_ROUTE_TRACE") {
+            eprintln!("logan route-trace: layer={li} route={current_route:?}");
+        }
+        route_scout_trace_record(c.layers, c.experts, k, li, idx, val, wsum);
+        route_scout_hidden_trace_record(c.layers, li, x);
+        if !self.sched_mode {
+            // The first routed layer marks a new token. Keep the authoritative
+            // same-token route history only long enough to train direct
+            // cross-layer RouteScout transitions for this token.
+            if li == 0 {
+                for route in &mut self.route_token_routes {
+                    route.clear();
+                }
+            }
+            let direct_source = li
+                .checked_sub(self.route_predict_horizon.saturating_add(1))
+                .and_then(|source| self.route_token_routes.get(source))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(predictor) = self.route_predictor.as_mut() {
+                let previous = self.route_prev[li].clone();
+                predictor.observe(li, &previous, &direct_source, current_route);
+            }
+            if let Some(route) = self.route_token_routes.get_mut(li) {
+                route.clear();
+                route.extend_from_slice(current_route);
+            }
+        }
         if std::env::var("QWEN_ROUTE_OVERLAP")
             .map(|v| v != "0")
             .unwrap_or(false)
+            || (allow_spatial_prefetch && env_flag("QWEN_ROUTE_SPATIAL_PREFETCH"))
+            || (allow_spatial_prefetch && self.route_predictor.is_some())
         {
             let previous = &self.route_prev[li];
             if previous.len() == current_route.len() && !previous.is_empty() {
@@ -6502,9 +7156,80 @@ impl Model {
                 self.route_overlap_total[li] += current_route.len() as u64;
                 self.route_overlap_pairs[li] += 1;
             }
+
+            if allow_spatial_prefetch {
+                if li == 0 {
+                    self.route_spatial_prev.clear();
+                } else if self.route_spatial_prev.len() == current_route.len()
+                    && !self.route_spatial_prev.is_empty()
+                {
+                    let common = current_route
+                        .iter()
+                        .filter(|&&e| self.route_spatial_prev.contains(&e))
+                        .count() as u64;
+                    self.route_spatial_common[li] += common;
+                    self.route_spatial_total[li] += current_route.len() as u64;
+                    self.route_spatial_pairs[li] += 1;
+                    self.route_spatial_top1_total[li] += 1;
+                    if self
+                        .route_spatial_prev
+                        .first()
+                        .is_some_and(|expert| current_route.contains(expert))
+                    {
+                        self.route_spatial_top1_hits[li] += 1;
+                    }
+                }
+                self.route_spatial_prev.clear();
+                self.route_spatial_prev.extend_from_slice(current_route);
+            }
         }
         self.route_prev[li].clear();
         self.route_prev[li].extend_from_slice(current_route);
+
+        // Training-free spatial prefetch experiment: expert IDs selected in
+        // adjacent MoE layers are often correlated. Stage the strongest IDs
+        // from this layer into the next layer while this layer still computes.
+        // This affects only transfer timing; the next layer's native router is
+        // still authoritative.
+        if allow_spatial_prefetch
+            && !self.sched_mode
+            && li + 1 < self.cfg.layers
+            && env_flag("QWEN_ROUTE_SPATIAL_PREFETCH")
+        {
+            let target_layer = li + 1;
+            let min_samples = std::env::var("QWEN_ROUTE_SPATIAL_MIN_SAMPLES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(16);
+            let min_confidence = std::env::var("QWEN_ROUTE_SPATIAL_MIN_CONFIDENCE")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.85)
+                .clamp(0.0, 1.0);
+            let confidence_gate = std::env::var("QWEN_ROUTE_SPATIAL_CONFIDENCE_GATE")
+                .map(|value| value != "0" && !value.is_empty())
+                .unwrap_or(true);
+            let samples = self.route_spatial_top1_total[target_layer];
+            let hits = self.route_spatial_top1_hits[target_layer];
+            let confidence = if samples == 0 {
+                0.0
+            } else {
+                hits as f64 / samples as f64
+            };
+            let has_spare_slot = self.route_speculation_has_headroom();
+            let confident =
+                !confidence_gate || (samples >= min_samples && confidence >= min_confidence);
+            if has_spare_slot && confident {
+                let budget = std::env::var("QWEN_ROUTE_SPATIAL_PREFETCH_BUDGET")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .min(current_route.len());
+                for &expert in current_route.iter().take(budget) {
+                    let _ = self.prefetch_routed_expert(target_layer, expert);
+                }
+            }
+        }
 
         // Scheduler-driven mode (issue #53): the model never issues expert
         // loads. If any routed expert of this layer is not resident in the
@@ -6825,6 +7550,64 @@ impl Model {
         let mut _fill_t = logan_core::telemetry::Span::begin("fill");
         for i in 0..k {
             let w = val[i] / wsum;
+
+            // Native GGUF demand cache. Keep one route-sized LRU per layer by
+            // default (~0.8 GiB for this 512-expert/top-10 Qwen3.8 checkpoint)
+            // and retain each expert in its original mixed GGML quantization.
+            // Hits borrow the cached matrices directly, avoiding a multi-MiB
+            // Vec clone on every token.
+            if self.gguf.is_some() && self.gguf_expert_store.is_some() {
+                let key = (li as u32, idx[i] as u32);
+                let resident = self
+                    .gguf_expert_store
+                    .as_ref()
+                    .expect("GGUF store checked above")
+                    .peek(key)
+                    .is_some();
+                if resident {
+                    let _ = self
+                        .gguf_expert_store
+                        .as_mut()
+                        .expect("GGUF store checked above")
+                        .get(key);
+                } else {
+                    let mats = crate::ggufload::load_expert(
+                        self.gguf.as_ref().expect("GGUF source checked above"),
+                        li,
+                        idx[i],
+                        &c,
+                    )
+                    .unwrap_or_else(|e| panic!("GGUF expert ({li},{}) fetch failed: {e}", idx[i]));
+                    let (evicted, _) = self
+                        .gguf_expert_store
+                        .as_mut()
+                        .expect("GGUF store checked above")
+                        .insert(key, GgufCachedExpert { mats });
+                    drop(evicted);
+                }
+
+                let cached = self
+                    .gguf_expert_store
+                    .as_ref()
+                    .expect("GGUF store checked above")
+                    .peek(key)
+                    .expect("GGUF expert must be resident after demand load");
+                let mut gate = vec![0.0; c.moe_inter];
+                let mut up = vec![0.0; c.moe_inter];
+                matmul(&mut gate, x, &cached.mats[0]);
+                matmul(&mut up, x, &cached.mats[1]);
+                let mut h = vec![0.0; c.moe_inter];
+                for ii in 0..c.moe_inter {
+                    h[ii] = silu(gate[ii]) * up[ii];
+                }
+                let mut y = vec![0.0; d];
+                matmul(&mut y, &h, &cached.mats[2]);
+                for dd in 0..d {
+                    acc[dd] += y[dd] * w;
+                }
+                continue;
+            }
+
             // .coli mode: slot-resident expert. The Metal fused path ran
             // above (returned early on success); this loop is the CPU
             // fallback (decodes the slot's shared-storage tiles lazily) or
@@ -6883,6 +7666,14 @@ impl Model {
                         ]
                     }
                 }
+            } else if let Some(gguf) = &self.gguf {
+                // Native GGUF path: routed experts remain file-backed and are
+                // sliced on demand in their original mixed GGML quantization.
+                // This is the correctness fallback; residency/prefetch for
+                // GGUF experts is qualified separately from the COLI MetalIO
+                // slot cache.
+                crate::ggufload::load_expert(gguf, li, idx[i], &c)
+                    .unwrap_or_else(|e| panic!("GGUF expert ({li},{}) fetch failed: {e}", idx[i]))
             } else {
                 self.experts[li][idx[i]].clone()
             };
@@ -6990,6 +7781,17 @@ impl Model {
                 for d in 0..hd_per {
                     emb[h * hd_per + d] = colisource::ColiSource::e4m3_decode(row_bytes[d]) * scale;
                 }
+            } else if let Some(gguf) = &self.gguf {
+                // GGUF split models keep the giant PLE table in its owning
+                // shard (Qwen3.8 puts it alone in shard 2). Read/dequantize
+                // exactly one logical row; never materialize the table.
+                let row = gguf
+                    .read_row_f32("per_layer_token_embd.weight", r)
+                    .unwrap_or_else(|e| panic!("GGUF PLE ngram row {r} fetch failed: {e}"));
+                if row.len() != hd_per {
+                    panic!("GGUF PLE row width {} != expected {hd_per}", row.len());
+                }
+                emb[h * hd_per..(h + 1) * hd_per].copy_from_slice(&row);
             } else if let Some((st, shards, width, scale)) = &self.ple_shards {
                 // Sharded SSD table (the real checkpoint): map the global row to
                 // (shard, row-within-shard) and pread exactly one row.
@@ -7339,7 +8141,7 @@ impl Model {
         );
         let (idx, val, wsum) = self.route_topk_n(&layer, &moe_in, mtp.experts, mtp.topk);
         let mut moe = vec![0.0_f32; d];
-        self.moe_token_routed(&layer, li, &moe_in, &mut moe, &idx, &val, wsum);
+        self.moe_token_routed(&layer, li, &moe_in, &mut moe, &idx, &val, wsum, true);
         for g in 0..hc {
             for dd in 0..d {
                 res_hc[g * d + dd] += inject[g] * moe[dd];
@@ -7556,6 +8358,9 @@ impl Model {
             if self.mtp.is_some() {
                 self.last_hidden_nextn.clear();
             }
+            let learn_spatial_routes =
+                env_flag("QWEN_ROUTE_SPATIAL_PREFETCH") || env_flag("QWEN_ROUTE_OVERLAP");
+            let mut spatial_prev_routes: Vec<Vec<usize>> = Vec::new();
 
             for l in 0..c.layers {
                 let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
@@ -7619,6 +8424,13 @@ impl Model {
                 let mut routes = Vec::with_capacity(rows);
                 for x in &moe_inputs {
                     routes.push(self.route_topk(&layer, x));
+                }
+                if learn_spatial_routes {
+                    let current_routes = routes
+                        .iter()
+                        .map(|(idx, _, _)| idx[..c.topk.min(idx.len())].to_vec())
+                        .collect();
+                    self.observe_spatial_route_batch(l, &mut spatial_prev_routes, current_routes);
                 }
 
                 let delegated = self.expert_source.is_some() || self.pool.is_some();
@@ -7717,6 +8529,9 @@ impl Model {
         let ropes: Vec<Vec<(f32, f32)>> = (0..tokens.len())
             .map(|row| rope_angles(start_pos + row, &c))
             .collect();
+        let learn_spatial_routes =
+            env_flag("QWEN_ROUTE_SPATIAL_PREFETCH") || env_flag("QWEN_ROUTE_OVERLAP");
+        let mut spatial_prev_routes: Vec<Vec<usize>> = Vec::new();
 
         for l in 0..c.layers {
             // Keep one layer borrowed for the entire chunk. Each row advances
@@ -7867,6 +8682,13 @@ impl Model {
                     }
                 }
                 routes.push(route);
+            }
+            if learn_spatial_routes {
+                let current_routes = routes
+                    .iter()
+                    .map(|(idx, _, _)| idx[..c.topk.min(idx.len())].to_vec())
+                    .collect();
+                self.observe_spatial_route_batch(l, &mut spatial_prev_routes, current_routes);
             }
 
             let batch_enabled = std::env::var("QWEN_PREFILL_MOE_BATCH")
@@ -8076,6 +8898,7 @@ impl Model {
                             idx,
                             val,
                             *wsum,
+                            false,
                         );
                         for g in 0..c.hc_count {
                             for dd in 0..c.hidden {
@@ -8538,6 +9361,7 @@ impl Model {
                             idx,
                             val,
                             *wsum,
+                            false,
                         );
                         for g in 0..c.hc_count {
                             for dd in 0..c.hidden {
@@ -8587,9 +9411,10 @@ impl Model {
         // pull the layer out, run both sub-phases, put it back.
         let mut layer = std::mem::replace(&mut self.layers[l], Layer::empty());
 
-        // Both residual layouts can overlap the previous route with temporal
-        // work; the helper retains its opt-in and scheduler exclusion gates.
-        self.prefetch_previous_route(l);
+        // Both residual layouts can overlap likely expert I/O with temporal
+        // work. The predictor is correctness-neutral: it only changes when a
+        // load is issued, never which experts the router ultimately selects.
+        self.prepare_route_prediction(l);
 
         // Qwen3.x classic residual block. The same temporal/MoE kernels and
         // expert residency machinery are shared with the hyper-connection
@@ -8972,14 +9797,108 @@ impl Model {
         Ok(())
     }
 
+    /// Snapshot every cumulative counter in one atomic step, for
+    /// [`Self::begin_decode_measurement`].
+    fn capture_decode_baseline(&self) -> DecodeBaseline {
+        let (expert_calls, expert_load_ns, expert_compute_ns) = mlx_expert_source_timings();
+        let (affine_metal, affine_fallback) = mlx_affine_dispatch_counts();
+        DecodeBaseline {
+            spans: self.spans.clone(),
+            expert_calls,
+            expert_load_ns,
+            expert_compute_ns,
+            affine_metal,
+            affine_fallback,
+            expert_load_parts: mlx_expert_load_decomposition(),
+            mio: logan_metal::mio_stats(),
+            metal: logan_metal::metal_profile(),
+            predictor: self
+                .route_predictor
+                .as_ref()
+                .map(route_predictor::RoutePredictor::layer_stats),
+            cache: self.expert_cache_counts(),
+        }
+    }
+
+    /// (hits, misses) of the expert store this model actually serves from.
+    /// The GGUF path uses its own store; every other layout uses the primary
+    /// one. Reading the wrong store would silently report a permanent 0.
+    fn expert_cache_counts(&self) -> (u64, u64) {
+        self.gguf_expert_store
+            .as_ref()
+            .map(|store| (store.hits, store.misses))
+            .unwrap_or((self.expert_store.hits, self.expert_store.misses))
+    }
+
+    /// Mark the start of the measured decode window.
+    ///
+    /// Call this after the LAST prompt forward has been evaluated — i.e.
+    /// immediately after `forward_token(last_prompt, ..)` and immediately
+    /// before the loop that feeds generated tokens. `profile_summary` then
+    /// reports every counter as a delta from this point, so per-token figures
+    /// divide decode-only work by the decode forward count.
+    ///
+    /// Prefill and decode have different costs, so a baseline cannot be
+    /// reconstructed after the fact by scaling lifetime totals; the snapshot
+    /// must be taken at the boundary.
+    ///
+    /// Self-gating: with `LOGAN_PROFILE` off there is no summary to normalize,
+    /// so this returns immediately and decode pays nothing.
+    pub fn begin_decode_measurement(&mut self) {
+        if !logan_core::telemetry::enabled() {
+            return;
+        }
+        self.decode_baseline = Some(self.capture_decode_baseline());
+    }
+
+    /// Re-arm the decode window at the current instant.
+    ///
+    /// Used by callers that emit per-step diagnostics inside the decode loop
+    /// and then report a summary at the end: without this, the summary would
+    /// either double-count the already-reported steps or lose them.
+    pub fn rebase_decode_measurement(&mut self) {
+        if !logan_core::telemetry::enabled() {
+            return;
+        }
+        self.decode_baseline = Some(self.capture_decode_baseline());
+    }
+
     /// Emit the LOGAN_PROFILE=1 per-request summary (spans + Metal counters
     /// + LRU hit/miss). No-op when profiling is disabled.
+    ///
+    /// `tokens` is the measured decode forward count. All cumulative counters
+    /// are reported as deltas from the decode-boundary baseline when one was
+    /// taken (`begin_decode_measurement`); otherwise their lifetime totals are
+    /// reported and the `lifetime` marker in the line says so.
     pub fn profile_summary(&self, tokens: usize, total_ms: f64) {
         if !logan_core::telemetry::enabled() {
             return;
         }
-        let (e, s, w, k, fc, fe) = logan_metal::metal_profile();
-        let mio = logan_metal::mio_stats();
+        let lifetime_metal = logan_metal::metal_profile();
+        let lifetime_mio = logan_metal::mio_stats();
+        // Decode-window deltas. Spans/MLX counters/MetalIO totals/Metal direct
+        // profile accumulate over prefill AND decode; only the decode window
+        // belongs in the per-token figures. Without a baseline the totals are
+        // reported as-is and the line is marked `lifetime` so the number is
+        // never mistaken for a decode-only figure.
+        let (spans_delta, mio, metal_counters, baseline) = match self.decode_baseline.as_ref() {
+            Some(b) => (
+                self.spans.delta_from(&b.spans),
+                subtract_mio(&lifetime_mio, &b.mio),
+                (
+                    lifetime_metal.0.saturating_sub(b.metal.0),
+                    lifetime_metal.1.saturating_sub(b.metal.1),
+                    lifetime_metal.2.saturating_sub(b.metal.2),
+                    lifetime_metal.3.saturating_sub(b.metal.3),
+                    lifetime_metal.4.saturating_sub(b.metal.4),
+                    lifetime_metal.5.saturating_sub(b.metal.5),
+                ),
+                Some(b),
+            ),
+            None => (self.spans.clone(), lifetime_mio, lifetime_metal, None),
+        };
+        let window = if baseline.is_some() { "decode" } else { "lifetime" };
+        let (e, s, w, k, fc, fe) = metal_counters;
         let metal = logan_core::telemetry::MetalCounters {
             encode_ns: e,
             submit_ns: s,
@@ -8992,14 +9911,45 @@ impl Model {
             mio_waits: mio.waits,
             mio_fails: mio.fails,
         };
-        let mut spans = self.spans.clone();
+        let mut spans = spans_delta;
         spans.total_ms = total_ms;
+        let (expert_hits, expert_misses) = {
+            let now = self.expert_cache_counts();
+            match baseline {
+                Some(b) => (
+                    now.0.saturating_sub(b.cache.0),
+                    now.1.saturating_sub(b.cache.1),
+                ),
+                None => now,
+            }
+        };
         logan_core::telemetry::emit_request_summary(
             tokens,
             &spans,
             &metal,
-            self.expert_store.hits,
-            self.expert_store.misses,
+            expert_hits,
+            expert_misses,
+        );
+        eprintln!("logan profile-window: {window} forwards={tokens}");
+        eprintln!(
+            "logan mio-prefetch: loads={} used={} wasted={} ready_at_demand={} late_at_demand={} outstanding={} peak={} avg_latency_ms={:.3} wait_total_ms={:.1} p50_ms={:.3} p90_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+            mio.prefetch_loads,
+            mio.prefetch_used,
+            mio.prefetch_wasted,
+            mio.prefetch_ready_at_demand,
+            mio.prefetch_late_at_demand,
+            mio.outstanding,
+            mio.peak_outstanding,
+            if mio.latency_samples == 0 {
+                0.0
+            } else {
+                mio.total_latency_s * 1e3 / mio.latency_samples as f64
+            },
+            mio.total_latency_s * 1e3,
+            mio_percentile_ms(&mio.lat_hist, mio.latency_samples, 0.50),
+            mio_percentile_ms(&mio.lat_hist, mio.latency_samples, 0.90),
+            mio_percentile_ms(&mio.lat_hist, mio.latency_samples, 0.99),
+            mio_max_ms(&mio.lat_hist),
         );
         if std::env::var("QWEN_ROUTE_OVERLAP")
             .map(|v| v != "0")
@@ -9031,7 +9981,314 @@ impl Model {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!("logan route-overlap layers: {detail}");
+
+            let spatial_common: u64 = self.route_spatial_common.iter().sum();
+            let spatial_total: u64 = self.route_spatial_total.iter().sum();
+            let spatial_pairs: u64 = self.route_spatial_pairs.iter().sum();
+            let spatial_top1_hits: u64 = self.route_spatial_top1_hits.iter().sum();
+            let spatial_top1_total: u64 = self.route_spatial_top1_total.iter().sum();
+            eprintln!(
+                "logan route-spatial: common={spatial_common} total={spatial_total} pairs={spatial_pairs} rate={:.3} top1_hits={spatial_top1_hits} top1_total={spatial_top1_total} top1_rate={:.3}",
+                if spatial_total == 0 {
+                    0.0
+                } else {
+                    spatial_common as f64 / spatial_total as f64
+                },
+                if spatial_top1_total == 0 {
+                    0.0
+                } else {
+                    spatial_top1_hits as f64 / spatial_top1_total as f64
+                }
+            );
+            let spatial_detail = self
+                .route_spatial_common
+                .iter()
+                .zip(&self.route_spatial_total)
+                .zip(&self.route_spatial_pairs)
+                .enumerate()
+                .filter(|(li, _)| *li != 0)
+                .map(|(li, ((&c, &t), &p))| {
+                    format!(
+                        "{li}:{:.3}/{p}",
+                        if t == 0 { 0.0 } else { c as f64 / t as f64 }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("logan route-spatial layers: {spatial_detail}");
         }
+        let (affine_metal, affine_fallback) = mlx_affine_dispatch_counts();
+        // The MLX dispatch counters are process cumulative; a decode window
+        // reports its own share so `calls_per_token` is the structural
+        // forwards * layers * topk rather than a prefill-inflated number.
+        let (affine_metal, affine_fallback) = match baseline {
+            Some(b) => (
+                affine_metal.saturating_sub(b.affine_metal),
+                affine_fallback.saturating_sub(b.affine_fallback),
+            ),
+            None => (affine_metal, affine_fallback),
+        };
+        if affine_metal + affine_fallback > 0 {
+            eprintln!(
+                "logan mlx-affine: metal={affine_metal} fallback={affine_fallback} metal_share={:.3}",
+                affine_metal as f64 / (affine_metal + affine_fallback) as f64
+            );
+        }
+        let (expert_calls_total, expert_load_ns_total, expert_compute_ns_total) =
+            mlx_expert_source_timings();
+        let (expert_calls, expert_load_ns, expert_compute_ns) = match baseline {
+            Some(b) => (
+                expert_calls_total.saturating_sub(b.expert_calls),
+                expert_load_ns_total.saturating_sub(b.expert_load_ns),
+                expert_compute_ns_total.saturating_sub(b.expert_compute_ns),
+            ),
+            None => (
+                expert_calls_total,
+                expert_load_ns_total,
+                expert_compute_ns_total,
+            ),
+        };
+        if expert_calls > 0 {
+            let load_ms = expert_load_ns as f64 / 1e6 / tokens.max(1) as f64;
+            let compute_ms = expert_compute_ns as f64 / 1e6 / tokens.max(1) as f64;
+            let (plan_ns, submit_ns, wait_ns, mat_ns, plan_hits, plan_misses) =
+                mlx_expert_load_decomposition();
+            let per_token = |ns: u64| ns as f64 / 1e6 / tokens.max(1) as f64;
+            let (plan_ms, submit_ms, wait_ms, mat_ms) = match baseline {
+                Some(b) => (
+                    per_token(plan_ns.saturating_sub(b.expert_load_parts.0)),
+                    per_token(submit_ns.saturating_sub(b.expert_load_parts.1)),
+                    per_token(wait_ns.saturating_sub(b.expert_load_parts.2)),
+                    per_token(mat_ns.saturating_sub(b.expert_load_parts.3)),
+                ),
+                None => (
+                    per_token(plan_ns),
+                    per_token(submit_ns),
+                    per_token(wait_ns),
+                    per_token(mat_ns),
+                ),
+            };
+            let (plan_hits, plan_misses) = match baseline {
+                Some(b) => (
+                    plan_hits.saturating_sub(b.expert_load_parts.4),
+                    plan_misses.saturating_sub(b.expert_load_parts.5),
+                ),
+                None => (plan_hits, plan_misses),
+            };
+            eprintln!(
+                "logan mlx-expert: calls={expert_calls} calls_per_token={:.1} \
+                 load_ms_per_token={load_ms:.1} compute_ms_per_token={compute_ms:.1} \
+                 load_share={:.3}",
+                expert_calls as f64 / tokens.max(1) as f64,
+                load_ms / (load_ms + compute_ms).max(1e-9)
+            );
+            // The load term decomposed into disjoint parts. `wait_ms` is the
+            // MetalIO completion wait (the only storage-latency term);
+            // `mat_ms` is the copy into owned `Wt` storage; `plan_ms` is I/O
+            // plan construction; `submit_ms` is slot alloc + enqueue.
+            eprintln!(
+                "logan mlx-expert-load: plan_ms_per_token={plan_ms:.1} \
+                 submit_ms_per_token={submit_ms:.1} wait_ms_per_token={wait_ms:.1} \
+                 materialize_ms_per_token={mat_ms:.1} plan_hits={plan_hits} \
+                 plan_misses={plan_misses}"
+            );
+        }
+        if let Some(predictor) = self.route_predictor.as_ref() {
+            // Predictor counters are process cumulative. Report the decode
+            // window's share when a baseline exists so precision/recall describe
+            // the measured forwards; the lifetime totals stay available in the
+            // `route-arrival-total` line below, clearly labelled.
+            let per_layer = predictor.layer_stats();
+            let (common, predicted, actual, pairs) = match baseline {
+                Some(b) => {
+                    let mut acc = (0u64, 0u64, 0u64, 0u64);
+                    for (li, row) in per_layer.iter().enumerate() {
+                        let base = b.predictor.as_ref().and_then(|rows| rows.get(li));
+                        let (bc, bp, ba, bpr) = base.copied().unwrap_or((0, 0, 0, 0));
+                        acc.0 = acc.0.saturating_add(row.0.saturating_sub(bc));
+                        acc.1 = acc.1.saturating_add(row.1.saturating_sub(bp));
+                        acc.2 = acc.2.saturating_add(row.2.saturating_sub(ba));
+                        acc.3 = acc.3.saturating_add(row.3.saturating_sub(bpr));
+                    }
+                    acc
+                }
+                None => predictor.stats(),
+            };
+            eprintln!(
+                "logan route-arrival: correct={common} predicted={predicted} actual={actual} \
+                 pairs={pairs} precision={:.3} recall={:.3} prefetch={} transition_bytes={}",
+                if predicted == 0 {
+                    0.0
+                } else {
+                    common as f64 / predicted as f64
+                },
+                if actual == 0 {
+                    0.0
+                } else {
+                    common as f64 / actual as f64
+                },
+                self.route_predict_prefetch,
+                predictor.transition_bytes()
+            );
+            if let Some(b) = baseline {
+                let (_, lifetime_predicted, _, lifetime_pairs) = predictor.stats();
+                let base_predicted = b
+                    .predictor
+                    .as_ref()
+                    .map(|rows| rows.iter().map(|row| row.1).sum::<u64>())
+                    .unwrap_or(0);
+                let base_pairs = b
+                    .predictor
+                    .as_ref()
+                    .map(|rows| rows.iter().map(|row| row.3).sum::<u64>())
+                    .unwrap_or(0);
+                eprintln!(
+                    "logan route-arrival-lifetime: predicted={lifetime_predicted} pairs={lifetime_pairs} \
+                     prefill_predicted={base_predicted} prefill_pairs={base_pairs}"
+                );
+            }
+            let detail = per_layer
+                .into_iter()
+                .enumerate()
+                .map(|(li, (c, predicted, actual, pairs))| {
+                    format!(
+                        "{li}:p{:.3}/r{:.3}/{pairs}",
+                        if predicted == 0 {
+                            0.0
+                        } else {
+                            c as f64 / predicted as f64
+                        },
+                        if actual == 0 {
+                            0.0
+                        } else {
+                            c as f64 / actual as f64
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("logan route-arrival layers: {detail}");
+        }
+    }
+}
+
+/// Choose how many of a ranked candidate list to actually read.
+///
+/// This is the unit-tested, default-off replacement for the binary
+/// confidence gate. It is NOT wired into `route_predict_plan`: EXP-031 concluded
+/// the prefetch branch it would serve, so committing it to the runtime would add
+/// unexercised branching to the decode path for no benefit. It is retained
+/// because the *policy question* it answers (how to size a budget from score
+/// shape rather than a layer-lifetime ratio) is the one a future target with a
+/// real miss penalty will need, and because the semantics are subtle enough to
+/// be worth pinning in tests.
+///
+/// `max_budget` is a hard ceiling on how many experts may be read. A candidate
+/// is read while it stays within `GRADE_TOLERANCE` of the best score, so a single
+/// clear winner is read alone and a tightly grouped top set is read together.
+/// Scores are conditional probabilities normalised per source expert, so a
+/// relative tolerance is the correct scale; an absolute threshold would behave
+/// differently on layers whose transition tables are simply better estimated.
+fn graded_selection(ranked: &[(usize, f32)], max_budget: usize) -> Vec<usize> {
+    const GRADE_TOLERANCE: f32 = 0.75;
+    let Some(&(_, best)) = ranked.first() else {
+        return Vec::new();
+    };
+    if best <= 0.0 {
+        return Vec::new();
+    }
+    let floor = best * GRADE_TOLERANCE;
+    let mut out: Vec<usize> = Vec::with_capacity(max_budget.min(ranked.len()));
+    for &(expert, score) in ranked {
+        if out.len() >= max_budget {
+            break;
+        }
+        // The leader is always taken; later candidates must stay near it.
+        if out.is_empty() || score >= floor {
+            out.push(expert);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Percentile (0..1) of a log2-bucketed microsecond latency histogram, in ms.
+///
+/// `hist_add` computes `b = floor(log2(us))`, so bucket `b` covers
+/// `[2^b, 2^(b+1))` us. The value reported is therefore the bucket's **upper**
+/// edge `2^(b+1)`, not `2^b`: reporting the lower edge would understate a stall
+/// by up to 2x, and "expected stall avoided" is a promotion metric.
+/// With no samples the result is 0 rather than NaN so callers can print it
+/// unconditionally.
+fn mio_percentile_ms(hist: &[u64; 32], samples: u64, quantile: f64) -> f64 {
+    if samples == 0 {
+        return 0.0;
+    }
+    let target = ((samples as f64 * quantile).ceil() as u64).max(1);
+    let mut seen = 0u64;
+    for (bucket, &count) in hist.iter().enumerate() {
+        seen = seen.saturating_add(count);
+        if seen >= target {
+            return bucket_upper_us(bucket) as f64 / 1e3;
+        }
+    }
+    // Every sample landed in the last bucket, or the histogram was truncated.
+    mio_max_ms(hist)
+}
+
+/// Largest populated latency bucket's **upper** edge, in ms.
+fn mio_max_ms(hist: &[u64; 32]) -> f64 {
+    for (bucket, &count) in hist.iter().enumerate().rev() {
+        if count > 0 {
+            return bucket_upper_us(bucket) as f64 / 1e3;
+        }
+    }
+    0.0
+}
+
+/// Upper edge of a `floor(log2(us))` bucket, in microseconds.
+fn bucket_upper_us(bucket: usize) -> u64 {
+    // Bucket 0 holds us == 0..1, so `hist_add`'s shift loop terminates at b = 0
+    // only for us <= 1. Every other bucket b spans [2^b, 2^(b+1)), and the last
+    // bucket is saturated by the `b < 31` clamp, so saturate rather than wrap.
+    1u64.checked_shl(bucket as u32 + 1).unwrap_or(u64::MAX)
+}
+
+/// Component-wise difference of two MetalIO counter snapshots (`self` minus
+/// `before`), used to report a decode-window share of process-cumulative
+/// streaming counters. `outstanding`/`peak_outstanding` are gauges: the
+/// current depth is carried through and the peak is the window's own peak
+/// when `self` was itself reset-bounded, otherwise the lifetime peak.
+fn subtract_mio(
+    now: &logan_metal::ColiMetalioStats,
+    before: &logan_metal::ColiMetalioStats,
+) -> logan_metal::ColiMetalioStats {
+    logan_metal::ColiMetalioStats {
+        loads: now.loads.saturating_sub(before.loads),
+        bytes: now.bytes.saturating_sub(before.bytes),
+        waits: now.waits.saturating_sub(before.waits),
+        fails: now.fails.saturating_sub(before.fails),
+        prefetch_loads: now.prefetch_loads.saturating_sub(before.prefetch_loads),
+        prefetch_used: now.prefetch_used.saturating_sub(before.prefetch_used),
+        prefetch_wasted: now.prefetch_wasted.saturating_sub(before.prefetch_wasted),
+        prefetch_ready_at_demand: now
+            .prefetch_ready_at_demand
+            .saturating_sub(before.prefetch_ready_at_demand),
+        prefetch_late_at_demand: now
+            .prefetch_late_at_demand
+            .saturating_sub(before.prefetch_late_at_demand),
+        outstanding: now.outstanding,
+        peak_outstanding: now.peak_outstanding.max(before.peak_outstanding),
+        latency_samples: now.latency_samples.saturating_sub(before.latency_samples),
+        total_latency_s: now.total_latency_s - before.total_latency_s,
+        lat_hist: {
+            let mut h = [0u64; 32];
+            for i in 0..32 {
+                h[i] = now.lat_hist[i].saturating_sub(before.lat_hist[i]);
+            }
+            h
+        },
     }
 }
 
@@ -9046,6 +10303,26 @@ impl Model {
 /// the GDN GPU work itself is unchanged. Keep more headroom for dense/GDN GPU
 /// resources on that tier; larger or unknown machines retain the established
 /// 256-slot default until they have their own measured residency curve.
+pub(crate) fn make_route_spec_store(
+) -> Option<logan_core::expert::ExpertStore<crate::colisource::SlotExpert>> {
+    let cap = std::env::var("QWEN_ROUTE_SPEC_CACHE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    (cap > 0).then(|| logan_core::expert::ExpertStore::new(cap))
+}
+
+pub(crate) fn make_gguf_expert_store(
+    layers: usize,
+    topk: usize,
+) -> Option<logan_core::expert::ExpertStore<GgufCachedExpert>> {
+    let per_layer = std::env::var("QWEN_GGUF_CACHE_PER_LAYER")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(topk.max(1));
+    (per_layer > 0).then(|| logan_core::expert::ExpertStore::new_layered(layers, per_layer))
+}
+
 fn make_expert_store(
     layers: usize,
     topk: usize,
@@ -9187,10 +10464,11 @@ fn load_mlx_quantized_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<
     let weights = st.payload(name, &wshape, 4)?;
 
     match sdtype.as_str() {
-        "BF16" => {
+        "BF16" | "F16" => {
+            let aux_fp16 = sdtype == "F16";
             if sshape.len() != 2 || sshape[0] != o as u64 || sshape[1] == 0 {
                 return Err(format!(
-                    "{scale_name}: expected [rows, groups] BF16 scales for {o} rows, got {sshape:?}"
+                    "{scale_name}: expected [rows, groups] BF16/F16 scales for {o} rows, got {sdtype}/{sshape:?}"
                 ));
             }
             let groups = usize::try_from(sshape[1])
@@ -9207,9 +10485,9 @@ fn load_mlx_quantized_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<
                 .get(&bias_name)
                 .cloned()
                 .ok_or_else(|| format!("missing affine quantization sidecar {bias_name}"))?;
-            if bdtype != "BF16" || bshape != sshape {
+            if bdtype != sdtype || bshape != sshape {
                 return Err(format!(
-                    "{bias_name}: expected BF16 shape {sshape:?}, got {bdtype}/{bshape:?}"
+                    "{bias_name}: expected {sdtype} shape {sshape:?}, got {bdtype}/{bshape:?}"
                 ));
             }
             let scales = st.payload(&scale_name, &sshape, 2)?;
@@ -9222,6 +10500,7 @@ fn load_mlx_quantized_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<
                     biases,
                     bits,
                     group_size,
+                    aux_fp16,
                     metal_aux: std::sync::OnceLock::new(),
                     metal_tensor: std::sync::Mutex::new(0),
                 cuda_resident: std::sync::Mutex::new(None),
@@ -9255,7 +10534,7 @@ fn load_mlx_quantized_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<
             })
         }
         other => Err(format!(
-            "{scale_name}: unsupported MLX quantization scale dtype {other}; expected BF16 affine or U8 MXFP4"
+            "{scale_name}: unsupported MLX quantization scale dtype {other}; expected BF16/F16 affine or U8 MXFP4"
         )),
     }
 }
@@ -9332,7 +10611,8 @@ fn load_mlx_quantized_expert_wt(
     let weights = st.payload_range(name, weight_offset, weight_slice)?;
 
     match sdtype.as_str() {
-        "BF16" => {
+        "BF16" | "F16" => {
+            let aux_fp16 = sdtype == "F16";
             let param_slice = o
                 .checked_mul(groups)
                 .and_then(|n| n.checked_mul(2))
@@ -9346,9 +10626,9 @@ fn load_mlx_quantized_expert_wt(
                 .get(&bias_name)
                 .cloned()
                 .ok_or_else(|| format!("missing affine expert sidecar {bias_name}"))?;
-            if bdtype != "BF16" || bshape != sshape {
+            if bdtype != sdtype || bshape != sshape {
                 return Err(format!(
-                    "{bias_name}: expected BF16 shape {sshape:?}, got {bdtype}/{bshape:?}"
+                    "{bias_name}: expected {sdtype} shape {sshape:?}, got {bdtype}/{bshape:?}"
                 ));
             }
             let scales = st.payload_range(&scale_name, param_offset, param_slice)?;
@@ -9361,6 +10641,7 @@ fn load_mlx_quantized_expert_wt(
                     biases,
                     bits,
                     group_size,
+                    aux_fp16,
                     metal_aux: std::sync::OnceLock::new(),
                     metal_tensor: std::sync::Mutex::new(0),
                     cuda_resident: std::sync::Mutex::new(None),
@@ -9399,18 +10680,683 @@ fn load_mlx_quantized_expert_wt(
     }
 }
 
+#[derive(Clone)]
+enum MlxExpertStorage {
+    Affine {
+        bits: u8,
+        group_size: usize,
+        aux_fp16: bool,
+    },
+    Mxfp4,
+}
+
+#[derive(Clone)]
+struct MlxMatrixIoPlan {
+    output: usize,
+    input: usize,
+    weights: std::ops::Range<usize>,
+    scales: std::ops::Range<usize>,
+    biases: Option<std::ops::Range<usize>>,
+    storage: MlxExpertStorage,
+}
+
+#[derive(Clone)]
+struct MlxExpertIoPlan {
+    matrices: [MlxMatrixIoPlan; 3],
+    /// (shard, absolute source offset, bytes, destination offset)
+    regions: Vec<(usize, u64, usize, usize)>,
+    used_bytes: usize,
+}
+
+struct MlxPendingExpert {
+    slot: i32,
+    event: i64,
+    plan: MlxExpertIoPlan,
+}
+
 pub(crate) struct MlxLocalExpertSource {
     st: StFile,
     experts: usize,
+    metalio: bool,
+    pending: std::collections::HashMap<(u32, usize), MlxPendingExpert>,
+    pending_order: std::collections::VecDeque<(u32, usize)>,
+    pending_cap: usize,
+    /// How many expert demand reads may be in flight at once
+    /// (`LOGAN_EXPERT_IO_CONCURRENCY`). 1 reproduces the legacy serial
+    /// issue-then-wait path; >1 issues a layer's reads before waiting on them.
+    ///
+    /// Default is 1 (serial) because the paired sweep in EXP-032 measured the
+    /// concurrent arms as equal-or-worse on wall time despite cutting the
+    /// measured MetalIO wait: the wait did not leave the critical path, it moved
+    /// into the compute term. Kept opt-in rather than defaulted until a paired
+    /// win exists.
+    io_concurrency: usize,
+    /// Immutable per-(layer,expert) I/O plans, resolved once.
+    ///
+    /// The checkpoint is fixed for the process lifetime, so an expert's shard,
+    /// source offsets, byte counts, slot destination offsets and matrix
+    /// metadata are constants. Rebuilding them on every demand re-does string
+    /// formatting, hash lookups and region assembly 320 times per decode
+    /// forward.
+    ///
+    /// **Default OFF**, because `env_flag` treats unset as false. EXP-030
+    /// measured the on-arm with `LOGAN_EXPERT_PLAN_CACHE=1` against an unset
+    /// baseline and found the saving is 1.2 -> 0.4 ms/token of a ~650 ms
+    /// forward, so it is not worth enabling; the flag exists to reproduce that
+    /// measurement and to keep the decomposition readable.
+    plan_cache: PlanCache,
+}
+
+/// A demand expert fetch that has been submitted but not necessarily completed.
+enum DemandFetch {
+    /// Already available (prefetch consumed, or the POSIX fallback ran inline).
+    Ready([Wt; 3]),
+    /// Submitted to MetalIO; `collect_demand_expert` waits for it.
+    Pending(MlxPendingExpert),
+    /// Placeholder left behind by `mem::replace`; collecting it is a bug.
+    NotIssued,
+}
+
+/// Lazily-populated, bounded-on-miss-cost plan cache. One slot per (layer,
+/// expert) for the whole model: 40 layers x 256 experts = 10,240 entries at
+/// this geometry, each a small struct plus a handful of ranges.
+#[derive(Default)]
+struct PlanCache {
+    enabled: bool,
+    plans: std::collections::HashMap<(u32, usize), std::sync::Arc<MlxExpertIoPlan>>,
+}
+
+impl Drop for MlxLocalExpertSource {
+    fn drop(&mut self) {
+        for (_, pending) in self.pending.drain() {
+            crate::ffi::mio_discard_slot(pending.slot);
+        }
+    }
 }
 
 impl MlxLocalExpertSource {
-    fn new(st: StFile, experts: usize) -> Self {
-        Self { st, experts }
+    fn new(st: StFile, experts: usize) -> Result<Self, String> {
+        // Canonical engine-wide flags use LOGAN_* because this I/O policy
+        // belongs to the source/runtime contract, not to Qwen. Keep the QWEN_*
+        // spellings as compatibility aliases for EXP-028 scripts.
+        let nocache = crate::env_flag("LOGAN_EXPERT_NOCACHE")
+            || crate::env_flag("QWEN_MLX_EXPERT_NOCACHE");
+        // NOCACHE is specifically an SSD-streaming qualification mode, so
+        // prefer MetalIO automatically there. Outside that experiment MetalIO
+        // remains opt-in until EXP-028 establishes a repeatable win.
+        let want_metalio = nocache
+            || crate::env_flag("LOGAN_EXPERT_METALIO")
+            || crate::env_flag("QWEN_MLX_METALIO");
+        let st = st.fork_for_streaming(nocache)?;
+        let metalio = want_metalio && crate::ffi::mio_init();
+        let pending_cap = std::env::var("LOGAN_EXPERT_PREFETCH_SLOTS")
+            .or_else(|_| std::env::var("QWEN_MLX_PREFETCH_CACHE"))
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32)
+            .max(1);
+        if nocache || want_metalio {
+            eprintln!(
+                "logan mlx-expert-source: nocache={} metalio={} prefetch_slots={}",
+                nocache, metalio, pending_cap
+            );
+        }
+        Ok(Self {
+            st,
+            experts,
+            metalio,
+            pending: std::collections::HashMap::new(),
+            pending_order: std::collections::VecDeque::new(),
+            pending_cap,
+            io_concurrency: std::env::var("LOGAN_EXPERT_IO_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1),
+            plan_cache: PlanCache {
+                enabled: crate::env_flag("LOGAN_EXPERT_PLAN_CACHE"),
+                plans: std::collections::HashMap::new(),
+            },
+        })
+    }
+
+    fn plan_matrix(
+        &self,
+        name: &str,
+        expert: usize,
+        output: usize,
+        input: usize,
+        cursor: &mut usize,
+        regions: &mut Vec<(usize, u64, usize, usize)>,
+    ) -> Result<MlxMatrixIoPlan, String> {
+        let (_, wshape, wdtype, _, _) = self
+            .st
+            .tensors
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        if wdtype != "U32"
+            || wshape.len() != 3
+            || wshape[0] != self.experts as u64
+            || wshape[1] != output as u64
+        {
+            return Err(format!(
+                "{name}: expected stacked U32 [{}, {output}, words], got {wdtype}/{wshape:?}",
+                self.experts
+            ));
+        }
+        let packed_words = usize::try_from(wshape[2])
+            .map_err(|_| format!("{name}: packed row width does not fit usize"))?;
+        let row_bits = packed_words
+            .checked_mul(32)
+            .ok_or_else(|| format!("{name}: packed row bit count overflows"))?;
+        if row_bits % input != 0 {
+            return Err(format!(
+                "{name}: {packed_words} U32 words cannot represent {input} logical columns exactly"
+            ));
+        }
+        let bits = u8::try_from(row_bits / input)
+            .map_err(|_| format!("{name}: inferred bit width overflows u8"))?;
+        if !matches!(bits, 4 | 5 | 6 | 8) {
+            return Err(format!("{name}: unsupported MLX expert bit width {bits}"));
+        }
+
+        let base = name
+            .strip_suffix(".weight")
+            .ok_or_else(|| format!("{name}: quantized expert name must end in .weight"))?;
+        let scale_name = format!("{base}.scales");
+        let (_, sshape, sdtype, _, _) = self
+            .st
+            .tensors
+            .get(&scale_name)
+            .cloned()
+            .ok_or_else(|| format!("missing expert sidecar {scale_name}"))?;
+        if sshape.len() != 3
+            || sshape[0] != self.experts as u64
+            || sshape[1] != output as u64
+            || sshape[2] == 0
+        {
+            return Err(format!(
+                "{scale_name}: expected [{}, {output}, groups], got {sshape:?}",
+                self.experts
+            ));
+        }
+        let groups = usize::try_from(sshape[2])
+            .map_err(|_| format!("{scale_name}: group count does not fit usize"))?;
+        if input % groups != 0 {
+            return Err(format!(
+                "{scale_name}: {groups} groups do not divide {input} logical columns"
+            ));
+        }
+        let group_size = input / groups;
+
+        let weight_bytes = output
+            .checked_mul(packed_words)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| format!("{name}: expert weight slice size overflows"))?;
+        let weight_within = expert
+            .checked_mul(weight_bytes)
+            .ok_or_else(|| format!("{name}: expert weight offset overflows"))?;
+        let (wshard, woff, wlen) = self.st.tensor_region(name, weight_within, weight_bytes)?;
+        let weights = *cursor..cursor.saturating_add(wlen);
+        regions.push((wshard, woff, wlen, *cursor));
+        *cursor = weights.end;
+
+        match sdtype.as_str() {
+            "BF16" | "F16" => {
+                let param_bytes = output
+                    .checked_mul(groups)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| format!("{scale_name}: expert parameter slice size overflows"))?;
+                let param_within = expert
+                    .checked_mul(param_bytes)
+                    .ok_or_else(|| format!("{scale_name}: expert parameter offset overflows"))?;
+                let (sshard, soff, slen) =
+                    self.st.tensor_region(&scale_name, param_within, param_bytes)?;
+                let scales = *cursor..cursor.saturating_add(slen);
+                regions.push((sshard, soff, slen, *cursor));
+                *cursor = scales.end;
+
+                let bias_name = format!("{base}.biases");
+                let (_, bshape, bdtype, _, _) = self
+                    .st
+                    .tensors
+                    .get(&bias_name)
+                    .cloned()
+                    .ok_or_else(|| format!("missing affine expert sidecar {bias_name}"))?;
+                if bdtype != sdtype || bshape != sshape {
+                    return Err(format!(
+                        "{bias_name}: expected {sdtype} shape {sshape:?}, got {bdtype}/{bshape:?}"
+                    ));
+                }
+                let (bshard, boff, blen) =
+                    self.st.tensor_region(&bias_name, param_within, param_bytes)?;
+                let biases = *cursor..cursor.saturating_add(blen);
+                regions.push((bshard, boff, blen, *cursor));
+                *cursor = biases.end;
+
+                Ok(MlxMatrixIoPlan {
+                    output,
+                    input,
+                    weights,
+                    scales,
+                    biases: Some(biases),
+                    storage: MlxExpertStorage::Affine {
+                        bits,
+                        group_size,
+                        aux_fp16: sdtype == "F16",
+                    },
+                })
+            }
+            "U8" => {
+                if bits != 4 || group_size != 32 {
+                    return Err(format!(
+                        "{name}: MLX MXFP4 expert requires 4-bit/group-32, got {bits}-bit/group-{group_size}"
+                    ));
+                }
+                let scale_bytes = output
+                    .checked_mul(groups)
+                    .ok_or_else(|| format!("{scale_name}: expert scale slice size overflows"))?;
+                let scale_within = expert
+                    .checked_mul(scale_bytes)
+                    .ok_or_else(|| format!("{scale_name}: expert scale offset overflows"))?;
+                let (sshard, soff, slen) =
+                    self.st.tensor_region(&scale_name, scale_within, scale_bytes)?;
+                let scales = *cursor..cursor.saturating_add(slen);
+                regions.push((sshard, soff, slen, *cursor));
+                *cursor = scales.end;
+                Ok(MlxMatrixIoPlan {
+                    output,
+                    input,
+                    weights,
+                    scales,
+                    biases: None,
+                    storage: MlxExpertStorage::Mxfp4,
+                })
+            }
+            other => Err(format!(
+                "{scale_name}: unsupported MLX expert scale dtype {other}"
+            )),
+        }
+    }
+
+    fn io_plan(
+        &self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<MlxExpertIoPlan, String> {
+        let prefix = format!("model.layers.{layer}.mlp.switch_mlp");
+        let mut cursor = 0usize;
+        let mut regions = Vec::with_capacity(9);
+        let gate = self.plan_matrix(
+            &format!("{prefix}.gate_proj.weight"),
+            expert,
+            d_hidden,
+            d_model,
+            &mut cursor,
+            &mut regions,
+        )?;
+        let up = self.plan_matrix(
+            &format!("{prefix}.up_proj.weight"),
+            expert,
+            d_hidden,
+            d_model,
+            &mut cursor,
+            &mut regions,
+        )?;
+        let down = self.plan_matrix(
+            &format!("{prefix}.down_proj.weight"),
+            expert,
+            d_model,
+            d_hidden,
+            &mut cursor,
+            &mut regions,
+        )?;
+        Ok(MlxExpertIoPlan {
+            matrices: [gate, up, down],
+            regions,
+            used_bytes: cursor,
+        })
+    }
+
+    /// The I/O plan for `(layer, expert)`, cached across calls.
+    ///
+    /// A checkpoint's expert layout is immutable for the process lifetime, so
+    /// the only difference between two plans for the same key is redundant
+    /// work: three `format!` names per matrix plus hash lookups on the tensor
+    /// map. At 320 expert evaluations per decode forward that repeated
+    /// construction is on the critical path. The cache returns a shared plan;
+    /// the caller only ever reads it.
+    fn cached_io_plan(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<std::sync::Arc<MlxExpertIoPlan>, String> {
+        if !self.plan_cache.enabled {
+            return self
+                .io_plan(layer, expert, d_model, d_hidden)
+                .map(std::sync::Arc::new);
+        }
+        if let Some(plan) = self.plan_cache.plans.get(&(layer, expert)) {
+            EXPERT_PLAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(std::sync::Arc::clone(plan));
+        }
+        EXPERT_PLAN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plan = std::sync::Arc::new(self.io_plan(layer, expert, d_model, d_hidden)?);
+        self.plan_cache
+            .plans
+            .insert((layer, expert), std::sync::Arc::clone(&plan));
+        Ok(plan)
+    }
+
+    fn issue_plan(
+        &self,
+        plan: &MlxExpertIoPlan,
+        speculative: bool,
+    ) -> Option<(i32, i64)> {
+        if !self.metalio {
+            return None;
+        }
+        let mut regions = Vec::with_capacity(plan.regions.len());
+        for &(shard, src_off, bytes, dst_off) in &plan.regions {
+            let path = self.st.shard_path(shard)?.to_str()?;
+            let file = crate::ffi::mio_file(path)?;
+            regions.push(crate::ffi::MioRegion {
+                file,
+                src_off,
+                bytes,
+                dst_off,
+            });
+        }
+        crate::ffi::mio_load_regions(&regions, speculative)
+    }
+
+    fn materialize_plan(plan: &MlxExpertIoPlan, raw: &[u8]) -> Result<[Wt; 3], String> {
+        let mut out = Vec::with_capacity(3);
+        for matrix in &plan.matrices {
+            let weights = raw
+                .get(matrix.weights.clone())
+                .ok_or_else(|| "MetalIO MLX weights outside slot".to_string())?
+                .to_vec();
+            let scales = raw
+                .get(matrix.scales.clone())
+                .ok_or_else(|| "MetalIO MLX scales outside slot".to_string())?
+                .to_vec();
+            let bytes = match matrix.storage {
+                MlxExpertStorage::Affine {
+                    bits,
+                    group_size,
+                    aux_fp16,
+                } => {
+                    let biases = raw
+                        .get(
+                            matrix
+                                .biases
+                                .clone()
+                                .ok_or_else(|| "MLX affine plan missing biases".to_string())?,
+                        )
+                        .ok_or_else(|| "MetalIO MLX biases outside slot".to_string())?
+                        .to_vec();
+                    WtBytes::MlxAffine {
+                        weights,
+                        scales,
+                        biases,
+                        bits,
+                        group_size,
+                        aux_fp16,
+                        metal_aux: std::sync::OnceLock::new(),
+                        metal_tensor: std::sync::Mutex::new(0),
+                        cuda_resident: std::sync::Mutex::new(None),
+                    }
+                }
+                MlxExpertStorage::Mxfp4 => WtBytes::Mxfp4 {
+                    weights,
+                    scales,
+                    metal_tensor: std::sync::Mutex::new(0),
+                },
+            };
+            out.push(Wt {
+                f: Vec::new(),
+                bytes: Some(bytes),
+                o: matrix.output,
+                i: matrix.input,
+            });
+        }
+        out.try_into()
+            .map_err(|_| "MLX MetalIO expert did not materialize three matrices".to_string())
+    }
+
+    fn finish_pending(&mut self, key: (u32, usize)) -> Option<Result<[Wt; 3], String>> {
+        let pending = self.pending.remove(&key)?;
+        // The queue is deliberately tiny (32 by default), so O(cap) removal
+        // is cheaper and safer than letting consumed keys accumulate during a
+        // long-lived server session.
+        self.pending_order.retain(|queued| *queued != key);
+        let raw = crate::ffi::mio_finish_slot(
+            pending.slot,
+            pending.event,
+            pending.plan.used_bytes,
+            true,
+        )?;
+        Some(Self::materialize_plan(&pending.plan, &raw))
+    }
+
+    fn evict_one_pending(&mut self) {
+        while let Some(key) = self.pending_order.pop_front() {
+            if let Some(pending) = self.pending.remove(&key) {
+                crate::ffi::mio_discard_slot(pending.slot);
+                break;
+            }
+        }
+    }
+
+    fn prefetch_one(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<bool, String> {
+        if !self.metalio || expert >= self.experts {
+            return Ok(false);
+        }
+        let key = (layer, expert);
+        if self.pending.contains_key(&key) {
+            return Ok(true);
+        }
+        while self.pending.len() >= self.pending_cap {
+            self.evict_one_pending();
+        }
+        let plan_t0 = std::time::Instant::now();
+        let plan = self.cached_io_plan(layer, expert, d_model, d_hidden)?;
+        EXPERT_PLAN_NS.fetch_add(
+            plan_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let Some((slot, event)) = self.issue_plan(&plan, true) else {
+            return Ok(false);
+        };
+        self.pending.insert(
+            key,
+            MlxPendingExpert {
+                slot,
+                event,
+                plan: (*plan).clone(),
+            },
+        );
+        self.pending_order.push_back(key);
+        Ok(true)
+    }
+
+    /// Read one expert's three quantized matrices from the checkpoint. In
+    /// MetalIO mode a matching RouteScout prefetch is consumed first; otherwise
+    /// demand I/O is submitted through MetalIO. Any MetalIO failure falls back
+    /// to the dedicated POSIX descriptors (F_NOCACHE in SSD-only mode).
+    fn expert_matrices(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<[Wt; 3], String> {
+        let fetch = self.issue_demand_expert(layer, expert, d_model, d_hidden)?;
+        self.collect_demand_expert(fetch)
+    }
+
+    /// Submit (but do not wait for) one expert's demand fetch.
+    ///
+    /// Splitting issue from collect is what allows a layer's experts to be in
+    /// flight simultaneously: the serial path submits one read and immediately
+    /// blocks on it, so the I/O queue never holds more than one command and the
+    /// per-read fixed cost is paid once per expert instead of once per layer.
+    fn issue_demand_expert(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<DemandFetch, String> {
+        // A consumed prefetch is already resident; materialize it without I/O.
+        // Its copy is real work that belongs in the load envelope, so it is
+        // counted the same way the demand collect path counts its copy.
+        if let Some(done) = self.finish_pending((layer, expert)) {
+            let mat_t0 = std::time::Instant::now();
+            let mats = done?;
+            let mat_ns = mat_t0.elapsed().as_nanos() as u64;
+            EXPERT_MATERIALIZE_NS.fetch_add(mat_ns, std::sync::atomic::Ordering::Relaxed);
+            EXPERT_LOAD_NS.fetch_add(mat_ns, std::sync::atomic::Ordering::Relaxed);
+            return Ok(DemandFetch::Ready(mats));
+        }
+        if self.metalio {
+            let t0 = std::time::Instant::now();
+            let plan = self.cached_io_plan(layer, expert, d_model, d_hidden)?;
+            let plan_ns = t0.elapsed().as_nanos() as u64;
+            EXPERT_PLAN_NS.fetch_add(plan_ns, std::sync::atomic::Ordering::Relaxed);
+            EXPERT_LOAD_NS.fetch_add(plan_ns, std::sync::atomic::Ordering::Relaxed);
+            let submit_t0 = std::time::Instant::now();
+            let issued = self.issue_plan(&plan, false);
+            let submit_ns = submit_t0.elapsed().as_nanos() as u64;
+            EXPERT_SUBMIT_NS.fetch_add(submit_ns, std::sync::atomic::Ordering::Relaxed);
+            EXPERT_LOAD_NS.fetch_add(submit_ns, std::sync::atomic::Ordering::Relaxed);
+            if let Some((slot, event)) = issued {
+                return Ok(DemandFetch::Pending(MlxPendingExpert {
+                    slot,
+                    event,
+                    plan: (*plan).clone(),
+                }));
+            }
+        }
+        // POSIX fallback (MetalIO unavailable, or its slot allocation failed).
+        let t0 = std::time::Instant::now();
+        let mats = self.posix_expert_matrices(layer, expert, d_model, d_hidden)?;
+        EXPERT_LOAD_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(DemandFetch::Ready(mats))
+    }
+
+    /// Wait for an issued demand fetch and turn it into matrices.
+    ///
+    /// The whole function is inside the load envelope, so `wait_ms` is a strict
+    /// child of `load_ms` and the remainder is materialization.
+    fn collect_demand_expert(&mut self, fetch: DemandFetch) -> Result<[Wt; 3], String> {
+        let (slot, event, plan) = match fetch {
+            DemandFetch::Ready(mats) => return Ok(mats),
+            DemandFetch::Pending(pending) => (pending.slot, pending.event, pending.plan),
+            // `issue` always returns Ready or Pending, so reaching here means a
+            // slot was never submitted for a call that is about to be used.
+            DemandFetch::NotIssued => {
+                return Err("demand expert fetch was collected without being issued".to_string());
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let raw = crate::ffi::mio_finish_slot(slot, event, plan.used_bytes, false);
+        EXPERT_WAIT_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        EXPERT_LOAD_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let raw = raw.ok_or_else(|| "MetalIO demand fetch failed".to_string())?;
+        // Materialization copies every fetched byte into owned `Wt` storage, so
+        // it is inside the load envelope and must be visible as its own term.
+        let mat_t0 = std::time::Instant::now();
+        let mats = Self::materialize_plan(&plan, &raw);
+        let mat_ns = mat_t0.elapsed().as_nanos() as u64;
+        EXPERT_MATERIALIZE_NS.fetch_add(mat_ns, std::sync::atomic::Ordering::Relaxed);
+        EXPERT_LOAD_NS.fetch_add(mat_ns, std::sync::atomic::Ordering::Relaxed);
+        mats
+    }
+
+    /// Uncached POSIX read of one expert's three matrices. The dedicated
+    /// streaming descriptors carry F_NOCACHE in SSD-only mode, so this is a
+    /// real page-cache bypass rather than a silent cached read.
+    fn posix_expert_matrices(
+        &self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<[Wt; 3], String> {
+        let prefix = format!("model.layers.{layer}.mlp.switch_mlp");
+        let gate = load_mlx_quantized_expert_wt(
+            &self.st,
+            &format!("{prefix}.gate_proj.weight"),
+            expert,
+            self.experts,
+            d_hidden,
+            d_model,
+        )?;
+        let up = load_mlx_quantized_expert_wt(
+            &self.st,
+            &format!("{prefix}.up_proj.weight"),
+            expert,
+            self.experts,
+            d_hidden,
+            d_model,
+        )?;
+        let down = load_mlx_quantized_expert_wt(
+            &self.st,
+            &format!("{prefix}.down_proj.weight"),
+            expert,
+            self.experts,
+            d_model,
+            d_hidden,
+        )?;
+        Ok([gate, up, down])
     }
 }
 
 impl crate::pool::ExpertSource for MlxLocalExpertSource {
+    fn supports_prefetch(&self) -> bool {
+        self.metalio
+    }
+
+    fn prefetch(
+        &mut self,
+        layer: u32,
+        experts: &[u32],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<usize, crate::pool::PoolError> {
+        let mut issued = 0usize;
+        for &expert in experts {
+            let expert = usize::try_from(expert)
+                .map_err(|_| format!("expert id {expert} does not fit usize"))?;
+            if self.prefetch_one(layer, expert, d_model, d_hidden)? {
+                issued += 1;
+            }
+        }
+        Ok(issued)
+    }
+
     fn eval(
         &mut self,
         calls: &[crate::pool::ExpertCall],
@@ -9423,10 +11369,7 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
                 "raw MLX expert source supports only silu activation, got {activation}"
             ));
         }
-        let mut outputs = Vec::with_capacity(calls.len());
         for call in calls {
-            let expert = usize::try_from(call.expert)
-                .map_err(|_| format!("expert id {} does not fit usize", call.expert))?;
             if call.input.len() != d_model {
                 return Err(format!(
                     "layer {} expert {} input width {} != d_model {d_model}",
@@ -9435,45 +11378,146 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
                     call.input.len()
                 ));
             }
-            let prefix = format!("model.layers.{}.mlp.switch_mlp", call.layer);
-            let gate = load_mlx_quantized_expert_wt(
-                &self.st,
-                &format!("{prefix}.gate_proj.weight"),
-                expert,
-                self.experts,
-                d_hidden,
-                d_model,
-            )?;
-            let up = load_mlx_quantized_expert_wt(
-                &self.st,
-                &format!("{prefix}.up_proj.weight"),
-                expert,
-                self.experts,
-                d_hidden,
-                d_model,
-            )?;
-            let down = load_mlx_quantized_expert_wt(
-                &self.st,
-                &format!("{prefix}.down_proj.weight"),
-                expert,
-                self.experts,
-                d_model,
-                d_hidden,
-            )?;
+            if usize::try_from(call.expert).is_err() {
+                return Err(format!("expert id {} does not fit usize", call.expert));
+            }
+        }
 
+        // Two-phase demand fetch: submit the experts the authoritative router
+        // selected, then wait for them. The serial version paid the full
+        // per-read submit/complete latency once per expert (~0.32 ms each,
+        // ~101 ms/token at top-8); overlapping them within a layer collapses
+        // those into roughly one latency. No prediction is involved, so the
+        // bytes read and the arithmetic are unchanged.
+        //
+        // `LOGAN_EXPERT_IO_CONCURRENCY` caps how many reads are in flight; 1
+        // reproduces the legacy serial path.
+        let limit = if self.io_concurrency > 1 && calls.len() > 1 {
+            self.io_concurrency
+        } else {
+            1
+        };
+        let mut fetches: Vec<DemandFetch> = Vec::with_capacity(calls.len());
+        for call in calls.iter().take(limit) {
+            let expert = call.expert as usize;
+            fetches.push(
+                self.issue_demand_expert(call.layer, expert, d_model, d_hidden)
+                    .map_err(crate::pool::PoolError::from)?,
+            );
+        }
+
+        let mut outputs = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let fetch = if index < fetches.len() {
+                std::mem::replace(&mut fetches[index], DemandFetch::NotIssued)
+            } else {
+                // Beyond the in-flight cap: issue now, then collect immediately
+                // so at most `limit` reads are ever outstanding.
+                self.issue_demand_expert(
+                    call.layer,
+                    call.expert as usize,
+                    d_model,
+                    d_hidden,
+                )
+                .map_err(crate::pool::PoolError::from)?
+            };
+            let mats = self
+                .collect_demand_expert(fetch)
+                .map_err(crate::pool::PoolError::from)?;
+            EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let compute_t0 = std::time::Instant::now();
             let mut gate_out = vec![0.0_f32; d_hidden];
             let mut hidden = vec![0.0_f32; d_hidden];
-            matmul(&mut gate_out, &call.input, &gate);
-            matmul(&mut hidden, &call.input, &up);
+            matmul(&mut gate_out, &call.input, &mats[0]);
+            matmul(&mut hidden, &call.input, &mats[1]);
             for index in 0..d_hidden {
                 hidden[index] *= silu(gate_out[index]);
             }
             let mut output = vec![0.0_f32; d_model];
-            matmul(&mut output, &hidden, &down);
+            matmul(&mut output, &hidden, &mats[2]);
+            EXPERT_COMPUTE_NS.fetch_add(
+                compute_t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             outputs.push(output);
         }
         Ok(outputs)
     }
+}
+
+static EXPERT_LOAD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPERT_COMPUTE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPERT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decomposition of the expert `load_ms` term, which the EXP-029-corrected
+/// attribution showed is far larger than the measured MetalIO wait. Separating
+/// planning, slot setup and the wait shows which one actually costs.
+static EXPERT_PLAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPERT_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPERT_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Copying the fetched bytes into the engine's `Wt` representation: one
+/// `to_vec()` per matrix, ~6 MiB per expert. Counted separately because it is a
+/// pure memory cost, not storage latency, and it sits inside the load envelope.
+static EXPERT_MATERIALIZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPERT_PLAN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPERT_PLAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cumulative-counter snapshot taken at the decode boundary.
+///
+/// Every counter here accumulates over the whole process, so dividing a
+/// lifetime total by the *decode* forward count attributes prefill's work to
+/// decode. A snapshot at the last prompt forward makes each reported per-token
+/// figure a decode-window delta instead.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodeBaseline {
+    spans: logan_core::telemetry::TokenSpans,
+    expert_calls: u64,
+    expert_load_ns: u64,
+    expert_compute_ns: u64,
+    affine_metal: u64,
+    affine_fallback: u64,
+    /// (plan_ns, submit_ns, wait_ns, materialize_ns, plan_hits, plan_misses).
+    expert_load_parts: (u64, u64, u64, u64, u64, u64),
+    mio: logan_metal::ColiMetalioStats,
+    /// (encode, submit, wait, kernel, fused_calls, fused_experts) — the Metal
+    /// direct-path profile tuple, process-cumulative like the rest.
+    metal: (u64, u64, u64, u64, u64, u64),
+    predictor: Option<Vec<(u64, u64, u64, u64)>>,
+    /// (hits, misses) of whichever expert store this model actually uses.
+    cache: (u64, u64),
+}
+
+/// (calls, load_ns, compute_ns) accumulated by the MLX safetensors expert source.
+///
+/// This is the attribution that established the routed-expert phase is
+/// dispatch-bound rather than I/O-bound (EXP-018, EXP-021): it separates reading
+/// the expert's bytes from issuing its GEMMs.
+pub fn mlx_expert_source_timings() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        EXPERT_CALLS.load(Relaxed),
+        EXPERT_LOAD_NS.load(Relaxed),
+        EXPERT_COMPUTE_NS.load(Relaxed),
+    )
+}
+
+/// (plan_ns, submit_ns, wait_ns, materialize_ns, plan_hits, plan_misses).
+///
+/// The four time terms are disjoint components of [`mlx_expert_source_timings`]'s
+/// load term; the remainder (if any) is the POSIX fallback and slot release.
+/// `wait_ns` is the MetalIO completion wait, `materialize_ns` is the copy into
+/// owned `Wt` storage, `plan_ns` is I/O-plan construction, and `submit_ns` is
+/// slot allocation plus command enqueue.
+pub fn mlx_expert_load_decomposition() -> (u64, u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        EXPERT_PLAN_NS.load(Relaxed),
+        EXPERT_SUBMIT_NS.load(Relaxed),
+        EXPERT_WAIT_NS.load(Relaxed),
+        EXPERT_MATERIALIZE_NS.load(Relaxed),
+        EXPERT_PLAN_HITS.load(Relaxed),
+        EXPERT_PLAN_MISSES.load(Relaxed),
+    )
 }
 
 fn load_mlp_residual_norm(
@@ -9523,7 +11567,7 @@ impl Model {
         let streamed_mlx_experts = mlx_switch_layout && pool.is_none();
         let local_mlx_expert_source: Option<Box<dyn crate::pool::ExpertSource>> =
             if streamed_mlx_experts {
-                Some(Box::new(MlxLocalExpertSource::new(st.clone(), cfg.experts)))
+                Some(Box::new(MlxLocalExpertSource::new(st.clone(), cfg.experts)?))
             } else {
                 None
             };
@@ -10154,6 +12198,7 @@ impl Model {
             ple_shards,
             coli: None,
             gguf: None,
+            gguf_expert_store: None,
             // These two flags decide GDN head-tiling and RoPE layout, and a
             // wrong value produces fluent-looking nonsense rather than an
             // error, so they are overridable for A/B while the correct
@@ -10277,11 +12322,35 @@ impl Model {
             ple_conv_state: vec![0.0; ple_conv_state_len(hcd, cfg.ple_conv_kernel, cfg.ngram_size)],
             expert_plan: None,
             expert_store: make_expert_store(cfg.layers, cfg.topk),
+            route_spec_store: make_route_spec_store(),
             spans: logan_core::telemetry::TokenSpans::default(),
+            decode_baseline: None,
             route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
             route_overlap_common: vec![0; cfg.layers],
             route_overlap_total: vec![0; cfg.layers],
             route_overlap_pairs: vec![0; cfg.layers],
+            route_spatial_prev: Vec::new(),
+            route_token_routes: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            route_predict_horizon: std::env::var("QWEN_ROUTE_PREDICT_HORIZON")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0),
+            route_spatial_common: vec![0; cfg.layers],
+            route_spatial_total: vec![0; cfg.layers],
+            route_spatial_pairs: vec![0; cfg.layers],
+            route_spatial_top1_hits: vec![0; cfg.layers],
+            route_spatial_top1_total: vec![0; cfg.layers],
+            route_predictor: if env_flag("QWEN_ROUTE_PREDICT")
+                || env_flag("QWEN_ROUTE_PREDICT_PREFETCH")
+            {
+                Some(route_predictor::RoutePredictor::new(
+                    cfg.layers,
+                    cfg.experts,
+                ))
+            } else {
+                None
+            },
+            route_predict_prefetch: env_flag("QWEN_ROUTE_PREDICT_PREFETCH"),
             metal_model_id: next_metal_model_id(),
             // safetensors mode: no package profile, so the Apple8 direct path
             // never applies (C parity: direct requires the Apple8 target
@@ -10601,10 +12670,33 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
     model.route_overlap_common.push(0);
     model.route_overlap_total.push(0);
     model.route_overlap_pairs.push(0);
+    model.route_spatial_common.push(0);
+    model.route_spatial_total.push(0);
+    model.route_spatial_pairs.push(0);
+    model.route_spatial_top1_hits.push(0);
+    model.route_spatial_top1_total.push(0);
+    if let Some(predictor) = model.route_predictor.as_mut() {
+        predictor.push_layer();
+    }
     model.gdn_metal.push(None);
     model.gdn_ane.push(crate::gdn_ane::GdnAneState::default());
     model.attn_metal.push(None);
     Ok(())
+}
+
+/// Greedy decode directly from a native qwen4exp GGUF (including split GGUF).
+///
+/// Dense tensors stay mmap-backed by default while routed experts and PLE keep
+/// their existing on-demand range-read behavior.
+pub fn run_greedy_gguf(
+    gguf_path: &std::path::Path,
+    prompt: &[u32],
+    max_new: usize,
+) -> Result<Vec<u32>, String> {
+    let src = ggufsource::GgufSource::open(gguf_path)?;
+    let cfg = ggufload::load_cfg_gguf(&src)?;
+    let model = Model::load_gguf(&src, &cfg)?;
+    run_greedy_with(model, cfg, prompt, max_new)
 }
 
 pub fn run_greedy(
@@ -10759,6 +12851,9 @@ pub fn run_greedy_with(
     }
 
     let mut out = Vec::with_capacity(max_new);
+    // Decode boundary: prompt prefill and the final prompt forward are done, so
+    // profile_summary reports a decode-only window from here.
+    model.begin_decode_measurement();
     for step in 0..max_new {
         let next = logits
             .iter()
@@ -10780,11 +12875,36 @@ pub fn run_greedy_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        causal_conv1d_sample, default_cache_cap_for_ram, gdn_metal_weight_view,
+        causal_conv1d_sample, default_cache_cap_for_ram, gdn_metal_weight_view, graded_selection,
         is_ple_ngram_weight, load_cfg, load_mlp_residual_norm, load_wt, matmul, ple_conv_state_len,
         quantize_bf16_to_mxfp4, rmsnorm_row, rmsnorm_row_shifted, silu, MlxLocalExpertSource,
         OutputGate, StFile, Wt, WtBytes, MAX_RESIDENT_PLE_NGRAM_BYTES,
     };
+
+    #[test]
+    fn graded_budget_reads_a_lone_leader_alone() {
+        // One clear winner: the runner-up is far below it, so reading it would
+        // spend a real speculative read on weak evidence.
+        let ranked = [(7usize, 0.90f32), (3, 0.10), (5, 0.05)];
+        assert_eq!(graded_selection(&ranked, 4), vec![7]);
+    }
+
+    #[test]
+    fn graded_budget_grows_when_the_top_scores_are_grouped() {
+        // A tightly grouped top set is genuine ambiguity, not noise, so the
+        // budget widens — up to the ceiling, and no further.
+        let ranked = [(7usize, 0.80f32), (3, 0.78), (5, 0.76), (9, 0.10)];
+        assert_eq!(graded_selection(&ranked, 4), vec![7, 3, 5]);
+        assert_eq!(graded_selection(&ranked, 2), vec![7, 3]);
+    }
+
+    #[test]
+    fn graded_budget_never_reads_zero_scored_candidates() {
+        // No evidence at all -> no reads, rather than a budget of zero-score
+        // experts that would be pure waste.
+        assert!(graded_selection(&[(4usize, 0.0f32), (2, 0.0)], 4).is_empty());
+        assert!(graded_selection(&[], 4).is_empty());
+    }
 
     #[test]
     fn raw_classic_qwen_uses_post_attention_norm_for_mlp_residual() {
@@ -11042,6 +13162,7 @@ mod tests {
                 biases: biases.clone(),
                 bits: 6,
                 group_size: 64,
+                aux_fp16: false,
                 metal_aux: std::sync::OnceLock::new(),
                 metal_tensor: std::sync::Mutex::new(0),
                 cuda_resident: std::sync::Mutex::new(None),
@@ -11073,6 +13194,7 @@ mod tests {
                 biases: (0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect(),
                 bits,
                 group_size,
+                aux_fp16: false,
                 metal_aux: std::sync::OnceLock::new(),
                 metal_tensor: std::sync::Mutex::new(0),
                 cuda_resident: std::sync::Mutex::new(None),
@@ -11119,6 +13241,7 @@ mod tests {
                 biases,
                 bits: 4,
                 group_size: GROUP,
+                aux_fp16: false,
                 metal_aux: std::sync::OnceLock::new(),
                 metal_tensor: std::sync::Mutex::new(0),
                 cuda_resident: std::sync::Mutex::new(None),
@@ -11183,7 +13306,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 let mut want = vec![0.0_f32; O];
                 super::matmul_mlx_affine_storage(
-                    &mut want, &x, &weights, &scales, &biases, O, I, bits, group,
+                    &mut want, &x, &weights, &scales, &biases, O, I, bits, group, false,
                 );
                 let w = Wt {
                     f: vec![],
@@ -11193,7 +13316,8 @@ mod tests {
                         biases,
                         bits,
                         group_size: group,
-                        metal_aux: std::sync::OnceLock::new(),
+                        aux_fp16: false,
+                metal_aux: std::sync::OnceLock::new(),
                         metal_tensor: std::sync::Mutex::new(0),
                         cuda_resident: std::sync::Mutex::new(None),
                     }),
@@ -11361,7 +13485,7 @@ mod tests {
             &[("model-00001-of-00001.safetensors", tensors)],
         );
         let st = StFile::open_dir(&dir).unwrap();
-        let mut source = MlxLocalExpertSource::new(st, experts);
+        let mut source = MlxLocalExpertSource::new(st, experts).expect("MLX expert source");
         let input = vec![1.0_f32; cols];
         let outs = source
             .eval(

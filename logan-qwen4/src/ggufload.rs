@@ -195,20 +195,45 @@ fn load_wt(src: &GgufSource, name: &str, o: usize, i: usize) -> Result<Wt, Strin
             tensor.dims
         ));
     }
-    let weights = src.read_tensor(name)?;
-    let expected = tensor.dtype.stored_bytes((i as u64) * (o as u64))? as usize;
-    if weights.len() != expected {
-        return Err(format!(
-            "{name}: stored byte count {} != {expected}",
-            weights.len()
-        ));
-    }
+    let dtype = tensor.dtype;
+    let expected = dtype.stored_bytes((i as u64) * (o as u64))? as usize;
+    let mmap_enabled = std::env::var("QWEN_GGUF_MMAP")
+        .map(|value| value != "0" && !value.is_empty())
+        .unwrap_or(true);
+    let bytes = if mmap_enabled {
+        src.mapped_tensor(name).map(|mapped| {
+            if mapped.len() != expected {
+                Err(format!(
+                    "{name}: mapped byte count {} != {expected}",
+                    mapped.len()
+                ))
+            } else {
+                Ok(WtBytes::GgufMapped {
+                    source: src.clone(),
+                    name: name.to_string(),
+                    dtype,
+                })
+            }
+        })
+    } else {
+        None
+    };
+    let bytes = match bytes {
+        Some(result) => result?,
+        None => {
+            let weights = src.read_tensor(name)?;
+            if weights.len() != expected {
+                return Err(format!(
+                    "{name}: stored byte count {} != {expected}",
+                    weights.len()
+                ));
+            }
+            WtBytes::Gguf { weights, dtype }
+        }
+    };
     Ok(Wt {
         f: vec![],
-        bytes: Some(WtBytes::Gguf {
-            weights,
-            dtype: tensor.dtype,
-        }),
+        bytes: Some(bytes),
         o,
         i,
     })
@@ -654,6 +679,7 @@ impl Model {
             ple_shards: None,
             coli: None,
             gguf: Some(src.clone()),
+            gguf_expert_store: crate::make_gguf_expert_store(cfg.layers, cfg.topk),
             gdn_v_tiled: true,
             rope_interleaved: true,
             embed: load_wt(src, "token_embd.weight", cfg.vocab, cfg.hidden)?,
@@ -745,11 +771,35 @@ impl Model {
             ],
             expert_plan: None,
             expert_store: make_expert_store(cfg.layers, cfg.topk),
+            route_spec_store: crate::make_route_spec_store(),
             spans: logan_core::telemetry::TokenSpans::default(),
+            decode_baseline: None,
             route_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
             route_overlap_common: vec![0; cfg.layers],
             route_overlap_total: vec![0; cfg.layers],
             route_overlap_pairs: vec![0; cfg.layers],
+            route_spatial_prev: Vec::new(),
+            route_token_routes: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            route_predict_horizon: std::env::var("QWEN_ROUTE_PREDICT_HORIZON")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0),
+            route_spatial_common: vec![0; cfg.layers],
+            route_spatial_total: vec![0; cfg.layers],
+            route_spatial_pairs: vec![0; cfg.layers],
+            route_spatial_top1_hits: vec![0; cfg.layers],
+            route_spatial_top1_total: vec![0; cfg.layers],
+            route_predictor: if crate::env_flag("QWEN_ROUTE_PREDICT")
+                || crate::env_flag("QWEN_ROUTE_PREDICT_PREFETCH")
+            {
+                Some(crate::route_predictor::RoutePredictor::new(
+                    cfg.layers,
+                    cfg.experts,
+                ))
+            } else {
+                None
+            },
+            route_predict_prefetch: crate::env_flag("QWEN_ROUTE_PREDICT_PREFETCH"),
             metal_model_id: next_metal_model_id(),
             metal_direct: false,
             metal_overlap: false,
@@ -809,8 +859,22 @@ mod tests {
     }
 
     #[test]
-    fn gguf_q4km_source_types_are_supported_without_requantization() {
-        for ty in [GgmlType::Q4K, GgmlType::Q5_0, GgmlType::Q6K, GgmlType::Q8_0] {
+    fn gguf_source_types_are_supported_without_requantization() {
+        for ty in [
+            GgmlType::Q4K,
+            GgmlType::Q5_0,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Q8_0,
+            GgmlType::Q2_0,
+            GgmlType::Iq2Xxs,
+            GgmlType::Iq2Xs,
+            GgmlType::Iq2S,
+            GgmlType::Iq3Xxs,
+            GgmlType::Iq3S,
+            GgmlType::Iq4Nl,
+            GgmlType::Iq4Xs,
+        ] {
             assert!(ty.stored_bytes(ty.block_geometry().0).is_ok());
         }
     }

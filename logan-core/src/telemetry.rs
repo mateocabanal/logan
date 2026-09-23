@@ -40,6 +40,38 @@ pub struct TokenSpans {
     pub total_ms: f64,
 }
 
+impl TokenSpans {
+    /// Component-wise difference between two *cumulative* span snapshots
+    /// (self minus `before`). `total_ms` is a caller-supplied whole-request
+    /// figure, not an accumulator, so it is not differenced — the caller sets
+    /// it on the result.
+    ///
+    /// This is the decode-boundary measurement primitive: spans accumulate
+    /// across prefill and decode, but the reported per-token figures must
+    /// divide only the decode window by the decode forward count.
+    pub fn delta_from(&self, before: &TokenSpans) -> TokenSpans {
+        TokenSpans {
+            route_ms: self.route_ms - before.route_ms,
+            io_ms: self.io_ms - before.io_ms,
+            shared_ms: self.shared_ms - before.shared_ms,
+            gpu_ms: self.gpu_ms - before.gpu_ms,
+            fill_ms: self.fill_ms - before.fill_ms,
+            gdn_ms: self.gdn_ms - before.gdn_ms,
+            gdn_in_proj_ms: self.gdn_in_proj_ms - before.gdn_in_proj_ms,
+            gdn_conv_ms: self.gdn_conv_ms - before.gdn_conv_ms,
+            gdn_prepare_ms: self.gdn_prepare_ms - before.gdn_prepare_ms,
+            gdn_recur_ms: self.gdn_recur_ms - before.gdn_recur_ms,
+            gdn_gate_ms: self.gdn_gate_ms - before.gdn_gate_ms,
+            gdn_out_proj_ms: self.gdn_out_proj_ms - before.gdn_out_proj_ms,
+            attn_ms: self.attn_ms - before.attn_ms,
+            hc_ms: self.hc_ms - before.hc_ms,
+            head_ms: self.head_ms - before.head_ms,
+            gdn_metal_ok: self.gdn_metal_ok.saturating_sub(before.gdn_metal_ok),
+            total_ms: 0.0,
+        }
+    }
+}
+
 /// A running span timer.
 pub struct Span {
     name: &'static str,

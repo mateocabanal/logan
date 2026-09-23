@@ -1164,6 +1164,10 @@ pub fn compile(request: &CompileRequest, progress: &mut dyn ProgressSink) -> Res
         .output
         .as_ref()
         .ok_or_else(|| ColicError::Usage("compile requires an output package path".into()))?;
+    eprintln!(
+        "logan: warning: compiler emission is currently legacy COLI compatibility output; \
+         .logan v1 is the canonical compiled format and its dual-emitter is being brought up"
+    );
     progress.stage(Stage::StoragePlanning);
     let sources = exact_sources(&model, &expert_quantization);
     let records = record_inventory(&model, &expert_quantization, target_profile)?;
