@@ -11323,6 +11323,12 @@ impl MlxLocalExpertSource {
         let raw = raw.ok_or_else(|| "MetalIO demand fetch failed".to_string())?;
         // Materialization copies every fetched byte into owned `Wt` storage, so
         // it is inside the load envelope and must be visible as its own term.
+        //
+        // This copy is NOT redundant, despite looking like one: the slot must be
+        // released BEFORE materialization runs, because a held slot cannot be
+        // reused by the concurrent demand batch and would serialize the reads.
+        // Copying the bytes out promptly and then materializing from the copy is
+        // faster than materializing directly out of the slot (EXP-048).
         let mat_t0 = std::time::Instant::now();
         let mats = Self::materialize_plan(&plan, &raw);
         let mat_ns = mat_t0.elapsed().as_nanos() as u64;

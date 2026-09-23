@@ -2258,7 +2258,7 @@ mod imp {
                 && dsc.fmt != 12
                 && dsc.fmt != 13
                 && dsc.fmt != 14
-                && !(16..=20).contains(&dsc.fmt))
+                && !(16..=24).contains(&dsc.fmt))
                 || dsc.i == 0
                 || dsc.o == 0
                 || dsc.i > i32::MAX as usize
@@ -2273,12 +2273,17 @@ mod imp {
                         .saturating_mul(std::mem::size_of::<u16>()),
                     0,
                 )
-            } else if (16..=20).contains(&dsc.fmt) {
+            } else if (16..=24).contains(&dsc.fmt) {
+                // 16..20 are BF16-sidecar MLX affine (20 is the experimental Q4
+                // FMA variant); 21..24 are the same widths with IEEE fp16
+                // sidecars, which is what an FP16 checkpoint produces. Widening
+                // this list makes the single-command-buffer full-GDN path
+                // reachable for such a checkpoint (EXP-049).
                 let bits = match dsc.fmt {
-                    16 | 20 => 4usize,
-                    17 => 5,
-                    18 => 6,
-                    19 => 8,
+                    16 | 20 | 21 => 4usize,
+                    17 | 22 => 5,
+                    18 | 23 => 6,
+                    19 | 24 => 8,
                     _ => unreachable!(),
                 };
                 if dsc.group_size == 0
@@ -2348,7 +2353,7 @@ mod imp {
                     11 | 14 => 32,
                     12 => 16,
                     13 => 8,
-                    16..=20 => dsc.group_size as i32,
+                    16..=24 => dsc.group_size as i32,
                     _ => 0,
                 },
                             // No per-descriptor activation on this path: every descriptor
@@ -2442,12 +2447,12 @@ mod imp {
                         .saturating_mul(std::mem::size_of::<u16>()),
                     0,
                 )
-            } else if (16..=20).contains(&dsc.fmt) {
+            } else if (16..=24).contains(&dsc.fmt) {
                 let bits = match dsc.fmt {
-                    16 | 20 => 4usize,
-                    17 => 5,
-                    18 => 6,
-                    19 => 8,
+                    16 | 20 | 21 => 4usize,
+                    17 | 22 => 5,
+                    18 | 23 => 6,
+                    19 | 24 => 8,
                     _ => unreachable!(),
                 };
                 if dsc.group_size == 0
@@ -2518,7 +2523,7 @@ mod imp {
                     11 | 14 => 32,
                     12 => 16,
                     13 => 8,
-                    16..=20 => dsc.group_size as i32,
+                    16..=24 => dsc.group_size as i32,
                     _ => 0,
                 },
                             // No per-descriptor activation on this path: every descriptor

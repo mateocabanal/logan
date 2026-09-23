@@ -2573,3 +2573,102 @@ explicit reversal or via the canonical harness, and are unaffected. This entry i
 the one that was not, and it is corrected here rather than left as a false win.
 
 ---
+
+## EXP-048 — Removing the MetalIO copy hop is SLOWER: the copy releases the slot
+
+**Date:** 2026-09-23  
+**Area:** MetalIO / expert streaming  
+**Status:** **REJECTED (instructive)**
+
+**Hypothesis:** The routed-expert load path copies each fetched slot twice:
+`mio_finish_slot` copies the slot into a fresh `Vec` (`to_vec`), and
+`materialize_plan` then copies that `Vec` into the three owned matrices. At 320
+expert fetches/token and ~1.6 MB each, that is ~512 MB of pure memcpy per token,
+and it plausibly explains why the `load` term stayed far above the measured
+MetalIO wait.
+
+**Candidate:** a borrow-scoped `mio_finish_slot_with(slot, event, bytes, spec, f)`
+that hands `f` a `&[u8]` over the slot and releases it when `f` returns, so
+`materialize_plan` writes directly from the slot.
+
+**Result — slower:**
+
+| arm | ms/token |
+|---|---:|
+| copy hop (baseline) | 305.03 |
+| direct from slot | 319.03 |
+
+Tokens identical. **0.956x**, i.e. a ~4.6% regression.
+
+**Why (the important part):** the slot must be released BEFORE materialization
+runs. With `LOGAN_EXPERT_IO_CONCURRENCY` at its default of "issue the whole route"
+(EXP-039), a layer submits all 8 reads and they are in flight together. Holding a
+slot across the CPU-side materialization keeps it out of the reusable pool and
+forces the next read to wait for a free slot, serializing what the concurrent
+issue just parallelized. The "redundant" copy is what makes prompt release
+possible: copying the bytes out and then materializing from the copy lets the
+slot be recycled immediately.
+
+**Decision:** **REJECTED.** The two-hop copy is retained, and the now-unused
+borrow API was removed rather than left as dead code. A comment at the copy site
+records why it is deliberate, so this is not "optimized away" later.
+
+**Generalizable lesson:** on this engine, a copy that looks redundant on the CPU
+side can be the mechanism that keeps a scarce asynchronous resource (a MetalIO
+slot) available. Slot occupancy is the resource, not bytes moved.
+
+---
+
+## EXP-049 — Full-GPU GDN for fp16-affine weights: correct and FASTER
+
+**Date:** 2026-09-23  
+**Area:** dense GDN / Metal  
+**Status:** **KEPT**
+
+**Hypothesis (from the dense-path analysis):** the full-Metal GDN path
+`coli_metal_gdn_mxfp4` encodes all five input projections, the conv + gated-delta
+recurrence, the gated RMSNorm and the output projection into **one** command
+buffer with no CPU synchronization. It was unreachable for this checkpoint only
+because the Rust wrapper `logan_metal::gdn_mxfp4`'s format allow-list stopped at
+`16..=20` while the C side already accepts 21..24 (the IEEE-fp16-sidecar affine
+formats an FP16 checkpoint produces). That was replacing ~18.5 ms/token of scalar
+CPU recurrence plus 2 dispatches per layer.
+
+**Change:** widened the Rust allow-list and bit-width mapping to accept `21..=24`
+(21..24 mirror 16..19 at 4/5/6/8 bits, with fp16 sidecars).
+
+**Result — it works and it wins.**
+
+- The path engaged exactly as predicted: `gdn_metal_ok=450` and every CPU
+  `gdn_parts` sub-span (`in/conv/prep/recur/gate/out`) dropped to **0.0**, i.e.
+  the scalar recurrence really was replaced by the GPU kernel.
+- The profile span `gdn` fell 52.4 -> **31.8 ms/token**.
+- **Tokens byte-identical**, which is a useful independent result: the GPU
+  conv/recurrence/gated-RMSNorm kernel reproduces the scalar CPU loop's numerics
+  for this checkpoint.
+
+**Paired A/B** (5 pairs, alternating arm order, 24 tokens). NOTE on polarity:
+this was run with `EXTRA_ON="QWEN_GDN_MXFP4_FULL=0"`, so the `on` arm is the FLAG
+DISABLED (CPU) arm and the `off` arm is the default (GPU) path:
+
+| arm | ms/token | tok/s |
+|---|---:|---:|
+| `on` = `QWEN_GDN_MXFP4_FULL=0` = **CPU GDN** | 317.77 | 3.1470 |
+| `off` = default = **GPU GDN** | 295.77 | 3.3810 |
+
+`speedup = off/on = 0.9308` in the script's convention (">1 means ON faster"), so
+<1 means the CPU arm is slower: **GPU GDN wins 295.77 vs 317.77 = +7.4%.** The
+first misread of this table inverted the arms and wrote a withdrawal into this
+entry; it is corrected here, and the independent evidence agrees (the GPU arm's
+`gdn` span is 31.8 vs 52.4, and an earlier GPU-first screen read 296.5 vs 307.7).
+
+**Decision:** **KEPT.** The Rust allow-list widening stays.
+
+**Process note (the real cost of this experiment):** the A/B driver puts the
+candidate on the `on` arm via `EXTRA_ON`, so when the candidate is expressed as
+*disabling* a default-on feature, the `on` arm is the control. That inversion
+produced a wrong KEEP/REJECT decision and needed a second correction pass. Future
+A/Bs of a default-on feature should express the candidate directly
+(e.g. `EXTRA_ON="..."` enabling something) or be labelled explicitly.
+
+---
