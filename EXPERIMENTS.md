@@ -2854,6 +2854,15 @@ the 53% was "diluted cross-layer reuse" and cited EXP-011's ~4.5% *temporal*
 figure; those two statements cannot both be true, and the measurement wins. The
 reuse is real.
 
+**Caveat on that hit-rate number:** its counters do not reconcile with the call
+count — the run reported `calls=15040` while `resident_hits + resident_misses =
+12517 + 11163 = 23680`, i.e. ~1.57x more lookups than calls, so the 53% ratio rests
+on a denominator that is not the decode call count (prefill or a second counting
+path is likely involved). The divergence from EXP-011's ~4.5% temporal figure on a
+32-expert fixture is also unexplained. **The rejection therefore rests on the thing
+that needs no overlap estimate at all:** the paired end-to-end result, a loss of
+**0.8351x measured at a capacity that demonstrably fires.**
+
 What is also real is that eliminating ~53% of the reads made things **worse**:
 `wait_ms_per_token` rose 73.2 -> 93.3 and `load_ms_per_token` rose 99.3 -> 120.4
 against the cache-off baseline, and the end-to-end result was 16.5% slower. So the
@@ -3125,11 +3134,11 @@ the 64-token numbers above, not the canonical run.
 
 ---
 
-## EXP-056 — `COLI_METAL_UNTRACKED=1` is null; the buffer-creation branch is closed
+## EXP-056 — `COLI_METAL_UNTRACKED=1` cannot reach the expert path (mechanical no-op); registered staging arena costed
 
 **Date:** 2026-09-23  
 **Area:** Metal resource options  
-**Status:** **NULL (not promoted)**
+**Status:** **NO-OP (flag inapplicable) / staging-arena design recorded**
 
 **Motivation:** EXP-052's exact counters isolated the remaining expert-phase cost as
 **MTLBuffer object creation** (1920 fresh buffer objects per forward, essentially
@@ -3149,23 +3158,56 @@ actually recoverable without changing residency.
 **1.0078x — null** (0.8%, well inside this host's noise band), token-identical. So
 hazard tracking is not a material part of the per-object cost here.
 
-**Decision:** **NOT PROMOTED.** `COLI_METAL_UNTRACKED` stays opt-in as before.
+**Correction — this flag cannot reach the path under test.** `wrap()` builds its
+buffers with a hardcoded `MTLResourceStorageModeShared`
+(`backend_metal.mm`, the two `newBufferWithBytes`/`...NoCopy` calls) and does **not**
+pass `g_res_opts`; only the registered-slab path and the scratch pools read
+`g_res_opts`. The 1920 per-token expert buffers are created inside `wrap()`, so
+`COLI_METAL_UNTRACKED` never touched them. The 1.0078x reading is therefore a
+mechanical **no-op**, not a measured +0.8%, and a future session must not promote or
+re-test it on the strength of this run. Testing hazard-tracking on the real path
+would require changing `wrap()` to pass `g_res_opts` — which pairs untracked
+resources with a `newBufferWithBytesNoCopy` alias whose backing `Vec` is freed per
+token, exactly the lifetime coupling that produces intermittent corruption — so it
+is not worth doing for a ~1% effect.
 
-**Why this closes the branch.** With (a) the per-forward cost measured as buffer
-*object creation* rather than copies, (b) hazard-tracking mode null, and (c) the
-only way to avoid creating those objects — keeping materialized `Wt`s and their warm
-handles resident — already rejected on this host three times (EXP-019's sweep,
-EXP-051 at a genuine 53% hit rate, both losing to UMA pressure on 16 GiB), there is
-no remaining contained lever on the expert phase at the 1-2% scale. The alternative
-that would raise the arithmetic-side ceiling is a GPU-side SwiGLU fusion to collapse
-the MoE phase from two command buffers per layer to one (~1.5%, requires a new C
-API and an FP-accumulation-order risk) — measured as poor risk/reward against a
-verified 2.0x.
+**Decision:** **NOT PROMOTED**, and the knob is recorded as inapplicable to the
+expert path rather than null-on-merit.
 
-**Stopping point:** this session's structural work is complete. All six kept changes
-are token-verified (baseline sha, 128-token kernel equivalence, 96-token fused
-equivalence), all four rejected branches carry a measured mechanism, and the ~2.0x
-result is confirmed at a horizon where the non-greedy arm genuinely diverges
-(EXP-055).
+**Superseded closure premise (kept for honesty).** An earlier version of this entry
+claimed the branch was closed because "the only way to avoid creating those objects
+is keeping materialized `Wt`s resident, already rejected". **That premise is wrong.**
+A third design exists and is untested: a **fixed registered staging arena**. Allocate
+page-aligned staging sized for a single layer (8 experts x 3 matrices x [weights +
+aux] ~= 14 MB, double-buffered ~28 MB), call `coli_metal_register` on it ONCE, and
+have `materialize_plan` copy slot bytes into it; then the tensor constructor's
+`resolve()` finds the registered slab and takes `t->w = wr; t->woff = ...` without
+ever calling `wrap()` — so the 1920 buffer creations per token go to zero with **no
+added copy** (the `to_vec` copy already happens today).
+
+This is neither a cache nor residency: every token overwrites the same arena, so the
+UMA-pressure mechanism that sank EXP-019 (a per-layer cap sweep) and EXP-051 (53%
+hits at 1.6-2 GB) does **not** apply at 14-28 MB, and the in-repo comment supports
+the reuse case ("registered slabs resolve to LIVE memory, so a pointer-keyed handle
+stays correct even when the caller reuses the slab for different weights").
+`coli_metal_register`/`resolve` currently has **no caller anywhere in the repo**, so
+this is greenfield but documented and tested.
+
+**Size of the prize, measured:** the probe's warm-vs-cold handle arms isolate exactly
+the tensor/buffer creation cost at **+395 us/layer ~= 15.8 ms/token (~5.7%)**
+(EXP-052's counter work established that this gap is creation, not copying).
+
+**Why it is not attempted here:** `materialize_plan`'s buffers are owned by
+`WtBytes::MlxAffine { weights/scales/biases: Vec<u8> }`, and `Wt` is constructed per
+token inside `eval`. Pointing descriptors into a registered arena therefore requires
+the pooled bytes to outlive the per-token `Wt` — i.e. either an ownership change to
+`WtBytes` (14 construction sites) or a borrowing `Wt` variant. Both sit on the FFI
+ownership boundary that this engine reads through raw pointers into Metal buffers,
+where a mistake silently serves wrong weights rather than failing. Given a verified
+2.0x in hand and a 5.7% prize, this is left as a precisely-costed next step rather
+than attempted unverified.
+
+**Also still unclaimed:** a GPU-side SwiGLU fusion to collapse the MoE phase from two
+command buffers per layer to one (~1.5%; new C API, FP accumulation-order risk).
 
 ---
