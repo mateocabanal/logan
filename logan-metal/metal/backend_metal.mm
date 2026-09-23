@@ -257,6 +257,30 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
         acc += dot(w0, xv0) * sc + bi * (xv0.x + xv0.y + xv0.z + xv0.w);
         acc += dot(w1, xv1) * sc + bi * (xv1.x + xv1.y + xv1.z + xv1.w);
       }
+#ifdef MLX8_SCALAR
+    } else if (false) {
+#else
+    } else if (qbits == 8 && (gsz & 15) == 0) {
+#endif
+      // Vectorized 8-bit path: one bitstream word IS 4 consecutive codes, so a
+      // single uchar4 load yields 4 elements with no shifting, no cross-word
+      // fixup and no per-element divide. Same ALU-bound defect as the 4-bit
+      // branch (EXP-040): the scalar loop below costs a word load, a variable
+      // shift, a mask and a divide per element.
+      int I4 = I / 4;
+      device const uchar4* w4 = (device const uchar4*)(w + (long)o * rb);
+      for (int c = slane; c < I4; c += 32) {
+        uchar4 b = w4[c];
+        int base = c * 4;
+        int g = base / gsz;
+        float sc = aux_half ? float(as_type<half>(scl[g]))
+                            : as_type<float>((uint)scl[g] << 16);
+        float bi = aux_half ? float(as_type<half>(bia[g]))
+                            : as_type<float>((uint)bia[g] << 16);
+        float4 xv = x4[c];
+        float4 wv = float4(float(b.x), float(b.y), float(b.z), float(b.w));
+        acc += dot(wv, xv) * sc + bi * (xv.x + xv.y + xv.z + xv.w);
+      }
     } else {
     for (int i = int(slane); i < I; i += 32) {
       int bit = i * qbits;
@@ -1699,11 +1723,16 @@ extern "C" int coli_metal_init(void) {
     std::string shader_src = SHADER;
     bool mlx4_scalar = false;
     if (const char *e = getenv("LOGAN_MLX4_SCALAR")) mlx4_scalar = (e[0] != 0 && e[0] != '0');
-    if (mlx4_scalar) {
+    bool mlx8_scalar = false;
+    if (const char *e = getenv("LOGAN_MLX8_SCALAR")) mlx8_scalar = (e[0] != 0 && e[0] != '0');
+    {
       const std::string marker = "#include <metal_stdlib>";
       size_t at = shader_src.find(marker);
       if (at != std::string::npos) {
-        shader_src.insert(at + marker.size(), "\n#define MLX4_SCALAR 1\n");
+        std::string defs;
+        if (mlx4_scalar) defs += "\n#define MLX4_SCALAR 1\n";
+        if (mlx8_scalar) defs += "\n#define MLX8_SCALAR 1\n";
+        if (!defs.empty()) shader_src.insert(at + marker.size(), defs);
       }
     }
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:shader_src.c_str()]

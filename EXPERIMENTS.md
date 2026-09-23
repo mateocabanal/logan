@@ -2227,3 +2227,108 @@ per-matrix shape for A/B.
 `logan-qwen4/examples/affine_dispatch_probe.rs`.
 
 ---
+
+## EXP-040 — Vectorized 4-bit MLX affine GEMV branch: the kernel was ALU-bound, not bandwidth-bound
+
+**Date:** 2026-09-23  
+**Area:** Metal kernel / MLX affine GEMM / decode throughput  
+**Status:** **KEPT**
+
+**Motivation:** EXP-037/EXP-038 removed the per-command-buffer overhead from the
+MoE phase, so the remaining cost inside `mlx-expert` compute had to be kernel
+time. EXP-018 had assumed a fixed ~278 us per dispatch independent of size; if
+true, a 512x2048 4-bit projection (~590 KB) should be ~6 us of UMA traffic and
+time should not scale with the matrix.
+
+**Diagnostic — `affine_dispatch_probe` with `PROBE_TOPK` sweeping 1..8 experts
+(byte count scaling):**
+
+| experts | moved bytes | time | achieved GB/s |
+|---:|---:|---:|---:|
+| 1 | 1.77 MB | 1.11 ms | 1.6 |
+| 2 | 3.54 MB | 1.50 ms | 2.4 |
+| 4 | 7.08 MB | 3.20 ms | 2.2 |
+| 8 | 14.2 MB | 6.84 ms | 2.1 |
+
+Time scales linearly with bytes and achieved bandwidth is a flat **~2.1 GB/s**
+regardless of size. So this is not fixed dispatch overhead — the kernel itself is
+**ALU-bound**. For calibration, the repository's own `moe_gemv` kernel documents
+358-389 GB/s on the same block shapes.
+
+**Root cause:** the generic bitstream branch of `mm_gemv`
+(`fmt 16..19` / `21..24`, backend_metal.mm) decodes **one element per lane
+iteration**, with a 32-bit word load, a variable shift, a cross-word fixup, an
+integer divide `i / gsz`, and two scale/bias gathers per element.
+
+**Fix:** the packing is LSB-first with consecutive columns in consecutive
+nibbles, so one `uchar4` load covers **8 columns** — byte *k* holds column *2k* in
+its low nibble and column *2k+1* in its high nibble (`mlx_affine_code` in
+`logan-qwen4/src/lib.rs` uses exactly this convention, and the kernel test packs
+with it too). When `gsz` is a multiple of 8 a group never splits an 8-column run,
+so one scale/bias pair covers the whole vector: 2 `dot` products plus a single
+scale/bias application per 8 elements instead of 8 scalar chains.
+
+**Correctness:** the four `logan-metal` differential tests
+(`native_mlx_affine_gemv_matches_reference_for_all_supported_widths`,
+`native_mlx_affine_multi_handles_mixed_bits_and_groups`,
+`q4_fma_variant_matches_reference_and_baseline`,
+`fused_gdn_accepts_mixed_mlx_affine_formats_and_group_sizes`) compare GPU output
+against the repository's own reference decoder and all pass. The greedy token
+trajectory is byte-identical.
+
+**A/B:** `LOGAN_MLX4_SCALAR=1` compiles the pre-EXP-040 scalar loop instead, so
+both arms come from one binary. The gate is a **shader-compile-time macro**
+because MSL has no `getenv` and forbids function-scope `static`; an earlier
+attempt to read the env inside the kernel broke shader compilation and silently
+dropped the whole model to the CPU path (~19.8 s/token). The host reads the env
+in `coli_metal_init` and injects `#define MLX4_SCALAR 1` into the shader source.
+
+| measurement | result |
+|---|---|
+| one-binary A/B, 8 tokens | 504.19 -> 565.77 ms/token scalar = **1.12x** |
+| canonical harness, quiet host | 2.1509 -> **2.6374** tok/s (**1.226x**) |
+
+**Decision:** **KEPT, default ON.** Set `LOGAN_MLX4_SCALAR=1` to restore the
+scalar branch.
+
+**Note on the probe as an instrument:** its own run-to-run spread is +-60%, so it
+is only usable for shape-level questions (does time scale with bytes) and not for
+fine-grained kernel A/B. The real-model harness is the reliable instrument.
+
+**Artifacts:** `logan-qwen4/examples/affine_dispatch_probe.rs` (with `PROBE_TOPK`).
+
+---
+
+## EXP-041 — Dense affine batching of attention QKV and shared gate/up: NEUTRAL
+
+**Date:** 2026-09-23  
+**Area:** dense path / Metal dispatch  
+**Status:** **REJECTED (reverted)**
+
+**Hypothesis:** The attention site (`QWEN_ATTN_FUSED_INPUT`) and the shared-expert
+site (`QWEN_SHARED_FUSED_INPUT`) call only `matmul_mxfp4_multi`, which hard-requires
+`WtBytes::Mxfp4`. On a raw MLX-affine checkpoint it therefore always declines, so
+q/k/v and gate/up each pay their own `commit`+`waitUntilCompleted`. Adding the
+`|| matmul_mlx_affine_multi(...)` fallback that the GDN input site has always had
+should remove ~60 dispatch sites per forward (40 attention + 20 shared).
+
+**A/B:** 5 interleaved pairs, sampled decode, 16 tokens, one binary via
+`QWEN_ATTN_FUSED_INPUT=0 QWEN_SHARED_FUSED_INPUT=0`:
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| on (affine fallback) | 509.12 | 1.9642 |
+| off | 507.62 | 1.9700 |
+
+**0.9970x — neutral.** Token-identical.
+
+**Why:** dense projections are 10-20x larger than expert projections and are
+partly bandwidth-bound, so the per-descriptor overhead the batch adds does not
+buy the dispatch saving it bought on the ~590 KB expert matrices. (It also means
+the dense-path dispatch count from the analysis was not the binding constraint it
+was for the routed experts.) The change was reverted; the analysis's expectation
+of ~28-40 ms/token was wrong and this entry supersedes it.
+
+**Artifact:** `.perf_runs/autoresearch/ab-dense/`.
+
+---
