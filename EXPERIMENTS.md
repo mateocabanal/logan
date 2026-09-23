@@ -2920,3 +2920,53 @@ the real-model greedy trajectory must remain byte-identical (`e4f361a8…`) — 
 is a memory-aliasing change, so it needs both.
 
 ---
+
+## EXP-053 — Fused affine shared expert (gate/up + GPU SwiGLU + down in one command buffer)
+
+**Date:** 2026-09-23  
+**Area:** dense shared expert / Metal  
+**Status:** **KEPT**
+
+**Motivation:** `shared` measured 27-29 ms/token for only ~6 MFLOP/token of real
+work — essentially pure per-dispatch overhead, because the shared expert ran as
+three separate `commit`+`waitUntilCompleted` dispatches per layer (120 command
+buffers/forward). `coli_metal_shared_mxfp4` already encodes gate_proj, up_proj,
+**SwiGLU** and down_proj as three encoders inside **one** command buffer (so the
+intermediate never returns to the host), and both it and its helpers
+`qwen_gdn_mx_tensor` / `qwen_gdn_mx_encode_gemv` already accept fmt `21..24`
+(MLX affine with fp16 sidecars) — the same formats EXP-049 enabled for GDN.
+
+**Blocker:** two format gates stopped at MXFP4 (`descs[i].fmt != 7` in C,
+`dsc.fmt != 7` + `fmt: 7` in the Rust wrapper), so the fused path declined every
+time on this checkpoint and fell through to three per-matrix dispatches.
+
+**Change:** widened both gates to accept `21..24`, and extended the engine's
+`full_mxfp4` gate to build affine descriptors (with `metal_aux` supplying the
+interleaved scales+biases layout the affine GEMV expects).
+
+**The one real hazard, handled explicitly:** the Rust wrapper's byte-count guard
+computed **MXFP4** sizes (`o * ceil(i/2)` weights, one scale byte per 32). Those
+are far smaller than the affine sizes, so reusing them would have let
+`weights.len() < weight_bytes` pass trivially while the C side read using its own
+larger `fmt_bytes` stride — an out-of-bounds read. The guard now branches by
+format and computes affine sizes (`o * ceil(i*bits/8)` weights, `2 * o *
+ceil(i/gs) * sizeof(u16)` scales) for `21..24`.
+
+**Result:** `shared` span 28.4 -> **21.1 ms/token**, tokens byte-identical.
+
+**Paired A/B** (5 pairs, alternating arm order, 32 tokens). NOTE on polarity: run
+with `EXTRA_ON="QWEN_SHARED_MXFP4_FULL=0"`, so the `on` arm **disables** the
+fusion and `off` is the default fused path:
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| `on` = `QWEN_SHARED_MXFP4_FULL=0` = **unfused** | 293.19 | 3.4107 |
+| `off` = default = **fused** | 274.36 | 3.6448 |
+
+**+6.9%** for the fused path. Canonical harness: 3.4715 -> **3.5256**
+(**1.99x** over the 1.7725 baseline), `arm_rate_gap` 0.0013.
+
+**Decision:** **KEPT, default ON.** `QWEN_SHARED_MXFP4_FULL=0` restores the
+unfused path.
+
+---
