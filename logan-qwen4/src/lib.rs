@@ -10170,10 +10170,10 @@ impl Model {
             // across token counts means the weight upload is already zero-copy
             // and what remains is buffer-object creation, which only residency
             // could avoid (EXP-019/051/052).
-            let (wrap_calls, wrap_zc, wrap_bytes) = logan_metal::wrap_stats();
+            let (wrap_calls, wrap_zc, wrap_bytes, wrap_created) = logan_metal::wrap_stats();
             eprintln!(
                 "logan metal-wrap: calls={wrap_calls} zero_copy={wrap_zc} \
-                 copied_bytes={wrap_bytes}"
+                 copied_bytes={wrap_bytes} bytes_created={wrap_created}"
             );
         }
         if let Some(predictor) = self.route_predictor.as_ref() {
@@ -10801,6 +10801,22 @@ pub(crate) struct MlxLocalExpertSource {
     st: StFile,
     experts: usize,
     metalio: bool,
+    /// Reusable per-route-slot expert matrices, keyed by `(layer, route index)`.
+    ///
+    /// Measured motivation (not an assumption): `wrap()` creates **540 MiB of
+    /// MTLBuffer objects per decode token** (13.5 MiB/layer, 1920 creations) at
+    /// ~zero copy bytes, because `materialize_plan` builds fresh `Wt`s every
+    /// token; the probe's warm-vs-cold handle arms isolate that creation cost at
+    /// ~395 us/layer (~15.8 ms/token). A layer's matrices are immutable and their
+    /// geometry is fixed, so one `[Wt; 3]` per route slot can be refilled in place
+    /// and the buffers/tensor objects behind it reused.
+    ///
+    /// This is **not** a residency cache: no expert identity or bytes survive the
+    /// token (every slot is overwritten before use), which is why it does not
+    /// inherit EXP-019's or EXP-051's UMA-pressure rejection — both of those
+    /// retained a growing set of experts.
+    wt_pool: std::collections::HashMap<(u32, usize), [Wt; 3]>,
+    wt_pool_on: bool,
     pending: std::collections::HashMap<(u32, usize), MlxPendingExpert>,
     pending_order: std::collections::VecDeque<(u32, usize)>,
     pending_cap: usize,
@@ -10907,6 +10923,8 @@ impl MlxLocalExpertSource {
                 enabled: crate::env_flag("LOGAN_EXPERT_PLAN_CACHE"),
                 plans: std::collections::HashMap::new(),
             },
+            wt_pool: std::collections::HashMap::new(),
+            wt_pool_on: crate::env_flag("LOGAN_EXPERT_WT_POOL"),
         })
     }
 
@@ -11163,6 +11181,84 @@ impl MlxLocalExpertSource {
             });
         }
         crate::ffi::mio_load_regions(&regions, speculative)
+    }
+
+    /// Refill an existing `[Wt; 3]` in place from `raw`, keeping every `Wt`'s Metal
+    /// handles so the buffers and tensor objects behind them are not re-created.
+    ///
+    /// Safe because `wrap()` aliases the `Vec`'s memory (`newBufferWithBytesNoCopy`,
+    /// no deallocator) and the `Vec`s keep both address and length, so overwriting
+    /// their contents in place is what the GPU observes — the same mechanism the
+    /// registered-slab comment relies on. `metal_aux` is updated in place for the
+    /// same reason; `metal_tensor` is deliberately left alone so the C side resolves
+    /// its cached wrapper instead of calling `wrap()` again.
+    ///
+    /// Returns `false` if any matrix's geometry or byte length differs from the
+    /// slot's, so the caller materializes fresh. Geometry is fixed per layer, so a
+    /// mismatch means the plan changed underneath the slot.
+    fn refill_plan_into(slot: &mut [Wt; 3], plan: &MlxExpertIoPlan, raw: &[u8]) -> bool {
+        for (dst, matrix) in slot.iter_mut().zip(plan.matrices.iter()) {
+            if dst.o != matrix.output || dst.i != matrix.input {
+                return false;
+            }
+            let Some(w) = raw.get(matrix.weights.clone()) else {
+                return false;
+            };
+            let Some(sc) = raw.get(matrix.scales.clone()) else {
+                return false;
+            };
+            match (dst.bytes.as_mut(), &matrix.storage) {
+                (
+                    Some(WtBytes::MlxAffine {
+                        weights,
+                        scales,
+                        biases,
+                        bits,
+                        group_size,
+                        aux_fp16,
+                        metal_aux,
+                        ..
+                    }),
+                    MlxExpertStorage::Affine {
+                        bits: pb,
+                        group_size: pg,
+                        aux_fp16: pa,
+                    },
+                ) => {
+                    let Some(bi) = matrix.biases.clone().and_then(|r| raw.get(r)) else {
+                        return false;
+                    };
+                    if bits != pb
+                        || group_size != pg
+                        || aux_fp16 != pa
+                        || weights.len() != w.len()
+                        || scales.len() != sc.len()
+                        || biases.len() != bi.len()
+                    {
+                        return false;
+                    }
+                    weights.copy_from_slice(w);
+                    scales.copy_from_slice(sc);
+                    biases.copy_from_slice(bi);
+                    if let Some(existing) = metal_aux.get_mut() {
+                        if existing.len() != sc.len() + bi.len() {
+                            return false;
+                        }
+                        existing[..sc.len()].copy_from_slice(sc);
+                        existing[sc.len()..].copy_from_slice(bi);
+                    }
+                }
+                (Some(WtBytes::Mxfp4 { weights, scales, .. }), MlxExpertStorage::Mxfp4) => {
+                    if weights.len() != w.len() || scales.len() != sc.len() {
+                        return false;
+                    }
+                    weights.copy_from_slice(w);
+                    scales.copy_from_slice(sc);
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn materialize_plan(plan: &MlxExpertIoPlan, raw: &[u8]) -> Result<[Wt; 3], String> {

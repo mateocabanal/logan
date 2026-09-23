@@ -1823,14 +1823,21 @@ static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
 static std::atomic<uint64_t> g_wrap_calls{0};
 static std::atomic<uint64_t> g_wrap_zero_copy{0};
 static std::atomic<uint64_t> g_wrap_copy_bytes{0};
-extern "C" void coli_metal_wrap_stats(uint64_t *calls, uint64_t *zero_copy, uint64_t *copy_bytes) {
+/// Bytes behind the buffers `wrap()` creates. With the copy count at ~0 this is the
+/// real per-token allocation volume, i.e. the size a staging arena would need to be
+/// to serve one layer without any `wrap()` call.
+static std::atomic<uint64_t> g_wrap_bytes_created{0};
+extern "C" void coli_metal_wrap_stats(uint64_t *calls, uint64_t *zero_copy, uint64_t *copy_bytes,
+                                      uint64_t *bytes_created) {
   if (calls) *calls = g_wrap_calls.load(std::memory_order_relaxed);
   if (zero_copy) *zero_copy = g_wrap_zero_copy.load(std::memory_order_relaxed);
   if (copy_bytes) *copy_bytes = g_wrap_copy_bytes.load(std::memory_order_relaxed);
+  if (bytes_created) *bytes_created = g_wrap_bytes_created.load(std::memory_order_relaxed);
 }
 static id<MTLBuffer> wrap(const void *p, size_t n) {
   size_t pg = 16384; // Apple Silicon page
   g_wrap_calls.fetch_add(1, std::memory_order_relaxed);
+  g_wrap_bytes_created.fetch_add(n, std::memory_order_relaxed);
   if (((uintptr_t)p % pg) == 0 && (n % pg) == 0) {
     g_wrap_zero_copy.fetch_add(1, std::memory_order_relaxed);
     return [g_dev newBufferWithBytesNoCopy:(void*)p length:n options:MTLResourceStorageModeShared deallocator:nil];
