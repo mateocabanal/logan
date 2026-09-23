@@ -2363,3 +2363,54 @@ mechanism as EXP-040).
 **Decision:** **KEPT, default ON.** `LOGAN_MLX8_SCALAR=1` restores the scalar branch.
 
 ---
+
+## EXP-043 — Vectorized 6-bit and 5-bit MLX affine branches (bit-width sweep complete)
+
+**Date:** 2026-09-23  
+**Area:** Metal kernel / decode throughput  
+**Status:** **KEPT**
+
+EXP-040 fixed the 4-bit branch and EXP-042 the 8-bit; the 5-bit and 6-bit branches
+had the same ALU-bound shape (one element per lane iteration, with a variable
+shift, a cross-word fixup and an integer divide per element). Both are now
+chunked:
+
+- **6-bit:** 16 codes = exactly 96 bits = 3 uint32 words, so a lane owns a
+  16-column chunk (3 coalesced loads, one scale/bias gather, one divide).
+  Covers the GDN input projections `[8192,2048]` and attention q/k — the largest
+  dense matrices in the forward.
+- **5-bit:** 32 codes = exactly 160 bits = 5 uint32 words, so a lane owns a
+  32-column chunk. Covers `gdn_out_proj` and `attn_o_proj`.
+
+Guarded on `gsz % 16 == 0` (6-bit) and `gsz % 32 == 0` (5-bit) so a chunk never
+splits a group.
+
+**A bug worth recording.** The first 6-bit implementation extracted codes 11..15
+with `(lo >> bit) | (hi << (64 - bit))` for bit = 66..90, i.e. a 64-bit shift by
+≥64 and by a *negative* amount — undefined behaviour that corrupted ~31% of every
+6-bit matrix and produced visibly garbage tokens (`92565,92565,...`). The correct
+form extracts each code from the half that contains it: `bit+6 <= 64` from `lo`,
+`bit >= 64` from `hi` at offset `bit-64`, and only the single straddling code from
+both. This is recorded because the wrong version still ran at plausible speed.
+
+**Test sensitivity was proven with a negative control.** For each branch, a
+deliberate corruption was introduced and the differential test was confirmed to
+FAIL at the matching case (`bits=6 group=64`, and `bits=5 group=128`
+respectively), which proves the test actually exercises that branch. The controls
+were applied on a scratch copy, verified removed (`grep` count 0), and the tree
+re-tested clean before any measurement.
+
+**A/B (one binary per branch via `LOGAN_MLX6_SCALAR` / `LOGAN_MLX5_SCALAR`):**
+
+| branch | off ms/token | on ms/token | speedup | canonical tok/s |
+|---|---:|---:|---:|---:|
+| 6-bit | 443.72 | 333.76 | **1.33x** | 2.7060 -> **3.0865** |
+| 5-bit | 349.08 | 321.14 | **1.09x** | 3.0865 -> **3.2206** |
+
+All four `logan-metal` differential tests pass with all four branches live, and
+the greedy trajectory is byte-identical throughout.
+
+**Decision:** **KEPT, default ON** for both. `LOGAN_MLX6_SCALAR=1` /
+`LOGAN_MLX5_SCALAR=1` restore the scalar branches.
+
+---

@@ -7028,10 +7028,14 @@ impl Model {
         let fused_input = std::env::var("QWEN_SHARED_FUSED_INPUT")
             .map(|v| v != "0")
             .unwrap_or(true);
+        // The MXFP4-only helper declines an MLX-affine checkpoint, so on raw MLX
+        // this fusion silently never engaged and gate/up paid two dispatches.
+        // The affine helper accepts the mixed 8-bit/gs128 + 8-bit/gs64 pair
+        // because each descriptor carries its own geometry.
         let fused_ok = if fused_input {
             let mut ys: [&mut [f32]; 2] = [&mut gv, &mut h];
             let ws = [&layer.se_gate, &layer.se_up];
-            matmul_mxfp4_multi(&mut ys, x, &ws)
+            matmul_mxfp4_multi(&mut ys, x, &ws) || matmul_mlx_affine_multi(&mut ys, x, &ws)
         } else {
             false
         };
