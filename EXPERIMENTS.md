@@ -3347,3 +3347,47 @@ figure on the restored protocol is **3.8070**, and the honest session headline i
 **~2.15x** rather than the 2.17x quoted from run #22.
 
 ---
+
+## EXP-059 — The ~536 us/layer MoE compute gap is real, and its leading cause is I/O contention
+
+**Date:** 2026-09-23  
+**Area:** MoE compute attribution  
+**Status:** **MEASURED, leading hypothesis identified, no contained fix**
+
+**The gap.** `compute_ms_per_token` measures **71.5-82.6 ms** in the model, i.e.
+1788-2065 us/layer at 40 layers, while `affine_dispatch_probe` measures the *same*
+two-command-buffer shape at a median of **1251 us/layer** (n=9; sorted 1106, 1189,
+1192, 1247, 1251, 1362, 1463, 1488, 1867 — median stable even though the spread is
+1.69x max/min). That is **+536 us/layer = 8.3% of the ~260 ms forward**, which is
+larger than any remaining lever I had costed (SwiGLU fusion ~1.5%).
+
+**Hypotheses considered and eliminated by measurement:**
+
+| hypothesis | verdict |
+|---|---|
+| weight-buffer re-creation (the probe caches handles) | **eliminated** — EXP-057's pool gives the model the same cached handles, so both now create nothing per token |
+| L2-cold weight streaming (probe's 14 MB working set is reused; a real token is 540 MB of distinct experts) | **eliminated** — the probe allocates `topk` *distinct* `Quant`s, so it already streams 14.16 MB per iteration, exactly matching the model's 14.16 MB/layer |
+| host SwiGLU between the phases | **too small** — 8 experts x 512 = 4096 `silu` calls/layer is tens of us, not 536 |
+| per-layer activation buffers | **too small** — ~96 KB/layer of `Vec` allocations |
+
+**Leading hypothesis: kernel-vs-I/O memory contention.** The model's expert reads
+stream 540 MB/token (~5.4 GB/s sustained against the SSD) into the same UMA while
+the batched kernels run; the probe issues **no I/O at all**. This matches the
+interference signature this session measured three other times (EXP-046 prefetch
+0.98x, EXP-049 GPU-GDN losing end-to-end despite a lower span, EXP-051 residency
+losing 16.5% at a 53% hit rate — all "a term improved while the forward did not").
+
+**Why no contained fix exists:** the only ways to reduce that contention are
+(i) read fewer bytes, which is residency — rejected three times on this host; or
+(ii) a kernel more robust to concurrent memory traffic, which is a different
+optimization axis with no measured handle. Neither is attemptable safely at this
+point, and the estimate above is a *hypothesis* consistent with prior results rather
+than a proven mechanism.
+
+**Decision:** recorded as an **open, attributed gap** rather than closed. It is the
+one place where a measurement disagrees with a model of the same code path, which is
+exactly the condition that produced EXP-057 — so it is written up with the
+eliminations and the leading hypothesis intact, for a future session to test by
+running the probe under a synthetic background reader.
+
+---
