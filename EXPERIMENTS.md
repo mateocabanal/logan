@@ -3398,3 +3398,68 @@ eliminations and the leading hypothesis intact, for a future session to test by
 running the probe under a synthetic background reader.
 
 ---
+
+## EXP-060 — EXP-059's gap: residency eliminated properly, GPU idle-wakeup measured, and the gap largely dissolves into instrument drift
+
+**Date:** 2026-09-23  
+**Area:** MoE compute attribution  
+**Status:** **CLOSED with evidence (EXP-059's 545 us/layer figure revised down)**
+
+**Correction to EXP-059 first.** That entry recorded "L2-cold weight streaming
+eliminated". **That was wrong.** The probe allocates its 24 distinct `Quant`s *once*
+and re-reads the same 14.16 MB on every iteration, so it is L2-resident after the
+first pass, whereas the model reads 14.16 MB of *different* bytes per layer
+(540 MB/token) and always comes from DRAM. Matching bytes-per-layer did not match
+residency, and residency was exactly the untested variable.
+
+**Residency, now measured properly.** A rotating arm (`PROBE_ROTATE=40`, i.e. 40
+weight sets totalling ~566 MB, cycled so each iteration reads bytes the previous one
+did not, with per-set tensor handles so no cached wrapper spans a switch):
+
+| arm | median us/layer (n=5) |
+|---|---:|
+| L2-resident (re-reads the same 14.16 MB) | 1168 |
+| rotating cold-DRAM (~566 MB working set) | 1243 |
+
+**Residency penalty = +75 us/layer (~1.2% of the forward, ~4% of the original gap).**
+So residency is real but small, and it is *not* the explanation.
+
+**GPU idle-wakeup, measured.** The model's compute follows a ~1.9 ms SSD wait during
+which the GPU has no work; the probe had no such gap. Adding `PROBE_GAP_MS` (with the
+sleep placed **outside** the timed window — an earlier version put it inside and so
+just measured the sleep, which also overshoots ~45% on macOS: 0.5/1/2/5 ms requested
+ran 0.75/1.46/2.91/6.99 ms actual):
+
+| preceding idle gap | compute-only median us/layer |
+|---|---:|
+| 0 ms | 1650 |
+| 2 ms | 2635 |
+
+**+986 us/layer** at a 2 ms gap, reproduced in both arm orders
+(`0,2,2,0,0,2,2,0`: gap=0 read 1602/1668/1652/1648, gap=2 read 2539/2674/2597/2703).
+So a *fully idle* GPU genuinely costs ~1 ms/layer to resume.
+
+**But the model does not pay that penalty.** Model `compute_ms` is **1788 us/layer**,
+only **+138 us/layer** above the probe's no-gap baseline of 1650 — far less than the
+~986 the idle model predicts. The reason is the change EXP-039 made: the whole route's
+8 reads are issued concurrently, so layer L's SSD wait overlaps layer L-1's compute
+and the GPU is never fully idle. **The idle-wakeup cost is already largely hidden**,
+which is an additional, independent reason the prefetch family could not win
+(EXP-046): there is little idle time left to recover.
+
+**The residual "545 us/layer gap" is instrument drift, not a real gap.** The probe's
+own no-gap batched figure measured **1251 us/layer (n=9)** in an earlier session and
+**1650 us/layer (n=4)** here — identical code, a **32%** spread — while the model sits
+at 1788. So EXP-059's gap was computed against a low-end probe sample and does not
+survive as a quantity: measured against the probe's *current* baseline, the model's
+excess is 138 us/layer, i.e. inside the probe's own cross-session spread.
+
+**Decision:** **CLOSED.** The compute term is accounted for by (a) a small residency
+penalty (~75 us/layer), (b) an idle-wakeup cost that the concurrent I/O already hides,
+and (c) probe instability large enough to make the original 545 us/layer unresolvable.
+No remaining lever is implied. Recorded because the sequence "hypothesis -> wrong
+elimination -> proper measurement -> effect dissolves into instrument error" is the
+useful outcome here, and because the *probe cannot set the model's ceiling* — only the
+model's own timers can.
+
+---

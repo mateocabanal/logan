@@ -194,6 +194,81 @@ fn main() {
         }
         (t0.elapsed().as_secs_f64() * 1e6 / iters as f64, groups)
     };
+    // ---- Arm: batched over a ROTATING weight set (cold-DRAM) ----------------
+    //
+    // The arms above re-read the SAME 14.16 MB of weights every iteration, so
+    // after the first pass they are L2-resident (~16 MB L2 on this M2). The real
+    // model reads 14.16 MB of *different* bytes per layer (540 MB/token), so its
+    // weights always come from DRAM. Matching bytes-per-layer did NOT match
+    // residency, which is why this arm exists: cycle through `PROBE_ROTATE` weight
+    // sets so each iteration reads mostly bytes the previous one did not.
+    let rotate: usize = std::env::var("PROBE_ROTATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let (rotated_us, rotated_bytes) = if rotate > 1 {
+        let rot: Vec<Experts> = (0..rotate)
+            .map(|r| Experts {
+                gates: (0..topk)
+                    .map(|e| Quant::new(D_HIDDEN, D_MODEL, 0x1000 + (r * 977 + e) as u64))
+                    .collect(),
+                ups: (0..topk)
+                    .map(|e| Quant::new(D_HIDDEN, D_MODEL, 0x2000 + (r * 977 + e) as u64))
+                    .collect(),
+                downs: (0..topk)
+                    .map(|e| Quant::new(D_MODEL, D_HIDDEN, 0x3000 + (r * 977 + e) as u64))
+                    .collect(),
+            })
+            .collect();
+        let bytes: usize = rot[0]
+            .gates
+            .iter()
+            .chain(rot[0].ups.iter())
+            .chain(rot[0].downs.iter())
+            .map(|q| q.weights.len() + q.aux.len())
+            .sum();
+        let mut ys: Vec<Vec<f32>> = slots.iter().map(|s| vec![0.0_f32; out_dim(s.role)]).collect();
+        // Separate handles per rotation slot so no cached wrapper spans a switch;
+        // this is the model's condition (a layer's matrices are freshly wrapped).
+        let mut ts: Vec<Vec<*mut ffi::ColiMetalTensor>> =
+            (0..rotate).map(|_| vec![std::ptr::null_mut(); n]).collect();
+        // `PROBE_GAP_MS` inserts an idle wait between iterations, mimicking the
+        // model's per-layer SSD wait (~1.9 ms) during which the GPU sits idle. If
+        // per-iteration time rises toward the model's 1788 us/layer, the gap is
+        // GPU idle-wakeup/power state rather than anything the kernel does.
+        let gap_ms: f64 = std::env::var("PROBE_GAP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        // Time ONLY the compute span, per iteration, with the idle gap outside it.
+        // Putting the sleep inside the measured window (the earlier version) just
+        // measures the sleep: `thread::sleep` also overshoots ~45% on macOS, so
+        // the reported per-layer cost was dominated by the gap it was meant to
+        // simulate. Accumulating each `run_batched` span separately is the only
+        // way to see whether a preceding idle period slows the compute down.
+        let mut compute_ns: u128 = 0;
+        for it in 0..iters {
+            if gap_ms > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(gap_ms / 1000.0));
+            }
+            let r = it % rotate;
+            let (ex, t) = (&rot[r], &mut ts[r]);
+            let t0 = std::time::Instant::now();
+            run_batched(&slots, ex, &mut ys, t, &x, &down_x);
+            compute_ns += t0.elapsed().as_nanos();
+        }
+        (
+            compute_ns as f64 / 1e3 / iters as f64,
+            bytes * rotate,
+        )
+    } else {
+        (0.0, 0)
+    };
+    if rotate > 1 {
+        println!("PROBE rotated_us_per_token={rotated_us:.2}");
+        println!("PROBE rotated_sets={rotate} rotated_total_bytes={rotated_bytes}");
+    }
+
     println!("PROBE batched_cold_us_per_token={batched_cold_us:.2}");
     println!("PROBE batched_cold_cmd_buffers={groups_cold}");
     println!(
