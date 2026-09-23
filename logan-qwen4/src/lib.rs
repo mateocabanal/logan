@@ -11406,7 +11406,12 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
             );
         }
 
-        let mut outputs = Vec::with_capacity(calls.len());
+        // Phase 1 — demand fetch. Issue/collect order and concurrency are
+        // UNCHANGED from the established path (`io_concurrency` still governs
+        // how many reads are in flight); the difference is that the
+        // materialized matrices are retained rather than consumed immediately,
+        // because the compute phase below needs them all at once to batch.
+        let mut mats_all: Vec<[Wt; 3]> = Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().enumerate() {
             let fetch = if index < fetches.len() {
                 std::mem::replace(&mut fetches[index], DemandFetch::NotIssued)
@@ -11421,27 +11426,104 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
                 )
                 .map_err(crate::pool::PoolError::from)?
             };
-            let mats = self
-                .collect_demand_expert(fetch)
-                .map_err(crate::pool::PoolError::from)?;
-            EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let compute_t0 = std::time::Instant::now();
-            let mut gate_out = vec![0.0_f32; d_hidden];
-            let mut hidden = vec![0.0_f32; d_hidden];
-            matmul(&mut gate_out, &call.input, &mats[0]);
-            matmul(&mut hidden, &call.input, &mats[1]);
-            for index in 0..d_hidden {
-                hidden[index] *= silu(gate_out[index]);
-            }
-            let mut output = vec![0.0_f32; d_model];
-            matmul(&mut output, &hidden, &mats[2]);
-            EXPERT_COMPUTE_NS.fetch_add(
-                compute_t0.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
+            mats_all.push(
+                self.collect_demand_expert(fetch)
+                    .map_err(crate::pool::PoolError::from)?,
             );
+            EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Phase 2 — batched projections.
+        //
+        // Every routed expert in a layer consumes the SAME activation, so all
+        // their gate/up projections share one input width (`d_model`). Encoding
+        // those 2*k GEMVs into a single command buffer, rather than 2*k separate
+        // commit+waitUntilCompleted pairs, removes the per-dispatch stall that
+        // dominates this phase. A 512x2048 4-bit projection moves only ~590 KB,
+        // but a standalone dispatch costs ~278 us; `examples/affine_dispatch_probe`
+        // measures the whole layer at 6683 us serial versus 3552 us with the
+        // gate/up batch, and the two are bit-identical.
+        //
+        // The down projections cannot join: each consumes its own expert's
+        // SwiGLU output, and the batch entry point requires one shared activation.
+        //
+        // The shared-activation precondition is checked rather than assumed. The
+        // `ExpertSource` trait makes no promise that every call carries the same
+        // input (a delegating pool source may not), and silently computing with
+        // the wrong activation would be a correctness bug, so a mismatch falls
+        // back to the per-matrix path.
+        let compute_t0 = std::time::Instant::now();
+        let k = calls.len();
+        // `LOGAN_EXPERT_BATCH_GATEUP=0` restores the per-matrix dispatch shape.
+        // It exists so an A/B can compare the two shapes from ONE binary; a
+        // build-per-arm comparison would also vary codegen.
+        let batch_enabled = std::env::var("LOGAN_EXPERT_BATCH_GATEUP")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        let shared_input = calls
+            .iter()
+            .all(|c| c.input.len() == calls[0].input.len() && c.input == calls[0].input);
+        let mut gate_outs: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_hidden]).collect();
+        let mut hiddens: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_hidden]).collect();
+        let mut batched = false;
+        if batch_enabled && shared_input && k > 1 {
+            // The batch entry point takes at most 16 descriptors, all sharing one
+            // activation width. Chunk rather than assume `2*k <= 16`: at topk 8
+            // the 16 gate/up projections fit exactly, but a topk-10 model (the
+            // 512-expert/top-10 Qwen3.8 path) would otherwise hand the entry
+            // point 20 descriptors, get a decline, and silently lose the win.
+            //
+            // Defined as a nested fn so each call takes its output set by
+            // `&mut [..]` and its own `iter_mut`; indexing two shared vectors
+            // from one loop cannot satisfy the borrow checker.
+            fn batch_projections(
+                outs: &mut [Vec<f32>],
+                mats: &[[Wt; 3]],
+                role: usize,
+                x: &[f32],
+                cap: usize,
+            ) -> bool {
+                let mut start = 0usize;
+                while start < outs.len() {
+                    let end = (start + cap).min(outs.len());
+                    let mut ys_chunk: Vec<&mut [f32]> = Vec::with_capacity(end - start);
+                    let mut ws_chunk: Vec<&Wt> = Vec::with_capacity(end - start);
+                    for (i, out) in outs[start..end].iter_mut().enumerate() {
+                        ys_chunk.push(out.as_mut_slice());
+                        ws_chunk.push(&mats[start + i][role]);
+                    }
+                    if !matmul_mlx_affine_multi(&mut ys_chunk, x, &ws_chunk) {
+                        return false;
+                    }
+                    start = end;
+                }
+                true
+            }
+            const BATCH_CAP: usize = 16;
+            batched = batch_projections(&mut gate_outs, &mats_all, 0, &calls[0].input, BATCH_CAP)
+                && batch_projections(&mut hiddens, &mats_all, 1, &calls[0].input, BATCH_CAP);
+        }
+        if !batched {
+            for (i, call) in calls.iter().enumerate() {
+                matmul(&mut gate_outs[i], &call.input, &mats_all[i][0]);
+                matmul(&mut hiddens[i], &call.input, &mats_all[i][1]);
+            }
+        }
+        for i in 0..k {
+            for index in 0..d_hidden {
+                hiddens[i][index] *= silu(gate_outs[i][index]);
+            }
+        }
+        let mut outputs = Vec::with_capacity(k);
+        for i in 0..k {
+            let mut output = vec![0.0_f32; d_model];
+            matmul(&mut output, &hiddens[i], &mats_all[i][2]);
             outputs.push(output);
         }
+        EXPERT_COMPUTE_NS.fetch_add(
+            compute_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(outputs)
     }
 }

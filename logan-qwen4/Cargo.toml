@@ -18,3 +18,6 @@ logan-ane = { path = "../logan-ane" }
 # Test-only: the project convention prefers parking_lot for locks that are
 # immediately unwrapped, and this crate takes no runtime lock dependency.
 parking_lot = "0.12"
+# Benchmark-only: `examples/decode_bench.rs` tokenizes real prompt text with the
+# checkpoint's own tokenizer.json. Not a runtime dependency.
+tokenizers = "0.23.1"

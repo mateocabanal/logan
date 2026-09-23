@@ -2067,3 +2067,89 @@ more strongly.
 `logan-qwen4/src/lib.rs` plus loader initializers.
 
 ---
+
+## EXP-037 — Expert gate/up projection command-buffer batching
+
+**Date:** 2026-09-23  
+**Area:** routed MoE / Metal dispatch / decode throughput  
+**Status:** **KEPT**
+
+**Motivation:** EXP-018 established that the routed-expert phase is not
+storage-bound (warm `pread` floor ~51 ms/token) but *dispatch*-bound: each
+routed-expert GEMM was a synchronous Metal dispatch with its own `commit` +
+`waitUntilCompleted`. EXP-029 corrected the accounting and put the decode-window
+expert terms at ~148 ms load + ~335 ms compute per forward, i.e. roughly 240 us
+per affine dispatch. A 512x2048 4-bit projection is ~590 KB, which is ~6 us of
+UMA traffic — so the bulk of each dispatch is per-command-buffer overhead, not
+data movement.
+
+**Hypothesis:** If the per-dispatch cost is command-buffer overhead, then
+encoding several independent GEMVs that consume the *same* activation into ONE
+command buffer will remove it. `metal_matmul_mlx_affine_multi` already
+implements exactly that (up to 16 descriptors, all sharing input width `I`) and
+is already used by the GDN fused-input path (`lib.rs`, `QWEN_GDN_FUSED_INPUT`) —
+but the routed-expert path never used it: `MlxLocalExpertSource::eval` issued one
+`matmul` per matrix.
+
+**Geometry that permits batching:** every routed expert in a layer consumes the
+SAME token activation, so all `2*k` gate/up projections share `I = d_model` and
+collapse into one command buffer. The `k` down projections cannot join: each
+consumes its own expert's SwiGLU output, and the batch entry point requires one
+shared activation. At `topk=8` that is 24 dispatches → 9 command buffers.
+
+**Standalone probe — `logan-qwen4/examples/affine_dispatch_probe.rs`:**
+
+Real Qwen3.6 expert geometry (d_model 2048, d_hidden 512, topk 8, 4-bit affine
+group 64), 200 iterations, no model loaded:
+
+| shape | us / layer | command buffers | us / dispatch |
+|---|---:|---:|---:|
+| serial (today's path) | 6682.7 | 24 | 278.5 |
+| batched gate/up | 3551.9 | 9 | 394.7 |
+
+**speedup 1.88x**, `max_abs_diff = 0.000000000`, `bit_identical = true`.
+
+**Paired real-model A/B:** `LOGAN_EXPERT_NOCACHE=1`, sampled decode
+(`BENCH_TEMP=1.0`, fixed `BENCH_SEED`), 16 generated tokens, 6 interleaved pairs
+(12 runs), both arms from ONE binary via
+`LOGAN_EXPERT_BATCH_GATEUP={1,0}` so codegen is held constant. Pooled per-step
+median over 90 measured forwards per arm:
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| off (per-matrix, EXP-018 shape) | 653.60 | 1.5300 |
+| on (batched gate/up) | 505.86 | 1.9768 |
+
+**+29.2% decode throughput**, and `identical_across_arms=True`: the batched arm
+reproduced the per-matrix arm's token sequence exactly (1 distinct trajectory in
+each arm, and the two arms' sequences are equal). The greedy trajectory
+`248068,198,8160,579,264,7047,1817,25,271,16,13,220,2972,15771,2598,2570` also
+matches the pre-change baseline byte for byte.
+
+**Why this is not the rejected EXP-032 shape:** EXP-032 overlapped the *I/O*
+(`LOGAN_EXPERT_IO_CONCURRENCY`), which moved wait into compute and lost. This
+change leaves I/O ordering and concurrency completely untouched — the fetch loop
+still issues and collects in the same order at `io_concurrency=1` — and only
+removes redundant Metal command buffers from the compute phase. The probe
+measures the compute shape in isolation, which is why the effect is clean.
+
+**Correctness / regression gates:**
+- bit-identical probe output (`bit_identical=true`)
+- identical real-model greedy and sampled token trajectories across arms
+- the shared-activation precondition is checked at runtime, not assumed; a
+  mismatch falls back to the per-matrix path, so a delegating `ExpertSource`
+  that does not share activations cannot be silently mis-computed
+
+**Decision:** **KEPT, default ON**, with `LOGAN_EXPERT_BATCH_GATEUP=0` retained
+so the A/B is reproducible.
+
+**Next (same mechanism, not yet done):** the `k` down projections are the
+remaining 8 command buffers per layer. They need either a grouped kernel that
+takes heterogeneous activations in one dispatch, or SwiGLU fused into the
+gate/up batch. That is the obvious follow-up; the probe's remaining serial
+portion is ~8 x 278 us per layer.
+
+**Artifacts:** `.perf_runs/autoresearch/ab-batch/`,
+`logan-qwen4/examples/affine_dispatch_probe.rs`.
+
+---

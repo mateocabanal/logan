@@ -1061,6 +1061,7 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "sha2",
+ "tokenizers",
 ]
 
 [[package]]
