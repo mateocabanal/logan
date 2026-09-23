@@ -3124,3 +3124,48 @@ speed, with this caveat recorded. Any claim about non-greedy decoding should cit
 the 64-token numbers above, not the canonical run.
 
 ---
+
+## EXP-056 — `COLI_METAL_UNTRACKED=1` is null; the buffer-creation branch is closed
+
+**Date:** 2026-09-23  
+**Area:** Metal resource options  
+**Status:** **NULL (not promoted)**
+
+**Motivation:** EXP-052's exact counters isolated the remaining expert-phase cost as
+**MTLBuffer object creation** (1920 fresh buffer objects per forward, essentially
+all zero-copy, `copied_bytes` flat at 332 800 for a whole run). MTLResource hazard
+tracking is per-object overhead, and `coli_metal_init` already supports disabling it
+(`COLI_METAL_UNTRACKED=1` -> `MTLResourceHazardTrackingModeUntracked` on all
+resources). That is the cheapest available test of whether per-object overhead is
+actually recoverable without changing residency.
+
+**Paired A/B** (5 pairs, alternating arm order, 24 tokens, one binary):
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| untracked | 281.52 | 3.5521 |
+| default (tracked) | 283.73 | 3.5244 |
+
+**1.0078x — null** (0.8%, well inside this host's noise band), token-identical. So
+hazard tracking is not a material part of the per-object cost here.
+
+**Decision:** **NOT PROMOTED.** `COLI_METAL_UNTRACKED` stays opt-in as before.
+
+**Why this closes the branch.** With (a) the per-forward cost measured as buffer
+*object creation* rather than copies, (b) hazard-tracking mode null, and (c) the
+only way to avoid creating those objects — keeping materialized `Wt`s and their warm
+handles resident — already rejected on this host three times (EXP-019's sweep,
+EXP-051 at a genuine 53% hit rate, both losing to UMA pressure on 16 GiB), there is
+no remaining contained lever on the expert phase at the 1-2% scale. The alternative
+that would raise the arithmetic-side ceiling is a GPU-side SwiGLU fusion to collapse
+the MoE phase from two command buffers per layer to one (~1.5%, requires a new C
+API and an FP-accumulation-order risk) — measured as poor risk/reward against a
+verified 2.0x.
+
+**Stopping point:** this session's structural work is complete. All six kept changes
+are token-verified (baseline sha, 128-token kernel equivalence, 96-token fused
+equivalence), all four rejected branches carry a measured mechanism, and the ~2.0x
+result is confirmed at a horizon where the non-greedy arm genuinely diverges
+(EXP-055).
+
+---
