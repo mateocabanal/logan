@@ -3594,3 +3594,101 @@ mildly contended; treat the absolute tok/s as indicative and the sha divergence 
 result. The GPU guard passed on this run (metal_share=1.000, fallback=0, sanity 261 ms).
 
 ---
+
+## EXP-064 — LM-head backend is a wash; baseline re-measured at repeats=3; final ratio confirmed ~2.0x
+
+**Date:** 2026-09-23  
+**Area:** LM head / methodology  
+**Status:** **CLOSED (no win) + baseline correction**
+
+**LM head has two plausible-but-wrong-looking leads, both measured and closed.**
+
+The head is `head` ~17-26 ms/token, the 4th-largest span. Two facts invited an
+optimization: (a) it reads **1.016 GB/token** because the LM head is stored **4-bit on
+disk** (`language_model.lm_head.weight U32 [248320,512]` = 508 MB, plus F16 scales/biases)
+but **dequantized to bf16 in RAM (1017 MB)** — i.e. the per-token read is ~2x the bytes
+actually on disk; and (b) a `metal` backend already exists and is selectable via
+`QWEN_LM_HEAD_BACKEND`.
+
+**(a) is off the table.** Re-quantizing the head would change the GEMV's accumulation
+numerics and therefore the logits, breaking the byte-identical trajectory gate that every
+change this session was required to preserve. The bf16 residency is a deliberate
+correctness cost, not an oversight.
+
+**(b) is a wash.** Three backends (`cpu` = bf16 NEON+threaded, `bnns` = Apple Accelerate,
+`metal`), interleaved, 24 tokens, `head=` span read from telemetry:
+
+| backend | head ms readings | median |
+|---|---|---:|
+| cpu | 17.6, 23.0, 25.8, 19.6 | **21.3** |
+| bnns | 23.0, 25.4 | **24.2** |
+| metal | 22.5, 19.8, 25.3, 25.3 | **23.9** |
+
+`metal` is nominally *slower* at the median; an earlier session showed metal at 17.1 vs
+cpu 23.0, but that was the fast tail of the same distribution — across 4 alternated pairs
+the arms overlap almost completely (cpu 17.6-25.8, metal 19.8-25.3). **All backends
+produced identical token ids** (md5 `18a2954b6555` for every run), so this is purely a
+performance question and the answer is: no backend wins. The head is bandwidth-bound at
+~60 GB/s on a 1 GB/token read, which is already near this M2's practical streaming rate.
+Recorded so the "the head reads 2x what's on disk" observation is not re-investigated:
+the 2x is the correctness-preserving dequantization, and the GPU path does not beat the
+threaded NEON path for this size.
+
+**Baseline correction (protocol exactness).** The canonical baseline readings were taken at
+`--repeats 2`; the canonical arms use 3. Re-measured the baseline worktree at the canonical
+setting:
+
+| baseline `de5795f` | reading |
+|---|---:|
+| repeats=1 | 2.0287, 1.6642, 1.7688 (median 1.7688) |
+| **repeats=3** | **1.8126, 1.8019 (median 1.807)** |
+
+**Final ratio, same harness:**
+- per-pair (alternating, base-first pairs): 3.8753/2.0287 = **1.910**, 3.4016/1.7688 = **1.923**
+- ratio of medians vs the repeats=3 baseline: 3.6838/1.807 = **2.04**
+
+**Headline: ~1.9-2.1x, i.e. quote ~2.0x.** The recorded 1.7725 from run #1 sits inside the
+same-harness baseline's own spread (1.66-2.03), so it was a representative reading, not a
+lucky one — but it should not anchor the headline. Both builds emit the identical
+`trajectory_sha` `e4f361a8…`, so the comparison is like-for-like.
+
+---
+
+## EXP-065 — Remaining-profile audit: every remaining span measured against its bandwidth ceiling
+
+**Date:** 2026-09-23  
+**Area:** headroom survey  
+**Status:** **RECORDED (no reachable lever at this host's noise)**
+
+Per-token spans at the final state (24-token decode, `LOGAN_PROFILE=1`):
+`fill=173.6 gdn=29.9 shared=21.5 head=17.0 attn=15.8 route=8.8`, total ~283 ms
+(profile-window total 609.9 ms includes the 4-token prefill forward).
+
+Each remaining span checked against what its irreducible traffic implies on this M2
+(~100 GB/s practical DRAM streaming, ~7 GB/s SSD floor for F_NOCACHE reads):
+
+| span | ms/tok | bytes/tok (irreducible) | implied GB/s | verdict |
+|---|---:|---:|---:|---|
+| `head` | 17-26 | 1017 MB (bf16, dequantized from 540 MB 4-bit on disk) | 39-60 | bandwidth-bound; quantizing breaks sha gate (EXP-064) |
+| `shared` | 21.5 | ~? (dense shared expert, resident) | — | already fused single-CB (EXP-053) |
+| `fill` | 173.6 | 566 MB experts + ~540 MB materialize | — | **split**: load ~107 (wait 80.7 @ ~7 GB/s SSD floor) + compute 65.8 |
+
+The two structural observations that close this out:
+
+1. **Expert I/O is already coalesced.** 7360 MIO loads/23 tokens = **320/token = 40 layers x
+   8 experts** — exactly one read per expert, the minimum possible. 13.02 GB/23 = 566 MB/token
+   moved from SSD. There is no per-layer or per-expert redundant read left to remove.
+2. **MoE compute is already 2 command buffers per layer** (phase 1 gate+up batch, phase 2
+   down batch, `LOGAN_EXPERT_BATCH_GATEUP` A/B lever still present in-tree,
+   `BATCH_CAP=16`), and the phase-2 SwiGLU is a CPU elementwise loop over
+   `k x d_hidden` (~8 k elements), i.e. microseconds. Fusing it into the GPU kernel could at
+   best collapse phase 2 from 2 CBs to 1 — worth ~1.5% by the dispatch-count model and
+   **not separable from this host's +-25% noise**, with a new C API and an FP
+   accumulation-order risk against the sha gate.
+
+**Decision:** the profile is bandwidth-bound and dispatched-minimally; the remaining known
+levers are each <=~2% and below this host's measurement resolution. The session's changes are
+kept on their own merits (each was validated by a paired A/B well above the noise floor, and
+by byte-identical trajectories), and no further change is attempted.
+
+---
