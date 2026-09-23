@@ -3056,3 +3056,60 @@ than an unattended loop attempting it.
 state rather than risking a numeric-corruption bug for ~5.6%.
 
 ---
+
+## EXP-055 — The 24-token sample arm replays argmax; non-greedy validation needs >=33 tokens
+
+**Date:** 2026-09-23  
+**Area:** harness / methodology  
+**Status:** **MEASURED (harness caveat recorded)**
+
+**Why this matters:** the harness's second arm is specified as a seeded
+temperature-1.0 multinomial sample over the full vocabulary, and the user
+explicitly asked for validation under non-greedy decoding. If that arm silently
+replays the argmax path, the harness is measuring one trajectory twice and the
+non-greedy claim is unsupported.
+
+**Measurement** (same prompt, same seed `20260923`, `BENCH_TEMP=1.0`,
+`BENCH_TOP_K=0`, `BENCH_TOP_P=1.0`):
+
+| horizon | greedy vs sample | first divergence |
+|---|---|---|
+| 24 tokens | **byte-identical** | none |
+| 64 tokens | **diverge** | token **33** (greedy 34080 vs sample 1536) |
+
+So the sampler is live (it does diverge), but the prompt's ` thinking` preamble makes
+the distribution peaked enough that the first 32 draws all land on the argmax. The
+canonical 24-token run therefore **cannot** distinguish the arms, which is what the
+near-zero `arm_rate_gap` (0.001-0.008) in every canonical run this session was
+saying.
+
+**Measured at a horizon where the arms genuinely differ** (`autoresearch.sh
+--tokens 64 --repeats 2`):
+
+| arm | pooled median ms/token | tok/s |
+|---|---:|---:|
+| greedy | 309.90 | 3.2268 |
+| sample (temp 1.0, diverged at token 33) | 304.12 | **3.2882** |
+| combined `tok_per_sec` | | **3.2575** |
+
+Both arms are fast and within 2% of each other, so the 2.03x over the baseline is
+**not** an artifact of measuring the greedy path twice: the sampled arm, decoding a
+genuinely different token sequence (hence different expert routes), retains the
+full speedup.
+
+**Caveat stated plainly:** the 3.2575 at 64 tokens is not directly comparable to
+the canonical 24-token 3.6063, because attention cost grows with context length
+(10 full-attention layers) and the 64-token greedy `trajectory_sha` is necessarily
+different from the canonical 24-token `e4f361a8…`. The baseline commit was not
+re-measured at 64 tokens, so the 64-token figure is reported as *both arms fast and
+close*, not as a second independent speedup ratio. The structural argument that the
+speedup is horizon-independent: every kept change is a **token-independent
+forward-path** change (command-buffer count, kernel vectorization, weight-wrapper
+creation, GDN execution placement). The token trajectory only selects *which*
+experts load — it cannot change the per-forward cost structure.
+
+**Decision:** the canonical 24-token harness is retained for comparability and
+speed, with this caveat recorded. Any claim about non-greedy decoding should cite
+the 64-token numbers above, not the canonical run.
+
+---
