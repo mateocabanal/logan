@@ -3002,7 +3002,7 @@ unfused path.
 
 **Date:** 2026-09-23  
 **Area:** verification / Metal weight upload  
-**Status:** **GATE PASSED** (EXP-053) / **wrap fix DEFERRED**
+**Status:** **GATE PASSED** (EXP-053) / **wrap fix SUPERSEDED by EXP-052 (refuted)**
 
 ### A. 96-token equivalence for the fused shared expert
 
@@ -3051,9 +3051,20 @@ EXP-052 already records the measurement, the prize, and both mechanisms includin
 the alignment/dealloc trap, a future session can implement it deliberately rather
 than an unattended loop attempting it.
 
-**Decision:** measurement **KEPT** as a finding and a candidate; the fix is
-**deferred, not rejected**. The session ends on the committed, verified 1.99x
-state rather than risking a numeric-corruption bug for ~5.6%.
+**Decision:** measurement **KEPT** as a finding; the fix is **superseded by
+EXP-052, which REFUTED the underlying hypothesis.** Exact `wrap()` counters added
+afterwards show the expert weight pointers are already 16 KiB-aligned:
+`copied_bytes` stays flat at 332 800 for an entire run while the call count reaches
+**1920 `wrap()` calls per forward** (320 experts x 3 matrices x 2 buffers), and
+essentially all of them take the zero-copy path. So there is no ~566 MB/token of
+copies to remove, the earlier recommendation to "pool page-aligned destination
+buffers" is withdrawn, and what remains is MTLBuffer *object creation* — whose only
+fix is residency, already rejected three times on this host (EXP-019 sweep, EXP-051
+at a real 53% hit rate).
+
+The ownership question raised in this entry was therefore never necessary, which is
+the useful outcome: the exact counter closed the branch for free and prevented an
+unaligned-`Vec`-dealloc risk being taken for a prize that did not exist.
 
 ---
 
