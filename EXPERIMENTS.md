@@ -3355,11 +3355,11 @@ figure on the restored protocol is **3.8070**, and the honest session headline i
 
 ---
 
-## EXP-059 — The ~536 us/layer MoE compute gap is real, and its leading cause is I/O contention
+## EXP-059 — MoE compute gap investigation (SUPERSEDED by EXP-060: gap was instrument drift)
 
 **Date:** 2026-09-23  
 **Area:** MoE compute attribution  
-**Status:** **MEASURED, leading hypothesis identified, no contained fix**
+**Status:** **SUPERSEDED by EXP-060 (residency mis-eliminated; gap was instrument drift)**
 
 **The gap.** `compute_ms_per_token` measures **71.5-82.6 ms** in the model, i.e.
 1788-2065 us/layer at 40 layers, while `affine_dispatch_probe` measures the *same*
@@ -3391,11 +3391,17 @@ optimization axis with no measured handle. Neither is attemptable safely at this
 point, and the estimate above is a *hypothesis* consistent with prior results rather
 than a proven mechanism.
 
-**Decision:** recorded as an **open, attributed gap** rather than closed. It is the
-one place where a measurement disagrees with a model of the same code path, which is
-exactly the condition that produced EXP-057 — so it is written up with the
-eliminations and the leading hypothesis intact, for a future session to test by
-running the probe under a synthetic background reader.
+**Status: SUPERSEDED by EXP-060.** The "L2-cold streaming eliminated" row above is
+**wrong** — the probe re-reads the same 14.16 MB every iteration, so it is
+L2-resident while the model always streams from DRAM, and residency was the untested
+variable. Measured properly (rotating ~566 MB weight set) the residency penalty is
+only **+75 us/layer**, and a **GPU idle-wakeup** cost of ~986 us/layer at a 2 ms idle
+gap was measured — but the model does not pay it, because EXP-039's concurrent route
+issue overlaps each layer's SSD wait with the previous layer's compute. Measured
+against the probe's *current* no-gap baseline (1650 us/layer, vs 1251 in the earlier
+session for identical code — a 32% cross-session spread), the model's excess is only
+~138 us/layer, i.e. inside the instrument's own drift. So this entry's 545 us/layer
+figure does not survive as a quantity. See EXP-060 for the full accounting.
 
 ---
 
