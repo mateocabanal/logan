@@ -10166,6 +10166,15 @@ impl Model {
                  materialize_ms_per_token={mat_ms:.1} plan_hits={plan_hits} \
                  plan_misses={plan_misses}"
             );
+            // Exact Metal-buffer wrapper accounting. `copied_bytes` staying flat
+            // across token counts means the weight upload is already zero-copy
+            // and what remains is buffer-object creation, which only residency
+            // could avoid (EXP-019/051/052).
+            let (wrap_calls, wrap_zc, wrap_bytes) = logan_metal::wrap_stats();
+            eprintln!(
+                "logan metal-wrap: calls={wrap_calls} zero_copy={wrap_zc} \
+                 copied_bytes={wrap_bytes}"
+            );
         }
         if let Some(predictor) = self.route_predictor.as_ref() {
             // Predictor counters are process cumulative. Report the decode

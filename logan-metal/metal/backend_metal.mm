@@ -1816,10 +1816,26 @@ static size_t fmt_scale_bytes(int fmt, int I, int O, int gs) {
 }
 
 // Wrap host memory zero-copy if page-aligned, else copy into a shared buffer.
+// Exact `wrap()` accounting. A timing probe cannot separate a memcpy from
+// MTLBuffer-creation churn (its run-to-run spread is ~60%), so count the calls
+// and the bytes instead: this decides whether the per-matrix weight upload is a
+// real cost worth restructuring ownership for, or nothing.
+static std::atomic<uint64_t> g_wrap_calls{0};
+static std::atomic<uint64_t> g_wrap_zero_copy{0};
+static std::atomic<uint64_t> g_wrap_copy_bytes{0};
+extern "C" void coli_metal_wrap_stats(uint64_t *calls, uint64_t *zero_copy, uint64_t *copy_bytes) {
+  if (calls) *calls = g_wrap_calls.load(std::memory_order_relaxed);
+  if (zero_copy) *zero_copy = g_wrap_zero_copy.load(std::memory_order_relaxed);
+  if (copy_bytes) *copy_bytes = g_wrap_copy_bytes.load(std::memory_order_relaxed);
+}
 static id<MTLBuffer> wrap(const void *p, size_t n) {
   size_t pg = 16384; // Apple Silicon page
-  if (((uintptr_t)p % pg) == 0 && (n % pg) == 0)
+  g_wrap_calls.fetch_add(1, std::memory_order_relaxed);
+  if (((uintptr_t)p % pg) == 0 && (n % pg) == 0) {
+    g_wrap_zero_copy.fetch_add(1, std::memory_order_relaxed);
     return [g_dev newBufferWithBytesNoCopy:(void*)p length:n options:MTLResourceStorageModeShared deallocator:nil];
+  }
+  g_wrap_copy_bytes.fetch_add(n, std::memory_order_relaxed);
   return [g_dev newBufferWithBytes:p length:n options:MTLResourceStorageModeShared];
 }
 

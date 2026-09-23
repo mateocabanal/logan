@@ -272,6 +272,7 @@ mod imp {
             o: i32,
             gs: i32,
         ) -> i32;
+        fn coli_metal_wrap_stats(calls: *mut u64, zero_copy: *mut u64, copy_bytes: *mut u64);
         fn coli_metal_matmul_multi(
             x: *const f32,
             s: i32,
@@ -2920,6 +2921,17 @@ mod imp {
     /// slot. Raw MLX currently copies from shared MTLBuffer into its native
     /// quantized `Wt` representation before dispatch; the I/O itself remains
     /// asynchronous and bypasses the POSIX page-cache path.
+    /// Exact `wrap()` accounting: `(calls, zero_copy_calls, copied_bytes)`.
+    /// Distinguishes a real memcpy cost from MTLBuffer-creation churn, which a
+    /// timing probe cannot do at this host's noise level.
+    pub fn wrap_stats() -> (u64, u64, u64) {
+        let mut calls = 0u64;
+        let mut zc = 0u64;
+        let mut bytes = 0u64;
+        unsafe { coli_metal_wrap_stats(&mut calls, &mut zc, &mut bytes) };
+        (calls, zc, bytes)
+    }
+
     pub fn mio_finish_slot(
         slot: i32,
         event: i64,

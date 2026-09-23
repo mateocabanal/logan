@@ -2794,7 +2794,7 @@ mismatch. Recorded explicitly so a future session measures rather than assumes.
 
 ---
 
-## EXP-051 — Expert residency cache on raw MLX: REJECTED for a now-understood reason (temporal reuse is ~5%, not ~50%)
+## EXP-051 — Expert residency cache on raw MLX: REJECTED (reuse is real at ~53%, residency still loses)
 
 **Date:** 2026-09-23  
 **Area:** routed MoE / storage  
@@ -2846,17 +2846,29 @@ order, 32 tokens, ~53% hit rate):
 
 **0.8351x — 16.5% SLOWER**, token-identical.
 
-**Mechanism (and the correction to this session's premise):** the premise for
-re-testing was the RouteScout note that "adjacent-route overlap was ~50%". That
-figure is **adjacent-layer (spatial)** overlap — layers L and L+1 of the same
-token. A `(layer, expert)` cache exploits **temporal** (token-to-token) reuse, and
-**EXP-011 measured temporal overlap collapsing to ~4.5%** while spatial held at
-~74.6%. So the reuse this cache was sized and justified against is on the wrong
-axis: the ~53% hit rate observed here is diluted cross-layer reuse, and the actual
-temporal reuse it needs is ~5%. At 53% hits the win is only ~13% of the 74 ms wait
-term (~5 ms) against a 1.6 GB working set on a 16 GiB host — a clear loss, and it
-matches EXP-019's and EXP-032's repeated finding that this host cannot trade
-memory for I/O.
+**Mechanism.** The measured ~53% hit rate *is* genuine temporal same-layer reuse:
+the cache is keyed by `(layer, expert)`, so a hit requires the same layer and the
+same expert on a different token — cross-layer reuse cannot produce a hit at all
+(different layers are different keys). An earlier version of this entry claimed
+the 53% was "diluted cross-layer reuse" and cited EXP-011's ~4.5% *temporal*
+figure; those two statements cannot both be true, and the measurement wins. The
+reuse is real.
+
+What is also real is that eliminating ~53% of the reads made things **worse**:
+`wait_ms_per_token` rose 73.2 -> 93.3 and `load_ms_per_token` rose 99.3 -> 120.4
+against the cache-off baseline, and the end-to-end result was 16.5% slower. So the
+~2 GB of resident raw bytes (plus their transient materialized MTLBuffers) actively
+degraded the memory system on this 16 GiB host — memory compression/swap, which is
+why both I/O-facing terms rose *despite* fewer reads. That mechanism matches
+EXP-019's and EXP-032's repeated finding, and it is a stronger result than "the
+reads were not overlapped".
+
+A caveat on the two rejected attempts at this: at cap 256 the cache reported **0%
+hits**, and the per-token working set is 40 layers x 8 experts = **320 distinct
+keys**, so any capacity below ~320 evicts the entire route before the next token
+can re-request it. The earlier screen at caps 64/320/512 therefore measured pure
+cache overhead, not cache value — which is why it produced a spurious "no capacity
+helps" reading.
 
 **Decision:** **REJECTED and reverted.** Two-times-confirmed (EXP-019, EXP-051),
 now with the axis error identified, and the capacity/working-set constraint
@@ -2867,57 +2879,72 @@ headroom.
 
 ---
 
-## EXP-052 — Per-matrix Metal weight upload costs 395 us/layer (1.33x on the MoE compute phase)
+## EXP-052 — Per-matrix Metal weight upload: HYPOTHESIS REFUTED by exact counters
 
 **Date:** 2026-09-23  
 **Area:** Metal weight upload / expert path  
-**Status:** **CONFIRMED (measured), fix not yet attempted**
+**Status:** **REFUTED — branch closed**
 
-**Motivation:** `compute_ms_per_token` reads ~77-89 ms for ~2.0 GFLOP/token of
-expert GEMM, i.e. ~25 GFLOPS against ~2.6 TFLOPS available — a ~100x gap that
-neither dispatch overhead nor arithmetic explains. EXP-050 records this as open.
+**Motivation:** `compute_ms_per_token` read ~77-89 ms for ~2.0 GFLOP/token of expert
+GEMM, i.e. ~25 GFLOPS against ~2.6 TFLOPS available — a ~100x gap neither dispatch
+overhead nor arithmetic explained.
 
-**Hypothesis:** the gap is per-matrix weight **upload**. `materialize_plan`
-(lib.rs) gives each of the 24 matrices per layer a fresh `Vec<u8>` with
-`metal_tensor = Mutex::new(0)`. `wrap()` in backend_metal.mm zero-copies only
-when the pointer is 16 KiB-aligned AND the length is page-rounded
-(`newBufferWithBytesNoCopy`); a `Vec` from `.to_vec()` satisfies neither, so it
-takes the `newBufferWithBytes` path — a full ~590 KB copy per matrix, i.e. ~960
-matrices/token ≈ 566 MB/token of MTLBuffer allocation + copy, all booked to
-`compute_ms`.
+**Hypothesis (now refuted):** the gap is per-matrix weight **copy**. `wrap()`
+zero-copies only when the pointer is 16 KiB-aligned AND the length is page-rounded;
+`materialize_plan` builds a fresh `Vec<u8>` per matrix, so if those were unaligned
+`wrap()` would take its `newBufferWithBytes` path — projecting ~566 MB/token of
+copies. A timing probe appeared to support this: a probe arm that resets
+`ts[m] = null` every iteration (matching what a fresh `Wt` does) measured
+1182 -> 1577 us/layer, ~1.33x.
 
-**Why the existing probe could not see it:** `affine_dispatch_probe` caches its
-`ts[]` (ColiMetalTensor) handles across iterations, so after warmup the C side
-already has a wrapper and `wrap()` runs **zero** times. The probe therefore
-measures pure dispatch cost by construction.
+**The timing probe was the wrong instrument, and the counter refutes the
+hypothesis.** Exact `wrap()` accounting was added to `backend_metal.mm`
+(`coli_metal_wrap_stats`: call count, zero-copy count, copied bytes) and read after
+real `decode_bench` runs:
 
-**Measurement — a third probe arm that resets `ts[m] = null` every iteration:**
+| decode tokens | wrap calls | zero-copy calls | copied bytes (whole run) |
+|---:|---:|---:|---:|
+| 8 | 65 982 | 65 842 | 332 800 |
+| 24 | 96 702 | 96 562 | 332 800 |
+| 40 | 127 422 | 127 282 | 332 800 |
 
-| arm | median us/layer (n=9) |
-|---|---:|
-| warm (handles cached, = what the probe measured before) | 1182.2 |
-| cold (fresh handles each iteration, = what the model actually does) | 1577.2 |
+`copied_bytes` is **constant at 332 800 bytes (0.33 MB) for the entire run** while
+the call count scales exactly with decode length: (127422 - 65982) / 32 =
+**1920 `wrap()` calls per decode forward**, of which essentially all are
+zero-copy. So:
 
-**+395 us/layer = 1.334x**, i.e. **~15.8 ms/token** at 40 layers. `bit_identical`
-is true in both arms, so this is pure upload cost, not a numerics difference.
+- The expert weight pointers **are** already 16 KiB-aligned. macOS malloc mmaps
+  allocations of this size, and the expert shapes' `fmt_bytes` are already
+  multiples of 16384, so both of `wrap()`'s conditions are met and the memcpy
+  never happens.
+- The projected ~566 MB/token of copies **does not exist**. The `~1.33x` "upload
+  overhead" the probe measured is therefore **MTLBuffer object creation and
+  registration** — 1920 fresh buffer objects per forward (320 experts x 3 matrices
+  x 2 buffers: weights + aux) — not data movement.
 
-**Consequence:** roughly a fifth of the measured MoE `compute_ms` is weight upload
-rather than arithmetic, and the probe numbers used throughout this session
-(EXP-040/050) understate the real per-layer cost because they omit it.
+**Why this closes the branch rather than deferring it:** the only design that
+avoids creating those buffers is keeping the materialized `Wt`s (and their warm
+`metal_tensor` handles) resident across tokens. That is **EXP-019**, which
+implemented exactly that (an `ExpertStore<CachedMlxExpert>` holding the three `Wt`s
+behind an `Arc` "so a hit reuses the already-created Metal tensor instead of
+rebuilding it"), swept it at N in {0,8,16,32}, showed the load term falling as
+designed — and measured end-to-end decode getting *worse* at every capacity
+(1586 -> 1642 ms/token) because of UMA pressure on this 16 GiB host. EXP-051
+re-confirmed the same outcome with modern methodology (53% hit rate, still 16.5%
+slower). So the buffer-creation cost is a *residency* question, and residency is
+already three-times rejected here.
 
-**Candidate fix (not attempted):** the repo already has both halves needed.
-`AlignedBuf` (16 KiB `posix_memalign`, used for GDN/attention/LM-head weights)
-supplies the alignment, and `coli_metal_register`/`resolve()` is the documented
-registered-slab zero-copy path — but `coli_metal_register` currently has **no
-caller anywhere in the repo**, so that fast path is dead and every expert matrix
-falls through to the copying `wrap()`. Pooling a small set of page-aligned,
-page-rounded destination buffers (one layer's worth: 8 experts x 3 roles = 24
-buffers, ~38 MB) and materializing into those would make `wrap()` take its
-zero-copy path and remove ~566 MB/token of copies plus ~960 alloc/free per token.
+**Method note worth carrying:** a timing probe cannot separate a memcpy from
+buffer-creation churn at this host's noise level (the same statistic printed
+-17.74 us on one run — physically impossible). Exact counters settle this class of
+question in ~15 lines with zero noise; reach for them before designing a
+memory-ownership change on top of probe timing. The counters are kept in the tree
+and are reported by `LOGAN_PROFILE=1` as `logan metal-wrap: calls=.. zero_copy=..
+copied_bytes=..`.
 
-**Correctness gate for any fix:** `bit_identical` must stay true in the probe, and
-the real-model greedy trajectory must remain byte-identical (`e4f361a8…`) — this
-is a memory-aliasing change, so it needs both.
+**Correction to this session's earlier reasoning:** EXP-052 as originally written
+recommended "pooling page-aligned destination buffers". That recommendation is
+withdrawn — there is nothing to align.
 
 ---
 
