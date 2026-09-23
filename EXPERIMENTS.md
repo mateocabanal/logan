@@ -3692,3 +3692,46 @@ kept on their own merits (each was validated by a paired A/B well above the nois
 by byte-identical trajectories), and no further change is attempted.
 
 ---
+
+## EXP-066 — Merged to main; final end-to-end verification on the merged tree
+
+**Date:** 2026-09-23  
+**Area:** delivery / verification  
+**Status:** **PASS (delivered)**
+
+**Merge.** The autoresearch branch was 35 commits ahead of `main` and 0 behind, so it
+fast-forwarded cleanly. `main` is now `036e776`; the working tree is clean; the branch is
+fully contained in `main` (`git merge-base --is-ancestor` confirms).
+
+**Final verification, run on the merged tree with the canonical settings**
+(`bash autoresearch.sh --tokens 24 --repeats 3`, GPU guard pass:
+`metal_share=1.000, fallback=0, sanity decode_ms=271.1`):
+
+| metric | value |
+|---|---:|
+| tok_per_sec (pooled) | 3.6578 |
+| greedy_tok_per_sec | **3.7955** |
+| sample_tok_per_sec | 3.5201 |
+| greedy `trajectory_sha` | `e4f361a875aafb3a05ae71d69ffa2530016b7e9b265ac728badf5946789ace9f` |
+
+The trajectory sha is **identical to the baseline's**, i.e. the merged build produces the
+same token sequence as `de5795f`. Against the repeats=3 baseline (1.807), greedy is
+**3.7955/1.807 = 2.10x**. (`arm_rate_gap=0.2754` on this run means the host was contended
+during it — consistent with the session-long drift — so treat the absolute figure as the
+top of the range and the sha identity as the robust result.)
+
+**Contention source ruled out.** At the time of the final runs the host reported load
+average 4.59, but **no process was consuming CPU** (`ps -Ao pcpu` top entries all 0.0) and
+the resident `logand` daemon was verified idle: 0.0% CPU and **0 open files under
+`~/models`**, so it was not reading the model or competing for the SSD. The drift is
+therefore not attributable to a visible contender — it is recorded as unexplained rather
+than mis-attributed, and it is the reason every result in this session is reported as a
+paired/alternating ratio rather than an absolute.
+
+**SSD floor (context for why I/O is closed).** A raw page-cache-bypassing sequential read
+of one shard measured **3.13 GB/s**. The model moves 566 MB of experts per token in 320
+reads (8 concurrent per layer) and its measured `wait_ms_per_token` is 80.7, i.e. an
+aggregate **~7.0 GB/s** — already ~2.3x a single stream's rate from concurrency, and at the
+practical device ceiling. Further I/O-side gains are not available.
+
+---
