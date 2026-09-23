@@ -114,7 +114,13 @@ int metalio_init(void){
         if (!g_dev) return 0;
         MTLIOCommandQueueDescriptor *desc = [MTLIOCommandQueueDescriptor new];
         const char *depth_env = getenv("MTLIO_DEPTH");
-        int depth = depth_env && atoi(depth_env) > 0 ? atoi(depth_env) : 64;
+        // 256 rather than 64: with the expert route issued as one concurrent
+        // batch (LOGAN_EXPERT_IO_CONCURRENCY default 0 after EXP-039), a layer
+        // submits 8 reads at once and consecutive layers can briefly overlap, so
+        // a 64-deep MTLIO queue is a real ceiling on outstanding transfers.
+        // Paired A/B on the batched+vectorized build: 326.5 -> 316.6 ms/token
+        // (1.0315x), token-identical. `MTLIO_DEPTH` still overrides.
+        int depth = depth_env && atoi(depth_env) > 0 ? atoi(depth_env) : 256;
         const char *reuse_env = getenv("QWEN_MIO_SLOT_POOL");
         atomic_store_explicit(&g_reuse_slots, !reuse_env || atoi(reuse_env) != 0, memory_order_relaxed);
         if (depth > 1024) depth = 1024;

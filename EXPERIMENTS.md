@@ -2447,3 +2447,68 @@ which is exactly why batching worked there (EXP-037) and not here.
 **Canonical:** 3.2206 -> **3.2973** with only the shared-expert site enabled.
 
 ---
+
+## EXP-045 — Unrolled 6-bit/5-bit code extraction
+
+**Date:** 2026-09-23  
+**Area:** Metal kernel  
+**Status:** **KEPT**
+
+EXP-043's 6-bit/5-bit branches selected the source word with a per-element
+conditional chain (`word == 0 ? w0 : (word == 1 ? w1 : ...)`) plus a runtime
+straddle test. The straddle positions are fixed at compile time — only codes 5
+and 10 of a 6-bit chunk, and 6, 12, 19, 25 of a 5-bit chunk, cross a word
+boundary — so all codes can be extracted with straight shifts. That removes the
+branch and lets the compiler vectorize the accumulate loop.
+
+All four differential tests pass; greedy trajectory byte-identical.
+
+| measurement | result |
+|---|---|
+| canonical harness | 3.2973 -> **3.3449** tok/s (1.014x) |
+
+**Incidental findings from bringing this up:** both branches initially failed to
+compile because the replacement left a duplicate `dot6`/`xs` (and `dot5`/`xs`)
+declaration, and because the 6-bit head still bound `ww[0..2]` into `lo`/`hi`
+while the new body referenced `w0/w1/w2`. Both are mechanical, but they are worth
+recording because **a broken shader fails closed to the CPU path**: `metal_init`
+reports `[metal] shader compile failed`, every kernel declines, and the model
+still produces plausible output thousands of times slower. Any Metal kernel edit
+should therefore be checked for a silent CPU fallback (the `mlx-affine:
+metal=... fallback=...` profile line and a decode_ms sanity check) before its
+speed is believed.
+
+---
+
+## EXP-046 — Expert prefetch re-test after the kernel sweep: still a loss
+
+**Date:** 2026-09-23  
+**Area:** routed MoE / RouteScout  
+**Status:** **REJECTED (re-confirmed)**
+
+EXP-031/EXP-036 rejected speculative expert prefetch on this host, with the stated
+mechanism that the saved wait reappears as shared-memory/queue interference. Both
+were measured when the MoE compute phase was ~1191 synchronous affine dispatches
+per forward. EXP-037/038/040/042/043 cut that to two command buffers per layer and
+made the kernel ~2.7x faster, so the compute/wait ratio changed by roughly 4x and
+the rejection was worth re-testing rather than assuming.
+
+5 interleaved pairs, 24 tokens, sampled decode, one binary, budget 1 with the
+confidence gate disabled (to exercise the mechanism at all):
+
+| arm | median ms/token | tok/s |
+|---|---:|---:|
+| off | 313.53 | 3.1895 |
+| on (budget-1 prefetch) | 320.03 | 3.1247 |
+
+**0.9797x — still a loss**, token-identical. The rejection therefore stands on the
+new shape too, and this time the mechanism cannot be dispatch overhead. Prediction
+quality was never the binding constraint (EXP-036 established that long-horizon
+prediction is genuinely accurate); the cost is that speculative reads compete with
+authoritative demand reads for the same UMA/SSD resources.
+
+**Decision:** prefetch stays **OFF** (shipped default). Do not re-open without a
+mechanism for isolating speculative traffic — e.g. an explicit bandwidth budget or
+a priority split — rather than more prediction work.
+
+---
