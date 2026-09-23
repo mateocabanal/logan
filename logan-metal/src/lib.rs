@@ -1261,6 +1261,7 @@ mod imp {
                     aux_fp16: false,
                     i: I,
                     o: 2,
+                    x: None,
                 },
                 MlxAffineMatmulDesc {
                     tensor: t6,
@@ -1272,6 +1273,7 @@ mod imp {
                     aux_fp16: false,
                     i: I,
                     o: 3,
+                    x: None,
                 },
             ];
             assert!(metal_matmul_mlx_affine_multi(&x, &mut descs));

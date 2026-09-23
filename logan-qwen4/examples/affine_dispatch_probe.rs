@@ -102,6 +102,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
+    let topk: usize = std::env::var("PROBE_TOPK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TOPK);
 
     if !ffi::metal_init() {
         eprintln!("PROBE metal_unavailable=1");
@@ -113,20 +117,20 @@ fn main() {
 
     let x: Vec<f32> = (0..D_MODEL).map(|i| ((i % 17) as f32) * 0.01 - 0.08).collect();
 
-    let gates: Vec<Quant> = (0..TOPK).map(|e| Quant::new(D_HIDDEN, D_MODEL, 0x1000 + e as u64)).collect();
-    let ups: Vec<Quant> = (0..TOPK).map(|e| Quant::new(D_HIDDEN, D_MODEL, 0x2000 + e as u64)).collect();
-    let downs: Vec<Quant> = (0..TOPK).map(|e| Quant::new(D_MODEL, D_HIDDEN, 0x3000 + e as u64)).collect();
+    let gates: Vec<Quant> = (0..topk).map(|e| Quant::new(D_HIDDEN, D_MODEL, 0x1000 + e as u64)).collect();
+    let ups: Vec<Quant> = (0..topk).map(|e| Quant::new(D_HIDDEN, D_MODEL, 0x2000 + e as u64)).collect();
+    let downs: Vec<Quant> = (0..topk).map(|e| Quant::new(D_MODEL, D_HIDDEN, 0x3000 + e as u64)).collect();
 
     // Slot order: 8 gate, 8 up, 8 down. gate/up take `x` (D_MODEL); down takes
     // the per-expert SwiGLU output (D_HIDDEN).
     let mut slots: Vec<Slot> = Vec::new();
-    for e in 0..TOPK {
+    for e in 0..topk {
         slots.push(Slot { q: e, role: Role::Gate });
     }
-    for e in 0..TOPK {
+    for e in 0..topk {
         slots.push(Slot { q: e, role: Role::Up });
     }
-    for e in 0..TOPK {
+    for e in 0..topk {
         slots.push(Slot { q: e, role: Role::Down });
     }
     let n = slots.len(); // 24
@@ -198,6 +202,23 @@ fn main() {
             max_abs = max_abs.max((va - vb).abs());
         }
     }
+    // Bytes moved by the serial arm, so a caller can compute achieved GB/s.
+    let bytes: usize = slots
+        .iter()
+        .map(|s| {
+            let q = experts.quant(s);
+            q.weights.len() + q.aux.len()
+        })
+        .sum();
+    println!("PROBE moved_bytes={bytes}");
+    println!(
+        "PROBE serial_gbs={:.1}",
+        bytes as f64 / serial_us / 1e3
+    );
+    println!(
+        "PROBE batched_gbs={:.1}",
+        bytes as f64 / batched_us / 1e3
+    );
     println!("PROBE max_abs_diff={max_abs:.9}");
     println!("PROBE bit_identical={}", max_abs == 0.0);
 }
@@ -263,6 +284,7 @@ fn run_batched(
                     aux_fp16: false,
                     i: q.i,
                     o: q.o,
+                    x: None,
                 });
             }
             assert!(

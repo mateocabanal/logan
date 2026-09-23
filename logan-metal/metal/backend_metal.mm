@@ -219,6 +219,45 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     device const ushort* scl = aux + (long)o * ng;
     device const ushort* bia = aux + (long)O * ng + (long)o * ng;
     uint mask = (1u << qbits) - 1u;
+#ifdef MLX4_SCALAR
+    if (false) {
+#else
+    if (qbits == 4 && (gsz & 7) == 0) {
+#endif
+      // Vectorized 4-bit path.
+      //
+      // The 4-bit case is the one that matters: every routed-expert projection on
+      // the Qwen3.6-oQ4 checkpoints is 4-bit affine, and the scalar loop below
+      // costs a 32-bit word load, a variable shift, a cross-word fixup and an
+      // integer divide per ELEMENT. Measured on real expert geometry that path
+      // moves ~2.1 GB/s, which is ALU-bound rather than bandwidth-bound (the
+      // reference moe_gemv kernel reaches 358-389 GB/s on the same shapes).
+      //
+      // The packing is LSB-first with consecutive columns in consecutive nibbles,
+      // so one uchar4 load covers 8 columns: byte k holds column 2k in its low
+      // nibble and column 2k+1 in its high nibble. A group never splits an 8-byte
+      // run because `gsz` is a multiple of 8 and `I8 = I/8` advances in whole
+      // 8-column units, so one scale/bias covers the whole vector.
+      int I8 = I / 8;
+      device const uchar4* w4 = (device const uchar4*)(w + (long)o * rb);
+      for (int c = slane; c < I8; c += 32) {
+        uchar4 b = w4[c];
+        int base = c * 8;
+        int g = base / gsz;
+        float sc = aux_half ? float(as_type<half>(scl[g]))
+                            : as_type<float>((uint)scl[g] << 16);
+        float bi = aux_half ? float(as_type<half>(bia[g]))
+                            : as_type<float>((uint)bia[g] << 16);
+        float4 xv0 = x4[2 * c];      // columns base+0 .. base+3
+        float4 xv1 = x4[2 * c + 1];  // columns base+4 .. base+7
+        float4 w0 = float4(float(b.x & 0xF), float(b.x >> 4),
+                           float(b.y & 0xF), float(b.y >> 4));
+        float4 w1 = float4(float(b.z & 0xF), float(b.z >> 4),
+                           float(b.w & 0xF), float(b.w >> 4));
+        acc += dot(w0, xv0) * sc + bi * (xv0.x + xv0.y + xv0.z + xv0.w);
+        acc += dot(w1, xv1) * sc + bi * (xv1.x + xv1.y + xv1.z + xv1.w);
+      }
+    } else {
     for (int i = int(slane); i < I; i += 32) {
       int bit = i * qbits;
       int wi = bit >> 5;
@@ -232,6 +271,7 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
       float bi = aux_half ? float(as_type<half>(bia[g]))
                           : as_type<float>((uint)bia[g] << 16);
       acc += (float(code) * sc + bi) * xr[i];
+    }
     }
   } else if (fmt == 8) {                            // fp8 e4m3 passthrough: one raw byte per
                                                        // element (like fmt=1), scale per 128x128
@@ -1651,7 +1691,22 @@ extern "C" int coli_metal_init(void) {
     if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
     NSError *err = nil;
-    id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:SHADER]
+    // The vectorized 4-bit affine branch (EXP-040) is selected at SHADER COMPILE
+    // time, not at runtime: Metal Shading Language has no `getenv` and forbids
+    // function-scope `static`, so an env read cannot live inside the kernel.
+    // `LOGAN_MLX4_SCALAR=1` compiles the pre-EXP-040 scalar loop instead, which
+    // makes the two variants A/B-able from one binary.
+    std::string shader_src = SHADER;
+    bool mlx4_scalar = false;
+    if (const char *e = getenv("LOGAN_MLX4_SCALAR")) mlx4_scalar = (e[0] != 0 && e[0] != '0');
+    if (mlx4_scalar) {
+      const std::string marker = "#include <metal_stdlib>";
+      size_t at = shader_src.find(marker);
+      if (at != std::string::npos) {
+        shader_src.insert(at + marker.size(), "\n#define MLX4_SCALAR 1\n");
+      }
+    }
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:shader_src.c_str()]
                                              options:nil error:&err];
     if (!lib) { fprintf(stderr, "[metal] shader compile failed: %s\n",
                         err ? [[err localizedDescription] UTF8String] : "?"); g_dev = nil; return 0; }
