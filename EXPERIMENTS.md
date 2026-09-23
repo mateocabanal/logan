@@ -2414,3 +2414,36 @@ the greedy trajectory is byte-identical throughout.
 `LOGAN_MLX5_SCALAR=1` restore the scalar branches.
 
 ---
+
+## EXP-044 — Attention QKV affine batching is a LOSS; shared-expert gate/up batching is a small win
+
+**Date:** 2026-09-23  
+**Area:** dense path / Metal dispatch  
+**Status:** **REJECTED (attention) / KEPT (shared expert)**
+
+Both dense fusion sites (`QWEN_ATTN_FUSED_INPUT`, `QWEN_SHARED_FUSED_INPUT`) call
+only `matmul_mxfp4_multi`, which hard-requires `WtBytes::Mxfp4`. On a raw
+MLX-affine checkpoint both always declined, so q/k/v and shared gate/up each paid
+a separate `commit`+`waitUntilCompleted`.
+
+EXP-041 tested the two together (bundled) and read 0.9970x neutral. Measured
+**separately** after the kernel sweep, the two sites have opposite signs:
+
+| site | off ms/token | on ms/token | ratio | verdict |
+|---|---:|---:|---:|---|
+| shared expert gate+up | 306.52 | 293.42 | **1.045x** | KEPT |
+| attention q/k/v | 291.43 | 300.82 | **0.969x** | REJECTED |
+
+So EXP-041's "neutral" was the two effects cancelling, not an absent effect. That
+is the lesson worth keeping: a bundled A/B of two sites can read neutral while
+each site individually has a real, opposite-signed effect.
+
+**Why attention loses:** `attn_q` is `[8192,2048]` — 8x wider output than the
+expert matrices — so batching three of them adds per-descriptor bookkeeping to a
+dispatch that is already large enough to amortise its own overhead. The expert
+matrices (~590 KB) are small enough that fixed per-dispatch overhead dominated,
+which is exactly why batching worked there (EXP-037) and not here.
+
+**Canonical:** 3.2206 -> **3.2973** with only the shared-expert site enabled.
+
+---

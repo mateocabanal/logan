@@ -279,22 +279,46 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
                             : as_type<float>((uint)scl[g] << 16);
         float bi = aux_half ? float(as_type<half>(bia[g]))
                             : as_type<float>((uint)bia[g] << 16);
+        // Unrolled: 32 codes span exactly 5 words and only codes 6, 12, 19 and 25
+        // straddle a word boundary, so no per-element branch is needed.
+        uint cs[32];
+        cs[0] = w0 & 31u;
+        cs[1] = (w0 >> 5) & 31u;
+        cs[2] = (w0 >> 10) & 31u;
+        cs[3] = (w0 >> 15) & 31u;
+        cs[4] = (w0 >> 20) & 31u;
+        cs[5] = (w0 >> 25) & 31u;
+        cs[6] = ((w0 >> 30) | (w1 << 2)) & 31u;
+        cs[7] = (w1 >> 3) & 31u;
+        cs[8] = (w1 >> 8) & 31u;
+        cs[9] = (w1 >> 13) & 31u;
+        cs[10] = (w1 >> 18) & 31u;
+        cs[11] = (w1 >> 23) & 31u;
+        cs[12] = ((w1 >> 28) | (w2 << 4)) & 31u;
+        cs[13] = (w2 >> 1) & 31u;
+        cs[14] = (w2 >> 6) & 31u;
+        cs[15] = (w2 >> 11) & 31u;
+        cs[16] = (w2 >> 16) & 31u;
+        cs[17] = (w2 >> 21) & 31u;
+        cs[18] = (w2 >> 26) & 31u;
+        cs[19] = ((w2 >> 31) | (w3 << 1)) & 31u;
+        cs[20] = (w3 >> 4) & 31u;
+        cs[21] = (w3 >> 9) & 31u;
+        cs[22] = (w3 >> 14) & 31u;
+        cs[23] = (w3 >> 19) & 31u;
+        cs[24] = (w3 >> 24) & 31u;
+        cs[25] = ((w3 >> 29) | (w4 << 3)) & 31u;
+        cs[26] = (w4 >> 2) & 31u;
+        cs[27] = (w4 >> 7) & 31u;
+        cs[28] = (w4 >> 12) & 31u;
+        cs[29] = (w4 >> 17) & 31u;
+        cs[30] = (w4 >> 22) & 31u;
+        cs[31] = (w4 >> 27) & 31u;
         float dot5 = 0.0f;
         float xs = 0.0f;
         for (int j = 0; j < 32; ++j) {
-          int bit = 5 * j;
-          int word = bit >> 5;
-          int sh = bit & 31;
-          uint wi = word == 0 ? w0 : (word == 1 ? w1 : (word == 2 ? w2 : (word == 3 ? w3 : w4)));
-          uint code;
-          if (sh + 5 <= 32 || word >= 4) {
-            code = (wi >> sh) & 31u;
-          } else {
-            uint wn = word == 0 ? w1 : (word == 1 ? w2 : (word == 2 ? w3 : w4));
-            code = ((wi >> sh) | (wn << (32 - sh))) & 31u;
-          }
           float xv = xr[base + j];
-          dot5 += float(code) * xv;
+          dot5 += float(cs[j]) * xv;
           xs += xv;
         }
         acc += dot5 * sc + bi * xs;
@@ -317,33 +341,37 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
       for (int c = slane; c < I16; c += 32) {
         int base = c * 16;
         device const uint* ww = wr + (long)c * 3;
-        ulong lo = ((ulong)ww[1] << 32) | (ulong)ww[0];
-        ulong hi = (ulong)ww[2];
+        uint w0 = ww[0], w1 = ww[1], w2 = ww[2];
         int g = base / gsz;
         float sc = aux_half ? float(as_type<half>(scl[g]))
                             : as_type<float>((uint)scl[g] << 16);
         float bi = aux_half ? float(as_type<half>(bia[g]))
                             : as_type<float>((uint)bia[g] << 16);
+        // Code j occupies bits 6j..6j+5 of the 96-bit chunk. Extracted directly
+        // from the word that holds it: codes 0..4 from w0, 6..9 from w1, 11..15
+        // from w2, and only codes 5 and 10 straddle.
+        uint cs[16];
+        cs[0] = w0 & 63u;
+        cs[1] = (w0 >> 6) & 63u;
+        cs[2] = (w0 >> 12) & 63u;
+        cs[3] = (w0 >> 18) & 63u;
+        cs[4] = (w0 >> 24) & 63u;
+        cs[5] = ((w0 >> 30) | (w1 << 2)) & 63u;
+        cs[6] = (w1 >> 4) & 63u;
+        cs[7] = (w1 >> 10) & 63u;
+        cs[8] = (w1 >> 16) & 63u;
+        cs[9] = (w1 >> 22) & 63u;
+        cs[10] = ((w1 >> 28) | (w2 << 4)) & 63u;
+        cs[11] = (w2 >> 2) & 63u;
+        cs[12] = (w2 >> 8) & 63u;
+        cs[13] = (w2 >> 14) & 63u;
+        cs[14] = (w2 >> 20) & 63u;
+        cs[15] = (w2 >> 26) & 63u;
         float dot6 = 0.0f;
         float xs = 0.0f;
-        // Code j occupies bits 6j..6j+5 of the 96-bit chunk. Shifting a 64-bit
-        // value by >=64 (or by a negative amount) is undefined, so each code is
-        // extracted from the half that actually contains it:
-        //   j = 0..9    bits 0..59   -> entirely in `lo`
-        //   j = 10      bits 60..65  -> straddles lo/hi
-        //   j = 11..15  bits 66..95  -> entirely in `hi`, at offset 6j-64
         for (int j = 0; j < 16; ++j) {
-          int bit = 6 * j;
-          uint code;
-          if (bit + 6 <= 64) {
-            code = (uint)((lo >> bit) & 63ul);
-          } else if (bit >= 64) {
-            code = (uint)((hi >> (bit - 64)) & 63ul);
-          } else {
-            code = (uint)(((lo >> bit) | (hi << (64 - bit))) & 63ul);
-          }
           float xv = xr[base + j];
-          dot6 += float(code) * xv;
+          dot6 += float(cs[j]) * xv;
           xs += xv;
         }
         acc += dot6 * sc + bi * xs;
