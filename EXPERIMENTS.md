@@ -2672,3 +2672,52 @@ A/Bs of a default-on feature should express the candidate directly
 (e.g. `EXTRA_ON="..."` enabling something) or be labelled explicitly.
 
 ---
+
+## EXP-050 — Vectorized kernels reproduce the scalar path over 128 tokens; MoE compute is now bandwidth-bound
+
+**Date:** 2026-09-23  
+**Area:** kernel correctness / MoE compute ceiling  
+**Status:** **KEPT (verification)**
+
+### A. Long-run kernel equivalence
+
+The EXP-040/042/043/045 vectorized branches were each gated on the
+`logan-metal` differential tests (which compare a single 3-row GEMV against the
+repository's own reference decoder) plus the 24-token trajectory. Both are short.
+This is the stronger gate: **128 greedy tokens** decoding with all four vectorized
+branches active versus with all four forced to their scalar implementations
+(`LOGAN_MLX4_SCALAR=1 LOGAN_MLX5_SCALAR=1 LOGAN_MLX6_SCALAR=1 LOGAN_MLX8_SCALAR=1`,
+i.e. the pre-EXP-040 kernel in every width).
+
+Result: the two 128-token token streams are **byte-identical** (595 bytes each,
+`cmp` clean). Greedy autoregressive decoding is maximally sensitive to any
+numerical difference — a single differing logit flips a token and every later
+token diverges — so equivalence over 128 steps is strong evidence that the
+vectorized decoding reproduces the scalar element order exactly for every width
+present in this checkpoint.
+
+### B. The MoE compute phase is now bandwidth-bound
+
+`affine_dispatch_probe` was updated to the real two-command-buffer shape (gate/up
+in one shared-activation batch, all `k` downs in one per-descriptor-activation
+batch, EXP-038). Measured **~1301 us/layer** (median of 5, `bit_identical=true`),
+down from 6683 us at the start of the session.
+
+That number is at the memory system's limit rather than an implementation limit.
+Per layer the expert work moves: 12 MB of weights + an output of 8 x 512 x 2048
+floats = 32 MB, and each of the 2048 output rows in the gate/up phase re-reads the
+2048-float activation (16 MB, mostly L2-resident). The gate/up phase alone is
+already ~1000 us at ~90 GB/s and writes 32 MB out, all against a shared UMA
+memory system. So:
+
+- Further MoE dispatch batching has nothing left (2 command buffers is the floor
+  for a correct schedule).
+- The remaining ~22 ms/token of command-buffer overhead (80 buffers at 278 us) is
+  real but the kernels they enclose are now bandwidth-bound, so fusing SwiGLU
+  GPU-side would remove one buffer per layer (~1.5%) at substantial kernel-work
+  risk.
+
+**Decision:** the kernel-sweep branch is **closed** — recorded so it is not
+re-opened as "obvious headroom".
+
+---

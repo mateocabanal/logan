@@ -298,26 +298,37 @@ fn run_batched(
             m = end;
             continue;
         }
-        // A down_proj consumes its own expert's activation, so it cannot join a
-        // shared-activation batch.
-        let q = experts.quant(&slots[m]);
+        // The downs consume per-expert activations, so they get their own single
+        // command buffer via the per-descriptor `x` path (EXP-038).
+        let mut end = m;
+        while end < slots.len() && slots[end].role == Role::Down {
+            end += 1;
+        }
+        let mut descs: Vec<ffi::MlxAffineMatmulDesc> = Vec::with_capacity(end - m);
+        for (k, y) in (m..end).zip(ys[m..end].iter_mut()) {
+            let q = experts.quant(&slots[k]);
+            descs.push(ffi::MlxAffineMatmulDesc {
+                tensor: ts[k],
+                y,
+                weights: &q.weights,
+                aux: &q.aux,
+                bits: BITS,
+                group_size: GROUP_SIZE,
+                aux_fp16: false,
+                i: q.i,
+                o: q.o,
+                x: Some(down_x),
+            });
+        }
         assert!(
-            ffi::metal_matmul_mlx_affine(
-                &mut ts[m],
-                &mut ys[m],
-                down_x,
-                &q.weights,
-                &q.aux,
-                BITS,
-                GROUP_SIZE,
-                false,
-                q.i,
-                q.o,
-            ),
-            "batched down_proj dispatch declined"
+            ffi::metal_matmul_mlx_affine_multi(&[], &mut descs),
+            "batched down_proj multi declined"
         );
+        for (k, d) in (m..end).zip(descs.iter()) {
+            ts[k] = d.tensor;
+        }
         groups += 1;
-        m += 1;
+        m = end;
     }
     groups
 }
