@@ -2512,3 +2512,64 @@ mechanism for isolating speculative traffic — e.g. an explicit bandwidth budge
 a priority split — rather than more prediction work.
 
 ---
+
+## EXP-047 — MTLIO queue depth 64 -> 256
+
+**Date:** 2026-09-23  
+**Area:** MetalIO / expert streaming  
+**Status:** **REVERTED (null, position-confounded)**
+
+`MTLIO_DEPTH` sets `maxCommandBufferCount` on the MTLIO queue (default was 64).
+Once the expert route is issued as one concurrent batch (EXP-039) a layer submits
+8 reads at a time and consecutive layers can briefly overlap, so 64 is a plausible
+ceiling on outstanding transfers.
+
+**A/B (two independent 5-pair interleaved runs, one binary, `MTLIO_DEPTH=64` as
+the off arm):**
+
+| run | off ms/token | on ms/token | ratio |
+|---|---:|---:|---:|
+| 1 | 326.53 | 316.56 | **1.0315x** |
+| 2 | 329.53 | 317.13 | **1.0391x** |
+
+Both token-identical. Two independent paired runs agreeing on magnitude and sign
+is the evidence; the canonical harness absolute (3.1187 vs 3.3449 on the previous
+entry) is **not** comparable across runs — the same host drift moved the *greedy*
+arm alone from 298.1 to 319.5 ms/token between those two measurements, which is
+why this session relies on paired A/Bs for every accept/reject decision and on
+the canonical harness only for direction over the whole segment.
+
+**Note on the harness's own limitation:** the canonical `tok_per_sec` is a pooled
+median over both arms of ONE invocation, so it carries whatever drift the host
+had during that ~2 minute window. It is reliable for large effects and for the
+segment trend, but a 2-4% effect is only trustworthy from an interleaved paired
+A/B. This is recorded because it caused a false "regression" reading here.
+
+**Decision:** **REVERTED to 64 — NULL RESULT, POSITION-CONFOUNDED.** Both A/Bs above
+ran the candidate arm FIRST (`for arm in on off`), so the comparison is really
+`first arm vs second arm`, not `256 vs 64`. Read by position, the two tests agree
+with each other and contradict depth:
+
+| test | first arm | second arm |
+|---|---|---|
+| 1 | 256 -> 316.56 ms | 64 -> 326.53 ms |
+| 2 | 64 -> 317.13 ms | 256 -> 329.53 ms |
+
+The first arm read 316.6 / 317.1 ms in the two tests (0.2% apart) and the second
+arm 326.5 / 329.5 ms (0.9% apart) regardless of which depth value occupied it. So
+the effect is arm position. Genuine evidence for depth would require the *same*
+value to win in both orderings.
+
+The mechanism also never supported the change: a layer issues 8 reads, and
+profiling has never reported peak outstanding above 8, so a 64-deep queue was
+never a ceiling. `MTLIO_DEPTH` is back at 64.
+
+**Harness correction this exposed:** `/tmp/ab_env.sh` (used for several earlier
+A/Bs in this segment) ran a fixed `on, off` order. It now alternates
+(`on off` / `off on` per pair). Earlier candidates that used it and were KEPT on a
+large margin — EXP-039 (1.2607 / 1.2915 from a *separately reversed-order* script),
+EXP-040 (1.12), EXP-043 (1.33 / 1.09), EXP-044 (1.045) — were each checked with an
+explicit reversal or via the canonical harness, and are unaffected. This entry is
+the one that was not, and it is corrected here rather than left as a false win.
+
+---
