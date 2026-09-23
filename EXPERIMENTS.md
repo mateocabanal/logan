@@ -3207,6 +3207,15 @@ where a mistake silently serves wrong weights rather than failing. Given a verif
 2.0x in hand and a 5.7% prize, this is left as a precisely-costed next step rather
 than attempted unverified.
 
+**Superseded by EXP-057:** the ownership problem described here was solved without
+any `WtBytes` change — the pool keeps one `[Wt; 3]` per `(layer, route index)` and
+refills the existing `Vec`s in place, so the Metal buffers and tensor objects survive
+across tokens while nothing about expert identity or bytes is retained. That removed
+the 1920 buffer creations/token for +3.4% (paired A/B), with a 128-token
+pool-ON/pool-OFF trajectory gate. The lesson: measure the *allocation volume* before
+reasoning about which fix is required — the 540 MiB/token figure is what showed the
+retention-free design existed.
+
 **Also still unclaimed:** a GPU-side SwiGLU fusion to collapse the MoE phase from two
 command buffers per layer to one (~1.5%; new C API, FP accumulation-order risk).
 
