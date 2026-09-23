@@ -257,6 +257,55 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
         acc += dot(w0, xv0) * sc + bi * (xv0.x + xv0.y + xv0.z + xv0.w);
         acc += dot(w1, xv1) * sc + bi * (xv1.x + xv1.y + xv1.z + xv1.w);
       }
+#ifdef MLX6_SCALAR
+    } else if (false) {
+#else
+    } else if (qbits == 6 && (gsz & 15) == 0) {
+#endif
+      // Vectorized 6-bit path. 16 six-bit codes occupy exactly 3 uint32 words
+      // (96 bits), so one lane handles a whole 16-column chunk with three
+      // coalesced word loads instead of sixteen scattered ones, and the group
+      // divide plus the scale/bias gather happen once per chunk instead of once
+      // per element. `gsz` a multiple of 16 keeps the chunk inside one group.
+      //
+      // 6-bit is the largest dense quantization on this checkpoint (the GDN input
+      // projections and attention q/k), so this branch covers the biggest dense
+      // matrices in the forward.
+      int I16 = I / 16;
+      for (int c = slane; c < I16; c += 32) {
+        int base = c * 16;
+        device const uint* ww = wr + (long)c * 3;
+        ulong lo = ((ulong)ww[1] << 32) | (ulong)ww[0];
+        ulong hi = (ulong)ww[2];
+        int g = base / gsz;
+        float sc = aux_half ? float(as_type<half>(scl[g]))
+                            : as_type<float>((uint)scl[g] << 16);
+        float bi = aux_half ? float(as_type<half>(bia[g]))
+                            : as_type<float>((uint)bia[g] << 16);
+        float dot6 = 0.0f;
+        float xs = 0.0f;
+        // Code j occupies bits 6j..6j+5 of the 96-bit chunk. Shifting a 64-bit
+        // value by >=64 (or by a negative amount) is undefined, so each code is
+        // extracted from the half that actually contains it:
+        //   j = 0..9    bits 0..59   -> entirely in `lo`
+        //   j = 10      bits 60..65  -> straddles lo/hi
+        //   j = 11..15  bits 66..95  -> entirely in `hi`, at offset 6j-64
+        for (int j = 0; j < 16; ++j) {
+          int bit = 6 * j;
+          uint code;
+          if (bit + 6 <= 64) {
+            code = (uint)((lo >> bit) & 63ul);
+          } else if (bit >= 64) {
+            code = (uint)((hi >> (bit - 64)) & 63ul);
+          } else {
+            code = (uint)(((lo >> bit) | (hi << (64 - bit))) & 63ul);
+          }
+          float xv = xr[base + j];
+          dot6 += float(code) * xv;
+          xs += xv;
+        }
+        acc += dot6 * sc + bi * xs;
+      }
 #ifdef MLX8_SCALAR
     } else if (false) {
 #else
@@ -1725,6 +1774,8 @@ extern "C" int coli_metal_init(void) {
     if (const char *e = getenv("LOGAN_MLX4_SCALAR")) mlx4_scalar = (e[0] != 0 && e[0] != '0');
     bool mlx8_scalar = false;
     if (const char *e = getenv("LOGAN_MLX8_SCALAR")) mlx8_scalar = (e[0] != 0 && e[0] != '0');
+    bool mlx6_scalar = false;
+    if (const char *e = getenv("LOGAN_MLX6_SCALAR")) mlx6_scalar = (e[0] != 0 && e[0] != '0');
     {
       const std::string marker = "#include <metal_stdlib>";
       size_t at = shader_src.find(marker);
@@ -1732,6 +1783,7 @@ extern "C" int coli_metal_init(void) {
         std::string defs;
         if (mlx4_scalar) defs += "\n#define MLX4_SCALAR 1\n";
         if (mlx8_scalar) defs += "\n#define MLX8_SCALAR 1\n";
+        if (mlx6_scalar) defs += "\n#define MLX6_SCALAR 1\n";
         if (!defs.empty()) shader_src.insert(at + marker.size(), defs);
       }
     }

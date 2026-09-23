@@ -2332,3 +2332,34 @@ of ~28-40 ms/token was wrong and this entry supersedes it.
 **Artifact:** `.perf_runs/autoresearch/ab-dense/`.
 
 ---
+
+## EXP-042 — Vectorized 8-bit MLX affine branch
+
+**Date:** 2026-09-23  
+**Area:** Metal kernel / decode throughput  
+**Status:** **KEPT**
+
+Same ALU-bound defect as EXP-040, same fix. In the 8-bit case one bitstream word
+*is* four consecutive codes, so a single `uchar4` load yields 4 elements with no
+variable shift, no cross-word fixup and no per-element integer divide. Guarded on
+`(gsz & 15) == 0` so one scale/bias pair covers the whole 4-element vector.
+
+Coverage on this checkpoint: `embed_tokens` (8-bit/gs64), `lm_head` (8-bit/gs64)
+and the shared expert's gate/up/down (8-bit/gs128).
+
+**Correctness:** the four `logan-metal` differential tests still pass, including
+the 8-bit/gs128 reference comparison; greedy trajectory byte-identical.
+
+**A/B:** one binary via `LOGAN_MLX8_SCALAR=1` (shader-compile-time macro, same
+mechanism as EXP-040).
+
+| measurement | result |
+|---|---|
+| one-binary A/B, 8 tokens | 358.30 vs 375.99 ms/token = **1.05x** |
+| canonical harness | 2.6374 -> **2.7060** tok/s |
+
+`arm_rate_gap` was 0.0005 — the tightest matched-arm reading in this session.
+
+**Decision:** **KEPT, default ON.** `LOGAN_MLX8_SCALAR=1` restores the scalar branch.
+
+---
