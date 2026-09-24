@@ -273,6 +273,9 @@ mod imp {
             gs: i32,
         ) -> i32;
         fn coli_metal_wrap_stats(calls: *mut u64, zero_copy: *mut u64, copy_bytes: *mut u64, bytes_created: *mut u64);
+        fn coli_metal_register(base: *mut c_void, len: usize);
+        fn coli_metal_unregister(base: *mut c_void);
+        fn coli_metal_ptr_registered(base: *const c_void) -> i32;
         fn coli_metal_matmul_multi(
             x: *const f32,
             s: i32,
@@ -465,6 +468,13 @@ mod imp {
             x: *const f32,
             y: *mut f32,
             s: i32,
+            o: i32,
+            i: i32,
+        ) -> i32;
+        pub fn coli_bnns_f16_matmul(
+            w: *const u16,
+            x: *const u16,
+            y: *mut f32,
             o: i32,
             i: i32,
         ) -> i32;
@@ -2689,8 +2699,30 @@ mod imp {
         }
     }
 
-    /// CPU BF16 batched dense projection through BNNS. `x`/`y` are row-major
-    /// `[rows, i]` and `[rows, o]`; the BF16 weight matrix remains caller-owned.
+    /// CPU FP16 x FP16 GEMV through Accelerate/BNNS, accumulating to f32.
+    /// Used by Edge0-compatible prerouter heads so their published FP16
+    /// safetensors can stay in their original representation.
+    pub fn bnns_f16_matmul(w: &[u16], x: &[u16], y: &mut [f32], o: usize, i: usize) -> bool {
+        if w.len() < o.saturating_mul(i)
+            || x.len() < i
+            || y.len() < o
+            || o > i32::MAX as usize
+            || i > i32::MAX as usize
+        {
+            return false;
+        }
+        unsafe {
+            coli_bnns_f16_matmul(
+                w.as_ptr() as *const u16,
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                o as i32,
+                i as i32,
+            ) == 1
+        }
+    }
+
+    /// CPU BF16 batched dense projection through BNNS. Inputs/outputs are row-major.
     pub fn bnns_bf16_matmul_batch(
         w: &[u8],
         x: &[f32],
@@ -2766,6 +2798,7 @@ mod imp {
         pub fn metalio_shutdown();
         pub fn metalio_file_add(path: *const std::os::raw::c_char) -> i32;
         pub fn metalio_slot_alloc(max_bytes: usize) -> i32;
+        pub fn metalio_slot_alloc_alias(base: *mut std::os::raw::c_void, len: usize) -> i32;
         pub fn metalio_slot_free(slot: i32);
         pub fn metalio_slot_ptr(slot: i32) -> *mut std::os::raw::c_void;
         pub fn metalio_slot_bytes(slot: i32) -> usize;
@@ -2780,6 +2813,7 @@ mod imp {
         pub fn metalio_batch_wait(event_value: i64, slots: *const i32, count: i32) -> i32;
         pub fn metalio_slot_consumed(slot: i32);
         pub fn metalio_prefetch_demanded(slot: i32);
+        pub fn metalio_probe(slot: i32) -> i32;
         pub fn metalio_stats(out: *mut ColiMetalioStats);
     }
 
@@ -2874,6 +2908,20 @@ mod imp {
         pub dst_off: usize,
     }
 
+    /// Translate engine-neutral regions into the native struct layout. Shared
+    /// so the allocating and the into-slot paths cannot drift apart.
+    fn mio_native_regions(regions: &[MioRegion]) -> Vec<ColiMetalioRegion> {
+        regions
+            .iter()
+            .map(|region| ColiMetalioRegion {
+                file: region.file,
+                src_off: region.src_off,
+                bytes: region.bytes,
+                dst_off: region.dst_off as u64,
+            })
+            .collect()
+    }
+
     fn mio_load_regions_kind(regions: &[MioRegion], kind: i32) -> Option<(i32, i64)> {
         if !mio_init() || regions.is_empty() {
             return None;
@@ -2891,15 +2939,7 @@ mod imp {
         if slot < 0 {
             return None;
         }
-        let native: Vec<ColiMetalioRegion> = regions
-            .iter()
-            .map(|region| ColiMetalioRegion {
-                file: region.file,
-                src_off: region.src_off,
-                bytes: region.bytes,
-                dst_off: region.dst_off as u64,
-            })
-            .collect();
+        let native = mio_native_regions(regions);
         let event = unsafe { metalio_loadv(slot, native.as_ptr(), native.len() as i32, kind) };
         if event < 0 {
             unsafe { metalio_slot_free(slot) };
@@ -2975,9 +3015,71 @@ mod imp {
         }
     }
 
+    /// Allocate a MetalIO slot that aliases caller-owned page-aligned memory, so
+    /// loads land directly in `base` with no MetalIO-side allocation or copy.
+    /// `base` must be 16384-aligned and `len` a multiple of 16384; the caller keeps
+    /// ownership and must outlive the slot. Returns a slot id, or -1.
+    pub fn mio_slot_alloc_alias(base: *mut u8, len: usize) -> i32 {
+        if !mio_init() {
+            return -1;
+        }
+        unsafe { metalio_slot_alloc_alias(base as *mut c_void, len) }
+    }
+
+    /// Submit regions into an ALREADY-ALLOCATED slot, leaving the slot in place
+    /// (the caller owns its lifetime). Returns the completion event, or None.
+    /// Mirrors `mio_load_regions` but does not allocate or free the slot.
+    pub fn mio_load_regions_into(slot: i32, regions: &[MioRegion], speculative: bool) -> Option<i64> {
+        mio_load_regions_into_kind(slot, regions, if speculative { 2 } else { 1 })
+    }
+
+    /// Shared body of `mio_load_regions_into`: validate, translate to the
+    /// native region layout, and hand the slot to `metalio_loadv`.
+    fn mio_load_regions_into_kind(slot: i32, regions: &[MioRegion], kind: i32) -> Option<i64> {
+        if !mio_init() || slot < 0 || regions.is_empty() {
+            return None;
+        }
+        let native = mio_native_regions(regions);
+        let event = unsafe { metalio_loadv(slot, native.as_ptr(), native.len() as i32, kind) };
+        (event > 0).then_some(event)
+    }
+
+    /// Wait for one exact MetalIO load event. True only when that exact load
+    /// completed successfully.
+    pub fn mio_wait(event: i64) -> bool {
+        event > 0 && unsafe { metalio_wait(event) } == 0
+    }
+
+    /// Register a page-aligned host allocation so the Metal backend resolves
+    /// pointers inside it zero-copy. Call once after allocating; unregister before
+    /// freeing. Safe to call when Metal is unavailable (no-op).
+    pub fn metal_register(base: *mut u8, len: usize) {
+        if base.is_null() || !metal_init() {
+            return;
+        }
+        unsafe { coli_metal_register(base as *mut c_void, len) };
+    }
+
+    pub fn metal_unregister(base: *mut u8) {
+        if base.is_null() {
+            return;
+        }
+        // Unregister is pure slab-registry teardown and remains valid even if
+        // the Metal device has already been shut down. Do not reinitialize Metal
+        // just to remove a stale pointer range.
+        unsafe { coli_metal_unregister(base as *mut c_void) };
+    }
+
+    pub fn metal_ptr_registered(base: *const u8) -> bool {
+        !base.is_null() && unsafe { coli_metal_ptr_registered(base as *const c_void) != 0 }
+    }
+
     #[cfg(test)]
     mod metalio_range_tests {
-        use super::{mio_file, mio_finish_slot, mio_load_regions, MioRegion};
+        use super::{
+            mio_discard_slot, mio_file, mio_finish_slot, mio_load_regions,
+            mio_load_regions_into, mio_slot_alloc_alias, mio_wait, MioRegion,
+        };
 
         #[test]
         fn vectored_load_can_span_two_source_files() {
@@ -3024,6 +3126,94 @@ mod imp {
             expected.extend_from_slice(&b_bytes[7..24]);
             assert_eq!(got, expected);
 
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// The one genuinely new native primitive EXP-067 rests on: MetalIO
+        /// loading into a destination MetalIO does not own.
+        ///
+        /// The `mio_load_regions` test above covers the *allocating* path, so it
+        /// would pass even if `MTLIOCommandBuffer.loadBuffer` rejected or
+        /// mishandled a `newBufferWithBytesNoCopy` destination — which would make
+        /// the whole "the tensors own the arena" design unavailable. This asserts
+        /// the bytes land in the caller's pages, at the caller's offsets, with the
+        /// untouched region still untouched.
+        #[test]
+        fn aliased_slot_lands_bytes_in_caller_memory() {
+            const PAGE: usize = 16384;
+            let root = std::env::temp_dir().join(format!(
+                "logan-metalio-alias-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let src = root.join("src.bin");
+            // Two distinguishable 4 KiB regions inside one page-sized file.
+            let mut file_bytes = vec![0u8; PAGE * 2];
+            file_bytes[0..4096].fill(0xAB);
+            file_bytes[8192..8192 + 4096].fill(0xCD);
+            std::fs::write(&src, &file_bytes).unwrap();
+
+            let Some(fid) = mio_file(src.to_str().unwrap()) else {
+                // MetalIO is an optional capability; the production path falls
+                // back rather than treating this as corruption.
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            };
+
+            // Caller-owned, page-aligned, page-multiple destination: exactly the
+            // arena's shape. `alloc` is used with one explicit Layout so the free
+            // matches (EXP-054's alignment trap).
+            let len = PAGE;
+            let layout = std::alloc::Layout::from_size_align(len, PAGE).unwrap();
+            let base = unsafe { std::alloc::alloc(layout) };
+            assert!(!base.is_null(), "arena-shaped allocation failed");
+            unsafe { std::ptr::write_bytes(base, 0x5A, len) };
+
+            let slot = mio_slot_alloc_alias(base, len);
+            if slot < 0 {
+                // A wrapper over caller memory is refused on some hosts; that is
+                // a fallback signal, not a test failure.
+                unsafe { std::alloc::dealloc(base, layout) };
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+
+            let regions = [
+                MioRegion {
+                    file: fid,
+                    src_off: 0,
+                    bytes: 4096,
+                    dst_off: 0,
+                },
+                MioRegion {
+                    file: fid,
+                    src_off: 8192,
+                    bytes: 4096,
+                    dst_off: 4096,
+                },
+            ];
+            let event = mio_load_regions_into(slot, &regions, false)
+                .expect("aliased MetalIO load must submit");
+            assert!(mio_wait(event), "aliased MetalIO load must complete");
+
+            // SAFETY: `base` is live for `len` bytes and the load completed.
+            let got = unsafe { std::slice::from_raw_parts(base, len) };
+            assert!(got[0..4096].iter().all(|&b| b == 0xAB), "first region landed");
+            assert!(got[4096..8192].iter().all(|&b| b == 0xCD), "second region landed");
+            // The tail the plan never wrote must be untouched: proof the load
+            // targeted the caller's pages rather than a MetalIO-side buffer.
+            assert!(got[8192..].iter().all(|&b| b == 0x5A), "untouched region preserved");
+
+            // Freeing an aliased slot must not free the caller's memory.
+            mio_discard_slot(slot);
+            assert!(
+                unsafe { std::slice::from_raw_parts(base, 4) }
+                    .iter()
+                    .all(|&b| b == 0xAB),
+                "caller memory survives slot release"
+            );
+
+            unsafe { std::alloc::dealloc(base, layout) };
             let _ = std::fs::remove_dir_all(&root);
         }
     }
@@ -3096,6 +3286,77 @@ mod imp {
             unsafe { metalio_stats(&mut s) };
         }
         s
+    }
+
+    /// Non-blocking completion probe for one slot's most recent load.
+    ///
+    /// `Some(true)` = that exact load has completed, `Some(false)` = still in
+    /// flight, `None` = no load / invalid slot / MetalIO inactive. Never waits
+    /// and never touches the slot's ownership, so a staging consumer can decide
+    /// whether to take the bytes already in memory instead of re-reading them.
+    pub fn mio_probe(slot: i32) -> Option<bool> {
+        if !mio_active() || slot < 0 {
+            return None;
+        }
+        match unsafe { metalio_probe(slot) } {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Mark a slot's latest load as consumed by compute.
+    ///
+    /// The slot is NOT freed — the caller owns it for the process lifetime, as
+    /// the streaming/staging arenas do. Kept separate from [`mio_finish_slot`]
+    /// (which frees) because a staging buffer is re-loaded into many times and
+    /// only the *bytes* are consumed.
+    pub fn mio_slot_consumed(slot: i32) {
+        if mio_active() && slot >= 0 {
+            unsafe { metalio_slot_consumed(slot) };
+        }
+    }
+
+    /// Record that a slot's speculative load is being demanded now.
+    ///
+    /// Feeds MetalIO's own ready-at-demand / late-at-demand split. Must be
+    /// called BEFORE the consumer waits, because it classifies by the command
+    /// buffer's status at the moment of the first demand.
+    pub fn mio_prefetch_demanded(slot: i32) {
+        if mio_active() && slot >= 0 {
+            unsafe { metalio_prefetch_demanded(slot) };
+        }
+    }
+
+    /// Take the bytes of an ALREADY-COMPLETE slot load without waiting, without
+    /// copying, and without freeing the slot.
+    ///
+    /// The caller must have established completion with [`mio_probe`] and must
+    /// still own the slot for as long as the returned view is read. This is the
+    /// read side of a staged hit: the bytes are where `metalio_loadv` put them,
+    /// so no SSD round trip and no memcpy is involved.
+    ///
+    /// # Safety
+    ///
+    /// The returned slice aliases the slot's shared-storage MTLBuffer. The
+    /// caller must not write through it and must not submit another load into
+    /// the same slot while it is live.
+    pub unsafe fn mio_slot_bytes_view<'a>(slot: i32, used_bytes: usize) -> Option<&'a [u8]> {
+        if !mio_active() || slot < 0 || used_bytes == 0 {
+            return None;
+        }
+        if unsafe { metalio_probe(slot) } != 1 {
+            return None;
+        }
+        let capacity = unsafe { metalio_slot_bytes(slot) };
+        if used_bytes > capacity {
+            return None;
+        }
+        let ptr = unsafe { metalio_slot_ptr(slot) } as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, used_bytes) })
     }
 
     // -------------------------------------------------------------------------
@@ -3175,6 +3436,32 @@ mod imp {
         ) -> i32;
         pub fn coli_apple8_metalio_moe_topk_finish(pending: *mut c_void, y: *mut f32) -> i32;
         pub fn coli_apple8_metalio_moe_topk_discard(pending: *mut c_void);
+        // EXP-068: single-command-buffer routed MoE over K MLX-affine experts.
+        pub fn coli_metal_moe_route_begin(
+            model_id: u64,
+            layer: i32,
+            descs: *mut ColiMetalMatmulDescRaw,
+            count: i32,
+            x: *const f32,
+            d: i32,
+            m: i32,
+        ) -> *mut c_void;
+        pub fn coli_metal_moe_route_finish(pending: *mut c_void, out: *mut f32, count: i32) -> i32;
+        pub fn coli_metal_moe_route_discard(pending: *mut c_void);
+        pub fn coli_metal_moe_route_drop_model(model_id: u64);
+        // EXP-071: full-attention decode island.
+        fn coli_metal_qwen_attn_decode(
+            q: *const f32,
+            heads: i32,
+            kv_heads: i32,
+            hd: i32,
+            max_t: i32,
+            nsel: i32,
+            scale: f32,
+            out: *mut f32,
+            kvk_host: *const f32,
+            kvv_host: *const f32,
+        ) -> i32;
         pub fn coli_apple8_metalio_profile_get(
             encode_ns: *mut u64,
             submit_ns: *mut u64,
@@ -3509,6 +3796,142 @@ mod imp {
             return false;
         };
         unsafe { coli_apple8_metalio_moe_topk_finish(raw.as_ptr(), y.as_mut_ptr()) == 1 }
+    }
+
+    /// Owning handle for the EXP-068 single-command-buffer routed MoE island.
+    /// `finish` consumes it; dropping it retires the submitted GPU work.
+    pub struct MoeRoutePending {
+        raw: Option<std::ptr::NonNull<c_void>>,
+        k: usize,
+        d: usize,
+    }
+
+    impl Drop for MoeRoutePending {
+        fn drop(&mut self) {
+            if let Some(raw) = self.raw.take() {
+                unsafe { coli_metal_moe_route_discard(raw.as_ptr()) };
+            }
+        }
+    }
+
+    /// Split-phase begin for the routed-MoE island: encode K gate + K up + GPU
+    /// SwiGLU + K down into ONE command buffer, commit with a single shared
+    /// event, and return without waiting so the caller can overlap the CPU
+    /// shared expert. `descs` must be exactly K*3 in expert-major order. Returns
+    /// None on a pre-submit decline; the caller keeps its established path.
+    pub fn moe_route_begin(
+        descs: &mut [MlxAffineMatmulDesc<'_>],
+        x: &[f32],
+        d: usize,
+        m: usize,
+    ) -> Option<MoeRoutePending> {
+        if !metal_available() || descs.is_empty() || descs.len() % 3 != 0 || x.len() < d {
+            return None;
+        }
+        let k = descs.len() / 3;
+        if k == 0 || k > 16 {
+            return None;
+        }
+        let mut raw = Vec::with_capacity(descs.len());
+        for dsc in descs.iter_mut() {
+            let Some(fmt) = mlx_affine_fmt(dsc.bits, q4_fma_enabled(), dsc.aux_fp16) else {
+                return None;
+            };
+            if dsc.i == 0
+                || dsc.o == 0
+                || dsc.i > i32::MAX as usize
+                || dsc.o > i32::MAX as usize
+                || dsc.group_size == 0
+                || dsc.i % dsc.group_size != 0
+                || dsc.group_size > i32::MAX as usize
+            {
+                return None;
+            }
+            raw.push(ColiMetalMatmulDescRaw {
+                tensor: dsc.tensor,
+                y: std::ptr::null_mut(),
+                weights: dsc.weights.as_ptr() as *const c_void,
+                scales: dsc.aux.as_ptr() as *const f32,
+                fmt,
+                i: dsc.i as i32,
+                o: dsc.o as i32,
+                gs: dsc.group_size as i32,
+                x: std::ptr::null(),
+                s: 1,
+            });
+        }
+        let pending = unsafe {
+            coli_metal_moe_route_begin(0, 0, raw.as_mut_ptr(), k as i32, x.as_ptr(), d as i32, m as i32)
+        };
+        for (dsc, r) in descs.iter_mut().zip(raw.iter()) {
+            dsc.tensor = r.tensor;
+        }
+        let raw = std::ptr::NonNull::new(pending)?;
+        Some(MoeRoutePending { raw: Some(raw), k, d })
+    }
+
+    /// Wait the single completion event and copy the K expert vectors
+    /// (`k * d` floats, expert-major) into `out`. Only 1 is success.
+    pub fn moe_route_finish(mut pending: MoeRoutePending, out: &mut [f32]) -> i32 {
+        if out.len() < pending.k * pending.d {
+            return 0;
+        }
+        let Some(raw) = pending.raw.take() else {
+            return 0;
+        };
+        unsafe { coli_metal_moe_route_finish(raw.as_ptr(), out.as_mut_ptr(), pending.k as i32) }
+    }
+
+    /// EXP-071: one-dispatch full-attention decode over the registered KV cache.
+    /// Returns 1 (success), 0 (pre-submit decline: keep the host path), or -1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_attn_decode(
+        q: &[f32],
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        max_t: usize,
+        nsel: usize,
+        scale: f32,
+        out: &mut [f32],
+        kvk_host: &[f32],
+        kvv_host: &[f32],
+    ) -> i32 {
+        if !metal_available()
+            || heads == 0
+            || kv_heads == 0
+            || hd == 0
+            || max_t == 0
+            || nsel == 0
+            || nsel > max_t
+            || q.len() < heads * 2 * hd
+            || out.len() < heads * hd
+            || kvk_host.len() < kv_heads * max_t * hd
+            || kvv_host.len() < kv_heads * max_t * hd
+        {
+            return 0;
+        }
+        unsafe {
+            coli_metal_qwen_attn_decode(
+                q.as_ptr(),
+                heads as i32,
+                kv_heads as i32,
+                hd as i32,
+                max_t as i32,
+                nsel as i32,
+                scale,
+                out.as_mut_ptr(),
+                kvk_host.as_ptr(),
+                kvv_host.as_ptr(),
+            )
+        }
+    }
+
+    /// Free every EXP-068 island context. Called from `Model::drop` beside the
+    /// other per-island teardowns; without it the contexts' scratch buffers and
+    /// shared event leak for the process lifetime.
+    pub fn moe_route_drop_model(model_id: u64) {
+        unsafe { coli_metal_moe_route_drop_model(model_id) };
     }
 
     /// Direct-path profile counters (encode/submit/wait/kernel ns +
@@ -4270,6 +4693,28 @@ mod imp {
         None
     }
     pub fn mio_discard_slot(_slot: i32) {}
+
+    /// MetalIO unavailable off macOS: the caller keeps its own arena and takes
+    /// the CPU path.
+    pub fn mio_slot_alloc_alias(_base: *mut u8, _len: usize) -> i32 {
+        -1
+    }
+    /// No MetalIO slot can exist off macOS, so there is nothing to load into.
+    pub fn mio_load_regions_into(
+        _slot: i32,
+        _regions: &[MioRegion],
+        _speculative: bool,
+    ) -> Option<i64> {
+        None
+    }
+    /// No MetalIO load can have completed off macOS.
+    pub fn mio_wait(_event: i64) -> bool {
+        false
+    }
+    /// No Metal backend to register slabs with.
+    pub fn metal_register(_base: *mut u8, _len: usize) {}
+    pub fn metal_unregister(_base: *mut u8) {}
+    pub fn metal_ptr_registered(_base: *const u8) -> bool { false }
     pub fn mio_load_expert(_fid: i32, _regions: &[(u64, usize)]) -> Option<(i32, i64)> {
         None
     }
@@ -4319,12 +4764,18 @@ mod imp {
         -1
     }
     pub unsafe fn metalio_prefetch_demanded(_slot: i32) {}
+    pub unsafe fn metalio_probe(_slot: i32) -> i32 {
+        -1
+    }
     pub fn metalio_slot_free(_slot: i32) {}
     pub fn metalio_slot_ptr(_slot: i32) -> *mut std::os::raw::c_void {
         std::ptr::null_mut()
     }
 
     pub fn bnns_bf16_matmul(_w: &[u8], _x: &[f32], _y: &mut [f32], _o: usize, _i: usize) -> bool {
+        false
+    }
+    pub fn bnns_f16_matmul(_w: &[u16], _x: &[u16], _y: &mut [f32], _o: usize, _i: usize) -> bool {
         false
     }
     pub fn bnns_bf16_matmul_batch(
@@ -4388,6 +4839,36 @@ mod imp {
     }
     pub fn moe_topk_finish(_pending: MoePending, _y: &mut [f32]) -> bool {
         false
+    }
+    pub struct MoeRoutePending {
+        _private: (),
+    }
+    pub fn moe_route_begin(
+        _descs: &mut [MlxAffineMatmulDesc<'_>],
+        _x: &[f32],
+        _d: usize,
+        _m: usize,
+    ) -> Option<MoeRoutePending> {
+        None
+    }
+    pub fn moe_route_finish(_pending: MoeRoutePending, _out: &mut [f32]) -> i32 {
+        0
+    }
+    pub fn moe_route_drop_model(_model_id: u64) {}
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen_attn_decode(
+        _q: &[f32],
+        _heads: usize,
+        _kv_heads: usize,
+        _hd: usize,
+        _max_t: usize,
+        _nsel: usize,
+        _scale: f32,
+        _out: &mut [f32],
+        _kvk: &[f32],
+        _kvv: &[f32],
+    ) -> i32 {
+        0
     }
     pub fn metal_profile() -> (u64, u64, u64, u64, u64, u64) {
         (0, 0, 0, 0, 0, 0)

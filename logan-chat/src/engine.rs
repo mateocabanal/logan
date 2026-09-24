@@ -16,7 +16,7 @@ use logan_qwen4::plan::prefix_runtime::{
     apply_max_performance_defaults, persist_prefix_boundary, restore_longest_prefix,
 };
 use logan_qwen4::plan::{RuntimeFeatures, RuntimeStats};
-use logan_qwen4::{Cfg, Model, load_cfg};
+use logan_qwen4::{Cfg, Model, StFile, load_cfg};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
@@ -1483,7 +1483,18 @@ impl ChatWorker {
     }
 
     fn reload_pristine(&mut self) -> Result<(), String> {
-        self.restore_zero_state()
+        // Cache recovery needs a pristine MODEL while preserving the logical
+        // prompt/history that still has to be replayed. restore_zero_state is
+        // the user-facing conversation reset and intentionally clears tokens.
+        self.zero_state.restore_tokens(&mut self.model, &[])?;
+        self.consumed = 0;
+        self.position = 0;
+        self.last_logits = None;
+        Ok(())
+    }
+
+    fn persistent_prefix_supported(&self) -> bool {
+        !is_raw_safetensors_package(&self.package)
     }
 
     fn restore_zero_state(&mut self) -> Result<(), String> {
@@ -1572,7 +1583,7 @@ impl ChatWorker {
 
         if self.turns == 0 && self.consumed == 0 && self.position == 0 {
             self.tokens = input_ids.clone();
-            let mut try_ssd = true;
+            let mut try_ssd = self.persistent_prefix_supported();
             match self
                 .hot_cache
                 .restore_longest(&mut self.model, &self.tokens)
@@ -1652,15 +1663,17 @@ impl ChatWorker {
                         )));
                     }
                 }
-                match persist_prefix_boundary(&self.model, &self.tokens[..system_end]) {
-                    Ok(Some(write)) if !write.already_existed => {
-                        cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        let _ = events.send(EngineEvent::Warning(format!(
-                            "system-prefix cache write failed (non-fatal): {error}"
-                        )));
+                if self.persistent_prefix_supported() {
+                    match persist_prefix_boundary(&self.model, &self.tokens[..system_end]) {
+                        Ok(Some(write)) if !write.already_existed => {
+                            cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = events.send(EngineEvent::Warning(format!(
+                                "system-prefix cache write failed (non-fatal): {error}"
+                            )));
+                        }
                     }
                 }
             }
@@ -1686,15 +1699,17 @@ impl ChatWorker {
                     )));
                 }
             }
-            match persist_prefix_boundary(&self.model, &self.tokens) {
-                Ok(Some(write)) if !write.already_existed => {
-                    cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = events.send(EngineEvent::Warning(format!(
-                        "prefix cache write failed (non-fatal): {error}"
-                    )));
+            if self.persistent_prefix_supported() {
+                match persist_prefix_boundary(&self.model, &self.tokens) {
+                    Ok(Some(write)) if !write.already_existed => {
+                        cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = events.send(EngineEvent::Warning(format!(
+                            "prefix cache write failed (non-fatal): {error}"
+                        )));
+                    }
                 }
             }
         }
@@ -1874,7 +1889,7 @@ impl ChatWorker {
         let mut cache_restore_ms = 0.0;
         let mut cache_write_ms = 0.0;
         let mut forward_tokens = 0usize;
-        let mut try_ssd = true;
+        let mut try_ssd = self.persistent_prefix_supported();
 
         match self
             .hot_cache
@@ -1939,15 +1954,17 @@ impl ChatWorker {
                     )));
                 }
             }
-            match persist_prefix_boundary(&self.model, &self.tokens) {
-                Ok(Some(write)) if !write.already_existed => {
-                    cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = events.send(EngineEvent::Warning(format!(
-                        "prefix cache write failed (non-fatal): {error}"
-                    )));
+            if self.persistent_prefix_supported() {
+                match persist_prefix_boundary(&self.model, &self.tokens) {
+                    Ok(Some(write)) if !write.already_existed => {
+                        cache_write_ms += write.elapsed.as_secs_f64() * 1e3;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = events.send(EngineEvent::Warning(format!(
+                            "prefix cache write failed (non-fatal): {error}"
+                        )));
+                    }
                 }
             }
         }
@@ -2109,9 +2126,19 @@ fn render_continuation_prompt(user: &str) -> String {
     format!("\n<|im_start|>user\n{user}<|im_end|>\n{ASSISTANT_NON_THINKING_PREFIX}")
 }
 
+fn is_raw_safetensors_package(package: &Path) -> bool {
+    package.join("model.safetensors.index.json").is_file()
+        || package.join("model.safetensors").is_file()
+}
+
 fn load_model(package: &Path, cfg: &Cfg) -> Result<Model, String> {
-    let src = ColiSource::open(package)?;
-    Model::load_coli(&src, cfg)
+    if is_raw_safetensors_package(package) {
+        let st = StFile::open_dir(package)?;
+        Model::load(&st, cfg)
+    } else {
+        let src = ColiSource::open(package)?;
+        Model::load_coli(&src, cfg)
+    }
 }
 
 fn apply_repeat_penalty(logits: &mut [f32], history: &[u32], penalty: f32) {

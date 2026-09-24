@@ -10,6 +10,7 @@ logan-format = { path = "../logan-format" }
 logan-metal = { path = "../logan-metal" }
 logan-core = { path = "../logan-core" }
 libc = "0.2"
+libm = "0.2"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 logan-ane = { path = "../logan-ane" }

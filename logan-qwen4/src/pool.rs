@@ -145,11 +145,11 @@ pub trait ExpertSource: Send {
     /// Evaluate each call and return outputs positionally aligned with `calls`.
     ///
     /// Must return exactly `calls.len()` vectors, each `d_model` long: the
-    /// caller scatters them by route weight into the layer's residual, so a
-    /// short or misordered reply silently corrupts the layer rather than
-    /// failing. The HTTP implementation already panics on a wrong count for
-    /// this reason; the contract is stated here so every implementation inherits
-    /// the obligation, and callers still check.
+    /// caller sums them by route weight into the layer's residual, so a short or
+    /// misordered reply silently corrupts the layer rather than failing. The HTTP
+    /// implementation already panics on a wrong count for this reason; the
+    /// contract is stated here so every implementation inherits the obligation,
+    /// and callers still check.
     fn eval(
         &mut self,
         calls: &[ExpertCall],
@@ -157,6 +157,61 @@ pub trait ExpertSource: Send {
         d_hidden: usize,
         activation: &str,
     ) -> Result<Vec<Vec<f32>>, PoolError>;
+
+    /// Whether this source can hold predicted expert bytes until the token that
+    /// wants them arrives.
+    ///
+    /// Distinct from [`Self::supports_prefetch`], which says only "I can start a
+    /// transfer early". A prefetch-capable source may have nowhere to *keep* the
+    /// bytes across a token boundary, which is exactly the gap that made Edge0's
+    /// early reads useless: they landed somewhere the next token never read from.
+    /// Staging means the bytes are addressed by `(layer, expert)` and consumed by
+    /// a later token without a second read.
+    fn supports_staging(&self) -> bool {
+        false
+    }
+
+    /// Tag every staged slot as stale. Called at a request/session boundary.
+    ///
+    /// After this, no slot can match a lookup, so a prediction from a previous
+    /// conversation can never be served as current bytes.
+    fn stage_begin_request(&mut self) {}
+
+    /// Advance the staging generation by one token.
+    ///
+    /// Staging submitted during token `t` is tagged for `t+1`, so this is what
+    /// makes that set servable and retires everything older.
+    fn stage_begin_token(&mut self) {}
+
+    /// Free the slots consumed by `layer` on the current token, so they can be
+    /// refilled for the next one.
+    ///
+    /// Must be called only after this layer's compute has finished reading those
+    /// bytes: a refill into a slot still being read is the aliasing the whole
+    /// design has to avoid.
+    fn stage_release_layer(&mut self, _layer: u32) {}
+
+    /// Stage `experts` for `layer`'s next-token route. Returns how many reads
+    /// were submitted.
+    ///
+    /// `experts` is a *prediction*: it may be wrong and it may be incomplete, and
+    /// neither is an error. The bytes are staged, not consumed, and the layer
+    /// that later wants them still asks the router what to execute — a staged set
+    /// can never change which experts run.
+    fn stage_route(
+        &mut self,
+        _layer: u32,
+        _experts: &[u32],
+        _d_model: usize,
+        _d_hidden: usize,
+    ) -> usize {
+        0
+    }
+
+    /// One line of staging counters, or `None` when the source does not stage.
+    fn stage_summary(&self) -> Option<String> {
+        None
+    }
 }
 
 /// [`ExpertSource`] backed by the inference-pool coordinator over HTTP.

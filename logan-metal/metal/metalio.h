@@ -50,6 +50,15 @@ size_t metalio_slot_bytes(int slot);
  * allocated. Plain C callers should keep using metalio_slot_ptr(). */
 void *metalio_slot_native_buffer(int slot);
 
+/* --- caller-owned alias slots ------------------------------------------- */
+/* Allocate a slot that aliases caller-owned page-aligned host memory instead of
+ * allocating its own MTLBuffer. MetalIO loads then land directly in `base`, so a
+ * caller that owns the bytes pays no copy. `base` must be 16384-aligned and
+ * `len` a multiple of 16384. MetalIO NEVER frees or reallocates `base`; the
+ * caller owns it and must keep it alive while the slot exists. Returns a slot id
+ * >= 0, or -1. */
+int  metalio_slot_alloc_alias(void *base, size_t len);
+
 /* --- vectored async loads ------------------------------------------------ */
 typedef enum { MIO_LOAD_DEMAND = 0, MIO_LOAD_ASYNC = 1, MIO_LOAD_SPEC = 2 }
     ColiMetalioKind;
@@ -85,6 +94,17 @@ int64_t metalio_batch_barrier(void);
 /* Wait for a queue barrier, then verify each selected slot's exact preceding
  * load completed successfully. One blocking wait, fail-closed status check. */
 int metalio_batch_wait(int64_t event_value, const int *slots, int count);
+
+/* Non-blocking completion probe for one slot's most recent load.
+ *
+ * Returns 1 = that exact MTLIOCommandBuffer has completed, 0 = still pending,
+ * -1 = no load / invalid slot / MetalIO inactive. Never blocks, never waits on
+ * the shared event (a concurrent queue may raise a later event value past this
+ * slot's), never consumes and never frees the slot — the caller keeps ownership.
+ *
+ * Exists so a staging consumer can decide "these bytes are already in memory,
+ * take them without re-reading" instead of paying the full NVMe round trip. */
+int  metalio_probe(int slot);
 
 /* --- prefetch accounting ------------------------------------------------- */
 /* Mark a slot's latest load as consumed by compute (prefetch_used), or as

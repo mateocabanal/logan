@@ -30,7 +30,8 @@ fn accumulate_normalized(
     weight: f32,
 ) -> usize {
     scores.fill(0.0);
-    let learned = accumulate_transition_scores(scores, transitions, from_observations, experts, sources);
+    let learned =
+        accumulate_transition_scores(scores, transitions, from_observations, experts, sources);
     if learned == 0 || weight == 0.0 {
         return learned;
     }
@@ -146,8 +147,42 @@ impl LayerPredictor {
         spatial_previous: &[usize],
         max_budget: usize,
     ) -> Vec<(usize, f32)> {
-        self.pending_prediction.clear();
-        self.pending_previous.clear();
+        self.rank_arrivals(experts, previous, spatial_previous, max_budget, true)
+    }
+
+    /// Same ranking, leaving `pending_prediction`/`pending_previous` untouched.
+    ///
+    /// See [`RoutePredictor::peek_arrivals_ranked`] for why a staging-only
+    /// consumer needs the second entry point rather than reusing the scoring one.
+    fn peek_arrivals_ranked(
+        &mut self,
+        experts: usize,
+        previous: &[usize],
+        spatial_previous: &[usize],
+        max_budget: usize,
+    ) -> Vec<(usize, f32)> {
+        self.rank_arrivals(experts, previous, spatial_previous, max_budget, false)
+    }
+
+    /// Shared body of the two ranked readers.
+    ///
+    /// `record` is the only behavioural difference: it decides whether the
+    /// selection is cached for the next `observe` to score. Splitting the
+    /// *evidence* computation from the *bookkeeping* is what lets a staging
+    /// consumer read the same ranking without corrupting the arrival statistics
+    /// the shadow/authoritative modes exist to report.
+    fn rank_arrivals(
+        &mut self,
+        experts: usize,
+        previous: &[usize],
+        spatial_previous: &[usize],
+        max_budget: usize,
+        record: bool,
+    ) -> Vec<(usize, f32)> {
+        if record {
+            self.pending_prediction.clear();
+            self.pending_previous.clear();
+        }
         if experts == 0 || max_budget == 0 {
             return Vec::new();
         }
@@ -165,7 +200,9 @@ impl LayerPredictor {
         if valid_previous.is_empty() && valid_spatial.is_empty() {
             return Vec::new();
         }
-        self.pending_previous.extend_from_slice(&valid_previous);
+        if record {
+            self.pending_previous.extend_from_slice(&valid_previous);
+        }
 
         self.scores.fill(0.0);
         let mut learned_sources = accumulate_normalized(
@@ -225,7 +262,9 @@ impl LayerPredictor {
             };
             selected[best] = true;
             ranked.push((best, self.scores[best]));
-            self.pending_prediction.push(best);
+            if record {
+                self.pending_prediction.push(best);
+            }
         }
 
         // Truncate the pending list to what was actually selected so `observe`
@@ -245,6 +284,128 @@ impl LayerPredictor {
             .into_iter()
             .map(|(expert, _)| expert)
             .collect()
+    }
+
+    /// The authoritative route: the `k` highest fused scores over *all*
+    /// experts, best first.
+    ///
+    /// This is deliberately not [`Self::predict_arrivals`]. That method exists to
+    /// choose speculative reads, so it excludes the previous route (already
+    /// resident) and only names *cold arrivals*. An authoritative route is the
+    /// route the kernel will execute, so it must be a full `k`-wide set — a
+    /// route of arrivals only would be narrower than the native one and change
+    /// bytes/token, which is the wrong variable to move when the question is
+    /// whether prediction can replace the router.
+    ///
+    /// Previous-route experts are therefore *in* the ranking with real fused
+    /// scores rather than forced in. Keeping them is then a consequence of the
+    /// evidence, not an ordering rule — which is what makes a stability bias a
+    /// tunable instead of a hard-coded policy.
+    ///
+    /// `stability_bias` adds `bias x (peak fused score)` to every expert in
+    /// `previous`, and `resident_bias` the same for experts in `resident` (the
+    /// ones an I/O policy expects to still be staged). `bias == 0.0` is the
+    /// unbiased ranking. The scale is the score's own peak, so the knob means
+    /// the same thing at every layer despite per-layer score magnitudes
+    /// differing.
+    fn authoritative_route(
+        &mut self,
+        experts: usize,
+        previous: &[usize],
+        spatial_previous: &[usize],
+        k: usize,
+        stability_bias: f32,
+        resident: &[usize],
+        resident_bias: f32,
+    ) -> Vec<(usize, f32)> {
+        if experts == 0 || k == 0 {
+            return Vec::new();
+        }
+        let valid_previous: Vec<usize> = previous
+            .iter()
+            .copied()
+            .filter(|&expert| expert < experts)
+            .collect();
+        let valid_spatial: Vec<usize> = spatial_previous
+            .iter()
+            .copied()
+            .filter(|&expert| expert < experts)
+            .collect();
+        if valid_previous.is_empty() && valid_spatial.is_empty() {
+            return Vec::new();
+        }
+
+        self.scores.fill(0.0);
+        let mut learned_sources = accumulate_normalized(
+            &mut self.scores,
+            &mut self.temporal_scores,
+            &self.transitions,
+            &self.from_observations,
+            experts,
+            &valid_previous,
+            self.temporal_weight,
+        );
+        learned_sources += accumulate_normalized(
+            &mut self.scores,
+            &mut self.spatial_scores,
+            &self.spatial_transitions,
+            &self.spatial_from_observations,
+            experts,
+            &valid_spatial,
+            1.0,
+        );
+        // No evidence at all: an authoritative route here would be an arbitrary
+        // set, so decline and let the caller run the native router.
+        if learned_sources == 0 {
+            return Vec::new();
+        }
+
+        let peak = self.scores.iter().copied().fold(0.0_f32, f32::max);
+        if peak > 0.0 && (stability_bias > 0.0 || resident_bias > 0.0) {
+            for &expert in &valid_previous {
+                if stability_bias > 0.0 {
+                    self.scores[expert] += peak * stability_bias;
+                }
+            }
+            for &expert in resident {
+                if expert < experts && resident_bias > 0.0 {
+                    self.scores[expert] += peak * resident_bias;
+                }
+            }
+        }
+
+        // Selection sort over the score vector, same tie-break as the router's
+        // own top-k (higher score, then lower expert id) so an unbiased
+        // authoritative route and the native router break ties identically.
+        let mut ranked: Vec<(usize, f32)> = Vec::with_capacity(k.min(experts));
+        let mut selected = vec![false; experts];
+        while ranked.len() < k {
+            let mut best: Option<usize> = None;
+            for candidate in 0..experts {
+                if selected[candidate] || self.scores[candidate] <= 0.0 {
+                    continue;
+                }
+                best = match best {
+                    None => Some(candidate),
+                    Some(current) => {
+                        if self.scores[candidate] > self.scores[current]
+                            || (self.scores[candidate] == self.scores[current]
+                                && candidate < current)
+                        {
+                            Some(candidate)
+                        } else {
+                            Some(current)
+                        }
+                    }
+                };
+            }
+            let Some(best) = best else {
+                break;
+            };
+            selected[best] = true;
+            ranked.push((best, self.scores[best]));
+        }
+        ranked
     }
 
     fn observe(
@@ -379,6 +540,57 @@ impl RoutePredictor {
             return Vec::new();
         };
         state.predict_arrivals_ranked(self.experts, previous, spatial_previous, max_budget)
+    }
+
+    /// Ranked cold arrivals for one layer **without disturbing the predictor's
+    /// prediction bookkeeping**.
+    ///
+    /// `predict_arrivals_ranked` caches `pending_prediction`/`pending_previous`
+    /// so that the next `observe` can score it. A staging-only consumer reads
+    /// this ranking *in addition to* whatever prediction the mode already makes,
+    /// so routing through the scoring path would overwrite that pending state
+    /// with a second, unobserved prediction and silently corrupt the arrival
+    /// statistics (predicted_total would count a set nothing ever scored).
+    ///
+    /// The evidence itself is a pure read of the transition tables, so the
+    /// separate entry point computes the same ranking and writes nothing.
+    pub(crate) fn peek_arrivals_ranked(
+        &mut self,
+        layer: usize,
+        previous: &[usize],
+        spatial_previous: &[usize],
+        max_budget: usize,
+    ) -> Vec<(usize, f32)> {
+        let Some(state) = self.layers.get_mut(layer) else {
+            return Vec::new();
+        };
+        state.peek_arrivals_ranked(self.experts, previous, spatial_previous, max_budget)
+    }
+
+    /// The authoritative route for one layer, best first. See
+    /// [`LayerPredictor::authoritative_route`].
+    pub(crate) fn authoritative_route(
+        &mut self,
+        layer: usize,
+        previous: &[usize],
+        spatial_previous: &[usize],
+        k: usize,
+        stability_bias: f32,
+        resident: &[usize],
+        resident_bias: f32,
+    ) -> Vec<(usize, f32)> {
+        let Some(state) = self.layers.get_mut(layer) else {
+            return Vec::new();
+        };
+        state.authoritative_route(
+            self.experts,
+            previous,
+            spatial_previous,
+            k,
+            stability_bias,
+            resident,
+            resident_bias,
+        )
     }
 
     pub(crate) fn observe(

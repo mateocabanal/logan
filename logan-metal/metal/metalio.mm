@@ -85,6 +85,8 @@ static struct {
     _Atomic int64_t consumed;      /* event value already consumed by compute (prefetch_used) */
     _Atomic int64_t demand_probed; /* last event classified ready/late at first demand */
     int last_kind;                 /* ColiMetalioKind for last_event */
+    int aliased;                   /* 1 = buf wraps caller-owned memory (metalio_slot_alloc_alias)
+                                    * and must NEVER be pooled for reuse after free */
 } g_slots[METALIO_MAX_SLOTS];
 static int g_nslots;
 
@@ -190,15 +192,36 @@ int metalio_file_add(const char *path){
     return fid;
 }
 
+/* Take an unused slot id from the pool, extending it if necessary. Caller
+ * holds g_lock. Returns -1 when the pool is exhausted. */
+static int slot_take_locked(void){
+    for (int i = 0; i < g_nslots; i++)
+        if (!g_slots[i].in_use) return i;
+    if (g_nslots < METALIO_MAX_SLOTS) return g_nslots++;
+    return -1;
+}
+
+/* Publish `b` into slot `sid` and reset its per-load state. Caller holds
+ * g_lock. `aliased` records that `b` wraps memory MetalIO does not own. */
+static void slot_activate_locked(int sid, id<MTLBuffer> b, size_t len, int aliased){
+    g_slots[sid].buf = b;
+    g_slots[sid].bytes = len;
+    g_slots[sid].last_cb = nil;
+    g_slots[sid].in_use = 1;
+    g_slots[sid].aliased = aliased;
+    atomic_store_explicit(&g_slots[sid].last_event, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_slots[sid].consumed, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_slots[sid].demand_probed, 0, memory_order_relaxed);
+    g_slots[sid].last_kind = MIO_LOAD_DEMAND;
+}
+
 int metalio_slot_alloc(size_t max_bytes){
     if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return -1;
     size_t len = (max_bytes + METALIO_ALIGN - 1) & ~(size_t)(METALIO_ALIGN - 1);
     [g_lock lock];
     int sid = -1;
     if (@available(macOS 13.0, *)) {
-        for (int i = 0; i < g_nslots && sid < 0; i++)
-            if (!g_slots[i].in_use) sid = i;
-        if (sid < 0 && g_nslots < METALIO_MAX_SLOTS) sid = g_nslots++;
+        sid = slot_take_locked();
         if (sid >= 0) {
             const int reuse = atomic_load_explicit(&g_reuse_slots, memory_order_relaxed);
             id<MTLBuffer> b = reuse ? g_slots[sid].buf : nil;
@@ -211,14 +234,34 @@ int metalio_slot_alloc(size_t max_bytes){
                 }
             }
             if (b) {
-                g_slots[sid].last_cb = nil;
-                g_slots[sid].in_use = 1;
-                atomic_store_explicit(&g_slots[sid].last_event, 0, memory_order_relaxed);
-                atomic_store_explicit(&g_slots[sid].consumed, 0, memory_order_relaxed);
-                atomic_store_explicit(&g_slots[sid].demand_probed, 0, memory_order_relaxed);
-                g_slots[sid].last_kind = MIO_LOAD_DEMAND;
+                slot_activate_locked(sid, b, g_slots[sid].bytes, 0);
                 verbose("slot_alloc: id=%d bytes=%zu %s", sid, g_slots[sid].bytes,
                         reuse && old_bytes >= len ? "reused" : "new");
+            } else sid = -1;
+        }
+    }
+    [g_lock unlock];
+    return sid;
+}
+
+int metalio_slot_alloc_alias(void *base, size_t len){
+    if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return -1;
+    if (!base || len == 0) return -1;
+    if (((uintptr_t)base % METALIO_ALIGN) != 0 || (len % METALIO_ALIGN) != 0) return -1;
+    [g_lock lock];
+    int sid = -1;
+    if (@available(macOS 13.0, *)) {
+        sid = slot_take_locked();
+        if (sid >= 0) {
+            /* No MetalIO-side allocation and no copy: the shared-storage buffer
+             * IS the caller's arena. deallocator:nil means releasing this
+             * wrapper never frees `base` -- the caller owns it. */
+            id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:base length:len
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+            if (b) {
+                slot_activate_locked(sid, b, len, 1);
+                verbose("slot_alloc_alias: id=%d base=%p bytes=%zu", sid, base, len);
             } else sid = -1;
         }
     }
@@ -238,10 +281,17 @@ void metalio_slot_free(int slot){
         atomic_fetch_add_explicit(&m_prefetch_wasted, 1, memory_order_relaxed);
     g_slots[slot].last_cb = nil;
     g_slots[slot].last_kind = MIO_LOAD_DEMAND;
-    if (!atomic_load_explicit(&g_reuse_slots, memory_order_relaxed)) {
+    /* An aliased slot is NEVER retained for reuse: the pooling branch below
+     * would otherwise hand a later metalio_slot_alloc a buffer that still
+     * points at another caller's (possibly already freed) arena. Dropping the
+     * reference here is harmless -- the buffer was created with
+     * deallocator:nil, so it does not free the caller's memory. */
+    const int aliased_slot = g_slots[slot].aliased;
+    if (!atomic_load_explicit(&g_reuse_slots, memory_order_relaxed) || aliased_slot) {
         g_slots[slot].buf = nil;
         g_slots[slot].bytes = 0;
     }
+    g_slots[slot].aliased = 0;
     g_slots[slot].in_use = 0;
     [g_lock unlock];
 }
@@ -491,6 +541,23 @@ void metalio_prefetch_demanded(int slot){
         atomic_fetch_add_explicit(&m_prefetch_ready_at_demand, 1, memory_order_relaxed);
     else if (classify == 2)
         atomic_fetch_add_explicit(&m_prefetch_late_at_demand, 1, memory_order_relaxed);
+}
+
+/* Non-blocking: is this slot's most recent load already complete?
+ * 1 = complete, 0 = pending, -1 = unknown/no load. Deliberately does NOT touch
+ * g_ev or wait on anything, and does NOT consume or free the slot. */
+int metalio_probe(int slot){
+    if (!atomic_load_explicit(&g_active, memory_order_relaxed)) return -1;
+    if (slot < 0 || slot >= g_nslots) return -1;
+
+    int state = -1;
+    [g_lock lock];
+    if (g_slots[slot].in_use && g_slots[slot].last_cb) {
+        int64_t ev = atomic_load_explicit(&g_slots[slot].last_event, memory_order_relaxed);
+        if (ev > 0) state = (g_slots[slot].last_cb.status == MTLIOStatusComplete) ? 1 : 0;
+    }
+    [g_lock unlock];
+    return state;
 }
 
 void metalio_prefetch_done(int slot){

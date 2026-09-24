@@ -11,6 +11,10 @@ use std::time::Instant;
 #[derive(Debug, Default, Clone)]
 pub struct TokenSpans {
     pub route_ms: f64,
+    /// Learned-prerouter (RouteScout/Edge0 head) evaluation, ms. Distinct from
+    /// `route_ms`, which is the native gate: a predictor's own cost has to be
+    /// comparable against the I/O it is trying to save.
+    pub predict_ms: f64,
     pub io_ms: f64,
     pub shared_ms: f64,
     pub gpu_ms: f64,
@@ -52,6 +56,7 @@ impl TokenSpans {
     pub fn delta_from(&self, before: &TokenSpans) -> TokenSpans {
         TokenSpans {
             route_ms: self.route_ms - before.route_ms,
+            predict_ms: self.predict_ms - before.predict_ms,
             io_ms: self.io_ms - before.io_ms,
             shared_ms: self.shared_ms - before.shared_ms,
             gpu_ms: self.gpu_ms - before.gpu_ms,
@@ -184,8 +189,9 @@ pub fn emit_request_summary_with_placement(
         return;
     }
     eprintln!(
-        "logan profile: tokens={tokens} route={:.1} io={:.1} shared={:.1} gpu={:.1} fill={:.1} gdn={:.1} attn={:.1} hc={:.1} head={:.1} total={:.1} ms/tok | gdn_parts in={:.1} conv={:.1} prep={:.1} recur={:.1} gate={:.1} out={:.1} | cache hits={cache_hits} misses={cache_misses} | gdn_metal_ok={} | metal encode={} submit={} wait={} kernel={} ns fused_calls={} fused_experts={} | mio loads={} bytes={} waits={} fails={} | placement requested={} selected={} fallback={} ane_calls={} ane_fallbacks={} probes={} promotions={} demotions={} round wall={:.1} draft={:.1} verify={:.1} handoff={:.1} fallback_ms={:.1}",
+        "logan profile: tokens={tokens} route={:.1} predict={:.1} io={:.1} shared={:.1} gpu={:.1} fill={:.1} gdn={:.1} attn={:.1} hc={:.1} head={:.1} total={:.1} ms/tok | gdn_parts in={:.1} conv={:.1} prep={:.1} recur={:.1} gate={:.1} out={:.1} | cache hits={cache_hits} misses={cache_misses} | gdn_metal_ok={} | metal encode={} submit={} wait={} kernel={} ns fused_calls={} fused_experts={} | mio loads={} bytes={} waits={} fails={} | placement requested={} selected={} fallback={} ane_calls={} ane_fallbacks={} probes={} promotions={} demotions={} round wall={:.1} draft={:.1} verify={:.1} handoff={:.1} fallback_ms={:.1}",
         spans.route_ms / tokens.max(1) as f64,
+        spans.predict_ms / tokens.max(1) as f64,
         spans.io_ms / tokens.max(1) as f64,
         spans.shared_ms / tokens.max(1) as f64,
         spans.gpu_ms / tokens.max(1) as f64,
@@ -258,6 +264,7 @@ mod tests {
         unsafe { std::env::set_var("LOGAN_PROFILE", "1") };
         let spans = TokenSpans {
             route_ms: 10.0,
+            predict_ms: 0.0,
             io_ms: 20.0,
             shared_ms: 5.0,
             gpu_ms: 15.0,

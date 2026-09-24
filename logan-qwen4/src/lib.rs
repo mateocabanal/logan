@@ -15,15 +15,20 @@ mod gguf_iq_tables;
 mod ggufload;
 pub mod ggufsource;
 pub use ggufload::load_cfg_gguf;
+mod edge0_router;
+mod edge0_train_trace;
 pub mod ffi;
 mod gdn_ane;
+pub mod hybrid_stage;
 #[doc(hidden)]
 pub mod mlx_affine_cuda;
 pub mod mtp;
 pub mod plan;
 pub mod pool;
+mod route_mode;
 mod route_predictor;
 pub mod scheduled;
+pub use route_mode::{LayerRouteError, RouteAgreement, RouteMode};
 
 use logan_core::expert::Slot as _; // for SlotExpert::release
 
@@ -42,6 +47,41 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false)
+}
+
+/// `QWEN_ROUTE_NATIVE_K`: truncate the native router to this width.
+///
+/// Only meaningful for [`RouteMode::NativeTruncated`]. `None` when unset, which
+/// is the default and leaves the native route untouched.
+fn native_k() -> Option<usize> {
+    std::env::var("QWEN_ROUTE_NATIVE_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|k| *k > 0)
+}
+
+/// [`native_k`] for the out-of-crate loaders.
+pub(crate) fn native_k_env() -> Option<usize> {
+    native_k()
+}
+
+/// Route-stability bias for authoritative routing (`QWEN_ROUTE_AUTHORITATIVE_STABILITY`).
+///
+/// Added to each previous-route expert's fused score, in units of that layer's
+/// peak fused score, so the knob is scale-free. Default `0.25` is measured, not
+/// chosen: over two real Qwen3.6 decode traces the offline simulator puts mean
+/// discarded native weight mass at 0.4237/0.2378 for `0.25` versus
+/// 0.4405/0.2509 for no bias, and `>=1.0` degenerates to pure static routing
+/// (0.4614/0.2695, which is exactly the previous-route-reuse figure). The
+/// optimum is at the low end and the curve is flat-to-worse beyond it, so a
+/// large bias is not a live option — the predictor must be able to displace an
+/// unstable resident or it is not predicting anything.
+fn route_authoritative_stability_bias() -> f32 {
+    std::env::var("QWEN_ROUTE_AUTHORITATIVE_STABILITY")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.25)
+        .clamp(0.0, 16.0)
 }
 
 struct RouteScoutTraceSink {
@@ -80,9 +120,7 @@ fn route_scout_hidden_trace_record(layers: usize, layer: usize, x: &[f32]) {
         match result {
             Ok(sink) => std::sync::Mutex::new(Some(sink)),
             Err(error) => {
-                eprintln!(
-                    "logan routescout: failed to open QWEN_ROUTESCOUT_HIDDEN_PATH: {error}"
-                );
+                eprintln!("logan routescout: failed to open QWEN_ROUTESCOUT_HIDDEN_PATH: {error}");
                 std::sync::Mutex::new(None)
             }
         }
@@ -101,7 +139,10 @@ fn route_scout_hidden_trace_record(layers: usize, layer: usize, x: &[f32]) {
     let event = sink.event;
     sink.event = sink.event.saturating_add(1);
     if sink.writer.write_all(&event.to_le_bytes()).is_err()
-        || sink.writer.write_all(&(layer as u16).to_le_bytes()).is_err()
+        || sink
+            .writer
+            .write_all(&(layer as u16).to_le_bytes())
+            .is_err()
     {
         return;
     }
@@ -145,9 +186,7 @@ fn route_scout_trace_record(
         match result {
             Ok(sink) => std::sync::Mutex::new(Some(sink)),
             Err(error) => {
-                eprintln!(
-                    "logan routescout: failed to open QWEN_ROUTESCOUT_TRACE_PATH: {error}"
-                );
+                eprintln!("logan routescout: failed to open QWEN_ROUTESCOUT_TRACE_PATH: {error}");
                 std::sync::Mutex::new(None)
             }
         }
@@ -170,7 +209,11 @@ fn route_scout_trace_record(
         .filter(|&p| p > 0.0 && p.is_finite())
         .map(|p| -p * p.ln())
         .sum::<f32>();
-    let margin = if val.len() >= 2 { val[0] - val[1] } else { val[0] };
+    let margin = if val.len() >= 2 {
+        val[0] - val[1]
+    } else {
+        val[0]
+    };
     let denom = if wsum > 0.0 && wsum.is_finite() {
         wsum
     } else {
@@ -556,6 +599,10 @@ impl StFile {
         self.files.len()
     }
 
+    pub(crate) fn first_path(&self) -> Option<&Path> {
+        self.paths.first().map(std::path::PathBuf::as_path)
+    }
+
     /// Re-open the same safetensors shards for streaming work. This keeps
     /// dense/static checkpoint reads on their ordinary cached descriptors while
     /// routed experts can use macOS F_NOCACHE without globally poisoning the
@@ -563,8 +610,7 @@ impl StFile {
     fn fork_for_streaming(&self, nocache: bool) -> Result<Self, String> {
         let mut files = Vec::with_capacity(self.paths.len());
         for path in self.paths.iter() {
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
             #[cfg(target_os = "macos")]
             if nocache {
                 use std::os::fd::AsRawFd as _;
@@ -703,6 +749,21 @@ impl StFile {
             .map_err(|e| e.to_string())?;
         file.read_exact(&mut raw).map_err(|e| e.to_string())?;
         Ok(raw)
+    }
+
+    /// Read an FP16 tensor without widening it. Edge0's pretrained
+    /// prerouter is deployed in FP16 and preserving the payload avoids both
+    /// a 2x resident expansion and an accidental precision change.
+    pub(crate) fn f16_bits(&self, name: &str, expect: &[u64]) -> Result<Vec<u16>, String> {
+        let dtype = self.tensors.get(name).map(|t| t.2.as_str()).unwrap_or("");
+        if dtype != "F16" {
+            return Err(format!("{name}: dtype {dtype} is not F16"));
+        }
+        let raw = self.payload(name, expect, 2)?;
+        Ok(raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
     }
 
     /// Read one tensor as f32, decoding whatever dtype it is stored in.
@@ -1256,6 +1317,228 @@ pub enum SchedForward {
     NeedExperts { layer: usize, experts: Vec<u32> },
 }
 
+/// A page-aligned host allocation owned for the process lifetime (or until the
+/// last view drops), registered with the Metal backend so pointers into it
+/// resolve zero-copy.
+///
+/// This is the backing store for [`crate::Bytes::Arena`]: MetalIO streams routed
+/// expert bytes straight into it, so the engine's tensors read the bytes where
+/// the I/O landed instead of copying them out of a MetalIO slot and into owned
+/// vectors. See EXP-067.
+///
+/// Alignment/dealloc discipline: allocated with `std::alloc::alloc` under an
+/// explicit `Layout` and freed with the *same* layout. That is deliberate — a
+/// `posix_memalign` buffer wrapped in `Vec::from_raw_parts` would be freed by
+/// `Vec`'s default drop at align 1, which is undefined behaviour rather than a
+/// performance question (EXP-054 recorded that trap).
+pub(crate) struct ArenaBuf {
+    base: *mut u8,
+    len: usize,
+}
+
+/// The Metal arena page size, matching `METALIO_ALIGN` and `coli_metal_register`'s
+/// documented requirement.
+pub(crate) const ARENA_ALIGN: usize = 16384;
+
+// SAFETY: the arena is a flat byte allocation. Every view is created after the
+// MetalIO loads for its region have been waited on, the GPU's read of a region
+// completes before the synchronous expert dispatch returns, and a region is not
+// re-loaded until that arena's next turn (two layers later). That is the same
+// single-owner-at-a-time discipline the engine already relies on for MetalIO
+// shared-storage slots.
+unsafe impl Send for ArenaBuf {}
+unsafe impl Sync for ArenaBuf {}
+
+impl ArenaBuf {
+    /// Allocate `len` bytes at [`ARENA_ALIGN`]. `len` must be a non-zero
+    /// multiple of that alignment, which is what both MetalIO aliasing and
+    /// `coli_metal_register` require.
+    fn alloc(len: usize) -> Result<std::sync::Arc<ArenaBuf>, String> {
+        if len == 0 || len % ARENA_ALIGN != 0 {
+            return Err(format!(
+                "arena length {len} is not a non-zero multiple of {ARENA_ALIGN}"
+            ));
+        }
+        let layout = std::alloc::Layout::from_size_align(len, ARENA_ALIGN)
+            .map_err(|e| format!("arena layout {len}/{ARENA_ALIGN}: {e}"))?;
+        // SAFETY: `layout` has a non-zero size, which is `alloc`'s precondition.
+        let base = unsafe { std::alloc::alloc(layout) };
+        if base.is_null() {
+            return Err(format!("arena allocation of {len} bytes failed"));
+        }
+        Ok(std::sync::Arc::new(ArenaBuf { base, len }))
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Borrow `len` bytes at `off`, or `None` when the range leaves the arena.
+    fn slice(&self, off: usize, len: usize) -> Option<&[u8]> {
+        if off.checked_add(len)? > self.len {
+            return None;
+        }
+        // SAFETY: the range was just proven inside the allocation, and the
+        // backing bytes outlive `self`.
+        Some(unsafe { std::slice::from_raw_parts(self.base.add(off), len) })
+    }
+}
+
+impl Drop for ArenaBuf {
+    fn drop(&mut self) {
+        // Unregister unconditionally. The backend treats an unknown base as a
+        // no-op, while any successful registration must be removed before the
+        // caller-owned pages are freed.
+        crate::ffi::metal_unregister(self.base);
+        // SAFETY: `base` was returned by `alloc` under exactly this layout, and
+        // any registered wrapper that aliases the same pages was released by
+        // `metal_unregister` above.
+        unsafe {
+            std::alloc::dealloc(
+                self.base,
+                std::alloc::Layout::from_size_align_unchecked(self.len, ARENA_ALIGN),
+            )
+        };
+    }
+}
+
+/// Expert weight bytes: either owned, or a view into a registered streaming
+/// arena.
+///
+/// Both variants deref to `[u8]`, so every consumer keeps reading `weights`,
+/// `scales`, `biases` and `aux` as byte slices exactly as it did when these
+/// fields were plain `Vec<u8>`. The arena variant exists to make the copy
+/// disappear: the bytes are already where MetalIO put them.
+pub(crate) enum Bytes {
+    Owned(Vec<u8>),
+    Arena {
+        buf: std::sync::Arc<ArenaBuf>,
+        off: usize,
+        len: usize,
+    },
+    /// EXP-069: a view into a retained per-layer RouteCache block. `generation`
+    /// records which cache epoch the bytes belong to, so a view held across a
+    /// cache rebuild can never be silently re-pointed at different bytes than
+    /// its tensor was built for.
+    #[allow(dead_code)]
+    CacheHeld {
+        buf: std::sync::Arc<ArenaBuf>,
+        off: usize,
+        len: usize,
+        generation: u64,
+    },
+    /// A view into the hybrid staging arena's per-layer row.
+    ///
+    /// Deliberately its own variant rather than reusing `Arena`: the two have
+    /// different owners and different lifetimes, and an expert read from staging
+    /// must never be handed back to `RouteArena`'s route slots (which is what
+    /// `mats_are_arena` would do) nor retained in `wt_pool` (which outlives the
+    /// token the bytes were staged for). Staged bytes are consumed and dropped.
+    Staged {
+        buf: std::sync::Arc<ArenaBuf>,
+        off: usize,
+        len: usize,
+    },
+}
+
+impl Bytes {
+    fn held(buf: std::sync::Arc<ArenaBuf>, off: usize, len: usize) -> Bytes {
+        Bytes::Arena { buf, off, len }
+    }
+
+    fn is_arena(&self) -> bool {
+        matches!(self, Bytes::Arena { .. })
+    }
+
+    /// EXP-069: bytes that live in a retained cache block. These must never
+    /// enter `wt_pool` (the pool would outlive the cache generation) and must
+    /// never be written by `refill_plan_into`.
+    #[allow(dead_code)]
+    fn is_cache_held(&self) -> bool {
+        matches!(self, Bytes::CacheHeld { .. })
+    }
+
+    /// Hybrid staging bytes. Like `CacheHeld`, these are owned by another
+    /// buffer: they must not be written in place, returned to the route arena, or
+    /// kept in `wt_pool` past the token they were staged for.
+    fn is_staged(&self) -> bool {
+        matches!(self, Bytes::Staged { .. })
+    }
+
+    /// A view into the hybrid staging arena's row for one expert block.
+    fn staged(buf: std::sync::Arc<ArenaBuf>, off: usize, len: usize) -> Bytes {
+        Bytes::Staged { buf, off, len }
+    }
+
+    /// Byte view. Inherent so `weights.as_slice()` resolves here rather than to
+    /// the unstable `<[u8]>::as_slice` through `Deref`.
+    fn as_slice(&self) -> &[u8] {
+        self
+    }
+
+    /// Exclusive byte access, or `None` for a borrowed view.
+    ///
+    /// The in-place refill path is what needs this, and it is exactly the path
+    /// the arena removes: an arena region is written by MetalIO and read by the
+    /// tensors, never rewritten by the engine. Returning `None` keeps
+    /// `refill_plan_into` from silently overwriting streaming memory.
+    fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        match self {
+            Bytes::Owned(v) => Some(v.as_mut_slice()),
+            Bytes::Arena { .. } | Bytes::CacheHeld { .. } | Bytes::Staged { .. } => None,
+        }
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Bytes::Owned(v) => v.as_slice(),
+            // SAFETY: `off`/`len` were validated when the view was built, and
+            // the `Arc` keeps the arena allocation alive for the view's lifetime.
+            Bytes::Arena { buf, off, len }
+            | Bytes::CacheHeld { buf, off, len, .. }
+            | Bytes::Staged { buf, off, len } => unsafe {
+                std::slice::from_raw_parts(buf.base().add(*off), *len)
+            },
+        }
+    }
+}
+
+impl Clone for Bytes {
+    fn clone(&self) -> Self {
+        match self {
+            Bytes::Owned(v) => Bytes::Owned(v.clone()),
+            Bytes::Arena { buf, off, len } => Bytes::Arena {
+                buf: std::sync::Arc::clone(buf),
+                off: *off,
+                len: *len,
+            },
+            Bytes::CacheHeld {
+                buf,
+                off,
+                len,
+                generation,
+            } => Bytes::CacheHeld {
+                buf: std::sync::Arc::clone(buf),
+                off: *off,
+                len: *len,
+                generation: *generation,
+            },
+            Bytes::Staged { buf, off, len } => Bytes::Staged {
+                buf: std::sync::Arc::clone(buf),
+                off: *off,
+                len: *len,
+            },
+        }
+    }
+}
+
 pub enum WtBytes {
     /// Canonical BF16 row-major matrix. The optional Metal tensor is created
     /// lazily and remains tied to this exact byte allocation.
@@ -1275,18 +1558,22 @@ pub enum WtBytes {
     /// little-endian U32 bitstream, while scales/biases are BF16 per group.
     /// The logical matrix shape lives on `Wt`; nothing is dequantized at load.
     MlxAffine {
-        weights: Vec<u8>,
-        scales: Vec<u8>,
-        biases: Vec<u8>,
+        weights: Bytes,
+        scales: Bytes,
+        biases: Bytes,
         bits: u8,
         group_size: usize,
-        /// True when the affine scale/bias sidecars are IEEE fp16. False
+        /// True when MLX affine scale/bias sidecars are IEEE fp16. False
         /// means BF16. The packed integer weights are identical either way.
         aux_fp16: bool,
         /// Lazily materialized `[scales][biases]` sidecar expected by Metal.
         /// Keeping the source vectors separate preserves the CPU oracle without
         /// paying a concatenation/allocation on every token.
-        metal_aux: std::sync::OnceLock<Vec<u8>>,
+        ///
+        /// For a streaming-arena expert this is a single view spanning the
+        /// arena's already-contiguous scales+biases pair, so the sidecar costs
+        /// no copy at all (EXP-067).
+        metal_aux: std::sync::OnceLock<Bytes>,
         metal_tensor: std::sync::Mutex<usize>,
         /// Persistent CUDA copy of packed affine weights and scratch buffers.
         cuda_resident: std::sync::Mutex<Option<mlx_affine_cuda::ResidentAffine>>,
@@ -1846,8 +2133,8 @@ pub struct Model {
     gdn_s: Vec<Vec<f32>>,
     // Long-context state is owned only by layers that consume it.
     // GDN layers keep empty KV vectors; QSA index storage is likewise sparse.
-    kv_k: Vec<Vec<f32>>, // [layer][kv_head*max_t*head_dim + pos*head_dim + d]
-    kv_v: Vec<Vec<f32>>,
+    kv_k: Vec<KvCache>, // [layer][kv_head*max_t*head_dim + pos*head_dim + d]
+    kv_v: Vec<KvCache>,
     idx_cache: Vec<Vec<f32>>, // [layer][pos*nk], empty unless QSA
     ple_ring: Vec<i64>,
     ple_conv_state: Vec<f32>,
@@ -1909,7 +2196,77 @@ pub struct Model {
     /// It observes only routes the model already chose; it can affect load
     /// timing through speculative prefetch but never changes router output.
     route_predictor: Option<route_predictor::RoutePredictor>,
+    /// Edge0's pretrained semantic cross-token prerouter. This is deliberately
+    /// separate from RouteScout's online transition predictor so either system
+    /// can be measured in isolation before a hybrid is designed.
+    edge0_router: Option<edge0_router::Edge0Router>,
+    /// Optional native-K4 trace collector used only for offline prerouter training.
+    /// It is inert unless QWEN_EDGE0_TRACE_DIR is set and never changes routing.
+    edge0_train_trace: Option<edge0_train_trace::TraceCollector>,
     route_predict_prefetch: bool,
+    /// The **native** router's route per layer, kept separate from `route_prev`.
+    ///
+    /// In authoritative mode `route_prev` is overwritten by the route that was
+    /// actually executed, so using it as the predictor's feedback signal would
+    /// train the predictor on its own output — a closed loop that drifts toward
+    /// self-consistency and stops tracking the router. This field is the
+    /// predictor's observation source in every mode, which is what keeps its
+    /// transition tables a model of the *router* rather than of itself.
+    route_native_prev: Vec<Vec<usize>>,
+    /// Native / shadow / authoritative routing policy. Resolved once at
+    /// construction so no layer can disagree about which policy is in force.
+    /// [`RouteMode::Native`] is the default and leaves every existing path
+    /// untouched.
+    route_mode: RouteMode,
+    /// `QWEN_ROUTE_NATIVE_K` snapshotted at construction, `0` when unset.
+    ///
+    /// Captured rather than read per call for the same reason the mode is:
+    /// `examples/quality_probe` sets the variable to build a truncated student
+    /// and then clears it before building the teacher, so a live read would make
+    /// the control arm silently run at full top-k and compare a native model to
+    /// itself (`KL == 0`).
+    route_native_k: usize,
+    /// Hybrid staging policy, snapshotted at construction for the same reason as
+    /// the mode: a second model in one process must be able to run a different
+    /// fusion arm without the first one's behaviour changing underneath it.
+    hybrid_stage_config: hybrid_stage::StageConfig,
+    /// Edge0's cached next-token ranking per consumer, for the hybrid fusion.
+    ///
+    /// Edge0's head produces it during owner layer `N`, but the fusion that
+    /// consumes it runs after layer `N+1` has routed (the point at which
+    /// RouteScout's evidence is current), so the ranking has to survive that one
+    /// layer of delay. Cleared every token, so a ranking is never fused into a
+    /// later token's staging.
+    hybrid_edge0_ranked: Vec<Vec<edge0_router::RankedCandidate>>,
+    /// True while a prompt row is being processed, which suppresses predictive
+    /// routing entirely.
+    ///
+    /// Mission Phase 12: prefill has different reuse characteristics from decode
+    /// (many rows share one layer's expert union, so the router's own selection
+    /// is the right thing to stage) and must not be forced onto the streaming
+    /// decode policy.
+    ///
+    /// It is also a *measurement* prerequisite. In authoritative mode the
+    /// executed route feeds the layer's output, so a student that routed
+    /// differently during prefill would carry different KV/GDN/conv state into
+    /// decode and every subsequent per-position teacher comparison would be
+    /// measuring accumulated state divergence rather than the routing error the
+    /// experiment is about. Gating the override during prefill makes both arms
+    /// share the teacher's state exactly, so the decode-window deltas mean what
+    /// they claim to.
+    in_prefill: bool,
+    /// Authoritative route width. `0` means "the model's own `topk`", which is
+    /// read from the checkpoint config rather than assumed, so a K sweep is an
+    /// explicit override and the default is the model's declared routing.
+    route_authoritative_k: usize,
+    /// Native-vs-authoritative disagreement, analysis only. Authoritative mode
+    /// never issues a corrective read, so this is read by the profile report and
+    /// never by the execution path.
+    route_agreement: RouteAgreement,
+    /// Per-layer attribution of the same disagreement, so the report can say
+    /// *which* layers the authoritative route is wrong in rather than only that
+    /// it is wrong on average.
+    route_layer_error: LayerRouteError,
     /// Process-unique owner identity for native model-scoped resources. The
     /// native GDN cache is keyed by this ID + layer, never by layer alone.
     metal_model_id: u64,
@@ -2008,6 +2365,7 @@ impl Drop for Model {
         }
         logan_metal::shared_mxfp4_drop_model(self.metal_model_id);
         logan_metal::gdn_mxfp4_drop_model(self.metal_model_id);
+        logan_metal::moe_route_drop_model(self.metal_model_id);
         crate::ffi::gdn_drop_model(self.metal_model_id);
     }
 }
@@ -2046,6 +2404,136 @@ fn lazy_zeroed_f32(n: usize) -> Vec<f32> {
 // created and freed on the host thread that owns the Model (decode is a
 // single-threaded per-token pipeline; the GPU reads the memory but Metal
 // shared-storage buffers are explicitly designed for host+device access).
+/// A KV cache that the EXP-071 attention island can register.
+///
+/// `newBufferWithBytesNoCopy` accepts only a page-aligned base with a
+/// page-multiple length, so the cache cannot be a plain `Vec<f32>`: `Vec`'s drop
+/// deallocates under `Layout::array::<f32>(cap)` (align 4), which would be
+/// undefined behaviour for a 16 KiB-aligned allocation — the exact trap EXP-054
+/// recorded. This type owns the allocation under one `Layout` and frees it under
+/// the same one, and it exposes the two views the engine needs: the exact `n`
+/// elements it indexes, and the page-rounded byte length to register.
+///
+/// Storage comes from `alloc_zeroed`, which preserves the lazy-zero property
+/// `lazy_zeroed_f32` documents: untouched pages stay on the shared zero page, so
+/// a large cache costs ~0 RSS until a token actually writes a position. The
+/// page-rounding tail is never indexed.
+struct KvCache {
+    ptr: *mut f32,
+    len: usize,
+    bytes: usize,
+}
+
+impl KvCache {
+    fn new(n: usize) -> KvCache {
+        if n == 0 {
+            return KvCache {
+                ptr: std::ptr::NonNull::<f32>::dangling().as_ptr(),
+                len: 0,
+                bytes: 0,
+            };
+        }
+        // Page alignment and registration exist ONLY to serve the EXP-071
+        // attention island, which is default-OFF. Registering is not free: at the
+        // default `max_t` a cache is ~134 MiB, so ten dense layers would put
+        // ~2.7 GiB of GPU-visible wrappers on a 16 GiB host and measurably slow
+        // everything else (whole-token time doubled with every profiled span
+        // unchanged). So the default path keeps the original align-4 lazy
+        // allocation and registers nothing.
+        const PAGE: usize = 16384;
+        let island = island_enabled();
+        let bytes = n.checked_mul(4).expect("KV byte size");
+        let (rounded, align) = if island {
+            (bytes.div_ceil(PAGE) * PAGE, PAGE)
+        } else {
+            (bytes, 4)
+        };
+        let layout = std::alloc::Layout::from_size_align(rounded, align).expect("KV layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut f32;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        KvCache {
+            ptr,
+            len: n,
+            bytes: if island { rounded } else { 0 },
+        }
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `ptr` owns `len` initialized f32s for this value's lifetime.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        // SAFETY: exclusive access through `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.ptr as *mut u8
+    }
+
+    /// Page-rounded byte length for `newBufferWithBytesNoCopy`, or 0 when this
+    /// cache is not meant to be registered (island disabled).
+    fn registered_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The allocation's true byte length, used for the matching dealloc.
+    fn alloc_bytes(&self) -> usize {
+        if self.bytes != 0 {
+            self.bytes
+        } else {
+            self.len * 4
+        }
+    }
+}
+
+impl std::ops::Deref for KvCache {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for KvCache {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        self.as_mut_slice()
+    }
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        let registered = self.bytes != 0;
+        let (size, align) = if registered {
+            (self.bytes, 16384usize)
+        } else {
+            (self.alloc_bytes(), 4usize)
+        };
+        if registered {
+            crate::ffi::metal_unregister(self.base());
+        }
+        let layout = std::alloc::Layout::from_size_align(size, align).expect("KV layout");
+        // SAFETY: allocated under exactly this layout in `new`.
+        unsafe { std::alloc::dealloc(self.base(), layout) };
+    }
+}
+
+// SAFETY: the allocation is owned exclusively by this value; Metal reads it via
+// a shared-storage alias, which is the designed host+device access mode, and the
+// model that owns these caches is driven from one thread.
+unsafe impl Send for KvCache {}
+
 unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {
@@ -2230,7 +2718,8 @@ fn bf16_simd_calls() -> u64 {
 /// distinguishes "wired" from "advertised", the same reason BF16 keeps its own
 /// counter.
 static MLX_AFFINE_METAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static MLX_AFFINE_FALLBACK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MLX_AFFINE_FALLBACK_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// (metal_dispatches, scalar_fallbacks) for the MLX affine GEMV.
 pub fn mlx_affine_dispatch_counts() -> (u64, u64) {
@@ -3231,8 +3720,7 @@ fn mlx_affine_row_f32(
     (0..columns)
         .map(|column| {
             let group = row * groups + column / group_size;
-            mlx_affine_code(wr, column, bits) as f32
-                * mlx_affine_param_at(scales, group, aux_fp16)
+            mlx_affine_code(wr, column, bits) as f32 * mlx_affine_param_at(scales, group, aux_fp16)
                 + mlx_affine_param_at(biases, group, aux_fp16)
         })
         .collect()
@@ -3384,25 +3872,27 @@ fn matmul(y: &mut [f32], x: &[f32], w: &Wt) {
                 metal_tensor,
                 cuda_resident,
             } => {
-                if !*aux_fp16 && mlx_affine_cuda::matmul(
-                    cuda_resident,
-                    y,
-                    x,
-                    weights,
-                    scales,
-                    biases,
-                    *bits,
-                    *group_size,
-                    i,
-                    o,
-                ) {
+                if !*aux_fp16
+                    && mlx_affine_cuda::matmul(
+                        cuda_resident,
+                        y,
+                        x,
+                        weights,
+                        scales,
+                        biases,
+                        *bits,
+                        *group_size,
+                        i,
+                        o,
+                    )
+                {
                     return;
                 }
                 let aux = metal_aux.get_or_init(|| {
                     let mut combined = Vec::with_capacity(scales.len() + biases.len());
                     combined.extend_from_slice(scales);
                     combined.extend_from_slice(biases);
-                    combined
+                    Bytes::Owned(combined)
                 });
                 let mut handle = metal_tensor
                     .lock()
@@ -3555,7 +4045,7 @@ fn matmul_mlx_affine_multi_x(
             let mut combined = Vec::with_capacity(scales.len() + biases.len());
             combined.extend_from_slice(scales);
             combined.extend_from_slice(biases);
-            combined
+            Bytes::Owned(combined)
         });
         parts.push((
             weights.as_slice(),
@@ -3579,7 +4069,12 @@ fn matmul_mlx_affine_multi_x(
     }
 
     let mut descs = Vec::with_capacity(parts.len());
-    for (i, ((y, part), guard)) in ys.iter_mut().zip(parts.iter()).zip(guards.iter()).enumerate() {
+    for (i, ((y, part), guard)) in ys
+        .iter_mut()
+        .zip(parts.iter())
+        .zip(guards.iter())
+        .enumerate()
+    {
         let (weights, aux, bits, group_size, aux_fp16, _, input, output) = *part;
         descs.push(logan_metal::MlxAffineMatmulDesc {
             tensor: **guard as *mut logan_metal::ColiMetalTensor,
@@ -3605,6 +4100,125 @@ fn matmul_mlx_affine_multi_x(
 /// Shared-activation form of [`matmul_mlx_affine_multi_x`].
 fn matmul_mlx_affine_multi(ys: &mut [&mut [f32]], x: &[f32], ws: &[&Wt]) -> bool {
     matmul_mlx_affine_multi_x(ys, x, ws, None)
+}
+
+/// EXP-068: single-command-buffer routed MoE island.
+///
+/// The established path calls [`matmul_mlx_affine_multi`] three times per layer
+/// (gate, up, down), and each call commits and synchronously waits on its own
+/// Metal command buffer — three blocking GPU synchronization boundaries and
+/// three host round-trips of gate/up/SwiGLU per layer. This helper instead
+/// encodes all K experts' gate and up projections, the SwiGLU, and all K down
+/// projections into ONE command buffer with a single completion event, and never
+/// brings the gate/up/SwiGLU intermediates back to the host.
+///
+/// `mats[i]` is `[gate, up, down]` for route rank `i`; the descriptors are built
+/// expert-major (`i*3 + role`) to match the native contract. The caller keeps
+/// its own canonical rank-ordered weighted reduction, so the accumulation order
+/// is unchanged.
+///
+/// Returns `None` when any matrix is not MLX affine, when the native side
+/// declines the geometry, or when the submitted layer fails — the caller then
+/// uses the established path. A `None` never leaves a partially computed layer
+/// behind: the outputs are only returned once the single event has fired.
+fn matmul_mlx_affine_route(
+    mats: &[[Wt; 3]],
+    x: &[f32],
+    d_model: usize,
+    d_hidden: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let k = mats.len();
+    if k < 2 || k > 16 {
+        return None;
+    }
+    // (weights, aux, bits, group_size, aux_fp16, metal_tensor, i, o)
+    let mut parts = Vec::with_capacity(k * 3);
+    for m in mats {
+        for role in 0..3 {
+            let w = &m[role];
+            let Some(WtBytes::MlxAffine {
+                weights,
+                scales,
+                biases,
+                bits,
+                group_size,
+                aux_fp16,
+                metal_aux,
+                metal_tensor,
+                ..
+            }) = w.bytes.as_ref()
+            else {
+                return None;
+            };
+            let aux = metal_aux.get_or_init(|| {
+                let mut combined = Vec::with_capacity(scales.len() + biases.len());
+                combined.extend_from_slice(scales);
+                combined.extend_from_slice(biases);
+                Bytes::Owned(combined)
+            });
+            parts.push((
+                weights.as_slice(),
+                aux.as_slice(),
+                *bits,
+                *group_size,
+                *aux_fp16,
+                metal_tensor,
+                w.i,
+                w.o,
+            ));
+        }
+    }
+
+    let mut guards = Vec::with_capacity(parts.len());
+    for (_, _, _, _, _, metal_tensor, _, _) in &parts {
+        guards.push(
+            metal_tensor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    // The island writes its own per-expert output buffers, so no descriptor
+    // consumes a host `y`; the field only has to stay valid for the call.
+    let mut ys: Vec<Vec<f32>> = (0..parts.len()).map(|_| Vec::new()).collect();
+    let mut descs = Vec::with_capacity(parts.len());
+    for (i, ((part, guard), y)) in parts
+        .iter()
+        .zip(guards.iter())
+        .zip(ys.iter_mut())
+        .enumerate()
+    {
+        let (weights, aux, bits, group_size, aux_fp16, _, input, output) = *part;
+        descs.push(logan_metal::MlxAffineMatmulDesc {
+            tensor: **guard as *mut logan_metal::ColiMetalTensor,
+            y: y.as_mut_slice(),
+            weights,
+            aux,
+            bits,
+            group_size,
+            aux_fp16,
+            i: input,
+            o: output,
+            x: None,
+        });
+    }
+
+    let pending = logan_metal::moe_route_begin(&mut descs, x, d_model, d_hidden)?;
+    for (guard, desc) in guards.iter_mut().zip(descs.iter()) {
+        **guard = desc.tensor as usize;
+    }
+    let host_t0 = std::time::Instant::now();
+    let mut flat = vec![0.0_f32; k * d_model];
+    if logan_metal::moe_route_finish(pending, &mut flat) != 1 {
+        return None;
+    }
+    let wait_ns = host_t0.elapsed().as_nanos() as u64;
+    let copy_t0 = std::time::Instant::now();
+    let out: Vec<Vec<f32>> = flat.chunks(d_model).map(<[f32]>::to_vec).collect();
+    let copy_ns = copy_t0.elapsed().as_nanos() as u64;
+    ISLAND_HOST_NS.fetch_add(wait_ns, std::sync::atomic::Ordering::Relaxed);
+    ISLAND_COPY_NS.fetch_add(copy_ns, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
 }
 
 /// Encode several resident MXFP4 GEMVs that consume the same activation in a
@@ -3738,7 +4352,7 @@ fn gdn_metal_weight_view(w: &Wt) -> Option<GdnMetalWeightView<'_>> {
                 let mut combined = Vec::with_capacity(scales.len() + biases.len());
                 combined.extend_from_slice(scales);
                 combined.extend_from_slice(biases);
-                combined
+                Bytes::Owned(combined)
             });
             Some(GdnMetalWeightView {
                 weights,
@@ -6133,12 +6747,12 @@ impl Model {
                 self.rope_interleaved,
             );
         }
-        debug_assert_eq!(self.kv_k[li].len(), kv * c.max_t * hd);
-        debug_assert_eq!(self.kv_v[li].len(), kv * c.max_t * hd);
+        debug_assert_eq!(self.kv_k[li].as_slice().len(), kv * c.max_t * hd);
+        debug_assert_eq!(self.kv_v[li].as_slice().len(), kv * c.max_t * hd);
         for g in 0..kv {
             let base = g * c.max_t * hd + pos * hd;
-            self.kv_k[li][base..base + hd].copy_from_slice(&k[g * hd..g * hd + hd]);
-            self.kv_v[li][base..base + hd].copy_from_slice(&vv[g * hd..g * hd + hd]);
+            self.kv_k[li].as_mut_slice()[base..base + hd].copy_from_slice(&k[g * hd..g * hd + hd]);
+            self.kv_v[li].as_mut_slice()[base..base + hd].copy_from_slice(&vv[g * hd..g * hd + hd]);
         }
 
         let positions: Vec<usize> = match selected {
@@ -6149,6 +6763,58 @@ impl Model {
         let scale = 1.0 / (hd as f32).sqrt();
         let mut scores = vec![0.0; nsel];
         let mut attn_out = vec![0.0; h * hd];
+
+        // EXP-071: one dispatch over the whole cached span instead of a scalar
+        // host walk. Only the contiguous full-span case qualifies; a `selected`
+        // subset (indexer layers) has no island equivalent and keeps the host path.
+        //
+        // **Default OFF — REJECTED on measurement.** The island is numerically
+        // exact (bit-identical trajectories) but costs 1594.7 ms/token of
+        // attention versus 20.8 ms for the host path at short context, and it
+        // stalls the whole GPU with it (gdn 49.2 -> 5925.8, shared 27.6 -> 735.0,
+        // head 29.6 -> 2962.6 ms/token). `LOGAN_ATTN_ISLAND=1` re-enables it for
+        // reproducing that result; see EXP-071 for the mechanism and for what a
+        // viable implementation would have to do differently.
+        let island_on = island_enabled();
+        if island_on && selected.is_none() {
+            let rc = crate::ffi::qwen_attn_decode(
+                &qg,
+                h,
+                kv,
+                hd,
+                c.max_t,
+                nsel,
+                scale,
+                &mut attn_out,
+                self.kv_k[li].as_slice(),
+                self.kv_v[li].as_slice(),
+            );
+            if rc == 1 {
+                if !metal_ok {
+                    matmul(out, &attn_out, &layer.attn_o);
+                } else if let Some(am) = self.attn_metal[li].as_ref() {
+                    let wo = unsafe {
+                        std::slice::from_raw_parts(am.o as *const u8, c.hidden * h * hd * 2)
+                    };
+                    let rc2 = crate::ffi::bf16_matmul(wo, &attn_out, out, 1, c.hidden, h * hd);
+                    if rc2 < 0 {
+                        eprintln!(
+                            "qwen4-rs: Metal attention out_proj failed after submission \
+                             (layer {li})"
+                        );
+                        std::process::exit(1);
+                    }
+                    if rc2 == 0 {
+                        matmul(out, &attn_out, &layer.attn_o);
+                    }
+                }
+                return;
+            }
+            if rc < 0 {
+                eprintln!("qwen4-rs: Metal attention island failed after submission (layer {li})");
+                std::process::exit(1);
+            }
+        }
         for hh in 0..h {
             let qh = &qg[hh * 2 * hd..hh * 2 * hd + hd];
             let hg = hh / groups;
@@ -6157,7 +6823,7 @@ impl Model {
                 let base = hg * c.max_t * hd + p * hd;
                 let mut acc = 0.0_f32;
                 for dd in 0..hd {
-                    acc += qh[dd] * self.kv_k[li][base + dd];
+                    acc += qh[dd] * self.kv_k[li].as_slice()[base + dd];
                 }
                 scores[s] = acc * scale;
                 if scores[s] > mx {
@@ -6177,7 +6843,7 @@ impl Model {
                 let base = hg * c.max_t * hd + p * hd;
                 let w = scores[s] / ssum;
                 for dd in 0..hd {
-                    oh[dd] += w * self.kv_v[li][base + dd];
+                    oh[dd] += w * self.kv_v[li].as_slice()[base + dd];
                 }
             }
             let gh = &qg[(2 * hh + 1) * hd..(2 * hh + 2) * hd];
@@ -6249,8 +6915,8 @@ impl Model {
                 self.rope_interleaved,
             );
             let base = g * c.max_t * hd + pos * hd;
-            self.kv_k[li][base..base + hd].copy_from_slice(&k[g * hd..g * hd + hd]);
-            self.kv_v[li][base..base + hd].copy_from_slice(&v[g * hd..g * hd + hd]);
+            self.kv_k[li].as_mut_slice()[base..base + hd].copy_from_slice(&k[g * hd..g * hd + hd]);
+            self.kv_v[li].as_mut_slice()[base..base + hd].copy_from_slice(&v[g * hd..g * hd + hd]);
         }
     }
 
@@ -6712,11 +7378,7 @@ impl Model {
     /// gate, the number of experts read is chosen from the candidate ranking's
     /// own shape — 1 for a single clear winner, more only when the top scores are
     /// tightly grouped. That is the policy EXP-031 identified as missing.
-    fn route_predict_plan(
-        &mut self,
-        li: usize,
-        budget: usize,
-    ) -> (usize, Vec<usize>, bool) {
+    fn route_predict_plan(&mut self, li: usize, budget: usize) -> (usize, Vec<usize>, bool) {
         let use_spatial = std::env::var("QWEN_ROUTE_PREDICT_SPATIAL")
             .map(|value| value != "0" && !value.is_empty())
             .unwrap_or(true);
@@ -6994,7 +7656,7 @@ impl Model {
                             let mut combined = Vec::with_capacity(scales.len() + biases.len());
                             combined.extend_from_slice(scales);
                             combined.extend_from_slice(biases);
-                            combined
+                            Bytes::Owned(combined)
                         });
                         parts.push((
                             weights.as_slice(),
@@ -7096,23 +7758,277 @@ impl Model {
         (sy, gs)
     }
 
+    /// Feed one executed route into Edge0's owner head and immediately stage
+    /// its next-token consumer experts. The neural head owns semantic
+    /// prediction; Logan owns transport timing.
+    fn edge0_predict_and_stage(&mut self, owner: usize, x: &[f32], executed: &[usize]) {
+        if self.route_mode != RouteMode::Edge0 || self.in_prefill {
+            return;
+        }
+        let plan = self
+            .edge0_router
+            .as_mut()
+            .expect("edge0 mode must have a loaded prerouter")
+            .predict_next(owner, x, executed)
+            .unwrap_or_else(|e| panic!("Edge0 prerouter failed at owner {owner}: {e}"));
+        if let Some((consumer, experts)) = plan {
+            // The published prerouter produces a full next-token route early,
+            // but Logan's current RouteArena is layer-parity buffered rather
+            // than token-double-buffered. Generic prefetch is therefore opt-in
+            // until the dedicated Edge0 staging arena lands; otherwise the
+            // demand RouteArena re-reads the same bytes.
+            let prefetch = std::env::var("QWEN_EDGE0_PREFETCH")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false);
+            if prefetch && !self.sched_mode {
+                if self.coli.is_none() {
+                    let d_model = self.cfg.hidden;
+                    let d_hidden = self.cfg.moe_inter;
+                    if let Some(source) = self.expert_source.as_mut() {
+                        if source.supports_prefetch() {
+                            let ids: Vec<u32> = experts.iter().map(|&e| e as u32).collect();
+                            let _ = source.prefetch(consumer as u32, &ids, d_model, d_hidden);
+                        }
+                    }
+                } else {
+                    for expert in experts {
+                        let _ = self.prefetch_routed_expert(consumer, expert);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hybrid: produce Edge0's next-token ranking for `owner`'s consumer, and
+    /// cache it for the fusion that happens once that consumer has run.
+    ///
+    /// Split from the staging step because the two have different newest-input
+    /// times: Edge0's head consumes owner `N`'s state and is available during
+    /// layer `N`, while RouteScout's temporal evidence for consumer `N+1` only
+    /// becomes current once consumer `N+1` has itself routed. Doing the fusion at
+    /// the later of the two is what gives the staged bytes the longest lead.
+    fn hybrid_edge0_predict(&mut self, owner: usize, x: &[f32], executed: &[usize]) {
+        if !self.route_mode.stages_only() || self.in_prefill {
+            return;
+        }
+        let consumer = owner + 1;
+        if consumer >= self.cfg.layers {
+            return;
+        }
+        // Edge0's learned consumers are 7..=38. Outside that range there is no
+        // trained head whose output may be used: the shipped owner-38 head does
+        // produce a consumer-39 ranking, but Edge0's own production engine
+        // deliberately does not consume it, and layers 0..6 have no trained owner
+        // at all. §10 of the mission is explicit that no Edge0 prediction may be
+        // invented for those layers — they get RouteScout-only staging, or none.
+        if consumer < edge0_router::EDGE0_START_LAYER
+            || consumer >= self.cfg.layers.saturating_sub(1)
+        {
+            return;
+        }
+        let width = self.hybrid_stage_config.candidates;
+        let mut _predict_t = logan_core::telemetry::Span::begin("predict");
+        let ranked = match self.edge0_router.as_mut() {
+            Some(router) => router
+                .predict_next_ranked(owner, x, executed, width)
+                .unwrap_or_else(|e| panic!("Edge0 prerouter failed at owner {owner}: {e}"))
+                .map(|(_, ranked)| ranked)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.spans.predict_ms += _predict_t.end();
+        // Held for exactly one token: `begin_token` clears it, so a ranking that
+        // was never consumed cannot leak into a later token's fusion.
+        self.hybrid_edge0_ranked[consumer] = ranked;
+    }
+
+    /// Hybrid: fuse both predictors for `consumer` and stage its next-token
+    /// bytes.
+    ///
+    /// Called **after** `consumer` has routed on this token, because that route
+    /// is RouteScout's newest evidence for the next token's arrivals — the whole
+    /// reason this runs here rather than at the token boundary. Staging here
+    /// gives the bytes from the end of this layer until the same layer on the
+    /// next token, which is very nearly a full token of lead.
+    fn hybrid_stage_for(&mut self, consumer: usize) {
+        if !self.route_mode.stages_only() || self.in_prefill {
+            return;
+        }
+        if consumer >= self.cfg.layers {
+            return;
+        }
+        let cfg = self.hybrid_stage_config;
+        if !cfg.enabled {
+            return;
+        }
+        let current = self.route_prev[consumer].clone();
+        if current.is_empty() {
+            // The consumer has not routed yet, so there is no temporal evidence
+            // to fuse and no resident prior to add. Staging now would be guessing.
+            return;
+        }
+
+        // RouteScout: cold arrivals for the *next* token given this token's
+        // route. `peek` rather than `predict_arrivals_ranked` so a staging-only
+        // read does not overwrite the pending-prediction bookkeeping that the
+        // shadow and authoritative modes' statistics depend on.
+        let spatial_source = consumer
+            .checked_sub(self.route_predict_horizon.saturating_add(1))
+            .map(|source| self.route_token_routes[source].clone())
+            .unwrap_or_default();
+        let per_source = cfg.candidates.saturating_mul(2);
+        let mut _predict_t = logan_core::telemetry::Span::begin("predict");
+        let routescout = self
+            .route_predictor
+            .as_mut()
+            .map(|p| p.peek_arrivals_ranked(consumer, &current, &spatial_source, per_source))
+            .unwrap_or_default();
+        self.spans.predict_ms += _predict_t.end();
+
+        let edge0_ranked = self.hybrid_edge0_ranked[consumer].clone();
+        // The previous token's same-layer route is the strongest single hint
+        // available, because this arena has no residency: those experts are NOT
+        // in memory, so unlike RouteScout's cold-arrivals framing they really do
+        // need reading. EXP-069 measured 31.3% same-layer reuse at retain-4.
+        //
+        // It is folded in as a *prior* on the fusion rather than appended
+        // afterwards. Appending was measured to be useless: `fuse_candidates`
+        // already fills exactly `M` slots from the two predictors, so an append
+        // loop never had a slot left — the best available hint was structurally
+        // excluded. Giving it its own reserved share of the budget is what
+        // actually gets it into the staged set.
+        let prior_cap = if cfg.resident_prior {
+            (cfg.candidates / 2).max(1).min(current.len())
+        } else {
+            0
+        };
+        let predictor_budget = cfg.candidates.saturating_sub(prior_cap);
+        let mut candidates = hybrid_stage::fuse_candidates(
+            &edge0_ranked,
+            &routescout,
+            cfg.arm,
+            cfg.w_edge0,
+            cfg.w_routescout,
+            predictor_budget,
+        );
+        if prior_cap > 0 {
+            for &expert in &current {
+                if candidates.len() >= cfg.candidates {
+                    break;
+                }
+                if !candidates.contains(&expert) {
+                    candidates.push(expert);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            if std::env::var("QWEN_HYBRID_TRACE").is_ok() {
+                eprintln!(
+                    "logan hybrid-trace: layer {consumer} empty candidates \
+                     (edge0={} routescout={} resident_prior={} current={})",
+                    edge0_ranked.len(),
+                    routescout.len(),
+                    cfg.resident_prior,
+                    current.len()
+                );
+            }
+            return;
+        }
+        let ids: Vec<u32> = candidates.iter().map(|&e| e as u32).collect();
+        if std::env::var("QWEN_HYBRID_TRACE").is_ok() {
+            eprintln!("logan hybrid-trace: layer {consumer} stage {ids:?}");
+        }
+        if let Some(source) = self.expert_source.as_mut() {
+            let _ = source.stage_route(consumer as u32, &ids, self.cfg.hidden, self.cfg.moe_inter);
+        }
+    }
+
     fn route_topk_n(
         &mut self,
         layer: &Layer,
+        li: usize,
         x: &[f32],
         experts: usize,
         topk: usize,
     ) -> (Vec<usize>, Vec<f32>, f32) {
         debug_assert_eq!(layer.router.o, experts);
-        let k = topk.min(experts);
+        let k = if self.route_mode == RouteMode::Edge0 {
+            self.edge0_router
+                .as_ref()
+                .map(|router| router.route_k())
+                .unwrap_or(edge0_router::DEFAULT_EDGE0_TOPK)
+                .min(topk)
+                .min(experts)
+        } else {
+            topk.min(experts)
+        };
         let mut _route_t = logan_core::telemetry::Span::begin("route");
+
+        // Edge0 mode consumes the route produced by layer li-1's head on the
+        // previous token. Crucially this happens BEFORE Qwen's native gate:
+        // once a prediction exists, the original router is not on the decode
+        // critical path for this consumer layer.
+        if self.route_mode == RouteMode::Edge0
+            && !self.in_prefill
+            && li != usize::MAX
+            && li < self.cfg.layers
+        {
+            let prediction = self
+                .edge0_router
+                .as_ref()
+                .and_then(|router| router.prediction(li))
+                .cloned();
+            if let Some(prediction) = prediction {
+                let wsum: f32 = prediction.scores.iter().sum();
+                self.spans.route_ms += _route_t.end();
+                self.edge0_predict_and_stage(li, x, &prediction.experts);
+                return (prediction.experts, prediction.scores, wsum);
+            }
+        }
+
         let mut logits = vec![0.0; experts];
         matmul(&mut logits, x, &layer.router);
         softmax_row(&mut logits);
 
         let mut idx: Vec<usize> = (0..experts).collect();
         let mut val = logits;
-        for i in 0..k {
+        // Control arm (see `RouteMode::NativeTruncated`): the router still
+        // selects, but only its top `native_k` are kept. This is the honest
+        // comparison for a reduced-K authoritative run — same bytes/token, same
+        // I/O shape, no predictor — so it separates "fewer experts is cheaper"
+        // from "the predicted few are good".
+        //
+        // Hybrid shares this branch: its mission is to be measured against
+        // native-K4 at identical bytes/token, so it must execute the same width
+        // the control does. Sharing one predicate is what makes that structural
+        // rather than two branches that could drift apart.
+        //
+        // Suppressed during prefill for the same reason predictive routing is:
+        // a teacher/student comparison must have both sides share the prompt's
+        // recurrent state. Without this, control-K4 would prefill at top-4 while
+        // the teacher prefills at top-8 and every decode-window delta would
+        // include that state divergence — an artifact that happens to flatter
+        // the treatment arm.
+        let selection = if self.route_mode.truncates_native() && !self.in_prefill {
+            if self.route_native_k == 0 {
+                // Hybrid with no explicit K means K=4 — the prerouter's regime
+                // and the arm it must be compared against. `0` is "unset", not
+                // "no truncation", for both truncating modes; an unset native_k
+                // leaving hybrid at the checkpoint's topk would silently run a
+                // different experiment from the one its own log line describes.
+                if self.route_mode == RouteMode::Hybrid {
+                    edge0_router::DEFAULT_EDGE0_TOPK.min(k)
+                } else {
+                    k
+                }
+            } else {
+                self.route_native_k.min(k)
+            }
+        } else {
+            k
+        };
+        for i in 0..selection {
             let mut best = i;
             for j in i + 1..experts {
                 if val[j] > val[best] || (val[j] == val[best] && idx[j] < idx[best]) {
@@ -7122,11 +8038,175 @@ impl Model {
             idx.swap(i, best);
             val.swap(i, best);
         }
-        let wsum: f32 = val[..k].iter().sum();
+        let k = selection;
         self.spans.route_ms += _route_t.end();
-        (idx, val, wsum)
-    }
+        let native_wsum: f32 = val[..k].iter().sum();
 
+        // Offline Edge0 training traces are taken from the exact native route
+        // before any predictor can override it. The collector itself enforces
+        // K=4 and pairs owner N at token t with consumer N+1 at token t+1.
+        if !self.in_prefill && li != usize::MAX && li < self.cfg.layers {
+            if let Some(trace) = self.edge0_train_trace.as_mut() {
+                trace
+                    .observe(li, x, &idx[..k], &val[..k], native_wsum)
+                    .unwrap_or_else(|e| panic!("Edge0 training trace failed at layer {li}: {e}"));
+            }
+        }
+
+        // Edge0 lower layers and the first decode step fall back to the native
+        // gate, but owner layers still use that executed route to produce the
+        // next token's prediction. Once warmed, consumers 7..39 bypass this
+        // native gate entirely.
+        if self.route_mode == RouteMode::Edge0 && !self.in_prefill && li != usize::MAX {
+            let executed = idx[..k].to_vec();
+            self.edge0_predict_and_stage(li, x, &executed);
+        }
+
+        // Hybrid, phase 1 of 2: Edge0's head runs here, because it consumes this
+        // owner's hidden state and executed route and nothing later makes that
+        // input fresher. Its ranking is cached for the phase-2 fusion below.
+        //
+        // Note what is NOT done here: nothing is staged yet. RouteScout's
+        // temporal evidence for consumer `li+1` only becomes current once that
+        // consumer has itself routed, which has not happened at this point.
+        if self.route_mode.stages_only() && !self.in_prefill && li != usize::MAX {
+            let executed = idx[..k].to_vec();
+            self.hybrid_edge0_predict(li, x, &executed);
+        }
+
+        // Predictive routing. The predicted route is computed in **both** shadow
+        // and authoritative mode, because the two answer different questions and
+        // the same code must produce both:
+        //
+        // - shadow: the native route is consumed (the trajectory stays native),
+        //   and the predicted route is scored against it. This is the clean
+        //   predictor-quality measurement — it isolates prediction from the
+        //   behavioural divergence that authoritative mode deliberately causes.
+        // - authoritative: the predicted route replaces the native one *now*,
+        //   before any I/O is planned, so the expert set the source stages is by
+        //   construction the set this layer consumes.
+        //
+        // `val` still holds the router's post-softmax probabilities (it is
+        // permuted, not truncated), so an authoritative expert the router also
+        // selected keeps its real router weight rather than an invented one.
+        // Predictive routing runs in shadow and authoritative mode during
+        // **decode only**. Prefill is suppressed for two independent reasons:
+        // its expert reuse shape is different (Phase 12), and in authoritative
+        // mode a route change during prefill would alter the model's recurrent
+        // state, so every later teacher comparison would measure state
+        // divergence instead of routing error.
+        if self.route_mode.needs_predictor()
+            && !self.in_prefill
+            && li != usize::MAX
+            && li < self.cfg.layers
+        {
+            let k_auth = if self.route_authoritative_k == 0 {
+                k
+            } else {
+                self.route_authoritative_k.max(1).min(k)
+            };
+            // Conditioning input for the predictor: the **native** router's past
+            // route where one exists, else the executed route.
+            //
+            // The native route is available at runtime at no extra cost — the
+            // router must run anyway, because the authoritative experts are
+            // weighted by the router's own probabilities. Feeding it to the
+            // predictor is therefore not a corrective read and does not weaken
+            // the experiment's invariant; it only stops the predictor from
+            // conditioning on its own output, which measured a real quality loss
+            // (recall@K 0.3041 vs 0.4671 in shadow mode) purely from
+            // distribution shift.
+            let previous_executed = self.route_prev[li].clone();
+            let previous_native = self.route_native_prev[li].clone();
+            let previous = if previous_native.is_empty() {
+                previous_executed
+            } else {
+                previous_native
+            };
+            // The spatial table for layer `li` is trained from the same-token
+            // source layer `li - (horizon + 1)` (see the `observe` call below),
+            // so the query must use that same source. Using the previous
+            // *token's* layer `li-1` would ask a table about a distribution it
+            // was never trained on, which measures nothing.
+            let spatial_previous = li
+                .checked_sub(self.route_predict_horizon.saturating_add(1))
+                .map(|source| self.route_native_prev[source].clone())
+                .unwrap_or_default();
+            let spatial_previous = if spatial_previous.is_empty() {
+                li.checked_sub(self.route_predict_horizon.saturating_add(1))
+                    .and_then(|source| self.route_token_routes.get(source))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                spatial_previous
+            };
+            let stability_bias = route_authoritative_stability_bias();
+            let predicted = self
+                .route_predictor
+                .as_mut()
+                .map(|predictor| {
+                    predictor.authoritative_route(
+                        li,
+                        &previous,
+                        &spatial_previous,
+                        k_auth,
+                        0.0,
+                        &previous,
+                        stability_bias,
+                    )
+                })
+                .unwrap_or_default();
+            let native: Vec<(usize, f32)> = idx[..k]
+                .iter()
+                .copied()
+                .zip(val[..k].iter().copied())
+                .collect();
+            // The predictor's own feedback signal must be the *native* router's
+            // route, not the route this layer ends up executing. If `route_prev`
+            // were fed the authoritative route in authoritative mode, the
+            // predictor would be trained on its own output and the transition
+            // tables would drift toward self-consistency instead of tracking the
+            // router — the feedback loop that produced a degenerate 3-token
+            // cycle in the first bring-up.
+            self.route_native_prev[li].clear();
+            self.route_native_prev[li]
+                .extend_from_slice(&native.iter().map(|&(e, _)| e).collect::<Vec<_>>());
+            if predicted.is_empty() {
+                // Cold start: no evidence, so there is no route to compare and
+                // nothing to override. Recorded as a fallback so the report
+                // distinguishes "declined" from "disagreed".
+                let native_set: Vec<usize> = native.iter().map(|&(e, _)| e).collect();
+                self.route_agreement.record(&native, &native_set, true);
+            } else {
+                let chosen: Vec<usize> = predicted.iter().map(|&(e, _)| e).collect();
+                // `(idx, val)` is a permuted pair: `val[i]` is the probability of
+                // `idx[i]`, so weighting must go through the permutation, not
+                // index `val` by expert id.
+                let weighted = route_mode::weight_authoritative_permuted(&chosen, &idx, &val);
+                match weighted {
+                    Some((a_idx, a_val, a_sum)) => {
+                        self.route_agreement.record(&native, &a_idx, false);
+                        self.route_layer_error.record(li, &native, &a_idx);
+                        if self.route_mode.overrides_route() {
+                            return (a_idx, a_val, a_sum);
+                        }
+                    }
+                    None => {
+                        let native_set: Vec<usize> = native.iter().map(|&(e, _)| e).collect();
+                        self.route_agreement.record(&native, &native_set, true);
+                    }
+                }
+            }
+        }
+
+        // The router's selection is the first `k` entries of the permutation;
+        // the tail is unused scratch. Truncating here is what makes `idx.len()`
+        // the authoritative width signal for every consumer, and it changes
+        // nothing about the native route or its weights.
+        idx.truncate(k);
+        val.truncate(k);
+        (idx, val, native_wsum)
+    }
     /// Learn same-token adjacent-layer route correlation from a layer-major
     /// prompt chunk without issuing speculative I/O. This lets decode enter
     /// with a confidence estimate learned from the prompt even though prefill
@@ -7162,11 +8242,29 @@ impl Model {
     }
 
     fn route_topk(&mut self, layer: &Layer, x: &[f32]) -> (Vec<usize>, Vec<f32>, f32) {
-        self.route_topk_n(layer, x, self.cfg.experts, self.cfg.topk)
+        self.route_topk_li(layer, usize::MAX, x)
+    }
+
+    /// [`Self::route_topk`] with the layer index, so authoritative routing can
+    /// consult that layer's predictor state.
+    ///
+    /// `li == usize::MAX` means the caller has no layer context (the MTP drafter
+    /// is a separate model at a virtual layer index, and prefill's grouped seam
+    /// routes several rows in one call). Authoritative routing declines there and
+    /// the router stays authoritative, which is the correct conservative
+    /// behaviour: those call sites are outside the decode path this experiment
+    /// targets.
+    fn route_topk_li(
+        &mut self,
+        layer: &Layer,
+        li: usize,
+        x: &[f32],
+    ) -> (Vec<usize>, Vec<f32>, f32) {
+        self.route_topk_n(layer, li, x, self.cfg.experts, self.cfg.topk)
     }
 
     fn moe_token(&mut self, layer: &Layer, li: usize, x: &[f32], out: &mut [f32]) {
-        let (idx, val, wsum) = self.route_topk(layer, x);
+        let (idx, val, wsum) = self.route_topk_li(layer, li, x);
         self.moe_token_routed(layer, li, x, out, &idx, &val, wsum, true);
     }
 
@@ -7182,10 +8280,18 @@ impl Model {
         allow_spatial_prefetch: bool,
     ) {
         let c = self.cfg.clone();
-        let k = c.topk;
         let d = c.hidden;
+        // The routed width is exactly `idx.len()` in every mode. The router's
+        // permutation is `experts` long, so the native path truncates to top-k
+        // before returning; an authoritative route is already exactly
+        // `QWEN_ROUTE_AUTHORITATIVE_K` wide. Every consumer below (the expert call
+        // list, the delegated batch, the fused island's descriptor count) reads
+        // this width, so a K sweep changes the route and the I/O together instead
+        // of reading past `idx`.
+        let k = idx.len();
+        debug_assert!(k > 0 && k <= c.experts);
 
-        let current_route = &idx[..k.min(idx.len())];
+        let current_route = &idx[..k];
         if env_flag("QWEN_ROUTE_TRACE") {
             eprintln!("logan route-trace: layer={li} route={current_route:?}");
         }
@@ -7200,14 +8306,42 @@ impl Model {
                     route.clear();
                 }
             }
+            // Same-token source layer for a horizon prediction. `route_native_prev`
+            // is the current token's native route for layers already executed, so
+            // it is the same distribution `observe` trains the spatial table on —
+            // and using it keeps the spatial term out of the self-referential
+            // loop as well (`route_token_routes` holds the *executed* route, which
+            // in authoritative mode is the predictor's own output).
             let direct_source = li
                 .checked_sub(self.route_predict_horizon.saturating_add(1))
-                .and_then(|source| self.route_token_routes.get(source))
-                .cloned()
+                .map(|source| self.route_native_prev[source].clone())
                 .unwrap_or_default();
+            let direct_source = if direct_source.is_empty() {
+                li.checked_sub(self.route_predict_horizon.saturating_add(1))
+                    .and_then(|source| self.route_token_routes.get(source))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                direct_source
+            };
             if let Some(predictor) = self.route_predictor.as_mut() {
-                let previous = self.route_prev[li].clone();
-                predictor.observe(li, &previous, &direct_source, current_route);
+                // Observe the NATIVE route, never the executed one: see
+                // `route_native_prev`. `current_route` is the executed route,
+                // which in authoritative mode is the predictor's own output.
+                let observed = self.route_native_prev[li].clone();
+                let observed = if observed.is_empty() {
+                    current_route.to_vec()
+                } else {
+                    observed
+                };
+                let previous_executed = self.route_prev[li].clone();
+                let previous_native = self.route_native_prev[li].clone();
+                let previous = if previous_native.is_empty() {
+                    previous_executed
+                } else {
+                    previous_native
+                };
+                predictor.observe(li, &previous, &direct_source, &observed);
             }
             if let Some(route) = self.route_token_routes.get_mut(li) {
                 route.clear();
@@ -8213,7 +9347,11 @@ impl Model {
             &mut moe_in,
             Some(&mut inject),
         );
-        let (idx, val, wsum) = self.route_topk_n(&layer, &moe_in, mtp.experts, mtp.topk);
+        // MTP drafter is a separate model at a virtual layer index; it has no
+        // predictor state, so authoritative routing correctly declines there
+        // (`usize::MAX` = "no layer context").
+        let (idx, val, wsum) =
+            self.route_topk_n(&layer, usize::MAX, &moe_in, mtp.experts, mtp.topk);
         let mut moe = vec![0.0_f32; d];
         self.moe_token_routed(&layer, li, &moe_in, &mut moe, &idx, &val, wsum, true);
         for g in 0..hc {
@@ -8291,6 +9429,36 @@ impl Model {
     }
 
     fn forward_token_inner(&mut self, token: usize, pos: usize, want_logits: bool) -> Vec<f32> {
+        if !self.in_prefill {
+            if let Some(trace) = self.edge0_train_trace.as_mut() {
+                trace.begin_token();
+            }
+        }
+        if !self.in_prefill && self.route_mode == RouteMode::Edge0 {
+            if let Some(router) = self.edge0_router.as_mut() {
+                router.begin_token();
+            }
+        }
+        // Hybrid: advance the Edge0 double buffer and the staging generation
+        // together, so the prediction this token produces and the bytes it
+        // stages are tagged for exactly one token, and a prediction that is never
+        // demanded cannot be served to a later one.
+        if !self.in_prefill && self.route_mode.stages_only() {
+            if let Some(router) = self.edge0_router.as_mut() {
+                router.begin_token();
+            }
+            // Edge0's cached ranking is a one-token object: it is produced during
+            // token `t`'s owner layer and fused during token `t`'s consumer layer.
+            // Clearing it here means a ranking whose consumer never ran — a
+            // blocked layer, an early return — cannot be fused into a later
+            // token's staging.
+            for ranked in &mut self.hybrid_edge0_ranked {
+                ranked.clear();
+            }
+            if let Some(source) = self.expert_source.as_mut() {
+                source.stage_begin_token();
+            }
+        }
         let c = self.cfg.clone();
         let rope = rope_angles(pos, &c);
         let mut stream = self.init_token_stream(token);
@@ -8360,6 +9528,15 @@ impl Model {
         self.ple_ring.fill(0);
         self.ple_conv_state.fill(0.0);
         self.last_hidden_nextn.clear();
+        if let Some(router) = self.edge0_router.as_mut() {
+            router.reset();
+        }
+        // A new conversation must not inherit this one's staged bytes: the tag
+        // bump makes every existing slot unreachable, so no prediction from the
+        // previous sequence can be served as the next sequence's bytes.
+        if let Some(source) = self.expert_source.as_mut() {
+            source.stage_begin_request();
+        }
         // A stale resume cursor would resume a token from a dead sequence.
         self.sched_blocked = None;
         self.sched_pause = None;
@@ -8370,7 +9547,9 @@ impl Model {
     /// `forward_token`; only the non-stateful global HC tail + LM head are
     /// omitted. Use `forward_token` for the final prompt token.
     pub fn prefill_token(&mut self, token: usize, pos: usize) {
+        self.in_prefill = true;
         let _ = self.forward_token_inner(token, pos, false);
+        self.in_prefill = false;
     }
 
     /// Bounded layer-major prompt prefill. This deliberately reuses the exact
@@ -9522,6 +10701,14 @@ impl Model {
             }
             let mut moe = vec![0.0; d];
             self.moe_token(&layer, l, &m2, &mut moe);
+            // Hybrid phase 2: this layer has routed, so stage its next-token
+            // bytes. This branch is the one this checkpoint actually takes
+            // (`hc_count == 0`), and it returns early, so the hook has to be here
+            // as well as at the shared tail below — that is exactly how the
+            // staging path was silently inert on the first attempt.
+            if self.route_mode.stages_only() && !self.in_prefill {
+                self.hybrid_stage_for(l);
+            }
             if let Some(experts) = self.sched_blocked.take() {
                 self.layers[l] = layer;
                 self.sched_pause = Some(TokenPause {
@@ -9589,6 +10776,19 @@ impl Model {
             Some(&mut inj),
         );
         self.moe_token(&layer, l, &m2, &mut moe);
+        // Hybrid, phase 2 of 2: layer `l` has now routed, so this token's
+        // executed route for it is final and is RouteScout's newest evidence for
+        // the *next* token's arrivals at this layer. Fuse and stage its bytes
+        // here — after the compute that consumed this layer's row, so the refill
+        // cannot alias bytes still being read, and with almost a full token of
+        // lead before layer `l` is reached again.
+        //
+        // Ordered before the scheduler's block check so a staged set is still
+        // produced on a layer that blocks; staging is I/O timing only and cannot
+        // affect the resumed computation.
+        if self.route_mode.stages_only() && !self.in_prefill {
+            self.hybrid_stage_for(l);
+        }
         if let Some(experts) = self.sched_blocked.take() {
             // Block point: the layer's MoE phase reported cold expert(s).
             // Restore the layer and stash the exact resume cursor. Nothing
@@ -9884,6 +11084,9 @@ impl Model {
             affine_metal,
             affine_fallback,
             expert_load_parts: mlx_expert_load_decomposition(),
+            island_calls: ISLAND_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            island_host_ns: ISLAND_HOST_NS.load(std::sync::atomic::Ordering::Relaxed),
+            island_copy_ns: ISLAND_COPY_NS.load(std::sync::atomic::Ordering::Relaxed),
             mio: logan_metal::mio_stats(),
             metal: logan_metal::metal_profile(),
             predictor: self
@@ -9919,6 +11122,34 @@ impl Model {
     /// Self-gating: with `LOGAN_PROFILE` off there is no summary to normalize,
     /// so this returns immediately and decode pays nothing.
     pub fn begin_decode_measurement(&mut self) {
+        // Trace capture uses the same canonical boundary as decode telemetry so
+        // no prompt bookkeeping row can become a training example.
+        if let Some(trace) = self.edge0_train_trace.as_mut() {
+            trace.begin_decode();
+        }
+        // This method is also Logan's canonical prompt/decode boundary. Edge0's
+        // reference engine prefills the whole prompt in a multi-token pass, so
+        // its first generated-token forward has NO prerouter prediction and
+        // falls back to the real K=4 router. Logan computes the final prompt
+        // token as a single-token forward; discard any captures/predictions
+        // produced by that bookkeeping forward so decode starts identically.
+        if self.route_mode == RouteMode::Edge0 {
+            if let Some(router) = self.edge0_router.as_mut() {
+                router.reset();
+            }
+        }
+        // Hybrid: the decode boundary is a *request* boundary for staging. Drop
+        // every tag so the final prompt forward's predictions — produced for a
+        // position that will never be decoded — cannot be served as the first
+        // generated token's bytes. Same reason Edge0's buffer is reset above.
+        if self.route_mode.stages_only() {
+            if let Some(router) = self.edge0_router.as_mut() {
+                router.reset();
+            }
+            if let Some(source) = self.expert_source.as_mut() {
+                source.stage_begin_request();
+            }
+        }
         if !logan_core::telemetry::enabled() {
             return;
         }
@@ -9971,7 +11202,11 @@ impl Model {
             ),
             None => (self.spans.clone(), lifetime_mio, lifetime_metal, None),
         };
-        let window = if baseline.is_some() { "decode" } else { "lifetime" };
+        let window = if baseline.is_some() {
+            "decode"
+        } else {
+            "lifetime"
+        };
         let (e, s, w, k, fc, fe) = metal_counters;
         let metal = logan_core::telemetry::MetalCounters {
             encode_ns: e,
@@ -10166,6 +11401,40 @@ impl Model {
                  materialize_ms_per_token={mat_ms:.1} plan_hits={plan_hits} \
                  plan_misses={plan_misses}"
             );
+            let island_calls = ISLAND_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let island_calls = match baseline {
+                Some(b) => island_calls.saturating_sub(b.island_calls),
+                None => island_calls,
+            };
+            let island_host_ns = ISLAND_HOST_NS.load(std::sync::atomic::Ordering::Relaxed);
+            let island_host_ns = match baseline {
+                Some(b) => island_host_ns.saturating_sub(b.island_host_ns),
+                None => island_host_ns,
+            };
+            let (rc_hits, rc_misses, rc_evict, rc_saved, rc_occ, rc_stride) = route_cache_stats();
+            if rc_occ > 0 {
+                eprintln!(
+                    "logan route-cache-stats: hits={rc_hits} misses={rc_misses}                      evictions={rc_evict} retained_occurrences={rc_occ} hit_rate={:.3}                      bytes_saved={rc_saved} MiB stride={rc_stride} B",
+                    rc_hits as f64 / rc_occ.max(1) as f64,
+                );
+            }
+            eprintln!(
+                "logan mlx-expert-island: layers_served={} island_share_of_expert_calls={:.3} \
+                 island_host_ms_per_token={:.2}",
+                island_calls,
+                island_calls as f64 / expert_calls.max(1) as f64,
+                island_host_ns as f64 / 1e6 / tokens.max(1) as f64
+            );
+            let island_copy_ns = ISLAND_COPY_NS.load(std::sync::atomic::Ordering::Relaxed);
+            let island_copy_ns = match baseline {
+                Some(b) => island_copy_ns.saturating_sub(b.island_copy_ns),
+                None => island_copy_ns,
+            };
+            eprintln!(
+                "logan mlx-expert-island-copy: copy_ms_per_token={:.3} copy_share_of_compute={:.4}",
+                island_copy_ns as f64 / 1e6 / tokens.max(1) as f64,
+                island_copy_ns as f64 / expert_compute_ns.max(1) as f64
+            );
             // Exact Metal-buffer wrapper accounting. `copied_bytes` staying flat
             // across token counts means the weight upload is already zero-copy
             // and what remains is buffer-object creation, which only residency
@@ -10176,19 +11445,44 @@ impl Model {
                 WT_POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed),
                 WT_POOL_STORES.load(std::sync::atomic::Ordering::Relaxed),
             );
-            eprintln!(
-                "logan wt-pool: hits={pool_hits} misses={pool_misses} stores={pool_stores}"
-            );
+            eprintln!("logan wt-pool: hits={pool_hits} misses={pool_misses} stores={pool_stores}");
             eprintln!(
                 "logan metal-wrap: calls={wrap_calls} zero_copy={wrap_zc} \
                  copied_bytes={wrap_bytes} bytes_created={wrap_created}"
             );
         }
+        if self.route_mode != RouteMode::Native {
+            let a = &self.route_agreement;
+            eprintln!(
+                "logan route-agreement: mode={} layers={} recall_at_k={:.4} \
+                 mean_discarded_mass={:.4} disagree_rate={:.4} fallbacks={} \
+                 width_mismatches={} k={} stability={:.3}",
+                self.route_mode,
+                a.total_layers,
+                a.recall_at_k(),
+                a.mean_discarded_mass(),
+                a.disagreement_rate(),
+                a.fallbacks,
+                a.width_mismatches,
+                if self.route_authoritative_k == 0 {
+                    self.cfg.topk
+                } else {
+                    self.route_authoritative_k
+                },
+                route_authoritative_stability_bias(),
+            );
+            let worst = self.route_layer_error.worst_layers(8);
+            eprintln!(
+                "logan route-layer-error: overall_mean_discarded_mass={:.4} worst_layers={}",
+                self.route_layer_error.overall_mean(),
+                worst
+                    .iter()
+                    .map(|(li, m)| format!("L{li}:{m:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         if let Some(predictor) = self.route_predictor.as_ref() {
-            // Predictor counters are process cumulative. Report the decode
-            // window's share when a baseline exists so precision/recall describe
-            // the measured forwards; the lifetime totals stay available in the
-            // `route-arrival-total` line below, clearly labelled.
             let per_layer = predictor.layer_stats();
             let (common, predicted, actual, pairs) = match baseline {
                 Some(b) => {
@@ -10259,6 +11553,18 @@ impl Model {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!("logan route-arrival layers: {detail}");
+        }
+        // Hybrid staging report. Emitted from the source (which owns the arena),
+        // so the numbers are the arena's own counters rather than a second copy
+        // that could drift. §11 of the mission: recall and coverage are reported
+        // alongside the timing figures, so a weak predictor cannot be hidden
+        // behind a tok/s number.
+        if let Some(line) = self
+            .expert_source
+            .as_ref()
+            .and_then(|source| source.stage_summary())
+        {
+            eprintln!("logan {line}");
         }
     }
 }
@@ -10586,9 +11892,9 @@ fn load_mlx_quantized_wt(st: &StFile, name: &str, o: usize, i: usize) -> Result<
             Ok(Wt {
                 f: Vec::new(),
                 bytes: Some(WtBytes::MlxAffine {
-                    weights,
-                    scales,
-                    biases,
+                    weights: Bytes::Owned(weights),
+                    scales: Bytes::Owned(scales),
+                    biases: Bytes::Owned(biases),
                     bits,
                     group_size,
                     aux_fp16,
@@ -10727,9 +12033,9 @@ fn load_mlx_quantized_expert_wt(
             Ok(Wt {
                 f: Vec::new(),
                 bytes: Some(WtBytes::MlxAffine {
-                    weights,
-                    scales,
-                    biases,
+                    weights: Bytes::Owned(weights),
+                    scales: Bytes::Owned(scales),
+                    biases: Bytes::Owned(biases),
                     bits,
                     group_size,
                     aux_fp16,
@@ -10805,6 +12111,344 @@ struct MlxPendingExpert {
     plan: MlxExpertIoPlan,
 }
 
+/// EXP-067 RouteArena: a bounded, route-sized streaming arena.
+///
+/// The problem it removes: `mio_finish_slot` waits for a MetalIO load, copies
+/// the slot into a fresh `Vec` (`to_vec`), frees the slot, and then
+/// `materialize_plan`/`refill_plan_into` copies again into the engine's `Wt`
+/// matrices — ~1.1 GB of memcpy per decode token at 320 experts x 1.77 MB.
+/// EXP-048 showed the *copy is load-bearing* under the old design (holding a
+/// slot across materialization starved the reusable slot pool), but that is a
+/// property of pooling one slot per expert, not of the destination.
+///
+/// This design changes the destination instead. Two arenas, one per layer
+/// parity, hold `topk` expert blocks each. Every block is aliased by its own
+/// MetalIO slot, so loads land *in the memory the tensors already read*. The
+/// arenas are registered once with the Metal backend, so `resolve()` hands the
+/// GPU a pointer into them and no `wrap()`/`MTLBuffer` is created per token
+/// either. Nothing is copied, and no slot is recycled mid-route, so EXP-048's
+/// starvation mechanism cannot arise.
+///
+/// Bounded by construction: `2 x topk x expert_stride` bytes (~28 MB at the
+/// Qwen3.6 geometry), independent of expert cardinality — no residency cache, no
+/// expert identity retained, and no speculative I/O.
+/// EXP-069: a bounded, layer-partitioned retention cache for routed experts.
+///
+/// Deliberately NOT the rejected EXP-019/EXP-051 designs. EXP-019 retained
+/// *decoded* experts (huge UMA pressure); EXP-051 was a global packed-byte LRU
+/// that churned under a 320-key/token working set. This one is keyed by
+/// `(layer, expert)`, partitioned per layer, and stores the expert's *packed*
+/// checkpoint bytes exactly as the arena holds them, so a hit costs zero SSD
+/// bytes and zero decode work. It is a retention cache, not speculative
+/// prefetch: only experts the authoritative router already selected are ever
+/// loaded into it, and always exactly once per token.
+struct RouteCache {
+    /// One arena per layer index. A layer's cache is only ever written during
+    /// that layer's own fill, so no two layers contend one arena.
+    bufs: Vec<std::sync::Arc<ArenaBuf>>,
+    /// `slots[layer][index]`, aliasing `bufs[layer]` at `index * expert_stride`.
+    slots: Vec<Vec<i32>>,
+    /// Retained bytes per block, exactly `plan.used_bytes`.
+    expert_stride: usize,
+    /// The plan's three matrix ranges; every cached expert must match this
+    /// destination layout or the entry is not reusable.
+    template: [MlxMatrixIoPlan; 3],
+    /// `tags[layer][index] = Some(expert)` when that block holds live bytes.
+    tags: Vec<Vec<Option<u32>>>,
+    /// Blocks retained per layer.
+    blocks: usize,
+    /// Eviction cursor per layer (next block to replace).
+    next: Vec<usize>,
+    /// Bumped whenever any block is reused, so a stale view is detectable.
+    generation: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl RouteCache {
+    fn capacity_per_layer(&self) -> usize {
+        self.blocks
+    }
+
+    /// Block index holding `expert` for `layer`, if retained.
+    fn lookup(&self, layer: usize, expert: u32) -> Option<usize> {
+        let tags = self.tags.get(layer)?;
+        tags.iter().position(|t| *t == Some(expert))
+    }
+
+    /// Reserve a block for `expert`, never selecting a block in `pinned`.
+    ///
+    /// Returns `(block, hit, evicted)`. `hit` is true only when the block already
+    /// held this exact expert, so a cold insert into an empty block is correctly
+    /// a MISS.
+    ///
+    /// `pinned` is load-bearing, not an optimisation. A route can hold both hits
+    /// and misses for the same layer (cap=4, tags=[A,B,C,D], next=2, route
+    /// [C,X,Y,Z]: rank 0 hits C in block 2 while ranks 1..3 miss). Without
+    /// excluding the hit's block, rank 1's miss would take cursor=2 and clobber
+    /// C, so rank 0 would afterwards read X's bytes while its tensor was built
+    /// for C — silently wrong output with no error. Every block already claimed
+    /// by this route (hit or miss) is therefore pinned for the duration of the
+    /// route, and the cursor skips pinned blocks.
+    fn reserve(
+        &mut self,
+        layer: usize,
+        expert: u32,
+        pinned: &[bool],
+    ) -> Option<(usize, bool, Option<u32>)> {
+        let cap = self.capacity_per_layer();
+        if cap == 0 {
+            return None;
+        }
+        if let Some(i) = self.lookup(layer, expert) {
+            return Some((i, true, None));
+        }
+        let start = self.next.get(layer).copied().unwrap_or(0) % cap;
+        // Find the first unpinned block at or after the cursor. Every block this
+        // route has claimed is pinned, so there is always one available whenever
+        // `retain <= cap`, which the caller guarantees.
+        let mut found = None;
+        for off in 0..cap {
+            let c = (start + off) % cap;
+            if !pinned.get(c).copied().unwrap_or(false) {
+                found = Some(c);
+                break;
+            }
+        }
+        let cursor = found?;
+        let replaced = self.tags[layer][cursor];
+        self.tags[layer][cursor] = Some(expert);
+        self.next[layer] = (cursor + 1) % cap;
+        if replaced.is_some() {
+            self.evictions += 1;
+        }
+        self.generation += 1;
+        Some((cursor, false, replaced))
+    }
+}
+
+struct RouteArena {
+    /// One arena per layer parity. A layer refills only its own parity, so a
+    /// refill can never overwrite bytes another layer's work still reads.
+    bufs: Vec<std::sync::Arc<ArenaBuf>>,
+    /// `slots[parity][route_index]` aliases `bufs[parity]` at
+    /// `route_index * expert_stride`.
+    slots: Vec<Vec<i32>>,
+    /// Per `(layer parity, route index)` expert matrices. Their arena offsets and
+    /// shapes are fixed for the process lifetime, so the Metal tensors behind
+    /// them stay valid and are built once. Entries are taken for the duration
+    /// of a layer's compute and returned immediately after, so a dropped
+    /// forward cannot leave a stale one behind.
+    ///
+    /// Keyed by parity rather than by layer: both layers of a parity share one
+    /// arena, and their expert geometry is identical, so one entry serves both.
+    /// That also means the arena needs no layer count.
+    experts: Vec<Option<[Wt; 3]>>,
+    /// Bytes per expert block, exactly `plan.used_bytes`.
+    expert_stride: usize,
+    /// The plan's three matrix ranges, as the template the arena's views were
+    /// built from. Compared against each layer's own plan before serving it.
+    template: [MlxMatrixIoPlan; 3],
+    topk: usize,
+}
+
+impl RouteArena {
+    /// Whether `plan` has the same destination layout as the template.
+    ///
+    /// Only the fields that determine where the kernel reads and where MetalIO
+    /// wrote need to agree; `output`/`input` are carried because they are the
+    /// matrix shape the tensor was built with.
+    fn layout_matches(template: &[MlxMatrixIoPlan; 3], plan: &[MlxMatrixIoPlan; 3]) -> bool {
+        template.iter().zip(plan.iter()).all(|(t, p)| {
+            t.output == p.output
+                && t.input == p.input
+                && t.weights == p.weights
+                && t.scales == p.scales
+                && t.biases == p.biases
+        })
+    }
+    fn index(&self, layer: usize, rank: usize) -> Option<usize> {
+        if rank >= self.topk {
+            return None;
+        }
+        Some(self.parity(layer) * self.topk + rank)
+    }
+
+    fn parity(&self, layer: usize) -> usize {
+        layer % self.bufs.len()
+    }
+
+    fn teardown(&mut self) {
+        // Drop every alias slot first: each still holds an `id<MTLBuffer>`
+        // wrapping one of these arenas, and the wrapper must be gone before the
+        // pages are freed.
+        for row in &self.slots {
+            for &slot in row {
+                if slot >= 0 {
+                    crate::ffi::mio_discard_slot(slot);
+                }
+            }
+        }
+        self.slots.clear();
+        // `experts` holds `Arc<ArenaBuf>` views and cached Metal tensors; dropping
+        // them releases the tensors, then `bufs` frees the pages (and unregisters).
+        self.experts.clear();
+        self.bufs.clear();
+    }
+}
+
+impl Drop for RouteArena {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+/// Build one expert's three matrices as views into a streaming arena.
+///
+/// Mirrors [`MlxLocalExpertSource::materialize_plan`] but borrows the arena
+/// instead of owning copies. The Metal affine sidecar is a single view spanning
+/// the arena's already-contiguous scales+biases pair, so it costs no copy at
+/// all. Checkpoints that lay those sidecars apart decline RouteArena before any
+/// load is submitted rather than caching bytes that have not been loaded yet.
+fn materialize_plan_arena(
+    plan: &MlxExpertIoPlan,
+    buf: &std::sync::Arc<ArenaBuf>,
+    base: usize,
+) -> Result<[Wt; 3], String> {
+    let held = |range: &std::ops::Range<usize>| -> Result<Bytes, String> {
+        buf.slice(base + range.start, range.len())
+            .ok_or_else(|| "expert plan leaves the streaming arena".to_string())?;
+        Ok(Bytes::held(
+            std::sync::Arc::clone(buf),
+            base + range.start,
+            range.len(),
+        ))
+    };
+    let mut out = Vec::with_capacity(3);
+    for matrix in &plan.matrices {
+        let weights = held(&matrix.weights)?;
+        let scales = held(&matrix.scales)?;
+        let bytes = match matrix.storage {
+            MlxExpertStorage::Affine {
+                bits,
+                group_size,
+                aux_fp16,
+            } => {
+                let biases_range = matrix
+                    .biases
+                    .clone()
+                    .ok_or_else(|| "MLX affine plan missing biases".to_string())?;
+                let biases = held(&biases_range)?;
+                // The shader reads `[scales][biases]` as one contiguous block.
+                // The arena was built from the plan's own ranges, so the two
+                // already abut when the plan ordered them adjacently. When they
+                // do not, fall back to an owned concatenation rather than
+                // handing the shader a view it would mis-index.
+                if matrix.scales.end != biases_range.start {
+                    return Err(
+                        "streaming arena requires contiguous affine scales+biases".to_string()
+                    );
+                }
+                let aux = held(&(matrix.scales.start..biases_range.end))?;
+                let aux_cell = std::sync::OnceLock::new();
+                let _ = aux_cell.set(aux);
+                WtBytes::MlxAffine {
+                    weights,
+                    scales,
+                    biases,
+                    bits,
+                    group_size,
+                    aux_fp16,
+                    metal_aux: aux_cell,
+                    metal_tensor: std::sync::Mutex::new(0),
+                    cuda_resident: std::sync::Mutex::new(None),
+                }
+            }
+            MlxExpertStorage::Mxfp4 => {
+                return Err("streaming arena supports affine MLX experts only".to_string())
+            }
+        };
+        out.push(Wt {
+            f: Vec::new(),
+            bytes: Some(bytes),
+            o: matrix.output,
+            i: matrix.input,
+        });
+    }
+    out.try_into()
+        .map_err(|_| "MLX streaming arena expert did not produce three matrices".to_string())
+}
+
+/// EXP-069: build the three views for a retained cache block. Mirrors
+/// [`materialize_plan_arena`] but tags every view with the cache generation so a
+/// view cannot be silently reused after its block was reassigned.
+fn materialize_plan_cache(
+    plan: &MlxExpertIoPlan,
+    buf: &std::sync::Arc<ArenaBuf>,
+    base: usize,
+    generation: u64,
+) -> Result<[Wt; 3], String> {
+    let held = |range: &std::ops::Range<usize>| -> Result<Bytes, String> {
+        buf.slice(base + range.start, range.len())
+            .ok_or_else(|| "expert plan leaves the retention cache".to_string())?;
+        Ok(Bytes::CacheHeld {
+            buf: std::sync::Arc::clone(buf),
+            off: base + range.start,
+            len: range.len(),
+            generation,
+        })
+    };
+    let mut out = Vec::with_capacity(3);
+    for matrix in &plan.matrices {
+        let weights = held(&matrix.weights)?;
+        let scales = held(&matrix.scales)?;
+        let bytes = match matrix.storage {
+            MlxExpertStorage::Affine {
+                bits,
+                group_size,
+                aux_fp16,
+            } => {
+                let biases_range = matrix
+                    .biases
+                    .clone()
+                    .ok_or_else(|| "MLX affine plan missing biases".to_string())?;
+                if matrix.scales.end != biases_range.start {
+                    return Err(
+                        "retention cache requires contiguous affine scales+biases".to_string()
+                    );
+                }
+                let biases = held(&biases_range)?;
+                let aux = held(&(matrix.scales.start..biases_range.end))?;
+                let aux_cell = std::sync::OnceLock::new();
+                let _ = aux_cell.set(aux);
+                WtBytes::MlxAffine {
+                    weights,
+                    scales,
+                    biases,
+                    bits,
+                    group_size,
+                    aux_fp16,
+                    metal_aux: aux_cell,
+                    metal_tensor: std::sync::Mutex::new(0),
+                    cuda_resident: std::sync::Mutex::new(None),
+                }
+            }
+            MlxExpertStorage::Mxfp4 => {
+                return Err("retention cache supports affine MLX experts only".to_string())
+            }
+        };
+        out.push(Wt {
+            f: Vec::new(),
+            bytes: Some(bytes),
+            o: matrix.output,
+            i: matrix.input,
+        });
+    }
+    out.try_into()
+        .map_err(|_| "MLX retention cache expert did not produce three matrices".to_string())
+}
+
 pub(crate) struct MlxLocalExpertSource {
     st: StFile,
     experts: usize,
@@ -10862,6 +12506,35 @@ pub(crate) struct MlxLocalExpertSource {
     /// forward, so it is not worth enabling; the flag exists to reproduce that
     /// measurement and to keep the decomposition readable.
     plan_cache: PlanCache,
+    /// EXP-067 streaming arena (`LOGAN_ROUTE_ARENA`). Default ON for this
+    /// raw-MLX expert source after the hardened repeat; set `LOGAN_ROUTE_ARENA=0`
+    /// to opt out. Built on first use, when the caller's `d_model`/`d_hidden`
+    /// are known; `None` with `arena_enabled` false leaves the fallback path untouched.
+    route_arena: Option<RouteArena>,
+    /// Whether the streaming arena is enabled. It defaults ON for raw MLX and
+    /// `LOGAN_ROUTE_ARENA=0` explicitly disables it. Construction is deferred
+    /// because the expert I/O plan needs the layer geometry, which is only known
+    /// at `eval` time. A failed construction clears this so fallback is silent
+    /// and permanent rather than retried per layer.
+    arena_enabled: bool,
+    /// EXP-069 packed per-layer retention cache (`LOGAN_ROUTE_CACHE=<blocks>`).
+    /// `0` (default) disables it and leaves every other path untouched.
+    route_cache: Option<RouteCache>,
+    route_cache_blocks: usize,
+    /// Hybrid next-token staging arena (`QWEN_ROUTE_MODE=hybrid`).
+    ///
+    /// Its own buffer, not the RouteArena: see [`crate::hybrid_stage`] for why
+    /// layer-parity scratch cannot serve a next-token prediction. `None` in
+    /// every other mode, so no other path pays for it.
+    stage: Option<crate::hybrid_stage::StageArena>,
+    /// Staging policy (candidate budget, fusion arm, weights).
+    stage_config: crate::hybrid_stage::StageConfig,
+    /// Whether staging has been permanently disabled, e.g. because the arena
+    /// could not be built. Retrying per layer would just repeat the failure.
+    stage_failed: bool,
+    /// Destination layout every staged plan must match, from layer 0's plan.
+    /// Cached because it is derived once and compared per expert.
+    stage_template: Option<[MlxMatrixIoPlan; 3]>,
 }
 
 /// A demand expert fetch that has been submitted but not necessarily completed.
@@ -10896,8 +12569,8 @@ impl MlxLocalExpertSource {
         // Canonical engine-wide flags use LOGAN_* because this I/O policy
         // belongs to the source/runtime contract, not to Qwen. Keep the QWEN_*
         // spellings as compatibility aliases for EXP-028 scripts.
-        let nocache = crate::env_flag("LOGAN_EXPERT_NOCACHE")
-            || crate::env_flag("QWEN_MLX_EXPERT_NOCACHE");
+        let nocache =
+            crate::env_flag("LOGAN_EXPERT_NOCACHE") || crate::env_flag("QWEN_MLX_EXPERT_NOCACHE");
         // NOCACHE is specifically an SSD-streaming qualification mode, so
         // prefer MetalIO automatically there. Outside that experiment MetalIO
         // remains opt-in until EXP-028 establishes a repeatable win.
@@ -10935,6 +12608,12 @@ impl MlxLocalExpertSource {
                 enabled: crate::env_flag("LOGAN_EXPERT_PLAN_CACHE"),
                 plans: std::collections::HashMap::new(),
             },
+            route_arena: None,
+            // Deferred: the arena needs the expert I/O plan's byte size, which
+            // requires `d_model`/`d_hidden` (known only at `eval` time).
+            arena_enabled: std::env::var("LOGAN_ROUTE_ARENA")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true),
             wt_pool: std::collections::HashMap::new(),
             // Default ON. Measured: `wrap()` created 540 MiB of MTLBuffer objects
             // per decode token (1920 creations, ~zero copy bytes); the pool holds
@@ -10950,7 +12629,758 @@ impl MlxLocalExpertSource {
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true),
             pool_rank_cap: topk.max(1),
+            route_cache: None,
+            // EXP-069. Unset/0 = disabled, so the default path is byte-for-byte
+            // the established one and this experiment cannot regress it.
+            route_cache_blocks: std::env::var("LOGAN_ROUTE_CACHE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            // The staging arena is built lazily on first use, because its block
+            // size is only known once `d_model`/`d_hidden` are (same reason as
+            // the route arena). A non-hybrid mode never enables it, so no other
+            // path pays for the field.
+            stage: None,
+            stage_config: crate::hybrid_stage::StageConfig::from_env(),
+            stage_failed: false,
+            stage_template: None,
         })
+    }
+
+    /// Build the packed per-layer retention cache on first use, or permanently
+    /// disable it. Sized from the real expert plan so it is exact: `blocks`
+    /// blocks of `plan.used_bytes` per layer, one arena per layer index.
+    fn route_cache_ensure(&mut self, d_model: usize, d_hidden: usize) -> bool {
+        if self.route_cache.is_some() {
+            return true;
+        }
+        let blocks = self.route_cache_blocks;
+        if blocks == 0 || !self.metalio {
+            return false;
+        }
+        match self.try_build_route_cache(d_model, d_hidden, blocks) {
+            Ok(cache) => {
+                let total_mib =
+                    (cache.expert_stride * cache.capacity_per_layer() * cache.bufs.len())
+                        / (1024 * 1024);
+                eprintln!(
+                    "logan route-cache: enabled blocks_per_layer={} layers={} stride={} B                      total={} MiB",
+                    cache.capacity_per_layer(),
+                    cache.bufs.len(),
+                    cache.expert_stride,
+                    total_mib
+                );
+                self.route_cache = Some(cache);
+                true
+            }
+            Err(e) => {
+                eprintln!("logan route-cache: unavailable, disabled ({e})");
+                self.route_cache_blocks = 0;
+                false
+            }
+        }
+    }
+
+    /// EXP-069: retrieve the current route's experts, taking the retained ones
+    /// straight from the packed per-layer cache and streaming only the rest.
+    ///
+    /// Retention policy is "the ranks the authoritative router selected", which
+    /// is exactly the set with the highest router weight in canonical order (the
+    /// route arrives sorted by weight). A hit costs zero SSD bytes; a miss is
+    /// loaded once, directly into its cache block, and used from there. There is
+    /// no speculative read and no second copy.
+    ///
+    /// Returns the matrices in canonical route order. `Ok(None)` means the cache
+    /// declined this route and the caller must take the established path.
+    fn cache_fetch_route(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<Option<Vec<[Wt; 3]>>, String> {
+        if !self.route_cache_ensure(d_model, d_hidden) {
+            return Ok(None);
+        }
+        let layer = calls[0].layer as usize;
+        let k = calls.len();
+        let Some(cache) = self.route_cache.as_ref() else {
+            return Ok(None);
+        };
+        let retain = cache.capacity_per_layer().min(k);
+        if retain == 0 {
+            return Ok(None);
+        }
+        // Everything must agree on the cache's destination layout before any
+        // block is touched, or a layer with a different expert geometry would be
+        // silently mis-mapped. Plans are collected first so the immutable
+        // `cache` borrow and the `&mut self` plan cache do not overlap.
+        let template = cache.template.clone();
+        let mut plans = Vec::with_capacity(calls.len());
+        for call in calls {
+            let expert = usize::try_from(call.expert)
+                .map_err(|_| format!("expert id {} does not fit usize", call.expert))?;
+            plans.push(self.cached_io_plan(call.layer, expert, d_model, d_hidden)?);
+        }
+        if plans
+            .iter()
+            .any(|p| !RouteArena::layout_matches(&template, &p.matrices))
+        {
+            return Ok(None);
+        }
+
+        // The non-retained tail is streamed through the EXP-067 arena, so the
+        // arena must exist before `arena_fetch_range` can serve it. Without this
+        // the cache would own the first route and then decline forever with
+        // "arena cannot serve this expert layout" the moment it needs a tail.
+        if retain < k && !self.route_arena_ensure(d_model, d_hidden) {
+            return Ok(None);
+        }
+
+        let load_t0 = std::time::Instant::now();
+        let mut arena_share_ns = 0u64;
+        // Reserve every retained rank's block first, so the reservations cannot
+        // evict a block this same route is about to reuse.
+        let mut plan: Vec<(usize, usize, Option<u32>, bool)> = Vec::with_capacity(retain);
+        // Blocks this route already owns; a later reservation must never choose
+        // one of them. See `RouteCache::reserve` for the failure this prevents.
+        let mut pinned = vec![false; retain.max(1)];
+        {
+            let Some(cache) = self.route_cache.as_ref() else {
+                return Ok(None);
+            };
+            let cap = cache.capacity_per_layer();
+            pinned = vec![false; cap];
+        }
+        for rank in 0..retain {
+            let expert = calls[rank].expert;
+            let Some(cache) = self.route_cache.as_mut() else {
+                return Ok(None);
+            };
+            let Some((block, hit, replaced)) = cache.reserve(layer, expert, &pinned) else {
+                return Ok(None);
+            };
+            if let Some(ev) = replaced {
+                RC_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = ev;
+            }
+            pinned[block] = true;
+            plan.push((rank, block, replaced, hit));
+        }
+        // Count hits/misses exactly once per retained occurrence; the
+        // reconciliation gate requires hits + misses == retained occurrences.
+        {
+            let Some(cache) = self.route_cache.as_mut() else {
+                return Ok(None);
+            };
+            for &(_, _, _, hit) in &plan {
+                if hit {
+                    cache.hits += 1;
+                    RC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    cache.misses += 1;
+                    RC_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            RC_STRIDE.store(
+                cache.expert_stride as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        // Submit misses into their own blocks.
+        let mut submitted: Vec<i32> = Vec::new();
+        let mut events: Vec<i64> = Vec::new();
+        let mut failure: Option<String> = None;
+        let submit_t0 = std::time::Instant::now();
+        for &(rank, block, _, hit) in &plan {
+            if hit {
+                continue;
+            }
+            let call = &calls[rank];
+            let expert = usize::try_from(call.expert)
+                .map_err(|_| format!("expert id {} does not fit usize", call.expert))?;
+            let Some(plan_io) =
+                self.arena_regions_into(layer as u32, expert, block, d_model, d_hidden)
+            else {
+                failure = Some("route cache cannot serve this expert layout".to_string());
+                break;
+            };
+            match crate::ffi::mio_load_regions_into(plan_io.0, &plan_io.1, false) {
+                Some(event) => {
+                    submitted.push(plan_io.0);
+                    events.push(event);
+                }
+                None => {
+                    failure = Some("route cache load submission failed".to_string());
+                    break;
+                }
+            }
+        }
+        EXPERT_SUBMIT_NS.fetch_add(
+            submit_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // The arena tail is SUBMITTED before either wait, so its reads are in
+        // flight alongside the cache misses. Waiting the cache misses first and
+        // only then starting the arena serialises the two halves of the route's
+        // I/O — measured as `load_ms` rising 92.9 -> 158.2 ms/token.
+        let tail_submitted = if failure.is_none() {
+            match self.arena_submit_range(calls, d_model, d_hidden, retain) {
+                Ok(sub) => Some(sub),
+                Err(e) => {
+                    failure = Some(e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if failure.is_none() {
+            let wait_t0 = std::time::Instant::now();
+            for event in &events {
+                if !crate::ffi::mio_wait(*event) {
+                    failure = Some("route cache load did not complete".to_string());
+                    break;
+                }
+            }
+            EXPERT_WAIT_NS.fetch_add(
+                wait_t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        if let Some(e) = failure.as_ref() {}
+        let arena_t0 = std::time::Instant::now();
+        let tail = match (failure.is_none(), tail_submitted) {
+            (true, Some(sub)) => match self.arena_collect_range(
+                calls,
+                calls[0].layer,
+                d_model,
+                d_hidden,
+                retain,
+                sub,
+            ) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    failure = Some(e);
+                    None
+                }
+            },
+            _ => None,
+        };
+        arena_share_ns = arena_t0.elapsed().as_nanos() as u64;
+
+        if let Some(e) = failure {
+            self.arena_drain(&submitted);
+            self.route_cache = None;
+            self.route_cache_blocks = 0;
+            return Err(e);
+        }
+
+        let generation = self.route_cache.as_ref().map(|c| c.generation).unwrap_or(0);
+        let mut mats: Vec<Option<[Wt; 3]>> = (0..k).map(|_| None).collect();
+        for &(rank, block, _, _) in &plan {
+            let Some(cache) = self.route_cache.as_ref() else {
+                return Ok(None);
+            };
+            let base = block * cache.expert_stride;
+            let buf = std::sync::Arc::clone(&cache.bufs[layer]);
+            let cell = materialize_plan_cache(&plans[rank], &buf, base, generation)?;
+            mats[rank] = Some(cell);
+        }
+        if let Some(tail) = tail {
+            for (i, m) in tail.into_iter().enumerate() {
+                mats[retain + i] = Some(m);
+            }
+        }
+        if mats.iter().any(|m| m.is_none()) {
+            return Ok(None);
+        }
+        // Only the cache's own share of the load envelope; `arena_collect_range`
+        // already accounts for the arena tail's wait. Adding the whole route here
+        // as well would double-count the tail and report a phantom regression.
+        let total = load_t0.elapsed().as_nanos() as u64;
+        EXPERT_LOAD_NS.fetch_add(
+            total.saturating_sub(arena_share_ns),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(Some(mats.into_iter().flatten().collect()))
+    }
+
+    /// EXP-069: region list for `expert` targeting a specific cache `block`
+    /// instead of an arena route slot. Same validation as `arena_regions`.
+    fn arena_regions_into(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        block: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Option<(i32, Vec<crate::ffi::MioRegion>)> {
+        if expert >= self.experts {
+            return None;
+        }
+        let (slot, template_matrices, stride) = {
+            let cache = self.route_cache.as_ref()?;
+            if block >= cache.capacity_per_layer() || layer as usize >= cache.bufs.len() {
+                return None;
+            }
+            (
+                cache.slots[layer as usize][block],
+                [0usize, 1, 2].map(|i| cache.template[i].clone()),
+                cache.expert_stride,
+            )
+        };
+        let _ = stride;
+        let plan_t0 = std::time::Instant::now();
+        let plan = self.cached_io_plan(layer, expert, d_model, d_hidden).ok()?;
+        EXPERT_PLAN_NS.fetch_add(
+            plan_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if !RouteArena::layout_matches(&template_matrices, &plan.matrices) {
+            return None;
+        }
+        let mut regions = Vec::with_capacity(plan.regions.len());
+        for &(shard, src_off, bytes, dst_off) in &plan.regions {
+            let path = self.st.shard_path(shard)?.to_str()?;
+            let file = crate::ffi::mio_file(path)?;
+            regions.push(crate::ffi::MioRegion {
+                file,
+                src_off,
+                bytes,
+                dst_off,
+            });
+        }
+        Some((slot, regions))
+    }
+
+    fn try_build_route_cache(
+        &self,
+        d_model: usize,
+        d_hidden: usize,
+        blocks: usize,
+    ) -> Result<RouteCache, String> {
+        let layers = self
+            .st
+            .tensors
+            .keys()
+            .filter_map(|k| {
+                let rest = k.strip_prefix("language_model.model.layers.")?;
+                rest.split('.').next()?.parse::<usize>().ok()
+            })
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        if layers == 0 {
+            return Err("could not determine layer count from the tensor table".to_string());
+        }
+        let plan = self.io_plan(0, 0, d_model, d_hidden)?;
+        let stride = plan.used_bytes;
+        if stride == 0 {
+            return Err("expert plan is empty".to_string());
+        }
+        let arena_bytes = stride
+            .checked_mul(blocks)
+            .and_then(|n| n.div_ceil(ARENA_ALIGN).checked_mul(ARENA_ALIGN))
+            .ok_or_else(|| format!("cache of {stride} x {blocks} overflows usize"))?;
+        let mut bufs = Vec::with_capacity(layers);
+        let mut slots: Vec<Vec<i32>> = Vec::with_capacity(layers);
+        let mut tags = Vec::with_capacity(layers);
+        let mut build = || -> Result<(), String> {
+            for _ in 0..layers {
+                let buf = ArenaBuf::alloc(arena_bytes)?;
+                crate::ffi::metal_register(buf.base(), buf.len());
+                let mut row = Vec::with_capacity(blocks);
+                for b in 0..blocks {
+                    let slot = crate::ffi::mio_slot_alloc_alias(
+                        buf.base().wrapping_add(b * stride),
+                        stride,
+                    );
+                    if slot < 0 {
+                        return Err(format!("cache alias slot {b} allocation failed"));
+                    }
+                    row.push(slot);
+                }
+                slots.push(row);
+                tags.push(vec![None; blocks]);
+                bufs.push(buf);
+            }
+            Ok(())
+        };
+        if let Err(e) = build() {
+            for row in &slots {
+                for &slot in row {
+                    crate::ffi::mio_discard_slot(slot);
+                }
+            }
+            return Err(e);
+        }
+        Ok(RouteCache {
+            bufs,
+            slots,
+            expert_stride: stride,
+            template: plan.matrices.clone(),
+            tags,
+            blocks,
+            next: vec![0; layers],
+            generation: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        })
+    }
+
+    /// Build the streaming arena on first use, or permanently disable it.
+    ///
+    /// Sized from the real expert plan, so it is exact rather than a guess:
+    /// `topk` blocks of `plan.used_bytes` each, one arena per layer parity.
+    fn route_arena_ensure(&mut self, d_model: usize, d_hidden: usize) -> bool {
+        if let Some(arena) = self.route_arena.as_ref() {
+            return !arena.experts.is_empty();
+        }
+        if !self.arena_enabled || !self.metalio {
+            return false;
+        }
+        match self.try_build_route_arena(d_model, d_hidden) {
+            Ok(arena) => {
+                eprintln!(
+                    "logan route-arena: enabled stride={} B topk={} arenas={} total={} MiB \
+                     (no slot copy, no per-expert tensor creation)",
+                    arena.expert_stride,
+                    arena.topk,
+                    arena.bufs.len(),
+                    (arena.expert_stride * arena.topk * arena.bufs.len()) / (1024 * 1024),
+                );
+                self.route_arena = Some(arena);
+                true
+            }
+            Err(e) => {
+                // Fall back once and stay fallen back: an arena that cannot be
+                // built must not retry every layer.
+                eprintln!("logan route-arena: unavailable, falling back ({e})");
+                self.arena_enabled = false;
+                false
+            }
+        }
+    }
+
+    fn try_build_route_arena(&self, d_model: usize, d_hidden: usize) -> Result<RouteArena, String> {
+        let topk = self.pool_rank_cap.max(1);
+        // Every layer shares the same expert geometry, so layer 0's plan gives
+        // the block size for all of them.
+        let plan = self.io_plan(0, 0, d_model, d_hidden)?;
+        let stride = plan.used_bytes;
+        if stride == 0 {
+            return Err("expert plan is empty".to_string());
+        }
+        // Arena size is a multiple of the Metal page, so each expert block starts
+        // page-aligned and the whole allocation is registerable.
+        let arena_bytes = stride
+            .checked_mul(topk)
+            .and_then(|n| n.div_ceil(ARENA_ALIGN).checked_mul(ARENA_ALIGN))
+            .ok_or_else(|| format!("arena of {stride} x {topk} overflows usize"))?;
+
+        let mut bufs = Vec::with_capacity(2);
+        let mut slots: Vec<Vec<i32>> = Vec::with_capacity(2);
+        let mut experts = Vec::with_capacity(2 * topk);
+        // Build into locals and only publish on success, so a failure releases
+        // every alias slot it has taken instead of leaking them.
+        let build_result = {
+            let mut build = || -> Result<(), String> {
+                for parity in 0..2usize {
+                    let buf = ArenaBuf::alloc(arena_bytes)?;
+                    // One registration per arena: `resolve()` then hands the GPU a
+                    // pointer into these pages, so no per-expert MTLBuffer is created.
+                    crate::ffi::metal_register(buf.base(), buf.len());
+                    let mut row = Vec::with_capacity(topk);
+                    for rank in 0..topk {
+                        let slot = crate::ffi::mio_slot_alloc_alias(
+                            buf.base().wrapping_add(rank * stride),
+                            stride,
+                        );
+                        if slot < 0 {
+                            return Err(format!(
+                                "arena alias slot {parity}/{rank} allocation failed"
+                            ));
+                        }
+                        row.push(slot);
+                    }
+                    // Views into this parity's arena, built once: the offsets and
+                    // shapes never change, and MetalIO replaces the bytes in place.
+                    for rank in 0..topk {
+                        experts.push(Some(materialize_plan_arena(&plan, &buf, rank * stride)?));
+                    }
+                    bufs.push(buf);
+                    slots.push(row);
+                }
+                Ok(())
+            };
+            build()
+        };
+        if let Err(e) = build_result {
+            for row in &slots {
+                for &slot in row {
+                    crate::ffi::mio_discard_slot(slot);
+                }
+            }
+            // Dropping `bufs` unregisters and frees the pages, and dropping
+            // `experts` releases any Metal tensor already built over them.
+            return Err(e);
+        }
+        Ok(RouteArena {
+            bufs,
+            slots,
+            experts,
+            expert_stride: stride,
+            template: plan.matrices.clone(),
+            topk,
+        })
+    }
+
+    /// Prepare one expert's read into the streaming arena: the alias slot it must
+    /// target plus its region list. Submits nothing, so the caller can decide
+    /// all-or-nothing before any I/O is in flight.
+    ///
+    /// `rank` selects the arena block (hence the slot and the view), `expert` is
+    /// the routed expert whose byte ranges are read — they are different: the
+    /// route's rank-1 expert is rarely expert 1.
+    ///
+    /// Returns `None` when the arena is not serving this layout, which is the
+    /// caller's signal to take the established materialize path.
+    fn arena_regions(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        rank: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Option<(i32, Vec<crate::ffi::MioRegion>)> {
+        if expert >= self.experts {
+            return None;
+        }
+        let (slot, template_matrices) = {
+            let arena = self.route_arena.as_ref()?;
+            if rank >= arena.topk {
+                return None;
+            }
+            (
+                arena.slots[arena.parity(layer as usize)][rank],
+                [0usize, 1, 2].map(|i| arena.template[i].clone()),
+            )
+        };
+        let plan_t0 = std::time::Instant::now();
+        let plan = self.cached_io_plan(layer, expert, d_model, d_hidden).ok()?;
+        EXPERT_PLAN_NS.fetch_add(
+            plan_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // The arena's views were built from one template plan, so this layer's
+        // plan must agree with it on the *destination* layout, not merely on the
+        // total. A layer with the same `used_bytes` but different matrix ranges
+        // would otherwise be silently mis-mapped — the offsets the kernel reads
+        // come from those ranges, and the bytes were written at this layer's
+        // dst_offsets. Uniform Qwen3.6 geometry satisfies this; the check is what
+        // makes that a verified property rather than an assumption.
+        if !RouteArena::layout_matches(&template_matrices, &plan.matrices) {
+            return None;
+        }
+        let mut regions = Vec::with_capacity(plan.regions.len());
+        for &(shard, src_off, bytes, dst_off) in &plan.regions {
+            let path = self.st.shard_path(shard)?.to_str()?;
+            let file = crate::ffi::mio_file(path)?;
+            regions.push(crate::ffi::MioRegion {
+                file,
+                src_off,
+                bytes,
+                dst_off,
+            });
+        }
+        Some((slot, regions))
+    }
+
+    /// Retire any outstanding arena loads so a failed route cannot leave a slot
+    /// with a pending command buffer, which `metalio_loadv` would afterwards
+    /// reject forever. `mio_batch_wait` waits for the exact commands, after which
+    /// their status is no longer pending and the slots are reusable as-is.
+    /// Best-effort: used only on the failure path.
+    fn arena_drain(&self, slots: &[i32]) {
+        if slots.is_empty() {
+            return;
+        }
+        if let Some(barrier) = crate::ffi::mio_batch_barrier() {
+            let _ = crate::ffi::mio_batch_wait(barrier, slots);
+        }
+    }
+
+    /// Fetch a whole route directly into the streaming arena (EXP-067).
+    ///
+    /// Issues every expert's read concurrently into its own arena block, waits
+    /// each exactly, and hands back the arena-backed matrices. No slot is copied
+    /// and no slot is recycled mid-route, so the ordering that EXP-048 found
+    /// load-bearing is not disturbed: each expert owns a dedicated alias slot
+    /// for the whole layer.
+    ///
+    /// All-or-nothing: a partial failure drains the outstanding loads, tears the
+    /// arena down (releasing the alias slots) and reports the error so the caller
+    /// can take the established path for this route and every later one.
+    fn arena_fetch_all(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<Vec<[Wt; 3]>, String> {
+        self.arena_fetch_range(calls, d_model, d_hidden, 0)
+    }
+
+    /// EXP-069: fetch ranks `[from_rank, k)` into the arena. The first
+    /// `from_rank` ranks are owned by the packed retention cache, so the arena
+    /// must not read them again (the cache is the copy that survives).
+    fn arena_fetch_range(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+        from_rank: usize,
+    ) -> Result<Vec<[Wt; 3]>, String> {
+        let layer = calls[0].layer;
+        let submitted = self.arena_submit_range(calls, d_model, d_hidden, from_rank)?;
+        self.arena_collect_range(calls, layer, d_model, d_hidden, from_rank, submitted)
+    }
+
+    /// Submit the arena's reads for ranks `[from_rank, k)` WITHOUT waiting.
+    /// Returns `(slots, events, submitted_count)`; `collect` waits them.
+    /// Splitting the wait out is what lets EXP-069 overlap the retention cache's
+    /// misses with the arena tail instead of serialising the two halves of a
+    /// route's I/O.
+    fn arena_submit_range(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+        from_rank: usize,
+    ) -> Result<(Vec<i32>, Vec<i64>, usize), String> {
+        // Prepare every region set before submitting anything, so a decline
+        // aborts with no I/O in flight.
+        let mut prepared = Vec::with_capacity(calls.len().saturating_sub(from_rank));
+        for (rank, call) in calls.iter().enumerate().skip(from_rank) {
+            let expert = usize::try_from(call.expert)
+                .map_err(|_| format!("expert id {} does not fit usize", call.expert))?;
+            match self.arena_regions(call.layer, expert, rank, d_model, d_hidden) {
+                Some(p) => prepared.push(p),
+                None => return Err("arena cannot serve this expert layout".into()),
+            }
+        }
+        let mut slots = Vec::with_capacity(prepared.len());
+        let mut events = Vec::with_capacity(prepared.len());
+        let submit_t0 = std::time::Instant::now();
+        // Demand, not speculative: these are the authoritative router's experts,
+        // and metering them as speculative would inflate `prefetch_loads` and
+        // make the `mio` counters incomparable with the baseline arms.
+        for (slot, regions) in &prepared {
+            match crate::ffi::mio_load_regions_into(*slot, regions, false) {
+                Some(event) => {
+                    slots.push(*slot);
+                    events.push(event);
+                }
+                None => {
+                    self.arena_drain(&slots);
+                    self.route_arena = None;
+                    self.arena_enabled = false;
+                    return Err("arena load submission failed".to_string());
+                }
+            }
+        }
+        EXPERT_SUBMIT_NS.fetch_add(
+            submit_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let n = slots.len();
+        Ok((slots, events, n))
+    }
+
+    /// Wait the arena reads submitted by [`arena_submit_range`] and take their
+    /// matrices. `submitted` is `(slots, events, count)`.
+    fn arena_collect_range(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        layer: u32,
+        d_model: usize,
+        d_hidden: usize,
+        from_rank: usize,
+        submitted: (Vec<i32>, Vec<i64>, usize),
+    ) -> Result<Vec<[Wt; 3]>, String> {
+        let (slots, events, _n) = submitted;
+        let load_t0 = std::time::Instant::now();
+        let mut failure = None;
+        let wait_t0 = std::time::Instant::now();
+        for event in &events {
+            if !crate::ffi::mio_wait(*event) {
+                failure = Some("arena load did not complete".to_string());
+                break;
+            }
+        }
+        EXPERT_WAIT_NS.fetch_add(
+            wait_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut mats = Vec::with_capacity(events.len());
+        if failure.is_none() {
+            for rank in from_rank..calls.len() {
+                match self.take_arena_expert(layer, rank) {
+                    Some(m) => mats.push(m),
+                    None => {
+                        failure = Some("arena expert slot was not materialized".to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = failure {
+            // Return anything already taken before tearing the arena down, so a
+            // partial route does not leave the arena half-empty.
+            for (i, m) in mats.into_iter().enumerate() {
+                self.return_arena_expert(layer, from_rank + i, m);
+            }
+            // Retire the in-flight commands before releasing the slots, then drop
+            // the arena so no later route reuses it.
+            self.arena_drain(&slots);
+            self.route_arena = None;
+            self.arena_enabled = false;
+            return Err(e);
+        }
+        let _ = (d_model, d_hidden);
+        // The whole fetch is the load envelope, exactly as on the materialize
+        // path, and `wait` is reported separately as its only storage-latency
+        // term.
+        EXPERT_LOAD_NS.fetch_add(
+            load_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(mats)
+    }
+
+    /// Take the arena-backed matrices for one route slot.
+    ///
+    /// The returned `[Wt; 3]` borrows the arena that the MetalIO load just
+    /// targeted, so the bytes are read where they landed. The entry is moved out
+    /// (not cloned), so a dropped forward cannot leave a stale view behind.
+    fn take_arena_expert(&mut self, layer: u32, rank: usize) -> Option<[Wt; 3]> {
+        let arena = self.route_arena.as_mut()?;
+        let index = arena.index(layer as usize, rank)?;
+        arena.experts.get_mut(index)?.take()
+    }
+
+    /// Return a route slot's matrices to the arena after its compute completed.
+    fn return_arena_expert(&mut self, layer: u32, rank: usize, mats: [Wt; 3]) {
+        if let Some(arena) = self.route_arena.as_mut() {
+            if let Some(index) = arena.index(layer as usize, rank) {
+                if let Some(entry) = arena.experts.get_mut(index) {
+                    *entry = Some(mats);
+                }
+            }
+        }
     }
 
     fn plan_matrix(
@@ -11040,12 +13470,15 @@ impl MlxLocalExpertSource {
                 let param_bytes = output
                     .checked_mul(groups)
                     .and_then(|n| n.checked_mul(2))
-                    .ok_or_else(|| format!("{scale_name}: expert parameter slice size overflows"))?;
+                    .ok_or_else(|| {
+                        format!("{scale_name}: expert parameter slice size overflows")
+                    })?;
                 let param_within = expert
                     .checked_mul(param_bytes)
                     .ok_or_else(|| format!("{scale_name}: expert parameter offset overflows"))?;
                 let (sshard, soff, slen) =
-                    self.st.tensor_region(&scale_name, param_within, param_bytes)?;
+                    self.st
+                        .tensor_region(&scale_name, param_within, param_bytes)?;
                 let scales = *cursor..cursor.saturating_add(slen);
                 regions.push((sshard, soff, slen, *cursor));
                 *cursor = scales.end;
@@ -11063,7 +13496,8 @@ impl MlxLocalExpertSource {
                     ));
                 }
                 let (bshard, boff, blen) =
-                    self.st.tensor_region(&bias_name, param_within, param_bytes)?;
+                    self.st
+                        .tensor_region(&bias_name, param_within, param_bytes)?;
                 let biases = *cursor..cursor.saturating_add(blen);
                 regions.push((bshard, boff, blen, *cursor));
                 *cursor = biases.end;
@@ -11094,7 +13528,8 @@ impl MlxLocalExpertSource {
                     .checked_mul(scale_bytes)
                     .ok_or_else(|| format!("{scale_name}: expert scale offset overflows"))?;
                 let (sshard, soff, slen) =
-                    self.st.tensor_region(&scale_name, scale_within, scale_bytes)?;
+                    self.st
+                        .tensor_region(&scale_name, scale_within, scale_bytes)?;
                 let scales = *cursor..cursor.saturating_add(slen);
                 regions.push((sshard, soff, slen, *cursor));
                 *cursor = scales.end;
@@ -11154,6 +13589,430 @@ impl MlxLocalExpertSource {
         })
     }
 
+    /// Build the hybrid staging arena on first use, or disable it permanently.
+    ///
+    /// Sized from the real expert plan, so `M` blocks of `plan.used_bytes` per
+    /// layer is exact rather than a guess, and the arena's memory cost is a
+    /// measured number the M sweep can be bounded by.
+    fn stage_ensure(&mut self, d_model: usize, d_hidden: usize) -> bool {
+        if self.stage.is_some() {
+            return true;
+        }
+        if self.stage_failed || !self.metalio || !self.stage_config.enabled {
+            return false;
+        }
+        let plan = match self.io_plan(0, 0, d_model, d_hidden) {
+            Ok(plan) => plan,
+            Err(e) => {
+                eprintln!("logan hybrid-stage: unavailable, disabled ({e})");
+                self.stage_failed = true;
+                return false;
+            }
+        };
+        if plan.used_bytes == 0 {
+            eprintln!("logan hybrid-stage: unavailable, disabled (empty expert plan)");
+            self.stage_failed = true;
+            return false;
+        }
+        // The staging arena's views are built from this template, so a layer
+        // whose destination layout differs must be declined rather than
+        // mis-mapped. Uniform Qwen3.6 geometry satisfies this; the check is what
+        // makes it verified rather than assumed.
+        let layers = self.layer_count();
+        match crate::hybrid_stage::StageArena::new(
+            layers,
+            self.stage_config.candidates,
+            plan.used_bytes,
+        ) {
+            Ok(arena) => {
+                let mib = arena.bytes() / (1024 * 1024);
+                eprintln!(
+                    "logan hybrid-stage: enabled M={} stride={} B layers={} total={} MiB \
+                     fusion={} resident_prior={}",
+                    arena.candidates(),
+                    arena.stride(),
+                    layers,
+                    mib,
+                    self.stage_config.arm.name(),
+                    self.stage_config.resident_prior
+                );
+                self.stage = Some(arena);
+                true
+            }
+            Err(e) => {
+                eprintln!("logan hybrid-stage: unavailable, disabled ({e})");
+                self.stage_failed = true;
+                false
+            }
+        }
+    }
+
+    /// Layer count from the checkpoint's own tensor table, as
+    /// `try_build_route_cache` derives it.
+    fn layer_count(&self) -> usize {
+        self.st
+            .tensors
+            .keys()
+            .filter_map(|k| {
+                let rest = k.strip_prefix("language_model.model.layers.")?;
+                rest.split('.').next()?.parse::<usize>().ok()
+            })
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0)
+    }
+
+    /// Build the three matrices for a staged expert block as zero-copy views into
+    /// the staging arena.
+    ///
+    /// Mirrors [`materialize_plan_arena`] but tags the views as `Staged`, so they
+    /// can never be written in place, returned to the route arena, or kept in
+    /// `wt_pool` past the token they were staged for.
+    fn materialize_plan_staged(
+        plan: &MlxExpertIoPlan,
+        buf: &std::sync::Arc<ArenaBuf>,
+        base: usize,
+    ) -> Result<[Wt; 3], String> {
+        let held = |range: &std::ops::Range<usize>| -> Result<Bytes, String> {
+            buf.slice(base + range.start, range.len())
+                .ok_or_else(|| "staged expert plan leaves the staging arena".to_string())?;
+            Ok(Bytes::staged(
+                std::sync::Arc::clone(buf),
+                base + range.start,
+                range.len(),
+            ))
+        };
+        let mut out = Vec::with_capacity(3);
+        for matrix in &plan.matrices {
+            let weights = held(&matrix.weights)?;
+            let scales = held(&matrix.scales)?;
+            let bytes = match matrix.storage {
+                MlxExpertStorage::Affine {
+                    bits,
+                    group_size,
+                    aux_fp16,
+                } => {
+                    let biases_range = matrix
+                        .biases
+                        .clone()
+                        .ok_or_else(|| "MLX affine plan missing biases".to_string())?;
+                    // The shader reads `[scales][biases]` as one contiguous block,
+                    // and the staging arena was sized from the plan's own ranges,
+                    // so the two abut exactly when the plan ordered them adjacent.
+                    if matrix.scales.end != biases_range.start {
+                        return Err(
+                            "staging arena requires contiguous affine scales+biases".to_string()
+                        );
+                    }
+                    let biases = held(&biases_range)?;
+                    let aux = held(&(matrix.scales.start..biases_range.end))?;
+                    let aux_cell = std::sync::OnceLock::new();
+                    let _ = aux_cell.set(aux);
+                    WtBytes::MlxAffine {
+                        weights,
+                        scales,
+                        biases,
+                        bits,
+                        group_size,
+                        aux_fp16,
+                        metal_aux: aux_cell,
+                        metal_tensor: std::sync::Mutex::new(0),
+                        cuda_resident: std::sync::Mutex::new(None),
+                    }
+                }
+                MlxExpertStorage::Mxfp4 => {
+                    return Err("staging arena supports affine MLX experts only".to_string())
+                }
+            };
+            out.push(Wt {
+                f: Vec::new(),
+                bytes: Some(bytes),
+                o: matrix.output,
+                i: matrix.input,
+            });
+        }
+        out.try_into()
+            .map_err(|_| "staged expert did not produce three matrices".to_string())
+    }
+
+    /// Prepare one expert's staged read: the alias slot of its block in `layer`'s
+    /// row, plus its region list.
+    ///
+    /// Mirrors `arena_regions` but addresses the staging arena, which is keyed by
+    /// `(layer, expert)` rather than `(parity, rank)`.
+    fn stage_regions(
+        &mut self,
+        layer: u32,
+        expert: usize,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Option<(i32, usize, Vec<crate::ffi::MioRegion>)> {
+        if expert >= self.experts {
+            return None;
+        }
+        let plan_t0 = std::time::Instant::now();
+        let plan = self.cached_io_plan(layer, expert, d_model, d_hidden).ok()?;
+        EXPERT_PLAN_NS.fetch_add(
+            plan_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let arena = self.stage.as_mut()?;
+        let (slot, base, fresh) = arena.claim_stage(layer as usize, expert as u32)?;
+        if !fresh {
+            // Already staged for this generation: hand back the existing slot
+            // without a second read. MetalIO would reject a concurrent write into
+            // it, and re-reading would be the duplicate I/O this design removes.
+            return Some((slot, base, Vec::new()));
+        }
+        let buf = arena.buf_for(layer as usize, slot)?;
+        // Validate the destination layout before any I/O: the staged views were
+        // built from the template plan, and the bytes are written at *this*
+        // expert's dst_offsets, so a layer with a different matrix layout must be
+        // declined rather than silently mis-mapped.
+        let template = self.stage_layout_template(d_model, d_hidden)?;
+        if !RouteArena::layout_matches(&template, &plan.matrices) {
+            return None;
+        }
+        let _ = buf;
+        let mut regions = Vec::with_capacity(plan.regions.len());
+        for &(shard, src_off, bytes, dst_off) in &plan.regions {
+            let path = self.st.shard_path(shard)?.to_str()?;
+            let file = crate::ffi::mio_file(path)?;
+            regions.push(crate::ffi::MioRegion {
+                file,
+                src_off,
+                bytes,
+                dst_off,
+            });
+        }
+        Some((slot, base, regions))
+    }
+
+    /// The destination layout every staged plan must match, taken from layer 0's
+    /// plan. Cached in the arena's own construction path so it is computed once.
+    fn stage_layout_template(
+        &mut self,
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Option<[MlxMatrixIoPlan; 3]> {
+        if let Some(template) = self.stage_template.clone() {
+            return Some(template);
+        }
+        let plan = self.io_plan(0, 0, d_model, d_hidden).ok()?;
+        self.stage_template = Some(plan.matrices.clone());
+        self.stage_template.clone()
+    }
+
+    /// Stage a predicted expert set for `layer`'s next token.
+    ///
+    /// Speculative by construction: these bytes are for a route the router has
+    /// not chosen yet, so they are submitted as `MIO_LOAD_SPEC` — which is what
+    /// makes them visible to MetalIO's own ready/late/wasted accounting instead
+    /// of being counted as demand work.
+    fn stage_route_reads(
+        &mut self,
+        layer: u32,
+        experts: &[u32],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> usize {
+        if experts.is_empty() || !self.stage_ensure(d_model, d_hidden) {
+            return 0;
+        }
+        let stride = match self.stage.as_ref() {
+            Some(arena) => arena.stride(),
+            None => return 0,
+        };
+        let mut issued = 0usize;
+        for &expert in experts {
+            let Ok(expert_usize) = usize::try_from(expert) else {
+                continue;
+            };
+            let Some((slot, base, regions)) =
+                self.stage_regions(layer, expert_usize, d_model, d_hidden)
+            else {
+                continue;
+            };
+            if regions.is_empty() {
+                // Already staged for this generation; nothing to submit.
+                continue;
+            }
+            let _ = base;
+            match crate::ffi::mio_load_regions_into(slot, &regions, true) {
+                Some(event) => {
+                    if let Some(arena) = self.stage.as_mut() {
+                        arena.set_event(layer as usize, expert, event);
+                        arena.record_submit(layer as usize, stride);
+                    }
+                    EXPERT_SUBMIT_NS.fetch_add(0, std::sync::atomic::Ordering::Relaxed);
+                    issued += 1;
+                }
+                None => {
+                    // Release the claim so a later pass can retry the slot, and
+                    // stop rather than hammering a failing submission path.
+                    break;
+                }
+            }
+        }
+        issued
+    }
+
+    /// Fetch a whole route for `layer`, consuming staged bytes where they are
+    /// already in memory and demand-loading only what is missing.
+    ///
+    /// This is where the design's central guarantee is enforced: an expert that
+    /// was staged for this token is read from the staged slot and never read
+    /// again, so `duplicate_reads` stays zero. A staged-but-incomplete expert is
+    /// *waited for* rather than re-issued, which is the whole point — re-issuing
+    /// would put the same bytes on the wire twice and is exactly the failure the
+    /// previous arena exhibited.
+    ///
+    /// Returns matrices in route order. `Ok(None)` means the arena declined this
+    /// route (layout mismatch, geometry) and the caller must take the established
+    /// path — never a partial result.
+    fn stage_fetch_route(
+        &mut self,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<Option<Vec<[Wt; 3]>>, String> {
+        if !self.stage_ensure(d_model, d_hidden) {
+            return Ok(None);
+        }
+        let layer = calls[0].layer;
+        let stride = match self.stage.as_ref() {
+            Some(arena) => arena.stride(),
+            None => return Ok(None),
+        };
+        // Resolve every plan and validate the layout before touching any slot, so
+        // a decline leaves the arena exactly as it was.
+        let template = match self.stage_layout_template(d_model, d_hidden) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let mut plans = Vec::with_capacity(calls.len());
+        for call in calls {
+            let expert = usize::try_from(call.expert)
+                .map_err(|_| format!("expert id {} does not fit usize", call.expert))?;
+            let plan = self.cached_io_plan(call.layer, expert, d_model, d_hidden)?;
+            if !RouteArena::layout_matches(&template, &plan.matrices) {
+                return Ok(None);
+            }
+            plans.push(plan);
+        }
+
+        // Classify each rank. `hits` carry (slot, buf); `misses` need a demand
+        // read. Classification first, then I/O, so a staged hit is known to be a
+        // hit before anything is submitted.
+        let mut staged_hits = 0usize;
+        let mut mats: Vec<Option<[Wt; 3]>> = (0..calls.len()).map(|_| None).collect();
+        let mut demand_ranks: Vec<usize> = Vec::new();
+        for (rank, call) in calls.iter().enumerate() {
+            let take = self
+                .stage
+                .as_mut()
+                .and_then(|a| a.lookup(layer as usize, call.expert));
+            match take {
+                Some(crate::hybrid_stage::StagedTake::Hit { slot }) => {
+                    let buf = self
+                        .stage
+                        .as_ref()
+                        .and_then(|a| a.buf_for(layer as usize, slot))
+                        .ok_or_else(|| "staged slot has no backing buffer".to_string())?;
+                    // SAFETY: the probe inside `lookup` established that this
+                    // slot's load completed, and the arena owns the slot for the
+                    // process so nothing can overwrite these bytes until the next
+                    // `begin_token` releases them.
+                    let raw = unsafe {
+                        crate::ffi::mio_slot_bytes_view(slot, stride)
+                            .ok_or_else(|| "staged slot bytes unavailable".to_string())?
+                    };
+                    let mats_rank = Self::materialize_plan_staged(&plans[rank], &buf, 0)?;
+                    // The bytes are already in the arena; the view above is only
+                    // used to prove completion, and `materialize_plan_staged`
+                    // builds views at the same offsets the load targeted.
+                    let _ = raw;
+                    mats[rank] = Some(mats_rank);
+                    staged_hits += 1;
+                    crate::ffi::mio_slot_consumed(slot);
+                    if let Some(arena) = self.stage.as_mut() {
+                        arena.consume(layer as usize, call.expert);
+                        arena.record_hit(layer as usize, stride, false);
+                    }
+                }
+                Some(crate::hybrid_stage::StagedTake::Late { slot, event }) => {
+                    // Staged but not landed: wait for the exact load instead of
+                    // re-issuing it.
+                    crate::ffi::mio_prefetch_demanded(slot);
+                    let wait_t0 = std::time::Instant::now();
+                    let ok = crate::ffi::mio_wait(event);
+                    EXPERT_WAIT_NS.fetch_add(
+                        wait_t0.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if !ok {
+                        // Fall through to a demand read for this rank: a failed
+                        // staged load must not become a dropped expert.
+                        demand_ranks.push(rank);
+                        continue;
+                    }
+                    let buf = self
+                        .stage
+                        .as_ref()
+                        .and_then(|a| a.buf_for(layer as usize, slot))
+                        .ok_or_else(|| "staged slot has no backing buffer".to_string())?;
+                    mats[rank] = Some(Self::materialize_plan_staged(&plans[rank], &buf, 0)?);
+                    staged_hits += 1;
+                    crate::ffi::mio_slot_consumed(slot);
+                    if let Some(arena) = self.stage.as_mut() {
+                        arena.consume(layer as usize, call.expert);
+                        arena.record_hit(layer as usize, stride, true);
+                    }
+                }
+                Some(crate::hybrid_stage::StagedTake::Miss) | None => {
+                    if let Some(arena) = self.stage.as_mut() {
+                        arena.stats.misses += 1;
+                    }
+                    demand_ranks.push(rank);
+                }
+            }
+        }
+        if let Some(arena) = self.stage.as_mut() {
+            arena.record_route(staged_hits, calls.len());
+        }
+
+        // Demand-load only what is missing. Each miss is read exactly once, into
+        // its own transient slot, using the established materialize path so the
+        // arithmetic and bytes are identical to a run with staging off.
+        for &rank in &demand_ranks {
+            let call = &calls[rank];
+            let expert = call.expert as usize;
+            let was_staged = mats[rank].is_some();
+            let fetch = self.issue_demand_expert(call.layer, expert, d_model, d_hidden)?;
+            mats[rank] = Some(self.collect_demand_expert(fetch, (call.layer, rank))?);
+            EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(arena) = self.stage.as_mut() {
+                arena.record_demand(call.layer as usize, was_staged, stride);
+            }
+        }
+
+        let mut out = Vec::with_capacity(mats.len());
+        for entry in mats {
+            match entry {
+                Some(m) => out.push(m),
+                // Every rank is filled by either the staged or the demand path,
+                // so a hole means an expert would be silently dropped.
+                None => {
+                    return Err(format!(
+                        "staged route left rank unfilled on layer {layer}; refusing to \
+                         compute a partial layer"
+                    ))
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// The I/O plan for `(layer, expert)`, cached across calls.
     ///
     /// A checkpoint's expert layout is immutable for the process lifetime, so
@@ -11186,11 +14045,7 @@ impl MlxLocalExpertSource {
         Ok(plan)
     }
 
-    fn issue_plan(
-        &self,
-        plan: &MlxExpertIoPlan,
-        speculative: bool,
-    ) -> Option<(i32, i64)> {
+    fn issue_plan(&self, plan: &MlxExpertIoPlan, speculative: bool) -> Option<(i32, i64)> {
         if !self.metalio {
             return None;
         }
@@ -11222,6 +14077,19 @@ impl MlxLocalExpertSource {
     /// slot's, so the caller materializes fresh. Geometry is fixed per layer, so a
     /// mismatch means the plan changed underneath the slot.
     fn refill_plan_into(slot: &mut [Wt; 3], plan: &MlxExpertIoPlan, raw: &[u8]) -> bool {
+        // An arena-backed expert needs no refill: its bytes are the MetalIO
+        // destination and are already correct for this route slot. Returning
+        // early keeps it out of the copy machinery below, which would otherwise
+        // fall through to `materialize_plan` and silently restore exactly the
+        // copies EXP-067 exists to delete.
+        if slot.iter().any(|w| {
+            matches!(
+                w.bytes.as_ref(),
+                Some(WtBytes::MlxAffine { weights, .. }) if weights.is_arena()
+            )
+        }) {
+            return true;
+        }
         for (dst, matrix) in slot.iter_mut().zip(plan.matrices.iter()) {
             if dst.o != matrix.output || dst.i != matrix.input {
                 return false;
@@ -11262,10 +14130,25 @@ impl MlxLocalExpertSource {
                     {
                         return false;
                     }
+                    // An arena-backed expert owns no writable vectors: its bytes
+                    // are the MetalIO destination itself, so there is nothing to
+                    // refill and the caller must materialize (a fresh arena view)
+                    // instead. Declining here is what keeps the streaming path
+                    // out of this in-place-copy machinery.
+                    let (Some(weights), Some(scales), Some(biases)) = (
+                        weights.as_mut_slice(),
+                        scales.as_mut_slice(),
+                        biases.as_mut_slice(),
+                    ) else {
+                        return false;
+                    };
                     weights.copy_from_slice(w);
                     scales.copy_from_slice(sc);
                     biases.copy_from_slice(bi);
                     if let Some(existing) = metal_aux.get_mut() {
+                        let Some(existing) = existing.as_mut_slice() else {
+                            return false;
+                        };
                         if existing.len() != sc.len() + bi.len() {
                             return false;
                         }
@@ -11273,7 +14156,12 @@ impl MlxLocalExpertSource {
                         existing[sc.len()..].copy_from_slice(bi);
                     }
                 }
-                (Some(WtBytes::Mxfp4 { weights, scales, .. }), MlxExpertStorage::Mxfp4) => {
+                (
+                    Some(WtBytes::Mxfp4 {
+                        weights, scales, ..
+                    }),
+                    MlxExpertStorage::Mxfp4,
+                ) => {
                     if weights.len() != w.len() || scales.len() != sc.len() {
                         return false;
                     }
@@ -11313,9 +14201,9 @@ impl MlxLocalExpertSource {
                         .ok_or_else(|| "MetalIO MLX biases outside slot".to_string())?
                         .to_vec();
                     WtBytes::MlxAffine {
-                        weights,
-                        scales,
-                        biases,
+                        weights: Bytes::Owned(weights),
+                        scales: Bytes::Owned(scales),
+                        biases: Bytes::Owned(biases),
                         bits,
                         group_size,
                         aux_fp16,
@@ -11581,6 +14469,70 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
         self.metalio
     }
 
+    fn supports_staging(&self) -> bool {
+        self.metalio && self.stage_config.enabled && !self.stage_failed
+    }
+
+    fn stage_begin_request(&mut self) {
+        if let Some(arena) = self.stage.as_mut() {
+            arena.begin_request();
+        }
+    }
+
+    fn stage_begin_token(&mut self) {
+        if let Some(arena) = self.stage.as_mut() {
+            arena.begin_token();
+        }
+    }
+
+    fn stage_release_layer(&mut self, layer: u32) {
+        // The consume path already freed each consumed expert's slot for this
+        // generation; nothing further is required here. Kept as an explicit hook
+        // because the caller must not refill a layer's row before its compute has
+        // finished reading those bytes, and stating that at the call site is what
+        // makes the ordering reviewable.
+        let _ = layer;
+    }
+
+    fn stage_route(
+        &mut self,
+        layer: u32,
+        experts: &[u32],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> usize {
+        self.stage_route_reads(layer, experts, d_model, d_hidden)
+    }
+
+    fn stage_summary(&self) -> Option<String> {
+        let arena = self.stage.as_ref()?;
+        let s = &arena.stats;
+        Some(format!(
+            "hybrid-stage arm={} M={} hits={} late={} misses={} demand_reads={} \
+             duplicate_reads={} stale_rejected={} unplaced={} staged_mib={:.1} \
+             consumed_mib={:.1} demand_mib={:.1} wasted_mib={:.1} efficiency={:.3} \
+             recall={:.4} full_route_coverage={:.4} route_layers={} peak_outstanding={}",
+            self.stage_config.arm.name(),
+            arena.candidates(),
+            s.hits,
+            s.late,
+            s.misses,
+            s.demand_reads,
+            s.duplicate_reads,
+            s.stale_rejected,
+            s.unplaced,
+            s.staged_bytes as f64 / (1024.0 * 1024.0),
+            s.consumed_bytes as f64 / (1024.0 * 1024.0),
+            s.demand_bytes as f64 / (1024.0 * 1024.0),
+            s.wasted_bytes() as f64 / (1024.0 * 1024.0),
+            s.efficiency(),
+            s.candidate_recall(),
+            s.full_route_coverage(),
+            s.route_layers,
+            crate::ffi::mio_stats().peak_outstanding,
+        ))
+    }
+
     fn prefetch(
         &mut self,
         layer: u32,
@@ -11641,42 +14593,222 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
         } else {
             self.io_concurrency.clamp(1, calls.len().max(1))
         };
-        let mut fetches: Vec<DemandFetch> = Vec::with_capacity(calls.len());
-        for call in calls.iter().take(limit) {
-            let expert = call.expert as usize;
-            fetches.push(
-                self.issue_demand_expert(call.layer, expert, d_model, d_hidden)
-                    .map_err(crate::pool::PoolError::from)?,
-            );
+        // EXP-067: when the streaming arena serves this route it replaces the
+        // whole fetch phase — every expert read lands in the memory its matrices
+        // already read, so nothing is copied out of a slot afterwards. The
+        // decision must precede the pre-issue loop, because that loop would
+        // otherwise submit the same eight reads into transient slots first.
+        //
+        // Only a full-width concurrent decode route qualifies. A capped in-flight
+        // count, or a batched-prefill shape whose call count is `rows x topk`,
+        // keeps the established path — the same decode-shape bound the `wt_pool`
+        // already uses, and the reason the arena needs no per-row slot mapping.
+        // EXP-069: when the packed retention cache is enabled it owns the fetch
+        // phase for qualified decode routes, because it is the copy that
+        // survives — the arena must not read the retained ranks again. Both
+        // mechanisms need the same full-width concurrent decode shape.
+        //
+        // `LOGAN_ROUTE_CACHE=0` (the default) leaves every path below untouched.
+        let decode_shape = calls.len() > 1
+            && calls.len() <= self.pool_rank_cap
+            && limit >= calls.len()
+            && self.metalio;
+        if decode_shape && self.route_cache_blocks > 0 {
+            match self.cache_fetch_route(calls, d_model, d_hidden) {
+                Ok(Some(mats)) => {
+                    EXPERT_CALLS
+                        .fetch_add(calls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    return self.eval_moe_compute(mats, calls, d_model, d_hidden);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // A failed cache route retires the cache permanently so a
+                    // later route cannot be a silent blend of cache and arena.
+                    self.route_cache = None;
+                    self.route_cache_blocks = 0;
+                    return Err(crate::pool::PoolError::from(e));
+                }
+            }
         }
 
-        // Phase 1 — demand fetch. Issue/collect order and concurrency are
-        // UNCHANGED from the established path (`io_concurrency` still governs
-        // how many reads are in flight); the difference is that the
-        // materialized matrices are retained rather than consumed immediately,
-        // because the compute phase below needs them all at once to batch.
+        // Hybrid next-token staging owns the fetch phase when it is active. It
+        // must come before the route arena because both address the same bytes:
+        // letting the arena serve this route is exactly the duplicate read the
+        // staging design exists to remove. Staging is opt-in per mode, so no
+        // other mode reaches here.
+        if decode_shape && self.stage.is_some() {
+            match self.stage_fetch_route(calls, d_model, d_hidden) {
+                Ok(Some(mats)) => {
+                    EXPERT_CALLS
+                        .fetch_add(calls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    return self.eval_moe_compute(mats, calls, d_model, d_hidden);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Terminal for staging: a partially staged route must never
+                    // blend with the arena, because the two would disagree about
+                    // which bytes belong to which slot.
+                    self.stage = None;
+                    self.stage_failed = true;
+                    return Err(crate::pool::PoolError::from(e));
+                }
+            }
+        }
+
+        let arena_eligible = calls.len() > 1
+            && calls.len() <= self.pool_rank_cap
+            && limit >= calls.len()
+            && self.route_arena_ensure(d_model, d_hidden);
+        let mut arena_used = false;
+
+        let mut fetches: Vec<DemandFetch> =
+            Vec::with_capacity(if arena_eligible { 0 } else { calls.len() });
+        if !arena_eligible {
+            for call in calls.iter().take(limit) {
+                let expert = call.expert as usize;
+                fetches.push(
+                    self.issue_demand_expert(call.layer, expert, d_model, d_hidden)
+                        .map_err(crate::pool::PoolError::from)?,
+                );
+            }
+        }
+
         let mut mats_all: Vec<[Wt; 3]> = Vec::with_capacity(calls.len());
-        for (index, call) in calls.iter().enumerate() {
-            let fetch = if index < fetches.len() {
-                std::mem::replace(&mut fetches[index], DemandFetch::NotIssued)
-            } else {
-                // Beyond the in-flight cap: issue now, then collect immediately
-                // so at most `limit` reads are ever outstanding.
-                self.issue_demand_expert(
-                    call.layer,
-                    call.expert as usize,
-                    d_model,
-                    d_hidden,
-                )
-                .map_err(crate::pool::PoolError::from)?
-            };
-            mats_all.push(
-                self.collect_demand_expert(fetch, (call.layer, index))
-                    .map_err(crate::pool::PoolError::from)?,
-            );
-            EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if arena_eligible {
+            match self.arena_fetch_all(calls, d_model, d_hidden) {
+                Ok(mats) => {
+                    EXPERT_CALLS
+                        .fetch_add(calls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    mats_all = mats;
+                    arena_used = true;
+                }
+                Err(_) => {
+                    // Any arena failure is terminal for this source. Some failures
+                    // happen before submission (layout/path/file lookup), so
+                    // `arena_fetch_all` cannot be relied on to have torn the arena
+                    // down itself. Drop it here before the established fallback
+                    // path creates owned matrices.
+                    self.route_arena = None;
+                    self.arena_enabled = false;
+                    for call in calls.iter() {
+                        let expert = call.expert as usize;
+                        let fetch = self
+                            .issue_demand_expert(call.layer, expert, d_model, d_hidden)
+                            .map_err(crate::pool::PoolError::from)?;
+                        mats_all.push(
+                            self.collect_demand_expert(fetch, (call.layer, mats_all.len()))
+                                .map_err(crate::pool::PoolError::from)?,
+                        );
+                        EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        } else {
+            for (index, call) in calls.iter().enumerate() {
+                let fetch = if index < fetches.len() {
+                    std::mem::replace(&mut fetches[index], DemandFetch::NotIssued)
+                } else {
+                    // Beyond the in-flight cap: issue now, then collect immediately
+                    // so at most `limit` reads are ever outstanding.
+                    self.issue_demand_expert(call.layer, call.expert as usize, d_model, d_hidden)
+                        .map_err(crate::pool::PoolError::from)?
+                };
+                mats_all.push(
+                    self.collect_demand_expert(fetch, (call.layer, index))
+                        .map_err(crate::pool::PoolError::from)?,
+                );
+                EXPERT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
+        return self.eval_moe_compute(mats_all, calls, d_model, d_hidden);
+    }
+}
+
+impl MlxLocalExpertSource {
+    /// EXP-068/EXP-069 compute phase, shared by every fetch mechanism.
+    ///
+    /// Extracted so the packed retention cache (EXP-069) and the streaming arena
+    /// (EXP-067) reach the identical arithmetic; only the fetch differs. Keeping
+    /// one copy is what makes "the cache changed nothing but the I/O" a property
+    /// of the code rather than a claim about two similar blocks.
+    /// True when a materialized expert's bytes are a view into the streaming
+    /// arena (and therefore must be returned to it).
+    fn mats_are_arena(m: &[Wt; 3]) -> bool {
+        m.iter().any(|w| {
+            matches!(
+                w.bytes.as_ref(),
+                Some(WtBytes::MlxAffine { weights, .. }) if weights.is_arena()
+            )
+        })
+    }
+
+    /// True when a materialized expert's bytes are owned by the retention cache.
+    fn mats_are_cache_held(m: &[Wt; 3]) -> bool {
+        m.iter().any(|w| {
+            matches!(
+                w.bytes.as_ref(),
+                Some(WtBytes::MlxAffine { weights, .. }) if weights.is_cache_held()
+            )
+        })
+    }
+
+    /// True when a materialized expert's bytes are a view into the hybrid
+    /// staging arena. Such a view must be dropped, never stored: the arena's row
+    /// is refilled at the next token, so anything holding the view past this
+    /// token would describe bytes that have been replaced.
+    fn mats_are_staged(m: &[Wt; 3]) -> bool {
+        m.iter().any(|w| {
+            matches!(
+                w.bytes.as_ref(),
+                Some(WtBytes::MlxAffine { weights, .. }) if weights.is_staged()
+            )
+        })
+    }
+
+    fn eval_moe_compute(
+        &mut self,
+        mut mats_all: Vec<[Wt; 3]>,
+        calls: &[crate::pool::ExpertCall],
+        d_model: usize,
+        d_hidden: usize,
+    ) -> Result<Vec<Vec<f32>>, crate::pool::PoolError> {
+        // Cache-held views (EXP-069) belong to the retention cache, not to the
+        // arena and not to `wt_pool`. They must be dropped at the end of this
+        // call: `wt_pool` would outlive the cache generation, and putting one
+        // into an arena route slot would make a later `arena_fetch_all` hand the
+        // kernel a cache block where it expects a freshly loaded arena expert.
+        // Such a route owns no view at all, so it has nothing to write back.
+        let cache_held = mats_all.iter().any(|m| {
+            m.iter().any(|w| {
+                matches!(
+                    w.bytes.as_ref(),
+                    Some(WtBytes::MlxAffine { weights, .. }) if weights.is_cache_held()
+                )
+            })
+        });
+        // A staged view belongs to the staging arena's row, which is refilled at
+        // the next token. Putting one into `wt_pool` would keep a tensor alive
+        // past the bytes it describes; returning one to the route arena would
+        // hand the arena a block it does not own. Staged matrices are dropped.
+        let staged_used = mats_all.iter().any(|m| {
+            m.iter().any(|w| {
+                matches!(
+                    w.bytes.as_ref(),
+                    Some(WtBytes::MlxAffine { weights, .. }) if weights.is_staged()
+                )
+            })
+        });
+        let _ = staged_used;
+        let arena_used = !cache_held
+            && mats_all.iter().any(|m| {
+                m.iter().any(|w| {
+                    matches!(
+                        w.bytes.as_ref(),
+                        Some(WtBytes::MlxAffine { weights, .. }) if weights.is_arena()
+                    )
+                })
+            });
         // Compute phase — batched projections.
         //
         // Every routed expert in a layer consumes the SAME token activation, so
@@ -11782,56 +14914,89 @@ impl crate::pool::ExpertSource for MlxLocalExpertSource {
         let mut hiddens: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_hidden]).collect();
         let mut down_outs: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0_f32; d_model]).collect();
 
-        let mut batched = batch_enabled
-            && shared_input
-            && k > 1
-            && batch_role(&mut gate_outs, &mats_all, 0, &calls[0].input, None, BATCH_CAP)
-            && batch_role(&mut hiddens, &mats_all, 1, &calls[0].input, None, BATCH_CAP);
-        if !batched {
-            for (i, call) in calls.iter().enumerate() {
-                matmul(&mut gate_outs[i], &call.input, &mats_all[i][0]);
-                matmul(&mut hiddens[i], &call.input, &mats_all[i][1]);
+        // EXP-068: one command buffer per layer instead of three. `LOGAN_MOE_ISLAND=0`
+        // keeps the established gate/up/down shape in the same binary, so an A/B
+        // varies only this mechanism, not codegen.
+        let island_enabled = std::env::var("LOGAN_MOE_ISLAND")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        let mut computed = false;
+        // `batch_enabled` is respected so `LOGAN_EXPERT_BATCH_GATEUP=0` still
+        // restores the per-matrix dispatch shape it exists to A/B; otherwise the
+        // island (default ON) would silently override it.
+        if island_enabled && batch_enabled && shared_input && k > 1 {
+            if let Some(outs) =
+                matmul_mlx_affine_route(&mats_all, &calls[0].input, d_model, d_hidden)
+            {
+                if outs.len() == k {
+                    down_outs = outs;
+                    computed = true;
+                }
             }
         }
-        for i in 0..k {
-            for index in 0..d_hidden {
-                hiddens[i][index] *= silu(gate_outs[i][index]);
+
+        if !computed {
+            let mut batched = batch_enabled
+                && shared_input
+                && k > 1
+                && batch_role(
+                    &mut gate_outs,
+                    &mats_all,
+                    0,
+                    &calls[0].input,
+                    None,
+                    BATCH_CAP,
+                )
+                && batch_role(&mut hiddens, &mats_all, 1, &calls[0].input, None, BATCH_CAP);
+            if !batched {
+                for (i, call) in calls.iter().enumerate() {
+                    matmul(&mut gate_outs[i], &call.input, &mats_all[i][0]);
+                    matmul(&mut hiddens[i], &call.input, &mats_all[i][1]);
+                }
             }
-        }
-        // Phase 2: the downs, now that every SwiGLU output is live.
-        if batched {
-            batched = batch_role(&mut down_outs, &mats_all, 2, &[], Some(&hiddens), BATCH_CAP);
-        }
-        if !batched {
             for i in 0..k {
-                matmul(&mut down_outs[i], &hiddens[i], &mats_all[i][2]);
+                for index in 0..d_hidden {
+                    hiddens[i][index] *= silu(gate_outs[i][index]);
+                }
             }
+            // Phase 2: the downs, now that every SwiGLU output is live.
+            if batched {
+                batched = batch_role(&mut down_outs, &mats_all, 2, &[], Some(&hiddens), BATCH_CAP);
+            }
+            if !batched {
+                for i in 0..k {
+                    matmul(&mut down_outs[i], &hiddens[i], &mats_all[i][2]);
+                }
+            }
+        } else {
+            ISLAND_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         EXPERT_COMPUTE_NS.fetch_add(
             compute_t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        // Put the materialized matrices back into the per-slot pool so the next
-        // token reuses their Metal buffers and tensor objects instead of creating
-        // them again (540 MiB of buffer objects per token otherwise).
-        //
-        // Keyed by `(layer, route index)` to match the take side exactly; using the
-        // expert id here would never match and the pool would read as a false
-        // negative. The pool is hard-bounded by layers x topk (320 entries), so
-        // there is no unbounded growth.
-        // Bound the pool by construction. In decode `calls.len()` is one per rank
-        // (topk), so keys stay under `layers x topk`; a batched-prefill call site
-        // builds one entry per (row, rank), which would make `(layer, i)` keys
-        // proliferate and the pool grow without bound. Skipping the pool for any
-        // non-decode-shaped batch keeps it hard-capped at 320 entries (~540 MB)
-        // while leaving prefill on the established fresh-materialize path.
-        if self.wt_pool_on && self.pool_rank_cap > 0 && calls.len() <= self.pool_rank_cap {
-            for (i, m) in mats_all.into_iter().enumerate() {
-                if let Some(call) = calls.get(i) {
-                    self.wt_pool.insert((call.layer, i), m);
-                }
+        // Write-back is dispatched PER MATRIX, not per route. A partial cache
+        // route legitimately mixes cache-held views (ranks 0..retain) with arena
+        // views (the streamed tail), and the two must go to different places:
+        // the arena tail has to be returned or the next token's
+        // `take_arena_expert` finds an empty slot and the arena tears down, while
+        // a cache-held view must go back to neither store. `_ = cache_held` is
+        // intentionally unused here; the decision is made per matrix below.
+        let _ = cache_held;
+        let _ = arena_used;
+        for (i, m) in mats_all.into_iter().enumerate() {
+            let layer = calls.get(i).map(|c| c.layer).unwrap_or(0);
+            if Self::mats_are_arena(&m) {
+                self.return_arena_expert(layer, i, m);
+            } else if Self::mats_are_cache_held(&m) || Self::mats_are_staged(&m) {
+                // Owned by the retention cache or the staging arena; dropping is
+                // correct for both, and required for staging (its row is
+                // refilled at the next token, so the view must not outlive it).
+            } else if self.wt_pool_on && self.pool_rank_cap > 0 && calls.len() <= self.pool_rank_cap
+            {
+                self.wt_pool.insert((layer, i), m);
+                WT_POOL_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            WT_POOL_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(down_outs)
     }
@@ -11856,6 +15021,47 @@ static EXPERT_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static EXPERT_MATERIALIZE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXPERT_PLAN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXPERT_PLAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// EXP-068: routed-MoE layers served by the single-command-buffer island.
+static ISLAND_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// EXP-071 attention island gate. Default OFF: the island is numerically exact
+/// but measured ~80x slower than the host walk (see EXP-071), and enabling it
+/// also changes KV allocation/registration, so one flag must control both.
+fn island_enabled() -> bool {
+    std::env::var("LOGAN_ATTN_ISLAND")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// EXP-069 retention-cache activity, process-cumulative like the other
+/// counters. Kept global because the profile printer lives on `Model`, which
+/// does not own the expert source.
+static RC_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RC_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RC_EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RC_STRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (hits, misses, evictions, bytes_saved_mib, retained_occurrences, stride).
+pub fn route_cache_stats() -> (u64, u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let hits = RC_HITS.load(Relaxed);
+    let misses = RC_MISSES.load(Relaxed);
+    let stride = RC_STRIDE.load(Relaxed);
+    (
+        hits,
+        misses,
+        RC_EVICTIONS.load(Relaxed),
+        hits.saturating_mul(stride) / (1024 * 1024),
+        hits + misses,
+        stride,
+    )
+}
+/// EXP-068: host-side cost of the island (wait for the single event + copy the
+/// K expert vectors + split into owned rows), i.e. exactly the term a GPU-side
+/// weighted reduction would remove.
+static ISLAND_HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The share of the island's host cost that a GPU-side weighted reduction could
+/// actually remove: splitting the K returned vectors into owned rows.
+static ISLAND_COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cumulative-counter snapshot taken at the decode boundary.
 ///
@@ -11873,6 +15079,10 @@ pub(crate) struct DecodeBaseline {
     affine_fallback: u64,
     /// (plan_ns, submit_ns, wait_ns, materialize_ns, plan_hits, plan_misses).
     expert_load_parts: (u64, u64, u64, u64, u64, u64),
+    /// EXP-068: routed-MoE layers served by the fused command-buffer island.
+    island_calls: u64,
+    island_host_ns: u64,
+    island_copy_ns: u64,
     mio: logan_metal::ColiMetalioStats,
     /// (encode, submit, wait, kernel, fused_calls, fused_experts) — the Metal
     /// direct-path profile tuple, process-cumulative like the rest.
@@ -11940,6 +15150,39 @@ impl Model {
         // as compiled COLI packages. Initialization is idempotent and non-macOS
         // builds simply decline, preserving the CPU fallback contract.
         crate::ffi::metal_init();
+        let route_mode = RouteMode::from_env();
+        // Snapshotted here, not read per layer: two models in one process must be
+        // able to run different fusion arms (same reason `route_native_k` is
+        // captured), and a per-call read would make one model's behaviour change
+        // when the other's env is edited.
+        let route_mode_config = hybrid_stage::StageConfig::from_env();
+        match route_mode {
+            RouteMode::Native => {}
+            RouteMode::Edge0 => eprintln!(
+                "logan route-mode: edge0 (pretrained cross-token prerouter authoritative on                  warmed consumer layers 7..38; native K4 fallback on cold/lower/final layers)"
+            ),
+            RouteMode::Shadow => eprintln!(
+                "logan route-mode: shadow (native router executes; RouteScout predictor is observed)"
+            ),
+            RouteMode::Authoritative => eprintln!(
+                "logan route-mode: authoritative (RouteScout predictor replaces native routed experts)"
+            ),
+            RouteMode::NativeTruncated => eprintln!(
+                "logan route-mode: native-truncated (native gate executes with QWEN_ROUTE_NATIVE_K)"
+            ),
+            RouteMode::Hybrid => {
+                let stage = hybrid_stage::StageConfig::from_env();
+                eprintln!(
+                    "logan route-mode: hybrid (native K4 is the executed route; edge0 + routescout \
+                     only stage next-token bytes: fusion={} M={} w_edge0={:.2} w_rs={:.2} stage={})",
+                    stage.arm.name(),
+                    stage.candidates,
+                    stage.w_edge0,
+                    stage.w_routescout,
+                    stage.enabled
+                );
+            }
+        }
         // Experts come from the pool when it is configured. Reading them
         // locally is not an option for this model (483 GB as f32), so the
         // choice is "delegate" or "cannot run" -- not a preference.
@@ -11962,7 +15205,11 @@ impl Model {
         let streamed_mlx_experts = mlx_switch_layout && pool.is_none();
         let local_mlx_expert_source: Option<Box<dyn crate::pool::ExpertSource>> =
             if streamed_mlx_experts {
-                Some(Box::new(MlxLocalExpertSource::new(st.clone(), cfg.experts, cfg.topk)?))
+                Some(Box::new(MlxLocalExpertSource::new(
+                    st.clone(),
+                    cfg.experts,
+                    cfg.topk,
+                )?))
             } else {
                 None
             };
@@ -11996,6 +15243,16 @@ impl Model {
             }
         }
         let cfg = &cfg;
+        let edge0_router = if route_mode.needs_edge0() {
+            let path = edge0_router::Edge0Router::resolve_weights_path(st)?;
+            eprintln!(
+                "logan edge0: loading pretrained prerouter {}",
+                path.display()
+            );
+            Some(edge0_router::Edge0Router::load(&path, cfg)?)
+        } else {
+            None
+        };
         // PLE metadata read from the checkpoint's own i64 side-tables, when it
         // ships them (it does). The config-derived prime math diverges on the
         // real model, so these override the derived values when present.
@@ -12583,7 +15840,7 @@ impl Model {
             }
         }
 
-        Ok(Model {
+        let mut model = Model {
             cfg: cfg.clone(),
             pool,
             // Raw MLX switch-expert checkpoints install a local file-backed
@@ -12685,9 +15942,9 @@ impl Model {
                 .iter()
                 .map(|&is_gdn| {
                     if is_gdn {
-                        Vec::new()
+                        KvCache::new(0)
                     } else {
-                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                        KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim)
                     }
                 })
                 .collect(),
@@ -12696,9 +15953,9 @@ impl Model {
                 .iter()
                 .map(|&is_gdn| {
                     if is_gdn {
-                        Vec::new()
+                        KvCache::new(0)
                     } else {
-                        lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                        KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim)
                     }
                 })
                 .collect(),
@@ -12735,9 +15992,7 @@ impl Model {
             route_spatial_pairs: vec![0; cfg.layers],
             route_spatial_top1_hits: vec![0; cfg.layers],
             route_spatial_top1_total: vec![0; cfg.layers],
-            route_predictor: if env_flag("QWEN_ROUTE_PREDICT")
-                || env_flag("QWEN_ROUTE_PREDICT_PREFETCH")
-            {
+            route_predictor: if route_mode.needs_routescout() {
                 Some(route_predictor::RoutePredictor::new(
                     cfg.layers,
                     cfg.experts,
@@ -12745,7 +16000,25 @@ impl Model {
             } else {
                 None
             },
+            edge0_router,
+            edge0_train_trace: edge0_train_trace::TraceCollector::from_env(
+                cfg.layers,
+                cfg.hidden,
+                cfg.experts,
+            )?,
             route_predict_prefetch: env_flag("QWEN_ROUTE_PREDICT_PREFETCH"),
+            route_native_prev: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            route_mode,
+            route_native_k: native_k().unwrap_or(0),
+            hybrid_stage_config: route_mode_config,
+            hybrid_edge0_ranked: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            in_prefill: false,
+            route_authoritative_k: std::env::var("QWEN_ROUTE_AUTHORITATIVE_K")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            route_agreement: RouteAgreement::default(),
+            route_layer_error: LayerRouteError::default(),
             metal_model_id: next_metal_model_id(),
             // safetensors mode: no package profile, so the Apple8 direct path
             // never applies (C parity: direct requires the Apple8 target
@@ -12768,8 +16041,35 @@ impl Model {
             sched_mode: false,
             sched_blocked: None,
             sched_pause: None,
-        })
+        };
+        // EXP-071: the full-attention island needs the KV caches to be
+        // registered slabs so `resolve()` can alias them with no per-call
+        // wrapper creation. Registration is idempotent and only covers pages
+        // the model owns for its lifetime.
+        model.register_kv_caches();
+        Ok(model)
     }
+
+    /// Register every dense layer's K/V cache for the attention island, and
+    /// remember whether each layer qualified. A layer whose caches cannot be
+    /// registered simply keeps the host attention path.
+    fn register_kv_caches(&mut self) {
+        for li in 0..self.cfg.layers {
+            if self.cfg.gdn_layers[li] {
+                continue;
+            }
+            let (k, v) = (&self.kv_k[li], &self.kv_v[li]);
+            if k.registered_bytes() == 0 || v.registered_bytes() == 0 {
+                continue;
+            }
+            // Page-rounded length: `newBufferWithBytesNoCopy` rejects anything
+            // that is not a whole number of pages, so registering `len * 4`
+            // would silently decline for any context not a multiple of 8.
+            crate::ffi::metal_register(k.base(), k.registered_bytes());
+            crate::ffi::metal_register(v.base(), v.registered_bytes());
+        }
+    }
+
     /// Snapshot the current causal state for the given prefix length.
     pub fn snapshot_state(&self, prefix_len: usize) -> Result<QwenSnapshot, String> {
         let digest = crate::plan::prefix_cache::live_prefix_state_digest(self, prefix_len)?;
@@ -13054,7 +16354,7 @@ pub fn attach_mtp_from_dir(model: &mut Model, dir: &Path, cfg: &Cfg) -> Result<(
     //
     // The drafter runs plain full attention, so its KV buffers are real (not the
     // empty vectors a GDN layer gets).
-    let kv_bytes = || crate::lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim);
+    let kv_bytes = || KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim);
 
     model.layers.push(layer);
     model.experts.push(experts);
@@ -13271,10 +16571,147 @@ pub fn run_greedy_with(
 mod tests {
     use super::{
         causal_conv1d_sample, default_cache_cap_for_ram, gdn_metal_weight_view, graded_selection,
-        is_ple_ngram_weight, load_cfg, load_mlp_residual_norm, load_wt, matmul, ple_conv_state_len,
-        quantize_bf16_to_mxfp4, rmsnorm_row, rmsnorm_row_shifted, silu, MlxLocalExpertSource,
-        OutputGate, StFile, Wt, WtBytes, MAX_RESIDENT_PLE_NGRAM_BYTES,
+        is_ple_ngram_weight, load_cfg, load_mlp_residual_norm, load_wt, materialize_plan_arena,
+        matmul, ple_conv_state_len, quantize_bf16_to_mxfp4, rmsnorm_row, rmsnorm_row_shifted,
+        route_authoritative_stability_bias, silu, ArenaBuf, Bytes, MlxExpertIoPlan,
+        MlxExpertStorage, MlxLocalExpertSource, MlxMatrixIoPlan, OutputGate, StFile, Wt, WtBytes,
+        ARENA_ALIGN, MAX_RESIDENT_PLE_NGRAM_BYTES,
     };
+
+    /// Authoritative routing must produce a *full-width* route.
+    ///
+    /// This is the property the advisory that rewrote the first design caught:
+    /// if the authoritative route were narrower than the native one, the
+    /// experiment would move bytes/token and quality at the same time and could
+    /// not attribute a decode speedup to route predictability. Top-k of the
+    /// fused score must therefore reach exactly `k` experts once the tables have
+    /// evidence, and a previous-route expert must be able to *enter* a route at
+    /// `k == previous.len()` rather than being crowded out by a forced warm set.
+    #[test]
+    fn authoritative_route_is_full_width_and_lets_predictions_enter() {
+        let mut p = crate::route_predictor::RoutePredictor::new(1, 8);
+        // Train a clear temporal transition [0,1] -> [2,3,...,7] so five cold
+        // arrivals have strong evidence.
+        for _ in 0..8 {
+            p.observe(0, &[0, 1], &[], &[2, 3, 4, 5, 6, 7]);
+        }
+        let prev = [0usize, 1];
+        let route = p.authoritative_route(0, &prev, &[], 4, 0.0, &[], 0.0);
+        let experts: Vec<usize> = route.iter().map(|&(e, _)| e).collect();
+        assert_eq!(
+            experts.len(),
+            4,
+            "an authoritative route must be exactly k wide, else bytes/token move too"
+        );
+        // The arrivals must be present: with cap == prev.len() + 2 and no
+        // previous-route exclusion, the old warm-set-first ordering would have
+        // returned exactly [0,1] and measured static routing instead.
+        assert!(
+            experts.iter().any(|e| !prev.contains(e)),
+            "a predicted arrival must be able to enter a route of width k: got {experts:?}"
+        );
+    }
+
+    #[test]
+    fn authoritative_route_declines_at_cold_start() {
+        // No observations: the engine must fall back to the native router rather
+        // than execute an arbitrary expert set.
+        let mut p = crate::route_predictor::RoutePredictor::new(1, 8);
+        assert!(p
+            .authoritative_route(0, &[0, 1], &[], 4, 0.0, &[], 0.0)
+            .is_empty());
+    }
+
+    #[test]
+    fn stability_bias_changes_selection_and_promotes_the_previous_route() {
+        let mut p = crate::route_predictor::RoutePredictor::new(1, 8);
+        // Evidence that strongly favours cold arrivals over the previous route.
+        for _ in 0..8 {
+            p.observe(0, &[0, 1], &[], &[2, 3, 4, 5]);
+        }
+        let prev = [0usize, 1];
+        let unbiased: Vec<usize> = p
+            .authoritative_route(0, &prev, &[], 4, 0.0, &[], 0.0)
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect();
+        let biased: Vec<usize> = p
+            .authoritative_route(0, &prev, &[], 4, 0.0, &prev, 4.0)
+            .into_iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_ne!(
+            unbiased, biased,
+            "a large stability bias must change the route, else the knob is inert"
+        );
+        assert!(
+            !unbiased.iter().take(2).all(|e| prev.contains(e)),
+            "without bias the strong arrival evidence must displace the residents"
+        );
+        // A large bias promotes the previous route to the top of the ranking but
+        // does NOT empty the route of arrivals: the remaining slots still fill
+        // from the fused score. That asymmetry is the point — the bias orders
+        // residents first, it does not make the predictor irrelevant.
+        assert_eq!(
+            biased.iter().take(prev.len()).copied().collect::<Vec<_>>(),
+            prev.to_vec(),
+            "a large stability bias must rank the previous route first"
+        );
+        assert!(
+            biased.iter().any(|e| !prev.contains(e)),
+            "the bias must not reduce the route to the previous route at k > |prev|"
+        );
+    }
+
+    #[test]
+    fn authoritative_stability_default_is_the_measured_optimum() {
+        // Guards against a silent default drift: the measured optimum is at the
+        // low end of the sweep, and >=1.0 degenerates to static routing.
+        assert!((route_authoritative_stability_bias() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn route_arena_drop_unregisters_backing_pages() {
+        let buf = ArenaBuf::alloc(ARENA_ALIGN).expect("arena allocation");
+        let base = buf.base();
+        crate::ffi::metal_register(base, buf.len());
+        if !crate::ffi::metal_ptr_registered(base) {
+            // Metal is optional on non-Apple test hosts.
+            return;
+        }
+        assert!(crate::ffi::metal_ptr_registered(base));
+        drop(buf);
+        assert!(
+            !crate::ffi::metal_ptr_registered(base),
+            "dropping an arena must unregister its pointer range before freeing it"
+        );
+    }
+
+    #[test]
+    fn route_arena_rejects_noncontiguous_affine_sidecars() {
+        let matrix = MlxMatrixIoPlan {
+            output: 1,
+            input: 64,
+            weights: 0..32,
+            scales: 32..34,
+            biases: Some(48..50),
+            storage: MlxExpertStorage::Affine {
+                bits: 4,
+                group_size: 64,
+                aux_fp16: false,
+            },
+        };
+        let plan = MlxExpertIoPlan {
+            matrices: [matrix.clone(), matrix.clone(), matrix],
+            regions: Vec::new(),
+            used_bytes: 64,
+        };
+        let buf = ArenaBuf::alloc(ARENA_ALIGN).expect("arena allocation");
+        let err = materialize_plan_arena(&plan, &buf, 0)
+            .err()
+            .expect("non-contiguous sidecars must decline RouteArena");
+        assert!(err.contains("contiguous affine scales+biases"), "{err}");
+    }
 
     #[test]
     fn graded_budget_reads_a_lone_leader_alone() {
@@ -13552,9 +16989,9 @@ mod tests {
         let w = Wt {
             f: vec![],
             bytes: Some(WtBytes::MlxAffine {
-                weights: vec![0_u8; 2 * 128 * 6 / 8],
-                scales: scales.clone(),
-                biases: biases.clone(),
+                weights: Bytes::Owned(vec![0_u8; 2 * 128 * 6 / 8]),
+                scales: Bytes::Owned(scales.clone()),
+                biases: Bytes::Owned(biases.clone()),
                 bits: 6,
                 group_size: 64,
                 aux_fp16: false,
@@ -13584,9 +17021,9 @@ mod tests {
         let make = |bits: u8, group_size: usize, o: usize| Wt {
             f: vec![],
             bytes: Some(WtBytes::MlxAffine {
-                weights: vec![0; o * I * bits as usize / 8],
-                scales: (0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect(),
-                biases: (0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect(),
+                weights: Bytes::Owned(vec![0; o * I * bits as usize / 8]),
+                scales: Bytes::Owned((0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect()),
+                biases: Bytes::Owned((0..o * (I / group_size)).flat_map(|_| bf16(1.0)).collect()),
                 bits,
                 group_size,
                 aux_fp16: false,
@@ -13631,9 +17068,9 @@ mod tests {
         let w = Wt {
             f: vec![],
             bytes: Some(WtBytes::MlxAffine {
-                weights,
-                scales,
-                biases,
+                weights: Bytes::Owned(weights),
+                scales: Bytes::Owned(scales),
+                biases: Bytes::Owned(biases),
                 bits: 4,
                 group_size: GROUP,
                 aux_fp16: false,
@@ -13706,13 +17143,13 @@ mod tests {
                 let w = Wt {
                     f: vec![],
                     bytes: Some(WtBytes::MlxAffine {
-                        weights,
-                        scales,
-                        biases,
+                        weights: Bytes::Owned(weights),
+                        scales: Bytes::Owned(scales),
+                        biases: Bytes::Owned(biases),
                         bits,
                         group_size: group,
                         aux_fp16: false,
-                metal_aux: std::sync::OnceLock::new(),
+                        metal_aux: std::sync::OnceLock::new(),
                         metal_tensor: std::sync::Mutex::new(0),
                         cuda_resident: std::sync::Mutex::new(None),
                     }),
@@ -13824,11 +17261,11 @@ mod tests {
         else {
             panic!("expected native MLX affine storage");
         };
-        assert_eq!(weights, &packed);
+        assert_eq!(weights.as_slice(), packed.as_slice());
         assert_eq!(*bits, 4);
         assert_eq!(*group_size, 64);
-        assert_eq!(scales, &bf16(0.25));
-        assert_eq!(biases, &bf16(-0.5));
+        assert_eq!(scales.as_slice(), bf16(0.25).as_slice());
+        assert_eq!(biases.as_slice(), bf16(-0.5).as_slice());
         assert!(
             w.f.is_empty(),
             "native quantized load must not expand to f32"
@@ -13910,6 +17347,62 @@ mod tests {
                 .all(|&v| (v - expected).abs() <= expected.abs() * 1e-6),
             "selected expert must use expert-1 packed bytes"
         );
+
+        // Force a RouteArena pre-submit decline by giving it a template whose
+        // destination layout cannot match the real layer plan. The established
+        // fallback must still compute correctly, and the failed arena must be
+        // torn down instead of receiving the owned fallback matrices.
+        let plan = source.io_plan(0, 0, cols, rows).unwrap();
+        let topk = source.pool_rank_cap;
+        let arena_len = (plan.used_bytes * topk).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+        let buf = ArenaBuf::alloc(arena_len).unwrap();
+        let mut arena_experts = Vec::with_capacity(topk);
+        for rank in 0..topk {
+            arena_experts.push(Some(
+                materialize_plan_arena(&plan, &buf, rank * plan.used_bytes).unwrap(),
+            ));
+        }
+        let mut bad_template = plan.matrices.clone();
+        bad_template[0].weights.start += 1;
+        source.route_arena = Some(super::RouteArena {
+            bufs: vec![buf],
+            slots: vec![vec![-1; topk]],
+            experts: arena_experts,
+            expert_stride: plan.used_bytes,
+            template: bad_template,
+            topk,
+        });
+        source.arena_enabled = true;
+
+        let fallback_input = vec![1.0_f32; cols];
+        let fallback_outs = source
+            .eval(
+                &[
+                    ExpertCall {
+                        layer: 0,
+                        expert: 0,
+                        input: fallback_input.clone(),
+                    },
+                    ExpertCall {
+                        layer: 0,
+                        expert: 1,
+                        input: fallback_input,
+                    },
+                ],
+                cols,
+                rows,
+                "silu",
+            )
+            .unwrap();
+        assert!(fallback_outs[0].iter().all(|&v| v == 0.0));
+        assert!(fallback_outs[1]
+            .iter()
+            .all(|&v| (v - expected).abs() <= expected.abs() * 1e-6));
+        assert!(
+            source.route_arena.is_none() && !source.arena_enabled,
+            "a pre-submit arena decline must permanently tear down the arena before fallback"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

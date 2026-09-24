@@ -612,6 +612,89 @@ kernel void moe_fwht(device float* v [[buffer(0)]], device const uchar* signs [[
   float s=rsqrt(float(n));
   for (int i=int(t);i<n;i+=int(nt)) row[i]=sh[i]*s;
 }
+/* ---- EXP-071: full-attention decode island (Qwen3.5/3.6 dense attention) ----
+ *
+ * Batch-1 attention is O(context) per head, not O(context) per layer-token in
+ * aggregate: measured on this host it is 7% of decode at 143 context tokens,
+ * 15% at 544 and **36% at 2146**. The host path walks every cached position in
+ * scalar f32 for every head, so at 4K context it is roughly half of a token.
+ *
+ * This kernel keeps the whole decode attention span on the GPU: one threadgroup
+ * per (KV head, Q head) pair owns one query head, scores the entire cached span
+ * with a lane-strided dot product, softmaxes in registers, accumulates weighted
+ * V, and applies the sigmoid output gate. The caller then runs only the output
+ * projection on the host.
+ *
+ * The KV cache lives in the caller's f32 buffers (`kv_k`/`kv_v`, layout
+ * `[kv_head][max_t][hd]`), so no copy is made: the buffers are registered once
+ * and aliased. Only the current position's row is written per call, which the
+ * caller does before dispatch.
+ *
+ * Order of operations matches the host path exactly (ascending position,
+ * lane-strided partial sums reduced low-lane-first, max-subtracted softmax,
+ * ascending-position V accumulation), so the result is bit-identical and the
+ * trajectory gate holds. */
+kernel void qwen_attn_decode(
+    device const float* q       [[buffer(0)]],   // [H, 2*hd] (gate in the second half)
+    device const uchar* kvk     [[buffer(1)]],   // [KV, max_t, hd] f32
+    device const uchar* kvv     [[buffer(2)]],   // [KV, max_t, hd] f32
+    device float*       out     [[buffer(3)]],   // [H, hd]
+    constant int&       kv_heads [[buffer(4)]],
+    constant int&       heads    [[buffer(5)]],
+    constant int&       hd       [[buffer(6)]],
+    constant int&       max_t    [[buffer(7)]],
+    constant int&       nsel     [[buffer(8)]],
+    constant float&     scale    [[buffer(9)]],
+    constant int&       gated    [[buffer(10)]],
+    constant long&      kbase    [[buffer(11)]],
+    constant long&      vbase    [[buffer(12)]],
+    uint tg                      [[threadgroup_position_in_grid]],
+    uint lane                    [[thread_index_in_simdgroup]])
+{
+    if (lane >= 32u) return;
+    const int groups = heads / kv_heads;
+    const int hh = (int)tg % heads;
+    const int hg = hh / groups;
+    device const float* qh = q + (long)hh * 2 * hd;
+    device const float* gh = qh + hd;
+    /* The K and V caches are independent allocations with independent slab base
+     * addresses, so each carries its own byte offset within its own buffer.
+     * Folding them into one shared uchar base would alias the wrong pages. */
+    device const float* kr = (device const float*)(kvk + kbase) + (long)hg * max_t * hd;
+    device const float* vr = (device const float*)(kvv + vbase) + (long)hg * max_t * hd;
+
+    /* Scores must be materialised because softmax needs the max first; `nsel`
+     * is the cached span (<= max_t), so this stays small. `threadgroup` memory
+     * is capped at 32 KiB = 8192 floats, which covers the model's context. */
+    threadgroup float sc[8192];
+    float mx = -1e30f;
+    for (int p = 0; p < nsel; ++p) {
+        device const float* kk = kr + (long)p * hd;
+        float acc = 0.0f;
+        for (int dd = (int)lane; dd < hd; dd += 32) acc += qh[dd] * kk[dd];
+        acc = simd_sum(acc);
+        float s = acc * scale;
+        if (lane == 0) sc[p] = s;
+        if (s > mx) mx = s;
+    }
+    float ssum = 0.0f;
+    for (int p = 0; p < nsel; ++p) {
+        float e = exp(sc[p] - mx);
+        sc[p] = e;
+        ssum += e;
+    }
+    float inv = (ssum > 0.0f) ? (1.0f / ssum) : 0.0f;
+    for (int dd = (int)lane; dd < hd; dd += 32) {
+        float acc = 0.0f;
+        for (int p = 0; p < nsel; ++p) {
+            device const float* vv2 = vr + (long)p * hd;
+            acc += (sc[p] * inv) * vv2[dd];
+        }
+        /* Sigmoid output gate, matching the host path's 1/(1+exp(-g)). */
+        out[(long)hh * hd + dd] = gated ? acc * (1.0f / (1.0f + exp(-gh[dd]))) : acc;
+    }
+}
+
 kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) { float v=g[i]; g[i]=(v/(1.0f+exp(-v)))*u[i]; }
 
@@ -1552,6 +1635,8 @@ struct ColiMetalTensor {
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_fwht;
+/* EXP-071 full-attention decode island. */
+static id<MTLComputePipelineState> g_qwen_attn_decode;
 
 // fmt=6: sign-bit buffers for the GPU FWHT, one per tile size, cached forever (a
 // handful of sizes). The xorshift64* draw replicates quant.h e8_signs exactly —
@@ -1890,6 +1975,9 @@ extern "C" int coli_metal_init(void) {
     g_gemv     = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_gemv"]   error:&err];
     g_moe_gemv = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_gemv"] error:&err];
     g_moe_silu = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_silu"] error:&err];
+    g_qwen_attn_decode = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"qwen_attn_decode"] error:&err];
+    if (!g_qwen_attn_decode) { fprintf(stderr, "[metal] qwen_attn_decode pipeline failed: %s\n",
+        err ? [[err localizedDescription] UTF8String] : "?"); g_dev = nil; return 0; }
     g_moe_fwht = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_fwht"] error:&err];
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
@@ -3481,6 +3569,345 @@ extern "C" void coli_metal_shared_mxfp4_drop_model(uint64_t model_id) {
       delete ctx; it = g_qwen_shared_mx_ctxs.erase(it);
     } else ++it;
   }
+}
+
+/* ---- EXP-071: full-attention decode island -----------------------------
+ *
+ * Single dispatch, single wait. `q` is [heads, 2*hd] f32 with the sigmoid gate
+ * in the second half of each head; `kvk`/`kvv` are the model-lifetime f32 KV
+ * caches laid out [kv_heads][max_t][hd]; `out` is [heads, hd] f32. The KV cache
+ * is registered once (`coli_metal_register`) so `resolve()` aliases it with no
+ * per-call wrapper creation, and only the caller's freshly written row is new.
+ *
+ * Returns 0 on a pre-submit decline (so the caller keeps the host path) and -1
+ * after a submitted failure, matching the other Logan islands. */
+static id<MTLBuffer> g_attn_q, g_attn_out;
+static size_t g_attn_q_cap, g_attn_out_cap;
+
+extern "C" int coli_metal_qwen_attn_decode(
+    const float *q, int heads, int kv_heads, int hd, int max_t, int nsel, float scale,
+    float *out, const float *kvk_host, const float *kvv_host) {
+  if (!g_dev || !g_queue || !g_qwen_attn_decode || !q || !out || !kvk_host || !kvv_host ||
+      heads <= 0 || kv_heads <= 0 || hd <= 0 || max_t <= 0 || nsel <= 0 || nsel > max_t ||
+      nsel > 8192 || heads % kv_heads != 0)
+    return 0;
+  uint64_t wa = 0, sa = 0;
+  id<MTLBuffer> kb = resolve(kvk_host, &wa);
+  id<MTLBuffer> vb = resolve(kvv_host, &sa);
+  /* Each cache resolves to its own MTLBuffer plus its own base address inside
+   * that buffer; the kernel offsets each independently. The engine allocates K
+   * and V separately, so both are registered at model load. */
+  if (!kb || !vb) return 0;
+  const long kbase = (long)(wa - (uint64_t)[kb gpuAddress]);
+  const long vbase = (long)(sa - (uint64_t)[vb gpuAddress]);
+  const int gated = 1;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    const size_t qb = (size_t)heads * 2u * (size_t)hd * sizeof(float);
+    const size_t ob = (size_t)heads * (size_t)hd * sizeof(float);
+    if (!ensure_multi_buffer(&g_attn_q, &g_attn_q_cap, qb)) return 0;
+    if (!ensure_multi_buffer(&g_attn_out, &g_attn_out_cap, ob)) return 0;
+    memcpy([g_attn_q contents], q, qb);
+    uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    if (!e) return 0;
+    [e setComputePipelineState:g_qwen_attn_decode];
+    [e setBuffer:g_attn_q offset:0 atIndex:0];
+    [e setBuffer:kb offset:0 atIndex:1];
+    [e setBuffer:vb offset:0 atIndex:2];
+    [e setBuffer:g_attn_out offset:0 atIndex:3];
+    [e setBytes:&kv_heads length:4 atIndex:4];
+    [e setBytes:&heads length:4 atIndex:5];
+    [e setBytes:&hd length:4 atIndex:6];
+    [e setBytes:&max_t length:4 atIndex:7];
+    [e setBytes:&nsel length:4 atIndex:8];
+    [e setBytes:&scale length:4 atIndex:9];
+    [e setBytes:&gated length:4 atIndex:10];
+    [e setBytes:&kbase length:8 atIndex:11];
+    [e setBytes:&vbase length:8 atIndex:12];
+    [e dispatchThreadgroups:MTLSizeMake((size_t)heads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [e endEncoding];
+    if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.encode_ns += t1 - t0; t0 = t1; }
+    [cb commit];
+    if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.submit_ns += t1 - t0; t0 = t1; }
+    [cb waitUntilCompleted];
+    if (t0) g_metal_prof.wait_ns += mnow_ns() - t0;
+    profile_gpu_cb(cb);
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+      fprintf(stderr, "[metal-attn] command failed after submission: %s\n",
+              cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+      return -1;
+    }
+    memcpy(out, [g_attn_out contents], ob);
+  }
+  return 1;
+}
+
+/* ---- EXP-068: one-command-buffer routed MoE island ----------------------
+ *
+ * The raw-MLX routed expert source reaches the GPU through
+ * `coli_metal_matmul_multi`, which is a *commit + waitUntilCompleted* per call.
+ * `MlxLocalExpertSource::eval` calls it three times per layer (gate, up, down),
+ * so a 40-layer decode pays up to 120 blocking GPU synchronizations per token
+ * even though every routed expert of a layer consumes the same activation.
+ *
+ * This entry point folds the whole layer into ONE command buffer:
+ *
+ *   upload x once -> K gate GEMVs -> K up GEMVs -> GPU SwiGLU -> K down GEMVs
+ *     -> 8 weighted expert vectors copied back, one completion wait
+ *
+ * The caller keeps its own canonical rank-ordered reduction, so the accumulation
+ * order (expert 0, then 1, ... K-1 for every hidden element) is unchanged and
+ * the trajectory gate is preserved. A single shared event covers the whole
+ * layer, so the host observes one completion boundary instead of three.
+ *
+ * The routed experts live in the streaming RouteArena: caller-owned, page-
+ * aligned, already registered pages. `resolve()` hands back the MTLBuffer that
+ * aliases them, so no per-expert wrapper buffer is created here. Unsupported
+ * formats and layouts decline (return 0) before anything is submitted. */
+struct MoeRouteCtx {
+  int D = 0, M = 0, K = 0;
+  id<MTLBuffer> x = nil;
+  id<MTLBuffer> gu = nil, mid = nil;          /* [2K*M], [K*M] */
+  std::vector<id<MTLBuffer>> outs;            /* K x D */
+  id<MTLSharedEvent> ev = nil;
+  uint64_t ev_val = 0;
+  id<MTLCommandBuffer> inflight = nil;
+};
+static std::vector<MoeRouteCtx *> g_moe_route_ctxs;
+
+static void moe_route_ctx_free(MoeRouteCtx *ctx) {
+  if (!ctx) return;
+  if (ctx->inflight) {
+    if (ctx->inflight.status == MTLCommandBufferStatusCommitted ||
+        ctx->inflight.status == MTLCommandBufferStatusScheduled)
+      [ctx->inflight waitUntilCompleted];
+    ctx->inflight = nil;
+  }
+  delete ctx;
+}
+
+/* One context per (D, M, K). All 40 layers of Qwen3.6 share identical expert
+ * geometry, so this is a single allocation for the whole decode. */
+static MoeRouteCtx *moe_route_ctx_locked(int D, int M, int K) {
+  if (!g_dev || !g_queue || D <= 0 || M <= 0 || K <= 0 || K > 16) return nullptr;
+  for (MoeRouteCtx *ctx : g_moe_route_ctxs) {
+    if (!ctx) continue;
+    if (ctx->D == D && ctx->M == M && ctx->K == K) return ctx;
+  }
+  MoeRouteCtx *ctx = new (std::nothrow) MoeRouteCtx();
+  if (!ctx) return nullptr;
+  ctx->D = D; ctx->M = M; ctx->K = K;
+  ctx->x = [g_dev newBufferWithLength:(size_t)D * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+  ctx->gu = [g_dev newBufferWithLength:(size_t)2 * K * M * sizeof(float)
+                                options:MTLResourceStorageModePrivate];
+  ctx->mid = [g_dev newBufferWithLength:(size_t)K * M * sizeof(float)
+                                 options:MTLResourceStorageModePrivate];
+  ctx->outs.resize((size_t)K);
+  for (int i = 0; i < K; ++i) {
+    ctx->outs[(size_t)i] = [g_dev newBufferWithLength:(size_t)D * sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+    if (!ctx->outs[(size_t)i]) { delete ctx; return nullptr; }
+  }
+  if (@available(macOS 10.14, *)) {
+    ctx->ev = [g_dev newSharedEvent];
+  }
+  if (!ctx->x || !ctx->gu || !ctx->mid || !ctx->ev) { delete ctx; return nullptr; }
+  g_moe_route_ctxs.push_back(ctx);
+  return ctx;
+}
+
+/* Encode one GEMV over a resolved tensor into `e`. Mirrors the generic
+ * `mm_gemv` bindings exactly (same buffer indices, same 4-rows-per-128-thread
+ * dispatch), so the arithmetic is bit-identical to the multi-GEMV path. */
+static void moe_route_encode_gemv(id<MTLComputeCommandEncoder> e, ColiMetalTensor *t,
+                                  id<MTLBuffer> xbuf, size_t xoff,
+                                  id<MTLBuffer> ybuf, size_t yoff) {
+  const int S = 1, I = t->I, O = t->O, fmt = t->fmt, gs = t->gs, NT = t->O;
+  [e setComputePipelineState:g_gemv];
+  [e setBuffer:t->w offset:t->woff atIndex:0];
+  [e setBuffer:t->s offset:t->soff atIndex:1];
+  [e setBuffer:xbuf offset:xoff atIndex:2];
+  [e setBuffer:ybuf offset:yoff atIndex:3];
+  [e setBytes:&S length:4 atIndex:4];
+  [e setBytes:&I length:4 atIndex:5];
+  [e setBytes:&O length:4 atIndex:6];
+  [e setBytes:&fmt length:4 atIndex:7];
+  [e setBytes:&NT length:4 atIndex:8];
+  [e setBytes:&gs length:4 atIndex:9];
+  [e dispatchThreadgroups:MTLSizeMake(((size_t)O + 3u) / 4u, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+}
+
+/* Split-phase submit: enqueue the whole layer, signal a shared event, return.
+ * The caller overlaps its own work (the shared expert) and then waits on the
+ * event, exactly like the Apple8 direct path's `_begin`/`_finish`. */
+extern "C" void *coli_metal_moe_route_begin(
+    uint64_t model_id, int layer, ColiMetalMatmulDesc *descs, int count,
+    const float *x, int D, int M) {
+  (void)model_id; (void)layer;
+  if (!g_dev || !g_queue || !g_gemv || !descs || count <= 0 || count > 16 ||
+      !x || D <= 0 || M <= 0) return nullptr;
+  const int K = count;
+  const int expected_I[3] = {D, D, M};
+  const int expected_O[3] = {M, M, D};
+  for (int i = 0; i < K; ++i) {
+    for (int role = 0; role < 3; ++role) {
+      const ColiMetalMatmulDesc &d = descs[i * 3 + role];
+      const bool fmt_ok = (d.fmt == 7) || (d.fmt >= 21 && d.fmt <= 24);
+      if (!fmt_ok || d.I != expected_I[role] || d.O != expected_O[role]) return nullptr;
+      if (d.fmt != 7 && d.gs <= 0) return nullptr;
+    }
+  }
+
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  @autoreleasepool {
+    MoeRouteCtx *ctx = moe_route_ctx_locked(D, M, K);
+    if (!ctx) return nullptr;
+    /* Resolve every expert (K*3) to a tensor before touching the encoder, so a
+     * decline leaves the queue untouched. */
+    std::vector<ColiMetalTensor *> wt((size_t)K * 3, nullptr);
+    for (int i = 0; i < K * 3; ++i) {
+      wt[(size_t)i] = qwen_gdn_mx_tensor(descs[i]);
+      if (!wt[(size_t)i]) return nullptr;
+    }
+    /* Upload the token activation once; every gate/up GEMV reads this buffer.
+     * Done before the encoder is built so the GPU cannot observe a stale row. */
+    memcpy([ctx->x contents], x, (size_t)D * sizeof(float));
+    uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+    @autoreleasepool {
+      id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+      if (!cb) return nullptr;
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+      if (!e) return nullptr;
+      const size_t row_off = (size_t)sizeof(float);
+      /* gate -> gu[i*M ..), up -> gu[K*M + i*M ..): two contiguous halves, so
+       * the existing in-place `moe_silu(g, u)` kernel can consume them, and the
+       * down GEMV below reads its expert's SwiGLU output straight out of the
+       * gate half. */
+      const size_t gu_expert = (size_t)M * row_off;
+      const size_t up_base = (size_t)K * gu_expert;
+      for (int i = 0; i < K; ++i) {
+        moe_route_encode_gemv(e, wt[(size_t)(i * 3 + 0)], ctx->x, 0,
+                              ctx->gu, (size_t)i * gu_expert);
+        moe_route_encode_gemv(e, wt[(size_t)(i * 3 + 1)], ctx->x, 0,
+                              ctx->gu, up_base + (size_t)i * gu_expert);
+      }
+      /* Dispatches inside one encoder are NOT mutually visible without a
+       * barrier, so the SwiGLU must be ordered after every gate/up write and
+       * the downs after every SwiGLU write. This mirrors the same-encoder
+       * chains elsewhere in this file. */
+      [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      /* GPU SwiGLU in place: gate[i] = silu(gate[i]) * up[i]. */
+      {
+        const int total = K * M;
+        [e setComputePipelineState:g_moe_silu];
+        [e setBuffer:ctx->gu offset:0 atIndex:0];
+        [e setBuffer:ctx->gu offset:up_base atIndex:1];
+        [e dispatchThreads:MTLSizeMake((NSUInteger)total, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake((NSUInteger)std::min(total, 256), 1, 1)];
+      }
+      [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      for (int i = 0; i < K; ++i) {
+        moe_route_encode_gemv(e, wt[(size_t)(i * 3 + 2)], ctx->gu,
+                              (size_t)i * gu_expert,
+                              ctx->outs[(size_t)i], 0);
+      }
+      [e endEncoding];
+      ctx->ev_val += 1;
+      [cb encodeSignalEvent:ctx->ev value:ctx->ev_val];
+      if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.encode_ns += t1 - t0; t0 = t1; }
+      [cb commit];
+      if (t0) { uint64_t t1 = mnow_ns(); g_metal_prof.submit_ns += t1 - t0; }
+      profile_gpu_cb(cb);
+      ctx->inflight = cb;
+      /* Return an owning handle: the ctx pointer plus the event value. Held in a
+       * heap cell so finish/discard can be separate C calls. */
+      struct MoeRoutePending { MoeRouteCtx *ctx; uint64_t value; };
+      MoeRoutePending *p = new (std::nothrow) MoeRoutePending{ctx, ctx->ev_val};
+      if (!p) [cb waitUntilCompleted];
+      return p;
+    }
+  }
+}
+
+extern "C" int coli_metal_moe_route_finish(void *pending, float *out, int count) {
+  if (!pending) return 0;
+  struct MoeRoutePending { MoeRouteCtx *ctx; uint64_t value; };
+  MoeRoutePending *p = (MoeRoutePending *)pending;
+  MoeRouteCtx *ctx = p->ctx;
+  const uint64_t value = p->value;
+  delete p;
+  if (!ctx || !out || count <= 0) return 0;
+  uint64_t t0 = g_coli_metal_profile_on ? mnow_ns() : 0;
+  @autoreleasepool {
+    MoeRouteCtx *live = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(g_op_mtx);
+      for (MoeRouteCtx *c : g_moe_route_ctxs) if (c == ctx) { live = c; break; }
+    }
+    if (!live) return 0;
+    id<MTLSharedEvent> ev = live->ev;
+    if (@available(macOS 10.14, *)) {
+      /* One host wait for the entire layer. */
+      bool signaled = false;
+      for (;;) {
+        if ([ev waitUntilSignaledValue:value timeoutMS:1000]) { signaled = true; break; }
+        /* Timeout is not failure: keep waiting, but let a torn-down context
+         * exit rather than spin forever. */
+        std::lock_guard<std::mutex> lk(g_op_mtx);
+        bool present = false;
+        for (MoeRouteCtx *c : g_moe_route_ctxs) if (c == live) { present = true; break; }
+        if (!present) return 0;
+      }
+      if (!signaled) return 0;
+    }
+    id<MTLCommandBuffer> cb = live->inflight;
+    if (cb) {
+      /* The shared event fires at the same point in the command stream as the
+       * buffer's own completion, but the CPU-side status transition is not
+       * guaranteed to be visible yet, so the event is the wait and `error` is
+       * the failure signal. Only a genuinely failed buffer is reported. */
+      if (cb.status == MTLCommandBufferStatusError || cb.error != nil) {
+        fprintf(stderr, "[metal-moe-route] command failed after submission: %s\n",
+                cb.error ? cb.error.localizedDescription.UTF8String : "unknown");
+        live->inflight = nil;
+        return -1;
+      }
+      live->inflight = nil;
+    }
+    if (t0) g_metal_prof.wait_ns += mnow_ns() - t0;
+    const int K = std::min(count, live->K);
+    for (int i = 0; i < K; ++i)
+      memcpy(out + (size_t)i * live->D, [live->outs[(size_t)i] contents],
+             (size_t)live->D * sizeof(float));
+  }
+  return 1;
+}
+
+extern "C" void coli_metal_moe_route_discard(void *pending) {
+  if (!pending) return;
+  struct MoeRoutePending { MoeRouteCtx *ctx; uint64_t value; };
+  MoeRoutePending *p = (MoeRoutePending *)pending;
+  MoeRouteCtx *ctx = p->ctx;
+  delete p;
+  if (!ctx) return;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  if (ctx->inflight) {
+    [ctx->inflight waitUntilCompleted];
+    ctx->inflight = nil;
+  }
+}
+
+extern "C" void coli_metal_moe_route_drop_model(uint64_t model_id) {
+  (void)model_id;
+  std::lock_guard<std::mutex> lk(g_op_mtx);
+  for (MoeRouteCtx *ctx : g_moe_route_ctxs) moe_route_ctx_free(ctx);
+  g_moe_route_ctxs.clear();
 }
 
 // ---- fused decode attention scratch (GLM-5.2 dims) ----

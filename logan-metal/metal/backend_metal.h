@@ -148,6 +148,35 @@ int coli_metal_shared_mxfp4(uint64_t model_id, int layer,
                             const float *x, float *out, int D, int Iinter);
 void coli_metal_shared_mxfp4_drop_model(uint64_t model_id);
 
+/* EXP-068: routed-MoE Metal island. `descs` are exactly K*3 descriptors in
+ * expert-major order [e0.gate, e0.up, e0.down, e1.gate, ...], each 4-bit/5-bit/
+ * 6-bit/8-bit MLX affine (fmt 21..24, or 7 for MXFP4) with shapes
+ * gate/up [M,D] and down [D,M]. All K experts are encoded into ONE command
+ * buffer: K gate GEMVs, K up GEMVs, an in-place GPU SwiGLU, then K down GEMVs.
+ * `begin` submits and returns an opaque pending handle (or NULL on a pre-submit
+ * decline); `finish` waits the single completion event and copies the K expert
+ * output vectors to `out` (`K*D` floats, expert-major). The caller performs its
+ * own rank-ordered weighted reduction, preserving the canonical accumulation
+ * order. `discard` releases a pending handle without producing output.
+ * Returns 1 (success), 0 (pre-submit decline/not found), -1 (post-submit
+ * failure). */
+void *coli_metal_moe_route_begin(uint64_t model_id, int layer,
+                                 ColiMetalMatmulDesc *descs, int count,
+                                 const float *x, int D, int M);
+int   coli_metal_moe_route_finish(void *pending, float *out, int count);
+void  coli_metal_moe_route_discard(void *pending);
+void  coli_metal_moe_route_drop_model(uint64_t model_id);
+
+/* EXP-071: full-attention decode island. `q` is [heads,2*hd] f32 with the sigmoid
+ * gate in each head's second half; `kvk_host`/`kvv_host` are the registered f32
+ * KV caches laid out [kv_heads][max_t][hd]; `out` is [heads,hd] f32. Both caches
+ * must resolve into the SAME registered buffer (one shared row stride), or the
+ * call declines with 0 so the engine keeps its host path. Returns 1 on success,
+ * 0 pre-submit decline, -1 post-submit failure. */
+int coli_metal_qwen_attn_decode(const float *q, int heads, int kv_heads, int hd,
+                                int max_t, int nsel, float scale, float *out,
+                                const float *kvk_host, const float *kvv_host);
+
 void   coli_metal_tensor_free(ColiMetalTensor *tensor);
 size_t coli_metal_tensor_bytes(const ColiMetalTensor *tensor);
 int    coli_metal_ptr_registered(const void *p);

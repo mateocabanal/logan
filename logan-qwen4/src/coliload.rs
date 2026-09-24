@@ -6,8 +6,8 @@
 
 use crate::{
     colisource::{bf16_to_f32, ColiSource},
-    lazy_zeroed_f32, make_expert_store, next_metal_model_id, Cfg, HcGlobal, Layer, Model, Wt,
-    WtBytes,
+    lazy_zeroed_f32, make_expert_store, next_metal_model_id, Cfg, HcGlobal, KvCache, Layer, Model,
+    Wt, WtBytes,
 };
 
 /// C parity (coli_target_registry.h): the direct Apple8/MetalIO execution
@@ -261,6 +261,12 @@ impl Model {
         let mut cfg = cfg.clone();
         // Bring up the Metal backend once (experts GEMV via FFI).
         crate::ffi::metal_init();
+        let route_mode = crate::RouteMode::from_env();
+        let edge0_router = if route_mode.needs_edge0() {
+            Some(crate::edge0_router::Edge0Router::load_from_env(&cfg)?)
+        } else {
+            None
+        };
         // Direct path default: ON for Apple8-profile packages (C parity —
         // the C runner enables the direct seam for the validated target
         // profile). QWEN_APPLE8_DIRECT=0 remains the opt-OUT.
@@ -808,14 +814,14 @@ impl Model {
                     .iter()
                     .map(|&is_gdn| {
                         if is_gdn {
-                            Vec::new()
+                            KvCache::new(0)
                         } else {
-                            lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                            KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim)
                         }
                     })
                     .collect::<Vec<_>>();
                 if runtime_layers > cfg.layers {
-                    v.push(lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim));
+                    v.push(KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim));
                 }
                 v
             },
@@ -825,14 +831,14 @@ impl Model {
                     .iter()
                     .map(|&is_gdn| {
                         if is_gdn {
-                            Vec::new()
+                            KvCache::new(0)
                         } else {
-                            lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim)
+                            KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim)
                         }
                     })
                     .collect::<Vec<_>>();
                 if runtime_layers > cfg.layers {
-                    v.push(lazy_zeroed_f32(cfg.kv_heads * cfg.max_t * cfg.head_dim));
+                    v.push(KvCache::new(cfg.kv_heads * cfg.max_t * cfg.head_dim));
                 }
                 v
             },
@@ -879,9 +885,7 @@ impl Model {
             route_spatial_pairs: vec![0; runtime_layers],
             route_spatial_top1_hits: vec![0; runtime_layers],
             route_spatial_top1_total: vec![0; runtime_layers],
-            route_predictor: if crate::env_flag("QWEN_ROUTE_PREDICT")
-                || crate::env_flag("QWEN_ROUTE_PREDICT_PREFETCH")
-            {
+            route_predictor: if route_mode.needs_routescout() {
                 Some(crate::route_predictor::RoutePredictor::new(
                     runtime_layers,
                     cfg.experts,
@@ -889,7 +893,21 @@ impl Model {
             } else {
                 None
             },
+            edge0_router,
+            edge0_train_trace: None,
             route_predict_prefetch: crate::env_flag("QWEN_ROUTE_PREDICT_PREFETCH"),
+            route_native_prev: (0..runtime_layers).map(|_| Vec::new()).collect(),
+            route_mode,
+            route_native_k: crate::native_k_env().unwrap_or(0),
+            hybrid_stage_config: crate::hybrid_stage::StageConfig::from_env(),
+            hybrid_edge0_ranked: (0..cfg.layers).map(|_| Vec::new()).collect(),
+            in_prefill: false,
+            route_authoritative_k: std::env::var("QWEN_ROUTE_AUTHORITATIVE_K")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            route_agreement: crate::RouteAgreement::default(),
+            route_layer_error: crate::LayerRouteError::default(),
             metal_model_id: next_metal_model_id(),
             metal_direct: direct_ok
                 && std::env::var("QWEN_APPLE8_DIRECT")
